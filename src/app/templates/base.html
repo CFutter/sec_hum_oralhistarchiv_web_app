@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{% block meta_description %}Digital Oral History Archive{% endblock %}">
+  {% if not is_production %}
+    <meta name="robots" content="noindex, nofollow">
+  {% endif %}
+    
+  <title>{% block title %}Digital Oral History Archive{% endblock %}</title>
+  <link rel="stylesheet" href="{{ request.url_for('static', path='css/style.css') }}">
+  
+  <link rel="preload" 
+      href="{{ request.url_for('static', path='fonts/source-sans-3-v19-latin-regular.woff2') }}" 
+      as="font" 
+      type="font/woff2" 
+      crossorigin>
+</head>
+
+<body>
+{% set user = request.state.user %}
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a href="{{ request.url_for('home') }}" class="header-logo">
+        <span class="logo-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <line x1="12" y1="19" x2="12" y2="22"/>
+          </svg>
+        </span>
+        <span class="logo-text">Oral History Archive</span>
+      </a>
+      {% set active_page = active_page | default("") %}
+      <nav class="header-nav" aria-label="Main navigation">
+        <a href="{{ request.url_for('home') }}" class="nav-link {% if active_page == 'home' %}active{% endif %}">Home</a>
+        <a href="{{ request.url_for('search_page') }}" class="nav-link {% if active_page == 'search' %}active{% endif %}">Search</a>
+        <a href="{{ request.url_for('about') }}" class="nav-link {% if active_page == 'about' %}active{% endif %}">About</a>
+        {% if user %}
+          {% if user.is_admin %}
+            <a href="{{ request.url_for('admin_dashboard') }}" class="nav-link {% if active_page == 'admin' %}active{% endif %}">Admin</a>
+          {% endif %}
+          <a href="{{ request.url_for('account_page') }}" class="nav-user">{{ user.display_name or user.email }}</a>
+          <form action="{{ request.url_for('logout') }}" method="post" class="nav-logout-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <button type="submit" class="nav-link nav-auth">Logout</button>
+          </form>
+        {% else %}
+          <a href="{{ request.url_for('login_page') }}" class="nav-link nav-auth">Login</a>
+        {% endif %}
+              </nav>
+    </div>
+  </header>
+
+  <main class="site-main">
+    {% set flash = get_flash(request) %}
+    {% if flash %}
+    {% set flash_message, flash_category = flash %}
+      <div class="auth-{{ flash_category }}">{{ flash_message }}</div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <div class="footer-left">
+        <strong>Digital Oral History Archive</strong>
+        <span>University of Zurich — Phase 1 Prototype</span>
+      </div>
+      <div class="footer-right">
+        <a href="{{ request.url_for('about') }}">About</a>
+        <a href="{{ request.url_for('search_page') }}">Search</a>
+      </div>
+    </div>
+  </footer>
+
+</body>
+</html>

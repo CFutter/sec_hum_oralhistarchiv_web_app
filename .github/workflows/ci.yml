@@ -1,0 +1,97 @@
+# CI quality gates: lint, types, security, tests.
+# Save as .github/workflows/ci.yml
+#
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+      - name: Ruff lint
+        run: uv run ruff check .
+
+  typecheck:
+    name: mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+      # Application code only — excludes src/tests and src/alembic.
+      - name: Mypy type check
+        run: uv run mypy src/app src/config run.py run_scheduler.py
+
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+      - name: Bandit
+        run: uv run bandit -r src/app src/config run.py run_scheduler.py gunicorn.conf.py
+      # Audit the exact locked dependency set for known vulnerabilities.
+      - name: Export locked requirements
+        run: uv export --locked --no-emit-project --no-hashes -o requirements-runtime.txt
+      - name: pip-audit
+        run: uv run pip-audit --disable-pip --no-deps -r requirements-runtime.txt
+
+  tests:
+    name: pytest
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: oralhistarchiv_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d oralhistarchiv_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://test:test@localhost:5432/oralhistarchiv_test
+      REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+      - name: Run test suite
+        run: uv run pytest

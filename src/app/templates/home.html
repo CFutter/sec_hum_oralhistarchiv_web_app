@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% set active_page = "home" %}
+{% block title %}Digital Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="hero">
+  <div class="hero-content">
+    <h1>Digital Oral History Archive</h1>
+    <p>Search and explore interview metadata from oral history research collections at the University of Zurich.</p>
+    <form class="hero-search" role="search" action="{{ request.url_for('search_page') }}" method="get">
+      <input type="text" name="q" maxlength="200" placeholder="Search by keyword, title, author, topic…" autocomplete="off" aria-label="Search datasets">
+      <button type="submit">Search</button>
+    </form>
+  </div>
+</section>
+
+<section class="container">
+
+  <div class="stats-row">
+    <div class="stat-card">
+      <span class="stat-number">{{ total_datasets }}</span>
+      <span class="stat-label">Interviews</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-number">{{ total_languages }}</span>
+      <span class="stat-label">Languages</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-number">{{ total_keywords }}</span>
+      <span class="stat-label">Keywords</span>
+    </div>
+  </div>
+
+  <p class="data-freshness">Data last fully updated: {{ last_full_rebuild | default('—') }}</p>
+  
+  <h2 class="section-heading">Recent Additions</h2>
+
+  <div class="card-grid">
+    {% for item in recent %}
+    <a href="{{ request.url_for('detail', dataset_id=item.id) }}" class="dataset-card">
+      <div class="card-access {{ item.access_level }}">{{ item.access_level }}</div>
+      <h3>{{ item.title }}</h3>
+
+      {% if can_view_full(item, user_tier) %}
+      <p class="card-authors">{{ item.authors | map(attribute='name')| join('; ') }}</p>
+      <p class="card-summary">{{ (item.description or '')[:120] }}{% if item.description and item.description|length > 120 %}…{% endif %}</p>
+      <div class="card-meta">
+        {% for lang in item.languages %}<span>{{ lang }}</span>{% endfor %}
+        <span>v{{ item.version }}</span>
+      </div>
+      <div class="card-topics">
+        {% for keyword in item.keywords[:4] %}
+        <span class="tag">{{ keyword }}</span>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="result-restricted">
+        Extended metadata available to authorized researchers.<br>
+        Log in or request access to view.
+      </p>
+      {% endif %}
+
+    </a>
+    {% endfor %}
+  </div>
+
+  <div class="section-cta">
+    <a href="{{ request.url_for('search_page') }}" class="btn btn-primary">Browse all datasets →</a>
+  </div>
+
+</section>
+{% endblock %}

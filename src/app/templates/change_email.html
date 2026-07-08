@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% set active_page = "account" %}
+{% block title %}Change Email — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+
+  <h1>Change Email Address</h1>
+  <p class="auth-intro">
+    Enter your new email address and confirm with your current password.
+    We'll send a confirmation link to the new address — the change takes
+    effect only after you click it.
+  </p>
+
+  {% if error %}
+  <div class="auth-error">{{ error }}</div>
+  {% endif %}
+
+  <div class="auth-section">
+    <form class="auth-form" action="{{ request.url_for('change_email_submit') }}" method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+
+      <div class="form-group">
+        <label for="current_email">Current Email</label>
+        <input type="email" id="current_email" value="{{ user.email }}"
+               disabled autocomplete="off">
+        <span class="form-hint">This is your current address.</span>
+      </div>
+
+      <div class="form-group">
+        <label for="new_email">New Email</label>
+        <input type="email" id="new_email" name="new_email" required maxlength="200"
+               autocomplete="email">
+      </div>
+
+      <div class="form-group">
+        <label for="current_password">Current Password</label>
+        <input type="password" id="current_password" name="current_password"
+               required maxlength="200" autocomplete="current-password">
+        <span class="form-hint">Required to confirm it's really you.</span>
+      </div>
+
+      <button type="submit" class="btn btn-primary">Send Confirmation Link</button>
+    </form>
+
+    <p class="auth-link"><a href="{{ request.url_for('account_page') }}">Back to account</a></p>
+  </div>
+
+</section>
+{% endblock %}

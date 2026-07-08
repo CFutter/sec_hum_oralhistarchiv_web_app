@@ -1,0 +1,74 @@
+# /etc/rsyslog.d/30-oralhistarchiv.conf  (example — copy and edit before use)
+#
+# Secure off-host audit-log shipping for the Oral History Archive.
+#
+# MODEL: The application does NOT ship logs itself. It writes structured
+# JSON to stdout, which systemd-journald captures. This rsyslog config
+# reads from journald and forwards to a central collector over RELP+TLS
+# (reliable, encrypted, mutually authenticated). See Deployment.md §12.
+#
+#
+# Replace every <...> placeholder before deploying.
+
+# ---------------------------------------------------------------------------
+# 1. Read from the systemd journal
+# ---------------------------------------------------------------------------
+module(load="imjournal"
+       StateFile="imjournal-oralhistarchiv.state"
+       Ratelimit.Interval="0")   # 0 = no rsyslog-side rate limiting; the app
+                                  # already bounds its own log volume. Raise
+                                  # only if a log storm is observed.
+
+# Avoid silent truncation of long audit records (events with stack traces can
+# exceed the 8 KiB default and would otherwise be cut mid-JSON).
+# NOTE: $MaxMessageSize is a global — for full effect set it at the very top
+# of /etc/rsyslog.conf; placed in a drop-in it only affects config parsed
+# after this file.
+$MaxMessageSize 64k
+
+# ---------------------------------------------------------------------------
+# 2. Forward over RELP + TLS to the central collector
+# ---------------------------------------------------------------------------
+# RELP gives application-level acknowledgement (no silent loss, unlike UDP/TCP
+# syslog). TLS with x509/name gives confidentiality + mutual authentication:
+#   - tls.caCert       verifies the collector is genuine (anti-spoof inbound)
+#   - tls.myCert/Key   proves THIS host to the collector (anti-spoof outbound,
+#                      so an attacker cannot inject forged audit records)
+#   - tls.permittedPeer pins the expected collector identity
+module(load="omrelp")
+
+# Optional but recommended: only forward records from this app + the backup
+# tag, not the entire host journal, to keep the audit stream focused.
+# (Adjust the programname values to match SYSLOG_IDENTIFIER / unit names.)
+if ($programname == "oralhistarchiv"
+    or $programname == "oralhistarchiv-scheduler"
+    or $syslogtag startswith "oralhistarchiv-backup") then {
+
+    action(
+        type="omrelp"
+        target="<logcollector.uzh.ch>"
+        port="<2514>"
+
+        tls="on"
+        tls.caCert="/etc/rsyslog.d/tls/ca.pem"
+        tls.myCert="/etc/rsyslog.d/tls/oralhistarchiv-client-cert.pem"
+        tls.myPrivKey="/etc/rsyslog.d/tls/oralhistarchiv-client-key.pem"
+        tls.authMode="name"   # omrelp accepts "name"/"fingerprint"/"certvalid" — NOT the imtcp-style "x509/name"
+        tls.permittedPeer=["<logcollector.uzh.ch>"]
+
+        # Disk-assisted queue: if the collector is unreachable, buffer to disk
+        # and retry indefinitely instead of dropping records. BOUND the disk
+        # use so a long outage cannot fill the VM disk and take the app down.
+        queue.type="LinkedList"
+        queue.filename="relp_oralhistarchiv_fwd"
+        queue.maxDiskSpace="512m"
+        queue.saveOnShutdown="on"
+        action.resumeRetryCount="-1"        # retry forever
+        action.resumeInterval="30"          # seconds between retries
+    )
+
+    # Keep a local journald copy too (do not stop after forwarding), so the
+    # on-host audit trail survives even if the collector link is down.
+    # Comment out the next line if you want forwarded-only.
+    # stop
+}

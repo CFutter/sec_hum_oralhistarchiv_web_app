@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% set active_page = "search" %}
+{% block title %}{{ dataset.title }} — Oral History Archive{% endblock %}
+
+{% block content %}
+{% set can_view = can_view_full(dataset, user_tier) %}
+<section class="container detail-page">
+
+  <a href="{{ request.url_for('search_page') }}" class="back-link">← Back to search</a>
+
+  <div class="detail-header">
+    <span class="card-access {{ dataset.access_level }}">{{ dataset.access_level }}</span>
+    <h1>{{ dataset.title }}</h1>
+    {% if can_view and dataset.project_title %}
+    <p class="detail-project">{{ dataset.project_title }}</p>
+    {% endif %}
+  </div>
+
+  {% if can_view %}
+  <div class="detail-layout">
+
+    <div class="detail-main">
+      <h2>Description</h2>
+      <p>{{ dataset.description or 'No description available.' }}</p>
+    
+      {% if dataset.resource_description %}
+      <h2>Resource</h2>
+      <p>{{ dataset.resource_description }}</p>
+      {% endif %}
+    
+      {% if dataset.project_description %}
+      <h2>Project</h2>
+      <p>{{ dataset.project_description }}</p>
+      {% endif %}
+    
+      <h2>Keywords</h2>
+      <div class="card-topics">
+        {% for keyword in dataset.keywords %}
+        <a href="{{ request.url_for('search_page') }}?keyword={{ keyword|urlencode }}" class="tag">{{ keyword }}</a>
+        {% endfor %}
+      </div>
+    
+      {% if dataset.bibliographical_citation %}
+      <h2>Citation</h2>
+      <p class="detail-citation">{{ dataset.bibliographical_citation }}</p>
+      {% endif %}
+    </div>
+
+    <aside class="detail-sidebar">
+      <div class="meta-card">
+        <h3>Dataset Details</h3>
+        <dl class="meta-list">
+          <dt>Authors</dt>
+          <dd>
+            {% for author in dataset.authors %}
+              {{ author.name }}<br>
+            {% endfor %}
+          </dd>
+          {% if dataset.resource_type %}
+          <dt>Type</dt>
+          <dd>{{ dataset.resource_type }}</dd>
+          {% endif %}
+          <dt>Languages</dt>
+          <dd>{{ dataset.languages | join(', ') or '—' }}</dd>
+          <dt>Version</dt>
+          <dd>{{ dataset.version or '—' }}</dd>
+          {% if dataset.doi %}
+          <dt>DOI</dt>
+          <dd><a href="{{ dataset.doi | doi_url }}">{{ dataset.doi }}</a></dd>
+          {% endif %}
+          <dt>Access Level</dt>
+          <dd><span class="card-access {{ dataset.access_level }}">{{ dataset.access_level }}</span></dd>
+          <dt>License</dt>
+          <dd>
+            {% if dataset.license_url %}
+            <a href="{{ dataset.license_url | safe_url }}">{{ dataset.license_val or 'View license' }}</a>
+            {% else %}
+            {{ dataset.license_val or '—' }}
+            {% endif %}
+          </dd>
+          <dt>Download</dt>
+          <dd>
+            {% if dataset.source == 'swissubase' and dataset.download_url %}
+              <a href="{{ dataset.download_url | safe_url}}" class="btn btn-primary btn-small">Download Dataset</a>
+            {% elif dataset.source == 'swissubase' and dataset.landing_page_url %}
+              <a href="{{ dataset.landing_page_url | safe_url}}" class="btn btn-secondary btn-small" target="_blank" rel="noopener">
+                View on SWISSUbase
+              </a>
+            {% else %}
+              <p class="download-restricted">Available to vetted researchers only.</p>
+              <p class="download-contact">Contact <a href="mailto:{{ contact_email }}">{{ contact_email }}</a> to request access.</p>
+            {% endif %}
+          </dd>
+          {% if dataset.project_title %}
+          <dt>Project</dt>
+          <dd>{{ dataset.project_title }}</dd>
+          {% endif %}
+        </dl>
+      </div>
+    </aside>
+
+  </div>
+
+  {% else %}
+
+  <div class="detail-restricted">
+    <h2>Restricted Dataset</h2>
+    <p>This dataset contains metadata classified as <strong>{{ dataset.access_level }}</strong>. Full details are available only to authorized researchers.</p>
+    {% if not user %}
+    <p><a href="{{ request.url_for('login_page') }}?next={{ request.url.path }}" class="btn btn-primary">Login to view</a></p>
+    {% endif %}
+    <p>To request elevated access, contact <a href="mailto:{{ contact_email }}">{{ contact_email }}</a> with your name, institutional affiliation, and research purpose.</p>
+  </div>
+
+  {% endif %}
+</section>
+{% endblock %}

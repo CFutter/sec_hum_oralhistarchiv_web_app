@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% set active_page = "login" %}
+{% block title %}Login — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+  {% if request.query_params.get('email_changed') %}
+  <div class="auth-success">Your email was changed. Please log in with your new address.</div>
+  {% endif %}
+
+  <h1>Login</h1>
+  <p class="auth-intro">Sign in to access extended metadata and restricted datasets.</p>
+
+  {% if error %}
+  <div class="auth-error">{{ error }}</div>
+  {% endif %}
+
+  {% if shibboleth_enabled %}
+  <div class="auth-section">
+    <h2>Institutional Login</h2>
+    <p>Authenticate with your university account via SWITCH edu-ID.</p>
+    <a href="/Shibboleth.sso/Login?target={{ request.url_for('shibboleth_callback').path }}" class="btn btn-primary btn-institutional">
+      Login with SWITCH edu-ID
+    </a>
+  </div>
+
+  <div class="auth-divider"><span>or</span></div>
+  {% endif %}
+
+  <div class="auth-section">
+    <h2>Local Account</h2>
+    <form class="auth-form" action="{{ request.url_for('login_submit') }}" method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <div class="form-group">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" required maxlength="200"
+               value="{{ email | default('') }}" autocomplete="email">
+      </div>
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required maxlength="200"
+               autocomplete="current-password">
+      </div>
+      <div class="form-group">
+        <label for="totp_code">Authentication Code</label>
+        <input type="text" id="totp_code" name="totp_code" maxlength="6"
+               pattern="[0-9]{0,6}" placeholder="6-digit code (if configured)"
+               autocomplete="off" inputmode="numeric">
+        <span class="form-hint">Leave blank if you haven't set up 2FA yet.</span>
+        <span class="form-hint">Codes are single-use and change every 30 seconds — if you just signed in, wait for a new code.</span>
+      </div>
+      <button type="submit" class="btn btn-primary">Login</button>
+    </form>
+
+    <p class="auth-link">Don't have an account? <a href="{{ request.url_for('register_page') }}">Register</a></p>
+    <p class="auth-link"><a href="{{ request.url_for('forgot_password_page') }}">Forgot your password?</a></p>
+    <p class="auth-link"><a href="{{ request.url_for('send_verification_page') }}">Need a new verification email?</a></p>
+  </div>
+
+</section>
+{% endblock %}

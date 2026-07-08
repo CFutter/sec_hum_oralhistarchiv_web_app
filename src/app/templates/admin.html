@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% set active_page = "admin" %}
+{% block title %}Admin — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container admin-page">
+
+  <h1>User Management</h1>
+
+  <div class="admin-table-wrap">
+    <table class="admin-table">
+      <thead>
+        <tr>
+          <th>Email</th>
+          <th>Name</th>
+          <th>Method</th>
+          <th>Tier</th>
+          <th>Admin</th>
+          <th>Active</th>
+          <th>Last Login</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in users %}
+        <tr class="{% if not u.is_active %}row-inactive{% endif %}">
+          <td>{{ u.email }}</td>
+          <td>{{ u.display_name or '—' }}</td>
+          <td>{{ u.auth_method }}</td>
+        
+          <td>
+            <form action="{{ request.url_for('admin_set_tier', user_id=u.id) }}" method="post" class="inline-form">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+              <select name="access_tier">
+                {% for tier in ['public', 'registered', 'vetted'] %}
+                <option value="{{ tier }}" {% if u.access_tier == tier %}selected{% endif %}>{{ tier }}</option>
+                {% endfor %}
+              </select>
+              <button type="submit" class="btn-save">Save</button>
+            </form>
+          </td>
+        
+          <td>
+            {# Admin toggle — was removed; restored here #}
+            {% if u.id == user.id %}
+              <span class="badge-admin">you</span>
+            {% elif u.is_admin %}
+              <form action="{{ request.url_for('admin_set_admin', user_id=u.id) }}" method="post" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="is_admin" value="false">
+                <button type="submit" class="btn-toggle active" title="Revoke admin">✓</button>
+              </form>
+            {% else %}
+              <form action="{{ request.url_for('admin_set_admin', user_id=u.id) }}" method="post" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="is_admin" value="true">
+                <button type="submit" class="btn-toggle" title="Grant admin">—</button>
+              </form>
+            {% endif %}
+          </td>
+        
+          <td>
+            {% if u.is_active %}
+              <span class="badge-active">active</span>
+            {% else %}
+              <span class="badge-inactive">inactive</span>
+            {% endif %}
+          </td>
+        
+          <td>{{ u.last_login.strftime('%d %b %Y, %H:%M') if u.last_login else '—' }}</td>
+        
+          <td>
+            {# Actions — was duplicated; deduplicated and email form added #}
+            {% if u.id != user.id %}
+              {% if u.is_active %}
+              <form action="{{ request.url_for('admin_set_active', user_id=u.id) }}" method="post" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="is_active" value="false">
+                <button type="submit" class="btn btn-small btn-danger">Deactivate</button>
+              </form>
+              {% else %}
+              <form action="{{ request.url_for('admin_set_active', user_id=u.id) }}" method="post" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="is_active" value="true">
+                <button type="submit" class="btn btn-small btn-secondary">Reactivate</button>
+              </form>
+              {% endif %}
+              {% else %}
+              <button type="button" class="btn btn-small btn-danger action-placeholder" 
+                      aria-hidden="true" tabindex="-1" disabled>Deactivate</button>
+              {% endif %}
+        
+            {% if u.auth_method == 'local' %}
+            <form action="{{ request.url_for('admin_change_email', user_id=u.id) }}"
+                  method="post" class="inline-form admin-email-form">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+              <input type="email" name="new_email" placeholder="new@address" maxlength="200" required>
+              <button type="submit" class="btn btn-small">Change Email</button>
+            </form>
+            {% if u.id == user.id %}
+            <span class="form-hint">You'll be logged out after confirming the link.</span>
+            {% endif %}
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <p class="admin-count">{{ users | length }} user{{ 's' if users | length != 1 }} total</p>
+
+</section>
+{% endblock %}

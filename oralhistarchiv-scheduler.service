@@ -1,0 +1,34 @@
+[Unit]
+Description=Oral History Archive — Background Scheduler
+After=network.target postgresql.service redis.service oralhistarchiv.service
+Wants=postgresql.service redis.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+User=oralhistarchiv
+Group=oralhistarchiv
+WorkingDirectory=/opt/oralhistarchiv/src
+EnvironmentFile=/opt/oralhistarchiv/.env
+Environment="PYTHONPATH=/opt/oralhistarchiv/src"
+
+ExecStart=/opt/oralhistarchiv/.venv/bin/python /opt/oralhistarchiv/run_scheduler.py
+
+Restart=on-failure
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/oralhistarchiv/data /run/oralhistarchiv
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

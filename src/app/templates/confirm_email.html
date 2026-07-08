@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% set active_page = "" %}
+{% block title %}Confirm Email Change — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+
+  <h1>Confirm Email Change</h1>
+  <p class="auth-intro">
+    {% if is_admin_initiated %}
+    An administrator requested to change the email address on your account to:
+    {% else %}
+    You requested to change the email address on your account to:
+    {% endif %}
+  </p>
+
+  <p class="auth-intro"><strong>{{ new_email }}</strong></p>
+
+  <div class="auth-section">
+    <form class="auth-form" action="{{ request.url_for('confirm_email_submit') }}" method="post">
+      <input type="hidden" name="token" value="{{ token }}">
+      <button type="submit" class="btn btn-primary">Confirm Change</button>
+    </form>
+    <p class="auth-link"><a href="{{ request.url_for('account_page') }}">Cancel</a></p>
+  </div>
+
+</section>
+{% endblock %}

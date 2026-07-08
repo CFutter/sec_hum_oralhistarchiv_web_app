@@ -1,0 +1,30 @@
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    volumes:
+      - ..:/workspaces:cached
+    depends_on:
+      - db
+
+
+  # ⚠️ DEVELOPMENT ONLY — do not use these credentials in production.
+  # Production should use a secrets management system (e.g. systemd EnvironmentFile,
+  # HashiCorp Vault, or university-provided secret store).
+  db:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: oralhistarchiv
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # No external ports — accessible only via Docker network from the app container.
+    # If you direct access is needed for debugging: uncomment the ports mapping below.
+    # ports:
+    #   - "5432:5432"
+
+volumes:
+  postgres-data:

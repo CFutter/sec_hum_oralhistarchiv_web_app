@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% set active_page = "about" %}
+{% block title %}About — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container about-page">
+
+  <h1>About the Archive</h1>
+  <p class="about-intro">The Digital Oral History Archive provides a unified search interface for interview metadata from oral history research collections at the University of Zurich.</p>
+
+  <div class="about-grid">
+
+    <div class="about-card">
+      <h2>What is this?</h2>
+      <p>This web application allows researchers to search, filter, and explore metadata from recorded oral history interviews. It aggregates data from multiple source systems into a single, consistent interface.</p>
+      <p>The archive does not store or serve interview recordings directly. Depending on access level and source, recordings are available through the originating repository.</p>
+    </div>
+
+    <div class="about-card">
+      <h2>Access Levels</h2>
+      <dl class="access-list">
+        <dt><span class="card-access public">public</span></dt>
+        <dd>Metadata visible to all visitors. No login required.</dd>
+        <dt><span class="card-access registered">registered</span></dt>
+        <dd>Extended metadata visible to registered academic users.</dd>
+        <dt><span class="card-access restricted">restricted</span></dt>
+        <dd>Full metadata available only to vetted researchers with approved access.</dd>
+      </dl>
+    </div>
+
+    <div class="about-card">
+      <h2>Data Sources</h2>
+      <table class="about-table">
+        <thead><tr><th>Source</th><th>Sensitivity</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td>Source A</td><td>Non-sensitive</td><td><span class="status-badge active">Active</span></td></tr>
+          <tr><td>Source B</td><td>Highly sensitive</td><td><span class="status-badge planned">Phase 2</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="about-card">
+      <h2>Contact</h2>
+      <p>This project is developed at the University of Zurich. For questions, access requests, or to report issues:</p>
+      <p><strong>Email:</strong> <a href="mailto:{{ contact_email }}">{{ contact_email }}</a></p>
+    </div>
+
+  </div>
+</section>
+{% endblock %}

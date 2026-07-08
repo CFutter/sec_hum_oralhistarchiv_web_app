@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% set active_page = "login" %}
+{% block title %}Register — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+
+  <h1>Create Account</h1>
+  <p class="auth-intro">Register a local account to access extended metadata. After creating your account, you will set up two-factor authentication.</p>
+
+  {% if error %}
+  <div class="auth-error">{{ error }}</div>
+  {% endif %}
+
+  <form class="auth-form" action="{{ request.url_for('register_submit') }}" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+
+    <div class="form-group">
+      <label for="email">Email</label>
+      <input type="email" id="email" name="email" required maxlength="200"
+             value="{{ email | default('') }}" autocomplete="email">
+    </div>
+
+    <div class="form-group">
+      <label for="display_name">Display Name</label>
+      <input type="text" id="display_name" name="display_name" required maxlength="200"
+             value="{{ display_name | default('') }}" autocomplete="name">
+    </div>
+
+    <div class="form-group">
+      <label for="affiliation">Affiliation (optional)</label>
+      <input type="text" id="affiliation" name="affiliation" maxlength="200"
+             value="{{ affiliation | default('') }}" autocomplete="organization"
+             placeholder="e.g. University of Zurich">
+    </div>
+
+    <div class="form-group">
+      <label for="country">Country (optional)</label>
+      <input type="text" id="country" name="country" maxlength="100"
+             value="{{ country | default('') }}" autocomplete="country-name"
+             placeholder="e.g. Switzerland">
+    </div>
+
+    <div class="form-group">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required
+             minlength="12" maxlength="200" autocomplete="new-password">
+      <span class="form-hint">Minimum 12 characters.</span>
+    </div>
+
+    <div class="form-group">
+      <label for="password_confirm">Confirm Password</label>
+      <input type="password" id="password_confirm" name="password_confirm" required
+             maxlength="200" autocomplete="new-password">
+    </div>
+
+    <button type="submit" class="btn btn-primary">Create Account</button>
+  </form>
+
+  <p class="auth-link">Already have an account? <a href="{{ request.url_for('login_page') }}">Login</a></p>
+
+</section>
+{% endblock %}

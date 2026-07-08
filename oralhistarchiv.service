@@ -1,0 +1,86 @@
+# /etc/systemd/system/oralhistarchiv.service
+#
+# Systemd service unit for the Oral History Archive.
+#
+# Install:
+#   sudo cp oralhistarchiv.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable oralhistarchiv
+#   sudo systemctl start oralhistarchiv
+#
+# Logs:
+#   sudo journalctl -u oralhistarchiv -f
+
+[Unit]
+Description=Oral History Archive (Gunicorn/Uvicorn)
+After=network.target postgresql.service redis.service
+Wants=postgresql.service redis.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+
+[Service]
+# --- User & Group ---
+# Run as a dedicated non-root user for security.
+# Create with: sudo useradd --system --no-create-home --shell /usr/sbin/nologin oralhistarchiv
+User=oralhistarchiv
+Group=oralhistarchiv
+
+# --- Working directory ---
+# Adjust to your installation path
+WorkingDirectory=/opt/oralhistarchiv/src
+
+# --- Environment ---
+# Load environment variables from the .env file
+EnvironmentFile=/opt/oralhistarchiv/.env
+
+# Ensure Python can find the application packages
+Environment="PYTHONPATH=/opt/oralhistarchiv/src"
+
+# --- Runtime directory for the Unix socket ---
+# systemd creates /run/oralhistarchiv/ with correct permissions on start
+RuntimeDirectory=oralhistarchiv
+RuntimeDirectoryMode=0755
+
+# --- Log output ---
+StandardOutput=journal
+StandardError=journal
+
+# --- Prestart command ---
+ExecStartPre=/opt/oralhistarchiv/.venv/bin/python -m alembic -c /opt/oralhistarchiv/src/alembic.ini upgrade head
+
+# --- Start command ---
+ExecStart=/opt/oralhistarchiv/.venv/bin/gunicorn \
+    -c /opt/oralhistarchiv/gunicorn.conf.py \
+    app.main:app
+
+# --- Restart policy ---
+Restart=on-failure
+RestartSec=5
+
+# --- Resource limits ---
+# Prevent runaway memory usage
+# Monitor Memory usage and change according to demand
+MemoryMax=1024M
+
+# File descriptor limit (connections + file handles)
+LimitNOFILE=4096
+
+# --- Security hardening ---
+# Restrict filesystem access
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/oralhistarchiv/data /run/oralhistarchiv
+
+# Restrict kernel capabilities
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Restrict network (allow outbound for OAI-PMH sync and SMTP)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

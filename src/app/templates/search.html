@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% set active_page = "search" %}
+{% block title %}Search — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container search-page">
+
+  <div class="search-header">
+    <h1>Search Datasets</h1>
+    <form class="search-bar" role="search" action="{{ request.url_for('search_page') }}" method="get">
+      <input type="text" name="q" value="{{ query }}" maxlength="200" placeholder="Search by keyword, title, author, topic…" autocomplete="off" aria-label="Search datasets">
+      {% if active_keyword %}<input type="hidden" name="keyword" value="{{ active_keyword }}">{% endif %}
+      {% if active_language %}<input type="hidden" name="language" value="{{ active_language }}">{% endif %}
+      {% if active_access_level %}<input type="hidden" name="access_level" value="{{ active_access_level }}">{% endif %}
+      <button type="submit">Search</button>
+    </form>
+  </div>
+
+  <div class="search-layout">
+
+    <!-- Filters -->
+    <aside class="filters">
+      <div class="filter-heading">
+        Filters
+        {% if active_keyword or active_language or active_access_level %}
+        <a href="{{ url_for_query(request, keyword=None, language=None, access_level=None) }}" class="filter-clear">Clear all</a>
+        {% endif %}
+      </div>
+
+      <div class="filter-group">
+        <h3>Keyword</h3>
+        {% for keyword in all_keywords %}
+        <a href="{{ url_for_query(request, keyword=keyword, page=None) }}"
+          class="filter-option {% if active_keyword == keyword %}active{% endif %}">{{ keyword }}</a>
+        {% endfor %}
+      </div>
+
+      <div class="filter-group">
+        <h3>Language</h3>
+        {% for language in all_languages %}
+        <a href="{{ url_for_query(request, language=language, page=None) }}"
+          class="filter-option {% if active_language == language %}active{% endif %}">{{ language }}</a>
+        {% endfor %}
+      </div>
+
+      <div class="filter-group">
+        <h3>Access Level</h3>
+        {% for access_level in all_access_levels %}
+        <a href="{{ url_for_query(request, access_level=access_level, page=None) }}"
+          class="filter-option {% if active_access_level == access_level %}active{% endif %}">{{ access_level }}</a>
+        {% endfor %}
+      </div>
+    </aside>
+
+    <!-- Results -->
+    <div class="results">
+      <div class="results-meta">
+        <span>{{ result_count }} dataset{{ 's' if result_count != 1 }} found</span>
+        {% if query %}<span class="results-query">for "{{ query }}"</span>{% endif %}
+      </div>
+
+      {% if results %}
+      <div class="results-list">
+        {% for item in results %}
+        <a href="{{ request.url_for('detail', dataset_id=item.id) }}" class="result-item">
+          <div class="result-main">
+            <div class="result-top">
+              <h3>{{ item.title }}</h3>
+              <span class="card-access {{ item.access_level }}">{{ item.access_level }}</span>
+            </div>
+
+            {% if can_view_full(item, user_tier) %}
+            <p class="result-authors">{{ item.authors | map(attribute='name') | join(', ') }}</p>
+            <p class="result-summary">{{ (item.description or '')[:200] }}{% if item.description and item.description|length > 200 %}…{% endif %}</p>
+            <div class="result-bottom">
+              <div class="card-topics">
+                {% for keyword in item.keywords[:5] %}
+                <span class="tag">{{ keyword }}</span>
+                {% endfor %}
+              </div>
+              <div class="card-meta">
+                {% for lang in item.languages %}<span>{{ lang }}</span>{% endfor %}
+              </div>
+            </div>
+            {% else %}
+              <p class="result-restricted">
+                Extended metadata available to authorized researchers.<br>
+                Log in or request access to view.
+              </p>
+            {% endif %}
+
+          </div>
+        </a>
+        {% endfor %}
+      </div>
+
+      {% if total_pages > 1 %}
+      <nav class="pagination" aria-label="Search results pagination">
+        {% if current_page > 1 %}
+        <a href="{{ url_for_query(request, page=current_page - 1) }}" class="pagination-link pagination-prev">← Previous</a>
+        {% else %}
+        <span class="pagination-link pagination-prev disabled">← Previous</span>
+        {% endif %}
+
+        <span class="pagination-info">Page {{ current_page }} of {{ total_pages }}</span>
+
+        {% if current_page < total_pages %}
+        <a href="{{ url_for_query(request, page=current_page + 1) }}" class="pagination-link pagination-next">Next →</a>
+        {% else %}
+        <span class="pagination-link pagination-next disabled">Next →</span>
+        {% endif %}
+      </nav>
+      {% endif %}
+
+      {% else %}
+      <div class="results-empty">
+        <p><strong>No datasets found.</strong></p>
+        <p>Try broadening your search or removing some filters.</p>
+      </div>
+      {% endif %}
+    </div>
+
+  </div>
+</section>
+{% endblock %}

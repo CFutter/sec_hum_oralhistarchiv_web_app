@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% set active_page = "account" %}
+{% block title %}Account — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+
+  <h1>Your Account</h1>
+
+  <div class="account-card">
+    <h2>Display Name</h2>
+    {% if user.auth_method == 'local' %}
+    <form action="{{ request.url_for('change_display_name') }}" method="post" class="inline-edit-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <label for="display_name" class="sr-only">Display name</label>
+      <input
+        type="text"
+        id="display_name"
+        name="display_name"
+        value="{{ user.display_name or '' }}"
+        maxlength="200"
+        required
+        autocomplete="name"
+      >
+      <button type="submit" class="btn btn-primary">Update</button>
+    </form>
+    {% else %}
+    <p>{{ user.display_name or '—' }}</p>
+    <p class="form-hint">Your display name is managed by your institution and cannot be changed here.</p>
+    {% endif %}
+  </div>
+
+  <div class="account-card">
+    <h2>Email Address</h2>
+    <p>{{ user.email }}</p>
+    {% if user.auth_method == 'local' %}
+    <a href="{{ request.url_for('change_email_page') }}" class="btn btn-secondary">Change Email</a>
+    {% else %}
+    <p class="form-hint">Your email address is managed by your institution and cannot be changed here.</p>
+    {% endif %}
+  </div>
+
+  <div class="account-card">
+    <dl class="meta-list">
+      {% if user.affiliation %}
+      <dt>Affiliation</dt>
+      <dd>{{ user.affiliation }}</dd>
+      {% endif %}
+
+      {% if user.country %}
+      <dt>Country</dt>
+      <dd>{{ user.country }}</dd>
+      {% endif %}
+
+      <dt>Authentication Method</dt>
+      <dd>{{ 'Institutional (SWITCH edu-ID)' if user.auth_method == 'shibboleth' else 'Local account with TOTP' }}</dd>
+
+      <dt>Access Tier</dt>
+      <dd><span class="card-access {{ user.access_tier }}">{{ user.access_tier }}</span></dd>
+
+      <dt>Member Since</dt>
+      <dd>{{ user.created_at.strftime('%d %B %Y') if user.created_at else '—' }}</dd>
+
+      <dt>Last Login</dt>
+      <dd>{{ user.last_login.strftime('%d %B %Y, %H:%M UTC') if user.last_login else '—' }}</dd>
+    </dl>
+  </div>
+
+  {% if user.auth_method == 'local' %}
+  <div class="account-card">
+    <h2>Two-Factor Authentication</h2>
+    {% if user.totp_configured %}
+    <p>Your authenticator app is configured and active.</p>
+    <a href="{{ request.url_for('reset_totp_page') }}" class="btn btn-secondary">Change Authenticator</a>
+    {% else %}
+    <p>Two-factor authentication is not yet configured. Please set it up to secure your account.</p>
+    <a href="{{ request.url_for('setup_totp_page') }}" class="btn btn-primary">Set Up 2FA</a>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if user.access_tier == 'public' or user.access_tier == 'registered' %}
+  <div class="account-card">
+    <h2>Request Elevated Access</h2>
+    <p>Your current access tier is <strong>{{ user.access_tier }}</strong>.
+    {% if user.access_tier == 'public' %}
+      Registered access provides extended metadata for oral history datasets.
+    {% else %}
+      Vetted researcher access provides full metadata including strictly confidential fields.
+    {% endif %}
+    </p>
+    <p>To request elevated access, contact <a href="mailto:{{ contact_email }}">{{ contact_email }}</a> with your name, institutional affiliation, and research purpose.</p>
+  </div>
+  {% endif %}
+
+  <div class="account-actions">
+    <form action="{{ request.url_for('logout') }}" method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <button type="submit" class="btn btn-secondary">Logout</button>
+    </form>
+  </div>
+
+</section>
+{% endblock %}

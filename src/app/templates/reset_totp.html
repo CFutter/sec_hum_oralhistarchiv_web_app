@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% set active_page = "account" %}
+{% block title %}Change Authenticator — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+
+  <a href="{{ request.url_for('account_page') }}" class="back-link">← Back to account</a>
+
+  <h1>Change Authenticator</h1>
+  <p class="auth-intro">To change your authenticator app, verify your current code, then scan the new QR code with your new device.</p>
+
+  {% if error %}
+  <div class="auth-error">{{ error }}</div>
+  {% endif %}
+
+  <form class="auth-form" action="{{ request.url_for('reset_totp_submit') }}" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+
+    <div class="auth-section">
+      <h2>Step 1: Verify Current Code</h2>
+      <p>Enter the 6-digit code from your current authenticator app.</p>
+      <p class="form-hint">Your current authenticator stays active until you complete this change. Don't remove it from your authenticator app until you've successfully verified the new code below.</p>
+      <div class="form-group">
+        <label for="current_totp_code">Current Code</label>
+        <input type="text" id="current_totp_code" name="current_totp_code" required maxlength="6"
+               pattern="[0-9]{6}" placeholder="6-digit code from current app"
+               autocomplete="off" inputmode="numeric">
+      </div>
+    </div>
+
+    <div class="auth-section">
+      <h2>Step 2: Set Up New Authenticator</h2>
+      <p>Scan this QR code with your new authenticator app.</p>
+
+      <div class="totp-setup">
+        <div class="totp-qr">
+          <img src="data:image/png;base64,{{ totp_qr_data }}"
+               alt="Scan this QR code with your new authenticator app" width="200" height="200">
+        </div>
+        <div class="totp-manual">
+          <p class="form-hint">Can't scan? Enter this key manually:</p>
+          <code class="totp-key">{{ new_totp_secret }}</code>
+          <p class="form-hint warning">
+            Treat this key like a password — don't share it, screenshot it, or save it anywhere.
+            Anyone with this key can generate valid login codes for your account.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="auth-section">
+      <h2>Step 3: Verify New Code</h2>
+      <p>Enter the 6-digit code from your new authenticator app to confirm.</p>
+      <div class="form-group">
+        <label for="new_totp_code">New Code</label>
+        <input type="text" id="new_totp_code" name="new_totp_code" required maxlength="6"
+               pattern="[0-9]{6}" placeholder="6-digit code from new app"
+               autocomplete="off" inputmode="numeric">
+      </div>
+    </div>
+
+    <button type="submit" class="btn btn-primary">Change Authenticator</button>
+  </form>
+
+</section>
+{% endblock %}

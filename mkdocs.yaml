@@ -1,0 +1,93 @@
+site_name: Oral History Archive Documentation
+site_description: Developer, operator, and user documentation for the Digital Oral History Archive
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+nav:
+  - Home: index.md
+  - User Guide:
+      - Overview: user-guide/overview.md
+      - Browsing & Searching: user-guide/browsing.md
+      - Accounts & Access Tiers: user-guide/accounts.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Request Lifecycle: architecture/request-lifecycle.md
+      - Data Model: architecture/data-model.md
+      - Authentication & Sessions: architecture/auth.md
+      - Access Control & Visibility: architecture/access-control.md
+      - OAI-PMH Sync Pipeline: architecture/sync.md
+      - Security Layers: architecture/security.md
+  - Configuration & Operations:
+      - Settings Reference: configuration/settings.md
+      - Deployment: configuration/deployment.md
+      - Logging & Audit: configuration/logging.md
+      - Runbook — Key Rotation: runbooks/key-rotation.md
+  - Code Reference:
+      - Application Entry: reference/main.md
+      - Routes:
+          - Pages: reference/routes/pages.md
+          - Auth: reference/routes/auth.md
+          - Health: reference/routes/health.md
+      - Services:
+          - Datasets: reference/services/datasets.md
+          - Users: reference/services/users.md
+          - Sessions: reference/services/sessions.md
+          - Sync & OAI: reference/services/sync.md
+          - Database & Schema: reference/services/db.md
+          - Crypto & Passwords: reference/services/crypto.md
+          - Email, Cache & Scheduler: reference/services/misc.md
+      - Middleware: reference/middleware.md
+      - Configuration Module: reference/config.md
+  - HTML Templates: templates.md
+
+plugins:
+  - search
+  - mermaid2
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: true
+            show_root_heading: true
+            show_type_to_nopackage: true
+            signature_crossrefs: true
+            members_order: source
+            docstring_style: google
+            separate_signature: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.snippets:
+      base_path: ["."]
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:mermaid2.fence_mermaid_custom
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true

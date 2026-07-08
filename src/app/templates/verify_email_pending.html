@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Verify your email — Oral History Archive{% endblock %}
+{% block content %}
+<section class="container auth-page">
+  <h1>Check your email</h1>
+  <p>We've sent a verification link to <strong>{{ email }}</strong>.</p>
+  <p>Click the link in that email to continue setting up your account.</p>
+  <p class="form-hint">
+    The link expires in 24 hours. If you don't see it, check your spam folder.
+  </p>
+
+  <div class="auth-section">
+    <p>Didn't receive the email?</p>
+    <form action="{{ request.url_for('send_verification_submit') }}" method="post" class="inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <input type="hidden" name="email" value="{{ email }}">
+      <button type="submit" class="btn btn-secondary">Resend verification email</button>
+    </form>
+  </div>
+</section>
+{% endblock %}
