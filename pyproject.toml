@@ -38,7 +38,7 @@ dev = [
     "httpx==0.28.1",
     "ruff==0.15.6",
     "bandit==1.9.2",
-    "pip-audit==2.9.0",
+    "pip-audit==2.10.1",
     "mypy==2.1.0",
     "types-gunicorn==26.0.0.20260518",
     "types-requests==2.32.4.20250611", 
