@@ -27,7 +27,7 @@ dependencies = [
     "cryptography==50.0.0",
     "qrcode[pil]==8.0",
     "gunicorn==26.2.0",
-    "redis==7.4.0",
+    "redis==8.1.0",
     "SQLAlchemy==2.0.50"
 ]
 
