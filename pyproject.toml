@@ -13,7 +13,7 @@ dependencies = [
     "uvicorn==0.40.0",
     "uvicorn-worker==0.4.0",
     "jinja2==3.1.6",
-    "psycopg[binary,pool]==3.3.2",
+    "psycopg[binary,pool]==3.3.6",
     "pydantic==2.12.5",
     "pydantic-settings==2.14.2",
     "secure==1.0.1",
