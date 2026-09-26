@@ -1,0 +1,31 @@
+# Requires the dedicated OS identity, redis.conf, and users.acl from Deployment.md.
+# systemd creates a private persistent state directory; the service restarts on
+# failure after three seconds. MemoryMax caps the process, separately from Redis
+# maxmemory. The web unit's local Redis dependency is installed as a drop-in.
+[Unit]
+Description=Oral History Archive dedicated rate-limit Redis
+After=network.target
+
+[Service]
+Type=simple
+User=oralhistarchiv-rate-limit-redis
+Group=oralhistarchiv-rate-limit-redis
+ExecStart=/usr/bin/redis-server /etc/oralhistarchiv-rate-limit-redis/redis.conf
+Restart=on-failure
+RestartSec=3
+UMask=0077
+StateDirectory=oralhistarchiv-rate-limit-redis
+StateDirectoryMode=0700
+MemoryMax=512M
+LimitNOFILE=4096
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+[Install]
+WantedBy=multi-user.target

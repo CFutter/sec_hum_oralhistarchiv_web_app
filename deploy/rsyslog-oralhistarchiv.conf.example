@@ -1,6 +1,6 @@
 # /etc/rsyslog.d/30-oralhistarchiv.conf  (example — copy and edit before use)
 #
-# Secure off-host audit-log shipping for the Oral History Archive.
+# Forward stdout/stderr journal records from the four selected service units.
 #
 # MODEL: The application does NOT ship logs itself. It writes structured
 # JSON to stdout, which systemd-journald captures. This rsyslog config
@@ -15,9 +15,7 @@
 # ---------------------------------------------------------------------------
 module(load="imjournal"
        StateFile="imjournal-oralhistarchiv.state"
-       Ratelimit.Interval="0")   # 0 = no rsyslog-side rate limiting; the app
-                                  # already bounds its own log volume. Raise
-                                  # only if a log storm is observed.
+       Ratelimit.Interval="0")   # Disable imjournal input rate limiting.
 
 # Avoid silent truncation of long audit records (events with stack traces can
 # exceed the 8 KiB default and would otherwise be cut mid-JSON).
@@ -29,22 +27,21 @@ $MaxMessageSize 64k
 # ---------------------------------------------------------------------------
 # 2. Forward over RELP + TLS to the central collector
 # ---------------------------------------------------------------------------
-# RELP gives application-level acknowledgement (no silent loss, unlike UDP/TCP
-# syslog). TLS with x509/name gives confidentiality + mutual authentication:
-#   - tls.caCert       verifies the collector is genuine (anti-spoof inbound)
-#   - tls.myCert/Key   proves THIS host to the collector (anti-spoof outbound,
-#                      so an attacker cannot inject forged audit records)
-#   - tls.permittedPeer pins the expected collector identity
+# RELP acknowledges delivery; queue/storage failures can still lose records.
+# TLS verifies the collector against caCert/permittedPeer and presents myCert
+# with myPrivKey. Provision certificates and validate peer names before enabling.
 module(load="omrelp")
 
-# Optional but recommended: only forward records from this app + the backup
-# tag, not the entire host journal, to keep the audit stream focused.
-# (Adjust the programname values to match SYSLOG_IDENTIFIER / unit names.)
-if ($programname == "oralhistarchiv"
-    or $programname == "oralhistarchiv-scheduler"
-    or $syslogtag startswith "oralhistarchiv-backup") then {
+# Forward the four application units selected by journald's trusted unit
+# metadata. Do not select on $programname/$syslogtag: an ordinary local
+# process can choose those values, and executable-derived names can drift.
+if (($!_SYSTEMD_UNIT == "oralhistarchiv.service")
+    or ($!_SYSTEMD_UNIT == "oralhistarchiv-scheduler.service")
+    or ($!_SYSTEMD_UNIT == "oralhistarchiv-backup.service")
+    or ($!_SYSTEMD_UNIT == "oralhistarchiv-migrate.service")) then {
 
     action(
+        name="oralhistarchiv_remote_audit"
         type="omrelp"
         target="<logcollector.uzh.ch>"
         port="<2514>"
@@ -56,19 +53,18 @@ if ($programname == "oralhistarchiv"
         tls.authMode="name"   # omrelp accepts "name"/"fingerprint"/"certvalid" — NOT the imtcp-style "x509/name"
         tls.permittedPeer=["<logcollector.uzh.ch>"]
 
-        # Disk-assisted queue: if the collector is unreachable, buffer to disk
-        # and retry indefinitely instead of dropping records. BOUND the disk
-        # use so a long outage cannot fill the VM disk and take the app down.
+        # Disk-assisted queue; retry indefinitely but monitor its 512 MiB disk
+        # limit, suspension, and host free space. Exhaustion can block/drop input.
         queue.type="LinkedList"
         queue.filename="relp_oralhistarchiv_fwd"
         queue.maxDiskSpace="512m"
         queue.saveOnShutdown="on"
         action.resumeRetryCount="-1"        # retry forever
         action.resumeInterval="30"          # seconds between retries
+        action.reportSuspension="on"
+        action.reportSuspensionContinuation="on"      
     )
 
-    # Keep a local journald copy too (do not stop after forwarding), so the
-    # on-host audit trail survives even if the collector link is down.
-    # Comment out the next line if you want forwarded-only.
+    # Later rsyslog rules still run; journald retention is independent.
     # stop
 }

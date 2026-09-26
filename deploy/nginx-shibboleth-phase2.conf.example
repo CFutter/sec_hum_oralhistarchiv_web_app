@@ -1,0 +1,80 @@
+# Phase-2 Shibboleth locations for the HTTPS server block.
+# These blocks have no edge rate/connection limits. Add and verify reviewed
+# admission controls before enabling them; location / limits do not carry over.
+#
+# This file is NOT used by deploy/nginx.conf.example. Install it only after the
+# SP, FastCGI services, issuer policy, REFEDS MFA assurance and every attribute
+# mapping have been verified. Replace (do not supplement) the Phase-1 exact
+# callback, so there is exactly one `location = /auth/shibboleth/callback`.
+#
+# The Variable-* response names below are the nginx-http-shibboleth/FastCGI
+# contract. Confirm them against the exact deployed module and attribute map;
+# an empty required value makes the application reject the login.
+
+location /Shibboleth.sso/ {
+    include fastcgi_params;
+    fastcgi_pass unix:/run/shibboleth/shibresponder.sock;
+}
+
+location = /shibauthorizer {
+    internal;
+    include fastcgi_params;
+    fastcgi_pass unix:/run/shibboleth/shibauthorizer.sock;
+}
+
+location = /auth/shibboleth/callback {
+    # Do not inherit a broader `satisfy any` policy: every configured access
+    # handler, including the Shibboleth authorizer, must succeed.
+    satisfy all;
+    shib_request /shibauthorizer;
+    # Pin the module's safer extraction mode even if a broader nginx context
+    # enables header copying. Only the reviewed shib_request_set variables
+    # below may cross into the application-facing header allowlist.
+    shib_request_use_headers off;
+
+    shib_request_set $oha_shib_issuer
+        $upstream_http_variable_shib_identity_provider;
+    shib_request_set $oha_shib_subject
+        $upstream_http_variable_edupersonuniqueid;
+    shib_request_set $oha_shib_mail
+        $upstream_http_variable_mail;
+    shib_request_set $oha_shib_authn_context
+        $upstream_http_variable_shib_authncontext_class;
+    shib_request_set $oha_shib_display_name
+        $upstream_http_variable_displayname;
+    shib_request_set $oha_shib_affiliation
+        $upstream_http_variable_affiliation;
+    shib_request_set $oha_shib_country
+        $upstream_http_variable_schachomeorganizationcountry;
+
+    proxy_pass http://oralhistarchiv;
+    proxy_http_version 1.1;
+
+    # Do not forward the client's header set to this trust-boundary endpoint.
+    # The Cookie header is the sole client header retained, so an existing app
+    # session can be revoked when the federated session replaces it.
+    proxy_pass_request_headers off;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Cookie            $http_cookie;
+
+    # Root-owned mode-0600 file containing only the non-empty
+    # X-OHA-Internal-Auth proxy_set_header directive.
+    include /etc/nginx/snippets/oralhistarchiv-shibboleth-secret.conf;
+
+    # Fixed private names: every value is overwritten from SP output, never
+    # inherited from the client request.
+    proxy_set_header X-OHA-Shib-Issuer        $oha_shib_issuer;
+    proxy_set_header X-OHA-Shib-Subject       $oha_shib_subject;
+    proxy_set_header X-OHA-Shib-Mail          $oha_shib_mail;
+    proxy_set_header X-OHA-Shib-Authn-Context $oha_shib_authn_context;
+    proxy_set_header X-OHA-Shib-Display-Name  $oha_shib_display_name;
+    proxy_set_header X-OHA-Shib-Affiliation   $oha_shib_affiliation;
+    proxy_set_header X-OHA-Shib-Country       $oha_shib_country;
+
+    proxy_connect_timeout 10s;
+    proxy_read_timeout    30s;
+    proxy_send_timeout    30s;
+}

@@ -1,10 +1,9 @@
-"""Shared Redis client for rate limiting and cross-worker cache invalidation.
+"""Lazy, process-local Redis client for best-effort cache invalidation.
 
-Lazy-initialized so import-time failures don't crash the app when
-Redis is disabled (dev mode). After a connection failure, attempts
-are suppressed for a cooldown period to avoid log spam during
-Redis outages.
+Uses REDIS_ENABLED and REDIS_URL; security rate limiting uses a separate
+client. Initial connection failures suppress retries for 30 seconds.
 """
+
 import logging
 import threading
 import time
@@ -22,19 +21,21 @@ _FAILURE_COOLDOWN_SECONDS = 30.0
 
 
 def get_redis() -> redis.Redis | None:
-    """Return the shared Redis client, or None if Redis is disabled or unreachable.
+    """Return the shared client, or None when disabled or initialization fails.
 
-    Thread-safe initialization via double-checked locking.
-    On failure, suppresses retries for _FAILURE_COOLDOWN_SECONDS to
-    prevent log spam during outages.
+    Initialization is thread-safe, pings Redis, and uses two-second connect
+    and socket timeouts. RedisError and ValueError trigger a 30-second
+    cooldown. A cached client is returned without another health check;
+    subsequent operation failures do not clear it.
     """
-    global _client, _last_failure_time
+    global _client, _last_failure_time  # noqa: PLW0603 - module-level singleton state is intentional here
 
     if not settings.redis_enabled:
         return None
 
-    if _client is not None:
-        return _client
+    cached = _client
+    if cached is not None:
+        return cached
 
     if (
         _last_failure_time is not None
@@ -43,8 +44,11 @@ def get_redis() -> redis.Redis | None:
         return None
 
     with _client_lock:
-        if _client is not None:
-            return _client
+        # Re-read under the lock: another thread may have initialized the
+        # client between the fast-path check above and acquiring the lock.
+        cached = _client
+        if cached is not None:
+            return cached
 
         if (
             _last_failure_time is not None
@@ -61,10 +65,10 @@ def get_redis() -> redis.Redis | None:
             )
             client.ping()
             _client = client
-            _last_failure_time = None          # reset on success — None, not 0.0
+            _last_failure_time = None
             logger.info("Redis client initialized")
             return _client
         except (redis.RedisError, ValueError) as e:
-            logger.error("Redis connection failed: %s", e)
+            logger.error("Redis connection failed: %s", e)  # noqa: TRY400
             _last_failure_time = time.monotonic()
             return None

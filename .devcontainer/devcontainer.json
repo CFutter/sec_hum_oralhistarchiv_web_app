@@ -2,7 +2,7 @@
   "name": "Oral History Archiv",
   "dockerComposeFile": "docker-compose.yaml",
   "service": "app",
-  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "workspaceFolder": "/workspaces",
   "postCreateCommand": "bash .devcontainer/setup.sh",
   "forwardPorts": [5000, 5432],
   "customizations": {

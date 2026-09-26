@@ -1,9 +1,9 @@
 ![CI](https://github.com/CFutter/sec_hum_oralhistarchiv_web_app/actions/workflows/ci.yml/badge.svg)
 # Digital Oral History Archive
 
-A web application providing unified search and tiered access to oral history dataset metadata. Built with security-first principles for the University of Zurich. It is intended as a practical query website that can be easily reused for different use cases.
+Search and browse harvested oral-history metadata with tier-based access.
 
-> **Status:** Phase 1 complete — Source A (SWISSUbase, OAI-PMH) integrated with full local authentication (Argon2, mandatory TOTP, email verification, account lockout), server-side sessions, CSRF protection, and tiered metadata visibility. Phase 2 will add Source B (sensitive data) and deploy Shibboleth federation.
+> **Status:** Source A and local authentication are implemented. Registration safety and deployment verification remain release gates; see [Known Limitations](#known-limitations) and [roadmap.md](roadmap.md). Source B is not implemented; federation requires a separately configured Shibboleth edge.
 
 ---
 
@@ -23,7 +23,6 @@ A web application providing unified search and tiered access to oral history dat
 - [Documentation](#documentation)
 - [Known Limitations](#known-limitations)
 - [Phase 2 Roadmap](#phase-2-roadmap)
-- [Contributing](#contributing)
 - [License](#license)
 
 ---
@@ -32,9 +31,11 @@ A web application providing unified search and tiered access to oral history dat
 
 The Oral History Archive is a search and browse interface for oral history research datasets. It harvests metadata from external repositories via the OAI-PMH protocol, stores it in a local PostgreSQL cache, and serves it through a server-rendered web interface.
 
+**Administrators can make dataset visibility more restrictive.** Source policy supplies each new record's `visibility_tier`; Source A does not publish a per-record application tier, so new records use `SWISSUBASE_MAX_VISIBILITY`. An authorised operator can raise an existing record's tier directly in the database. Incremental sync and full rebuild preserve the stricter of the stored tier and the incoming source-policy tier. Metadata corrections and withdrawals remain upstream responsibilities; for an urgent removal before the source changes, follow the [emergency withdrawal runbook](docs/runbooks/emergency-dataset-withdrawal.md). See [access control](docs/architecture/access-control.md) for the administrative workflow and its limits.
+
 Two characteristics distinguish it from a generic catalogue front-end:
 
-1. **Tiered metadata visibility.** Every dataset carries a `visibility_tier` (`public`, `registered`, `vetted`). Users below the required tier see only the title and access level — every other field is redacted server-side, before rendering. This is enforced in the service layer (both in the SQL queries and in `filter_for_tier`), so the templates never receive the hidden fields.
+1. **Tiered metadata visibility.** Every dataset carries a `visibility_tier` (`public`, `registered`, `vetted`). Users below the required tier see only a fixed set of non-sensitive fields — `title`, `access_level`, `visibility_tier`, `source`, `version`, and the identifiers `id`/`uuid` — while every other field is redacted server-side, before rendering. (`uuid` is the public upstream OAI identifier for Source A; its visibility below tier is a deliberate choice to re-evaluate per source policy for Source B.) This is enforced in the service layer (both in the SQL queries and in `filter_for_tier`), so the templates never receive the hidden fields.
 2. **Security-first prototype.** The application is designed as a foundation for handling sensitive research data. Argon2 password hashing, mandatory TOTP, email verification, account lockout, server-side sessions, HMAC-bound CSRF cookies, encrypted TOTP secrets at rest, strict CSP, audit logging with sensitive-field redaction, and startup validators for misconfiguration are implemented before sensitive data flows through the system.
 
 ### Audiences
@@ -42,9 +43,9 @@ Two characteristics distinguish it from a generic catalogue front-end:
 | Audience | What they see |
 |---|---|
 | **Public visitors** | Title and access level of all datasets; full metadata of public-tier datasets |
-| **Registered users** | Everything public visitors see, plus full metadata of registered-tier datasets |
+| **Registered-tier users** | Public and registered-tier metadata; creating a local account alone leaves its tier public |
 | **Vetted users** | Full metadata of all tiers, including strictly confidential fields |
-| **Administrators** | User management, tier assignment, account deactivation (which also revokes the user's sessions), staged email changes |
+| **Administrators** | User management, **user** access-tier assignment, account deactivation (which also revokes the user's sessions), staged email changes; authorised database operators can also raise dataset visibility tiers |
 
 ---
 
@@ -55,13 +56,13 @@ Two characteristics distinguish it from a generic catalogue front-end:
 - CMDI XML parsing via XXE-hardened lxml
 - Institution-based filtering of records, which allows reuse for different use cases
 - Incremental sync, deleted-record tombstone handling, and periodic full rebuild on independent schedules
-- Per-source visibility ceiling: harvested records are clamped to `SWISSUBASE_MAX_VISIBILITY` via a `SourcePolicy` at ingest
+- Per-source visibility ceiling: harvested records are clamped to `SWISSUBASE_MAX_VISIBILITY` via a `SourcePolicy` at ingest; updates and rebuilds preserve any stricter stored classification
 - Background scheduler (APScheduler) running in its own dedicated process, not inside the web workers
 
 ### Data access
-- Trigram-indexed substring search across titles, descriptions, authors, and keywords — tier-aware, so datasets above the user's tier match on title and access level only
+- Trigram-indexed substring search across titles, descriptions, authors, and keywords — tier-aware, so datasets above the user's tier expose only the visible field set (title, access level, tier, source, version, id/uuid)
 - Faceted filtering by keyword, language, and access level (keyword and language filters are tier-gated so they cannot probe redacted metadata)
-- In-process facet cache, invalidated after each sync (cross-worker via Redis pub/sub when enabled)
+- In-process cache for two global statistics (dataset total and last full rebuild). Redis pub/sub invalidates it across workers after sync; without Redis the one-hour TTL is the fallback. Tier-sensitive facets and metadata counts are queried live.
 - Pagination with configurable page size
 - Per-tier metadata redaction in the service layer
 
@@ -76,171 +77,82 @@ Two characteristics distinguish it from a generic catalogue front-end:
 - TOTP secrets encrypted at rest with Fernet; keys derived from `TOTP_ENCRYPTION_KEYS` via HKDF (MultiFernet — the first key encrypts, all keys decrypt, enabling rotation)
 - Common-password blocklist (SecLists 10k) plus contextual checks and a 12-character minimum
 - Shibboleth callback implemented for reverse-proxy federated login (SP deployment is Phase 2)
-- Admin dashboard for tier changes, deactivation (revokes sessions), admin promotion, and staged email changes
+- Admin dashboard for user access-tier changes, deactivation (revokes sessions), admin promotion, and staged email changes
+
+`LOCAL_REGISTRATION_ENABLED` controls new sign-ups, not existing local login. Keeping local administrator sign-in available during federation rollout is deliberate; see [authentication policy](docs/architecture/auth.md#local-sign-in-and-registration-policy) 
 
 ### Security middleware
 - Server-side sessions (DB-backed, signed cookie holds only the random ID; `SameSite=Strict`)
-- CSRF protection via an HMAC-bound double-submit cookie, verified as a route-level dependency
+- Fail-closed HTTP route policy: every application route is declared through `SecureAPIRouter` with one immutable access class, and startup refuses unclassified or duplicate routes, unreviewed mounts, and WebSocket routes
+- HMAC-bound double-submit CSRF and form Content-Type validation are installed automatically on every mutation method; only the two exact token-capability POSTs reviewed in `route_security.py` omit CSRF
 - Strict Content Security Policy (no `unsafe-inline`)
 - HSTS in production with preload
-- `Cache-Control: no-store` on authenticated responses
-- Rate limiting via slowapi (configurable per minute / hour / day; memory or Redis backend)
-- Content-Type allow-list on form endpoints
+- `Cache-Control: no-store` on every dynamic response
+- Pre-session rate admission via slowapi (configurable per minute / hour /
+  day). Hardened deployments require dedicated Redis counters shared across
+  web workers and fail closed on storage errors; in-memory counters are
+  development-only
 - Audit logging on every request, with structured JSON output
 
 ### Operations
-- Alembic migrations run automatically at startup **in dev only**; in production the app verifies the schema version and migrations are applied out of band
-- Startup invariant checks: dataclass/column-list sync, redaction-field classification, and a live-database drift check
-- Connection pooling via psycopg_pool, with per-process `application_name` and statement timeout
+- The application auto-migrates only in dev. The supplied migration creates a new schema; no upgrade path from earlier prototype schemas is included. In staging and production,
+  migrations are an explicit reviewed release operation performed by the
+  manual `oralhistarchiv-migrate.service` while web and scheduler are stopped.
+  Runtime services use separate peer-authenticated non-owner roles and refuse
+  startup unless both the Alembic/schema contract and the exact database-role
+  contract pass.
+- Startup invariant checks: dataclass/column-list sync, redaction-field classification, 
+  and a live-database drift check
+- Bounded connection pooling via psycopg_pool, with per-process
+  `application_name`, statement timeout, and a finite waiter queue that fails
+  promptly under saturation
 - Logs to stdout, captured by systemd-journald in production (rotation/retention handled by journald)
 - Optional off-host audit shipping via a host-level rsyslog agent (RELP/TLS)
 - Public liveness endpoint and token-protected detail health endpoint
-- DevContainer with PostgreSQL for one-click reproducible development *(planned — not yet in the repository)* <!-- TODO(devcontainer): re-mark as shipped once .devcontainer/ lands and is verified -->
+- DevContainer with PostgreSQL for reproducible development 
+  (`.devcontainer/` — Dockerfile, devcontainer.json docker-compose.yaml, setup.sh)
 - Gunicorn + two systemd units (web and scheduler) for production
-- ~825 tests across 55 test files (53 unit + 2 integration) <!-- TODO(tests-rework): update this section once the new test suite lands -->
-
+- Tests cover unit, HTTP-client and real-service integration tiers. Get the current collected count with `pytest --collect-only -q`; parametrization makes source-function counts different.
 ---
 
 ## Architecture at a Glance
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Browser ──HTTPS──▶ nginx ──▶ gunicorn (FastAPI, web service)         │
-│                                   │                                    │
-│                                   ├──▶ PostgreSQL (pooled)             │
-│                                   │      • oral_history_datasets       │
-│                                   │      • users  (incl. hashed        │
-│                                   │        reset / verification /      │
-│                                   │        email-change tokens)        │
-│                                   │      • sessions                    │
-│                                   │      • sync_status                 │
-│                                   │                                    │
-│                                   ├──▶ Redis (optional): shared rate   │
-│                                   │      limit + facet-cache pub/sub   │
-│                                   │                                    │
-│                                   └──▶ SMTP (verification, reset,      │
-│                                          email-change mail, notices)   │
-│                                                                        │
-│  Scheduler service (run_scheduler.py, separate process)               │
-│                                   ├──▶ PostgreSQL (own pool)           │
-│                                   ├──▶ SWISSUbase OAI-PMH (30s tmo)    │
-│                                   └──▶ jobs:                           │
-│                                          • OAI incremental sync        │
-│                                          • OAI full rebuild            │
-│                                          • expired-session cleanup     │
-│                                          • unverified-account reaper   │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-The browser only ever talks to nginx, which proxies to gunicorn over a Unix socket. All external API calls (currently OAI-PMH only) originate from the **scheduler** process, which runs separately from the web workers so the jobs fire once globally rather than once per worker; the web process itself only sends transactional email. There is no client-side JavaScript driving the UI — pages are server-rendered Jinja2.
-
-For a deeper walkthrough of the request lifecycle, sync pipeline, and access control model, see the MkDocs site under **Architecture**.
+nginx terminates HTTPS and proxies to web workers over a Unix socket. Workers
+render Jinja pages, query PostgreSQL, enqueue mail and use dedicated limiter
+Redis in hardened deployments. The separate scheduler harvests SWISSUbase,
+delivers outbox mail and runs cleanup jobs. Optional general Redis invalidates
+catalogue statistics across processes. See docs/architecture/ for the contracts.
 
 ---
 
 ## Technology Stack
 
-| Layer | Choice | Why |
-|---|---|---|
-| Language | Python 3.11+ | Modern type hints, mature security tooling |
-| Web framework | FastAPI 0.136.3 | Pydantic validation, dependency injection, typed routes |
-| Server (prod) | Gunicorn + Uvicorn workers | Standard async-capable ASGI deployment |
-| Templating | Jinja2 (auto-escaping) | XSS prevention by default, server-side rendering |
-| Database | PostgreSQL 15+ | JSONB, trigram indexes, robust constraints |
-| DB driver | psycopg 3 + psycopg_pool | Modern driver with native pooling |
-| Migrations | Alembic | Version-controlled schema changes |
-| Scheduler | APScheduler | Background jobs in a dedicated process |
-| Coordination (optional) | Redis | Shared rate-limit store + facet-cache pub/sub invalidation |
-| OAI client | requests + lxml | Direct, auditable, XXE-hardened |
-| Password hashing | argon2-cffi | OWASP-recommended modern key derivation |
-| TOTP | pyotp + qrcode | RFC 6238 |
-| Encryption at rest | cryptography (Fernet + HKDF) | TOTP secret protection |
-| Rate limiting | slowapi | Decorator-based; memory or Redis backend |
-| Security headers | secure | Explicit, audit-friendly configuration |
-| Session signing | itsdangerous | Tamper-evident cookie payloads |
-| Email validation | email-validator | RFC-compliant |
-| Tests | pytest + pytest-asyncio + httpx | Standard FastAPI testing stack <!-- TODO(tests-rework): update this section once the new test suite lands --> |
-| Lint / SAST | ruff, bandit, pip-audit | Recommended CI gates |
-| Dependency mgmt | uv + pyproject.toml | Fast, reproducible installs |
+## Technology Stack
+
+Python 3.11+, FastAPI, Jinja2, psycopg/PostgreSQL, Alembic, APScheduler and Redis.
+Production uses Gunicorn/Uvicorn behind nginx. Dependencies and pinned versions
+are in pyproject.toml and uv.lock; the reference deployment uses PostgreSQL 16.
 
 ---
 
 ## Project Layout
 
-```
-oralhistarchiv/
-├── run.py                          # Entry point — uvicorn (dev) or gunicorn (prod)
-├── run_scheduler.py                # Entry point — standalone scheduler process
-├── dev.sh                          # Runs web + scheduler together for development
-├── gunicorn.conf.py                # Production worker / logging config
-├── oralhistarchiv.service          # systemd unit — web service
-├── oralhistarchiv-scheduler.service# systemd unit — scheduler service
-├── pyproject.toml                  # Dependencies and build config
-├── mkdocs.yaml                     # Documentation site config
-├── README.md
-├── Deployment.md                   # Full deployment runbook
-├── roadmap.md                      # Development & security roadmap
-├── deploy/                         # nginx.conf.example, journald drop-in, rsyslog example
-├── docs/                           # MkDocs source (incl. docs/runbooks/key-rotation.md)
-└── src/
-    ├── alembic.ini
-    ├── alembic/
-    │   ├── env.py
-    │   └── versions/               # Schema migrations
-    ├── app/
-    │   ├── main.py                 # FastAPI app, lifespan, middleware wiring
-    │   ├── paths.py                # Centralized path constants
-    │   ├── template_setup.py       # Jinja2 environment + globals
-    │   ├── jinja_helpers.py        # Template helpers (url_for_query, etc.)
-    │   ├── url_safety.py           # Shared http(s)-scheme allowlist check
-    │   ├── routes/
-    │   │   ├── pages.py            # Home, search, detail, about
-    │   │   ├── health.py           # /health and /health/detail
-    │   │   └── auth/               # login, register, verify_email, totp,
-    │   │                           #   password_reset, account, email_change, admin
-    │   ├── middleware/
-    │   │   ├── audit_logging.py
-    │   │   ├── content_type.py
-    │   │   ├── cookies.py          # Session-cookie signing, CSRF identifier
-    │   │   ├── csrf.py
-    │   │   ├── rate_limiting.py
-    │   │   ├── security_headers.py
-    │   │   ├── session.py          # Session resolution + TOTP/purpose gate middlewares
-    │   │   ├── utils.py
-    │   │   └── validators.py       # Startup config validation
-    │   ├── services/
-    │   │   ├── access_tiers.py     # Tier ranking, can_access, SourcePolicy/resolve_tier
-    │   │   ├── audit.py            # Structured audit event helpers
-    │   │   ├── authentication.py   # Password verify, rehash-on-login, lockout counters
-    │   │   ├── cache.py            # FacetCache (+ Redis pub/sub)
-    │   │   ├── crypto.py           # Fernet + HKDF (TOTP secrets), audit email hash
-    │   │   ├── datasets.py         # Dataset model + queries + tier filtering
-    │   │   ├── db.py               # Pool + cursor context manager
-    │   │   ├── db_drift.py         # Live-DB column drift check (startup)
-    │   │   ├── email.py            # SMTP sender + message builders
-    │   │   ├── email_change.py     # Self-service / admin email change
-    │   │   ├── email_verification.py # Verification token lifecycle
-    │   │   ├── oai_client.py       # OAI-PMH protocol + CMDI parsing
-    │   │   ├── password_reset.py   # Reset token generation/validation/finalise
-    │   │   ├── password_validation.py # Blocklist + contextual + length checks
-    │   │   ├── redis_client.py     # Optional Redis connection helper
-    │   │   ├── scheduler.py        # APScheduler job registration
-    │   │   ├── schema.py           # Single source of truth for column lists
-    │   │   ├── seed_admin.py       # First-run admin seeding
-    │   │   ├── seed_mock_data.py   # Debug-mode mock restricted datasets
-    │   │   ├── sessions.py         # Server-side session CRUD + flash messages
-    │   │   ├── sync.py             # Sync orchestrator + access-level classifier
-    │   │   ├── tokens.py           # Shared token-hashing primitive
-    │   │   ├── totp.py             # TOTP enrollment / verification helpers
-    │   │   └── users.py            # User CRUD, schema invariant, unverified reaper
-    │   ├── templates/              # Jinja2 templates
-    │   └── static/                 # CSS, fonts
-    ├── config/
-    │   ├── settings.py             # Pydantic Settings + validators
-    │   └── logging.py              # Structured logging + redaction
-    └── tests/                      # ~825 tests across 55 files (incl. integration/)
-                                    # TODO(tests-rework): update this section once the new test suite lands
-```
+| Path | Purpose |
+|---|---|
+| src/app/routes/ | HTTP handlers and access-policy declarations |
+| src/app/services/ | Authentication, datasets, sync, outbox and persistence |
+| src/app/middleware/ | Admission, sessions, CSRF, audit and security checks |
+| src/app/templates/, src/app/static/ | Server-rendered UI and assets |
+| src/config/ | Environment settings and logging |
+| src/alembic/ | Schema migration and revision template |
+| src/tests/ | Unit, client and integration tests |
+| run.py, run_scheduler.py, dev.sh | Development web, standalone scheduler and combined launcher |
+| oralhistarchiv*.service, deploy/ | Reference deployment units, policies and helpers |
+| scripts/ | Release, verification and maintenance tools |
+| docs/, mkdocs.yaml | Documentation sources and site configuration |
+
+Deployment.md is the installation/runbook reference; roadmap.md lists pending
+work and test_plan.md lists acceptance requirements.
 
 ---
 
@@ -252,48 +164,65 @@ oralhistarchiv/
 - PostgreSQL 15+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 
-### Option A — DevContainer (planned — not yet in this repository)
+### Option A — DevContainer
 
-<!-- TODO(devcontainer): restore this as the recommended path once .devcontainer/ (including the Dockerfile) is committed and verified end-to-end (container opens, builds, seeds, ./dev.sh runs). -->
-A one-click DevContainer (Python + PostgreSQL + seeded database, via VS Code's Dev Containers extension) is planned. A draft exists outside the repository but is not yet committed or verified to run — use Option B for now.
+A DevContainer (Python 3.11 + PostgreSQL, via VS Code's Dev Containers extension) ships in `.devcontainer/`. Open the repo in the container at `/workspaces`; setup installs the locked environment and creates `.env` if absent, pointing `DATABASE_URL` at the Compose service `db`. Existing `.env` files are preserved: set their database host to `db` yourself. Review `.env`, then run `uv run bash dev.sh`.
 
 ### Option B — Manual setup (recommended)
 
+Run from the uploaded checkout (or clone your project's actual repository URL).
+These commands assume a local Linux PostgreSQL server with postgres peer access:
+
 ```bash
-git clone <repository-url>
-cd oralhistarchiv
-
-uv venv
+uv sync --locked --extra dev --extra doc --python 3.11
 source .venv/bin/activate
-uv pip install -e ".[dev,doc]"
 
+# Create this OS user's PostgreSQL role once; skip if it already exists.
+sudo -u postgres createuser --createdb "$(id -un)"
 createdb oralhistarchiv
-
 cp .env.example .env
-# Edit .env: set at least DATABASE_URL and OAI_INSTITUTION_FILTER.
-# The placeholder secrets (SECRET_KEY, SESSION_SECRET, TOTP_ENCRYPTION_KEYS, ...)
-# are accepted in dev with warnings; generate real ones before any deployed use.
-
-./dev.sh            # runs the web server and the scheduler together
 ```
+
+Set DATABASE_URL="postgresql:///oralhistarchiv" in .env for local peer access;
+for a different host, use that server's working PostgreSQL URL. Confirm the
+source URL/institution pair and change or remove both ADMIN_SEED_* values
+before starting. The example's signing/encryption keys are public dev values.
+
+```bash
+bash dev.sh
+```
+
+Both launcher and web lifespan run the dev migration; the launcher completes
+it before starting the scheduler. The release builder requires a Git checkout
+and CI provenance; the uploaded ZIP alone is not a production release.
 
 On first start the web application:
 
 1. Configures logging and (dev only) warns about unconsumed `.env` keys
 2. Validates security settings (refuses to start with weak secrets in staging/production) and, if SMTP is enabled with TLS, verifies the relay's certificate
-3. Opens the database connection pool and creates the facet cache
-4. Runs Alembic migrations to head **in dev** (in staging/production it only verifies the schema version and refuses to start on a mismatch)
+3. Runs Alembic migrations to head **in dev only**. Staging/production never
+   migrate during runtime startup.
+4. Opens the database pool and validates the expected migration/schema contract
+   and the process-specific non-owner database-role contract.
 5. Validates the dataset/user schema invariants, the redaction-field classification, and the live database columns
-6. Seeds mock restricted datasets if `FASTAPI_DEBUG=true`
+6. Seeds mock restricted datasets in dev if `SEED_MOCK_DATA=true` (off by default). In staging, the scheduler seeds after its database preflight; set the flag only in `scheduler.env`. Production rejects the flag.
 7. Seeds the admin account if `ADMIN_SEED_EMAIL` and `ADMIN_SEED_PASSWORD` are set and no admin exists yet
 
-The web process does **not** start the background scheduler. Run `run_scheduler.py` as a second process (or use `./dev.sh`, which launches both). The scheduler runs an incremental sync immediately on start, then on the configured interval; the first full rebuild is staggered five minutes after start.
+
+The web process does **not** start the background scheduler. Run `run_scheduler.py` as a second process (or use `./dev.sh`, which launches both). The scheduler independently calls the same `validate_security_settings()` gate before it creates or opens its PostgreSQL pool, then validates the runtime schema before constructing APScheduler. It does not rely on the web unit starting successfully or on systemd `After=` ordering. The scheduler runs an incremental sync immediately on start, then on the configured interval; the first full rebuild is staggered five minutes after start.
 
 ---
 
 ## Configuration
 
-All configuration is loaded from environment variables, with `.env` supported in development only. Pydantic Settings validates types and ranges; startup validators block staging/production launch on weak secrets, unsafe CORS or `ALLOWED_HOSTS`, invalid database URLs, insecure cookies, a non-HTTPS `PUBLIC_BASE_URL`, or misconfigured SMTP/Shibboleth.
+All configuration is loaded from environment variables. In development,
+pydantic-settings also reads a local `.env`. Outside dev both runtime units
+load root-owned `/etc/oralhistarchiv/common.env`; web additionally loads
+`web.env` and the optional Phase-2 `shibboleth.env`, while scheduler loads
+`scheduler.env`. `DATABASE_URL` is forbidden in `common.env`: each runtime URL
+uses its peer-authenticated non-owner role. The manual migration unit loads only
+`migration.env` and uses the owner-only `MIGRATION_DATABASE_URL`. OS environment
+variables always take precedence. See `Deployment.md` §§3, 6, 7, and 17.
 
 A complete and annotated example lives in `.env.example`. The most important settings:
 
@@ -303,36 +232,40 @@ A complete and annotated example lives in `.env.example`. The most important set
 | | `PUBLIC_BASE_URL` | External base URL used in emailed links (required; must be non-localhost `https://` in staging/production) |
 | | `FASTAPI_DEBUG` | Enables `/docs`, `/redoc`, mock seeding, open `/health/detail` (forbidden outside dev) |
 | | `ALLOWED_HOSTS` | Host headers accepted by `TrustedHostMiddleware` (required) |
-| **Database** | `DATABASE_URL` | PostgreSQL connection string (validated as `postgresql://`) |
+| **Database** | `DATABASE_URL` | Runtime PostgreSQL URL. Development may use a password URL; staging/production receive a Unix-socket peer URL only from `web.env` or `scheduler.env`. Never place it in `common.env`, and never use it for migrations. |
 | | `DATABASE_POOL_SIZE` | Max connections (1–50) |
+| | `DATABASE_POOL_MAX_WAITING` | Finite per-process pool waiter queue (default 32); saturation fails promptly with a retryable 503 |
 | | `DB_STATEMENT_TIMEOUT` | Per-connection statement timeout (default `5s`) |
-| **Secrets** | `SECRET_KEY` | Signs email-verification / password-reset / email-change tokens and derives the audit-email HMAC key. Does **not** encrypt TOTP secrets |
+| **Secrets** | `SECRET_KEY` | Signs email-verification / password-reset / email-change tokens and derives separate audit-email and pseudonymous limiter-client HMAC keys. Does **not** encrypt TOTP secrets |
 | | `SESSION_SECRET` | Session cookie signing + CSRF HMAC key (separate from `SECRET_KEY`) |
 | | `TOTP_ENCRYPTION_KEYS` | JSON list of Fernet key material for TOTP secrets at rest — first key encrypts, all keys decrypt (rotation) |
-| | `HEALTH_DETAIL_TOKEN` | Bearer token for `/health/detail` (required in production) |
+| | `OUTBOX_ENCRYPTION_KEYS` | JSON list of Fernet key material for outbox secrets at rest — first key encrypts, all keys decrypt (rotation) |
+| | `HEALTH_DETAIL_TOKEN` | Bearer token for `/health/detail` (required outside development: staging and production) |
 | **Sessions** | `SESSION_MAX_AGE_SECONDS` | Default 28800 (8 hours) |
 | | `SESSION_COOKIE_NAME` | Default `oha_session` |
 | | `COOKIES_SECURE` | Secure flag on cookies — `false` only for local plaintext-HTTP dev |
-| **Auth** | `LOCAL_AUTH_ENABLED` | Toggle local login/register |
+| **Auth** | `LOCAL_REGISTRATION_ENABLED` | Enable new local registrations; existing local users can still sign in |
 | | `TOTP_ISSUER_NAME` | Label shown in authenticator apps |
 | | `LOGIN_FAILURE_THRESHOLD` / `LOGIN_LOCKOUT_MINUTES` | Account lockout policy |
 | | `UNVERIFIED_REAP_AFTER_DAYS` | Reap unverified accounts after N days |
 | | `SHIBBOLETH_ENABLED` / `SHIBBOLETH_INTERNAL_SECRET` | Trust reverse-proxy auth headers on the callback (secret required whenever enabled) |
 | | `ADMIN_SEED_EMAIL` / `ADMIN_SEED_PASSWORD` | First-run admin bootstrap |
 | **Reverse proxy** | `TRUSTED_PROXY_IPS` | Peer IPs trusted for client-IP attribution |
-| **Redis** | `REDIS_ENABLED` / `REDIS_URL` | Shared rate-limit store + facet-cache invalidation |
+| **Redis** | `RATE_LIMIT_REDIS_URL` | Dedicated, authenticated security-counter Redis URL; required and functionally probed by hardened web startup, and permitted only in `web.env` |
+| | `REDIS_ENABLED` / `REDIS_URL` | General Redis for catalogue-statistics invalidation; dev may reuse it for limiting |
 | **OAI sync** | `SWISSUBASE_OAI_PMH_URL` | Endpoint URL |
 | | `OAI_INSTITUTION_FILTER` | Required institution name |
 | | `SWISSUBASE_MAX_VISIBILITY` | Visibility ceiling applied to harvested records at ingest |
 | | `SYNC_INTERVAL_SECONDS` / `FULL_REBUILD_INTERVAL_SECONDS` | Job intervals |
+| | `SYNC_WRITE_TIMEOUT_SECONDS` | Complete harvest write-phase deadline (default 120 seconds) |
 | | `OAI_MAX_PAGES` | Resumption-token pagination cap |
-| **SMTP** | `SMTP_ENABLED` | When false, mail is logged instead of sent |
+| **SMTP** | `SMTP_ENABLED` | Required in staging/production; false in dev writes private `.eml` files |
 | | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | SMTP credentials |
 | | `SMTP_FROM_ADDRESS` / `SMTP_FROM_NAME` / `CONTACT_EMAIL` | Sender + contact identity |
 | | `SMTP_CA_BUNDLE` | PEM CA bundle for a relay signed by a private CA |
-| **Logging** | `LOG_LEVEL` / `LOG_FORMAT` | Verbosity and `json`/`text` output |
+| **Logging** | `LOG_LEVEL` / `LOG_FORMAT` | Application verbosity and `json`/`text` output; audit events always use JSON |
 | **Rate limit** | `RATE_LIMIT_ENABLED` | Master switch |
-| | `RATE_LIMIT_PER_MINUTE` / `_PER_HOUR` / `_PER_DAY` | Tier limits |
+| | `RATE_LIMIT_PER_MINUTE` / `_PER_HOUR` / `_PER_DAY` | Fixed-window per-client limits, independent of account tier |
 | | `RATE_LIMIT_TRUST_PROXY` | Trust `X-Real-IP` / `X-Forwarded-For` (must be `true` in production behind nginx) |
 | **CORS** | `CORS_ENABLED` / `CORS_ORIGINS` / `CORS_ALLOW_METHODS` / `CORS_ALLOW_HEADERS` / `CORS_ALLOW_CREDENTIALS` | Disabled by default |
 
@@ -340,49 +273,31 @@ A complete and annotated example lives in `.env.example`. The most important set
 > ```bash
 > python -c "import secrets; print(secrets.token_urlsafe(64))"
 > ```
-> Never commit `.env` files. Production deployments should set `ENV_STATE` as a real OS environment variable so pydantic-settings does not try to load `.env` at all. Each secret has different rotation consequences — see the table below and the full procedure in `docs/runbooks/key-rotation.md` before rotating anything.
+> Never commit `.env` files. Outside dev, `ENV_STATE` must be a real OS environment variable — the production systemd units provide it (and the rest of the config) via `EnvironmentFile=`; the app refuses to start if a non-dev `ENV_STATE` is seen only from a `.env` file.
 
 ### Secrets & key rotation
 
-The application uses three independent secrets. They are not interchangeable,
-and each has different rotation consequences.
+Signing, session, TOTP, outbox, health, federation and limiter credentials have distinct purposes and rotation effects.
 
 | Secret | Protects | Rotating it… |
 |---|---|---|
-| `SECRET_KEY` | Audit-email HMAC key; signs email-verification, password-reset, email-change tokens | Invalidates outstanding verification/reset/change links (short-lived — users request new ones) and breaks audit-hash correlation across the boundary. **Does not affect TOTP secrets or sessions.** |
+| `SECRET_KEY` | Audit-email and pseudonymous limiter-client HMAC keys; signs email-verification, password-reset, email-change tokens | Invalidates outstanding verification/reset/change links, breaks audit-hash correlation, and grants each client one fresh limiter allowance. Rotate only with a non-overlapping web maintenance restart; mixed-key workers multiply quotas. **Does not affect TOTP secrets or sessions.** |
 | `SESSION_SECRET` | Session-cookie signature + CSRF HMAC | Logs out all users and invalidates outstanding CSRF tokens; users log in again. **Does not affect TOTP secrets.** |
 | `TOTP_ENCRYPTION_KEYS` | TOTP secrets at rest (MultiFernet) | See the safe procedure below. Done wrong, **every enrolled authenticator becomes unrecoverable.** |
 
-**Rotating `TOTP_ENCRYPTION_KEYS` safely** (MultiFernet: first key encrypts, all keys decrypt):
-
-1. **Prepend** a freshly generated key, keeping the current one(s):
-   `TOTP_ENCRYPTION_KEYS='["<new-key>", "<old-key>"]'`
-   New secrets encrypt under `<new-key>`; existing secrets still decrypt under `<old-key>`.
-2. **Re-encrypt** every stored TOTP secret under the new key — decrypt with the
-   MultiFernet and re-encrypt (a one-off maintenance script; `MultiFernet.rotate`
-   does exactly this per token).
-3. Once all secrets are confirmed re-encrypted, **retire** the old key:
-   `TOTP_ENCRYPTION_KEYS='["<new-key>"]'`
-
-Never remove or replace the key existing secrets were encrypted under before step 2
-completes — decryption then returns `None` for those users and they must re-enroll.
-
-The step-by-step operator procedure, including the re-encryption script and
-verification checks, lives in `docs/runbooks/key-rotation.md`.
-
-Generate any secret with:
-`python -c "import secrets; print(secrets.token_urlsafe(64))"`
+Follow [key rotation](docs/runbooks/key-rotation.md) for each credential. TOTP rotation requires re-encryption and primary-key verification; outbox rotation requires retaining old keys until all affected retained messages and backups are handled. The TOTP scripts do not rotate outbox bodies.
 
 ### Startup validators
 
-The `validate_security_settings()` function runs before the app starts accepting requests. It checks `SECRET_KEY`, `SESSION_SECRET`, every `TOTP_ENCRYPTION_KEYS` entry, and — when set — `HEALTH_DETAIL_TOKEN` and `SHIBBOLETH_INTERNAL_SECRET`. In staging and production it blocks startup if:
+Both the web lifespan and the standalone scheduler call `validate_security_settings()` before opening their PostgreSQL pools or performing application network work. Each process therefore fails on its own;
+a failed web startup cannot leave an insecure scheduler running. The function checks `SECRET_KEY`, `SESSION_SECRET`, every `TOTP_ENCRYPTION_KEYS` and `OUTBOX_ENCRYPTION_KEYS` entry, and — when set — `HEALTH_DETAIL_TOKEN` and `SHIBBOLETH_INTERNAL_SECRET`. In staging and production it blocks startup if:
 
 - Any of those secrets is a hardcoded template default, on the blocklist, below the minimum length (43 characters ≙ 256 bits), or below the minimum Shannon entropy
 - `SWISSUBASE_OAI_PMH_URL` is not `https://`
 - Rate limiting is enabled in production without `RATE_LIMIT_TRUST_PROXY=true` (per-IP limits would collapse onto nginx's IP)
 - CORS credentials are combined with wildcard or non-HTTPS origins
 
-Pydantic model validators add more: CORS and `ALLOWED_HOSTS` misconfiguration is blocked in staging/production (wildcards, empty lists, localhost origins); `DATABASE_URL` must be a PostgreSQL URL; `PUBLIC_BASE_URL` must be a non-localhost `https://` URL in staging/production; `COOKIES_SECURE` and `FASTAPI_DEBUG=false` are enforced outside dev; SMTP is required in production (with TLS, matching user/password pairs, and no placeholder values); `HEALTH_DETAIL_TOKEN` is required in production; and `SHIBBOLETH_INTERNAL_SECRET` is required whenever Shibboleth is enabled, in every environment. In `ENV_STATE=dev`, blocking findings are logged as warnings instead so local development is not painful.
+Pydantic model validators add more: CORS and `ALLOWED_HOSTS` misconfiguration is blocked in staging/production (wildcards, empty lists, localhost origins); `DATABASE_URL` must be a PostgreSQL URL; `PUBLIC_BASE_URL` must be a non-localhost `https://` URL in staging/production; `COOKIES_SECURE` and `FASTAPI_DEBUG=false` are enforced outside dev; SMTP is required in staging and production (with STARTTLS and paired authentication settings; host/sender placeholders are rejected in production); `HEALTH_DETAIL_TOKEN` is required outside development (staging and production); and `SHIBBOLETH_INTERNAL_SECRET` is required whenever Shibboleth is enabled, in every environment. In dev, the aggregate startup security check downgrades many findings to warnings; Settings validation still rejects invalid values, and enabled federation retains its strict checks.
 
 ---
 
@@ -397,54 +312,72 @@ python run.py
 python run_scheduler.py
 ```
 
+`dev.sh` requires Bash 4.3+. It supervises both processes, propagates the first exit status, and waits for both children on exit or interruption. Shutdown can take up to the scheduler's 300-second drain plus cleanup.
+
 The web app starts on `http://127.0.0.1:5000`. With `FASTAPI_DEBUG=true`:
 
-- Mock restricted datasets are seeded (refused in production)
 - `/docs` (Swagger UI) and `/redoc` are available
 - `/health/detail` is open without a token
 
 (Weak-secret findings being warnings instead of startup blockers is tied to `ENV_STATE=dev`, not to the debug flag.)
 
+With the default `SMTP_ENABLED=false`, the scheduler writes email to
+`.dev-mailbox/` (`DEV_MAILBOX_DIR`). Open the newest `.eml` file in a mail
+reader to complete registration, password reset or an email change. Run both
+processes with `./dev.sh`; the web process only queues mail. Logs redact links
+at every level. The mailbox is private and should be cleared after testing.
+
 ### Production
 
-The repository ships with `gunicorn.conf.py`, `oralhistarchiv.service`, and `oralhistarchiv-scheduler.service`. See [`Deployment.md`](./Deployment.md) for the full VM runbook covering nginx, SSL, Redis, Shibboleth SP, firewall, backups, and log shipping. The short version of the web process:
+The three application units are at the repository root; backup units are under `deploy/`. 
+The migration unit has no `[Install]` section and must never be
+enabled at boot. See `Deployment.md` for the reviewed maintenance, backup,
+migration, grant-reapplication, runtime-preflight, smoke-test, and reopen
+sequence. Gunicorn and scheduler remain separate long-running services.
 
 ```bash
-gunicorn -c gunicorn.conf.py app.main:app
+/opt/oralhistarchiv/.venv/bin/python -I -m gunicorn \
+  -c /opt/oralhistarchiv/gunicorn.conf.py app.main:app
 ```
 
-with the scheduler running as its own service alongside it.
+This is the installed interpreter command used by the web unit, whose `flock`
+wrapper holds the shared deployment lock. Start production through systemd,
+with the scheduler as its own service; see Deployment.md for provisioning and
+the manual migration sequence.
 
 ### Health checks
 
 | Endpoint | Auth | Returns |
 |---|---|---|
-| `GET /health` | Public, rate-limit exempt | `{"status": "alive"}`, always 200 — liveness only, no dependency checks |
-| `GET /health/detail` | Bearer token (production) / open (debug) | Database connectivity and sync status (last harvest, last error). Overall status `healthy` / `degraded` (sync error recorded) / `unhealthy`; HTTP 503 only when the database is unreachable |
+| `GET /health` | Public; exempt from application limiting | Handler returns 200 with {"status":"alive"}; nginx admission and outer middleware can reject requests; no dependency check |
+| `GET /health/detail` | Bearer token (production) / open (debug) | Database connectivity and synchronization status. Handler JSON returns `healthy`, `degraded`, or `unhealthy`; its 503 means database unreachable. The non-exempt route may instead receive the generic pre-routing limiter 503 during a limiter outage/capacity incident. Sync errors, missing or stale harvests, and missing or stale full rebuilds return HTTP 200 with `"status": "degraded"`; monitoring must inspect content type/body as well as status. |
 
 ---
 
 ## Testing
 
-<!-- TODO(tests-rework): update this section once the new test suite lands -->
+The suite has three tiers:
 
 ```bash
-# The full suite (~825 tests)
-pytest
+# Unit + client tiers; use a disposable Redis instance for the shared fixture
+pytest -m "not integration"
 
-# With coverage report
-pytest --cov=src --cov-report=html
+# Full suite, including the real-PostgreSQL integration tier.
+# Start disposable PostgreSQL and Redis first:
+docker compose up -d db redis
+REQUIRE_DB=1 REQUIRE_REDIS=1 pytest
 
-# Run a specific area
-pytest src/tests/test_auth_routes.py
-pytest src/tests/test_visibility.py
+# With coverage (branch), as CI runs it
+pytest --cov=src/app --cov=src/config --cov-branch
+
+# A single tier or file
+pytest src/tests/unit/
+pytest src/tests/client/test_csrf.py
 ```
 
-Most tests use FastAPI's `TestClient`. The shared `conftest.py` provides a mock connection pool on `app.state.db_pool` and patches service functions, so the bulk of the suite runs without a real PostgreSQL instance. Integration tests for SQL behaviour live under `src/tests/integration/` and use a real PostgreSQL via the DevContainer. (Test counts are approximate — they depend on parametrization and shift as the suite grows.)
+Unit/client tests replace database access, but the shared fixture configures Redis limiter counters and can reset that backend; use only disposable test services. The integration tier (`src/tests/integration/`) needs a real PostgreSQL — its `DATABASE_URL` defaults to the `docker-compose.yml` service (`docker compose up -d db`). **`REQUIRE_DB=1` turns a missing database from a silent skip into a hard failure** (pytest exits 0 on an all-skipped tier, so CI sets this to prove the integration tier actually ran). A Redis-backed behavior tier (`test_redis_tier.py`) is gated the same way with `REQUIRE_REDIS=1` (`docker compose up -d redis`).
 
-<!-- TODO(devcontainer): the DevContainer referenced above is not yet in the repository — see Quick Start Option A. -->
-
-Coverage spans: dataset parsing and search, OAI-PMH protocol and CMDI parsing, sync operations, the full auth flow (login, register, email verification and resend, TOTP enrollment and rotation, password reset, email change, admin actions, account lockout), session lifecycle, CSRF token generation and validation, all middleware, security headers, structured logging and redaction, settings validation, scheduler job registration and lifecycle events, the Redis client and facet-cache pub/sub, the email service in disabled mode, the schema column-list invariant, and visibility tier filtering.
+Coverage spans: dataset parsing and search, OAI-PMH protocol and CMDI parsing, sync operations, the full auth flow (login, register, email verification and resend, TOTP enrollment and rotation, password reset, email change, admin actions, account lockout), session lifecycle, CSRF token generation and validation, all middleware, security headers, structured logging and redaction, settings validation, scheduler job registration and lifecycle events, the Redis client and catalogue-statistics pub/sub, the email service in disabled mode, the schema column-list invariant, and visibility tier filtering.
 
 ---
 
@@ -455,11 +388,10 @@ Coverage spans: dataset parsing and search, OAI-PMH protocol and CMDI parsing, s
 | `ruff` | `ruff check src/` | PEP 8, type hint hygiene, common bugs |
 | `bandit` | `bandit -r src/ --exclude src/tests/` | OWASP / CWE security smells |
 | `pip-audit` | `pip-audit` | Known CVEs in pinned dependencies |
+| `mypy` | `mypy src/app src/config run.py run_scheduler.py` | Static type errors (pydantic plugin enabled) |
 | `pytest --cov` | `pytest --cov=src --cov-report=html` | Coverage gate |
 
-<!-- TODO(tests-rework): update this section once the new test suite lands -->
-
-All four are recommended to run before merge.
+CI runs on pull requests, main-branch pushes and manual dispatch; use its exact commands in .github/workflows/ci.yml.
 
 ---
 
@@ -470,13 +402,14 @@ A short tour. The MkDocs **Architecture → Security Layers** page covers each c
 | Concern | Control |
 |---|---|
 | Credential exposure in tracebacks | `SecretStr` for all secrets, masked `__repr__` on Settings |
-| Weak secrets at boot | Entropy + length + blocklist + hardcoded-default checks on every secret, including each `TOTP_ENCRYPTION_KEYS` entry |
+| Weak secrets at boot | Strength checks on signing/session/TOTP/outbox keys and configured health/federation secrets; not every external credential |
 | SQL injection | `psycopg.sql.Identifier` / `Placeholder` everywhere; no f-string SQL |
 | ILIKE wildcard abuse | User input is escaped before being interpolated into ILIKE patterns |
-| Search as a redaction oracle | Free-text, keyword, and language matching is tier-gated in SQL; redacted datasets are only matchable on title + access level |
+| Search as a redaction oracle | Full-text, keyword, and language matching is tier-gated in SQL; redacted datasets remain deliberately matchable on the public discovery subset (title + access level) |
 | XXE in OAI responses | `lxml.etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False)` |
 | XSS | Jinja2 auto-escaping; CSP forbids inline scripts and styles; `safe_url` filter on rendered URLs |
-| CSRF | HMAC-bound double-submit cookie verified by route-level dependency; `SameSite=Strict` |
+| CSRF / form confusion | `SecureAPIRouter` installs HMAC-bound double-submit verification and form Content-Type validation on every mutation method; only two exact reviewed token-capability POSTs omit CSRF; `SameSite=Strict` |
+| Route authorization drift | SecureAPIRouter installs declared policies; startup validates the effective route registry |
 | Session hijacking | DB-backed sessions; cookie holds only the random ID; signed with `itsdangerous` |
 | Session fixation | New random session ID issued on every login; the previous session is revoked |
 | Password storage | Argon2id with default-strong parameters, rehash on login |
@@ -484,16 +417,16 @@ A short tour. The MkDocs **Architecture → Security Layers** page covers each c
 | Account compromise | Mandatory email verification; temporary lockout after repeated failures (with email notice) |
 | TOTP secret theft from DB | Fernet encryption; keys derived from `TOTP_ENCRYPTION_KEYS` via HKDF (rotatable via MultiFernet) |
 | TOTP replay | Verified codes consume their time-step; a captured code cannot be reused |
-| Brute force | slowapi rate limits per IP; failed login responses time-constant |
+| Brute force and account discovery | slowapi limits attempts per resolved client IP; the canonical address is HMAC-pseudonymized before Redis storage. Login failures use one generic response and perform Argon2 work even when no usable stored hash exists. Complete request timing is not claimed to be constant because lockout, audit, and outbox work varies. |
 | Click-jacking | `X-Frame-Options: DENY` and CSP `frame-ancestors 'none'` |
 | TLS downgrade | HSTS with `max-age=31536000; includeSubDomains; preload` in production |
-| Cached private content | `Cache-Control: no-store` on responses to authenticated requests |
+| Cached private/capability content | All non-static application responses use `Cache-Control: no-store`; nginx caches only `/static/` assets |
 | Misconfigured CORS | Staging/production startup blocked on `*`, empty origins, or localhost |
 | Admin-area discovery | `require_admin` returns 404 (not 403) for non-admins |
 | Stack-trace leakage | Custom 404/422/500 handlers, no debug pages in production |
-| Sensitive data in logs | Field-metadata-driven redaction in `config/logging.py` |
-| Tamper-evident audit | journald capture, plus optional remote syslog shipping outside the host |
-
+| Sensitive data in logs | Application structured-field redaction; arbitrary text and nginx error logs still require review |
+| Audit retention | journald capture and optional remote shipping; tamper evidence requires independently controlled collector retention |
+| Database-backup disclosure | Separate read-only identity, no filesystem plaintext, `0700` state directory, atomic `age`-encrypted archives, and off-host private-key custody |
 
 ---
 
@@ -503,14 +436,15 @@ A short tour. The MkDocs **Architecture → Security Layers** page covers each c
 |---|---|
 | `README.md` | This file — overview, setup, configuration, security summary |
 | `Deployment.md` | Production deployment runbook for the VM (nginx, SSL, Redis, Shibboleth, firewall, backups, log shipping) |
-| `docs/runbooks/key-rotation.md` | Operator runbook for rotating every secret, including the TOTP-key re-encryption procedure |
+| `docs/runbooks/local-staging.md` | Laptop-only staging with demo SWISSUbase, Mailtrap Sandbox, isolated PostgreSQL, Redis and loopback nginx |
+| `docs/runbooks/key-rotation.md` | Operator runbook for rotating application secrets and the separately custodied backup recipient |
 | `roadmap.md` | Development phases and resolved-debt tracker |
 | `docs/` (MkDocs) | User guide, architecture deep dives, settings reference, code reference |
 
 To build the documentation site locally:
 
 ```bash
-uv pip install -e ".[doc]"
+uv sync --locked --extra doc
 mkdocs serve
 ```
 
@@ -522,11 +456,11 @@ The site will be available at `http://127.0.0.1:8000`.
 
 These are accepted limitations of the current Phase 1 prototype, with planned resolutions noted.
 
-- **Rate limiting and facet cache require Redis to coordinate across workers.** With `REDIS_ENABLED=false`, slowapi counters and the facet cache are per-process — the gunicorn config therefore runs a single worker in that mode, which keeps rate limiting correct but caps throughput. Enabling Redis unlocks multiple workers, makes rate limits global, and propagates facet-cache invalidations across workers via pub/sub. Production at scale should enable Redis.
+- **Hardened admission depends on a dedicated Redis service.** The web tier fails startup, and later dynamic admission fails closed with a retryable 503, if the dedicated `RATE_LIMIT_REDIS_URL` backend cannot execute its reviewed command contract. nginx retains independent coarse limits during that incident. Optional `REDIS_ENABLED` / `REDIS_URL` state is a physically separate, best-effort catalogue-cache pub/sub service and does not control Gunicorn worker count or security quotas.
 - **Single-source ingestion.** Only Source A (SWISSUbase OAI-PMH) is wired up. Source B integration is the headline item of Phase 2.
 - **Federated authentication is not yet deployed.** Local accounts with mandatory TOTP cover Phase 1. The Shibboleth callback route and user model are in place, but the nginx SP plumbing (shibd + FastCGI, via the nginx-http-shibboleth module) and SWITCH AAI registration are Phase 2.
 - **Per-dataset (not per-field) visibility.** `filter_for_tier` is all-or-nothing per dataset today; a per-field visibility matrix and PostgreSQL Row-Level Security are Phase 2.
-- **No admin UI for dataset tiers.** A dataset's `visibility_tier` starts at the source's configured ceiling and is changed by editing the database directly.
+- **Manual dataset-tier administration.** Authorised operators can raise existing dataset classifications directly in the database; there is no dataset-tier admin UI. Sync preserves stricter stored tiers, including those inherited from an earlier source policy. Future Source B records must also carry a valid source-owned tier and pass the [mandatory ingestion contract](docs/architecture/source-b-ingestion-contract.md).
 
 ---
 
@@ -538,12 +472,24 @@ The headline goals of Phase 2:
 - **Shibboleth / SWITCH edu-ID deployment.** An nginx-integrated Shibboleth SP (shibd + FastCGI) in front of the app, federation registration, attribute mapping into the existing user model, attribute-based tier assignment.
 - **Field-level visibility matrix.** Per-field minimum tiers, backed by PostgreSQL Row-Level Security as a defense-in-depth layer.
 - **FADP / GDPR compliance.** Data processing register, purpose limitation, encryption at rest for Source B, audit trail immutability via remote log shipping, data subject access request procedures.
-- **Operational hardening.** CI/CD pipeline, automated backups with point-in-time recovery, log monitoring and alerting.
+- **Operational hardening.** Point-in-time recovery, automated deployment, and
+  log monitoring/alerting. Encrypted logical-backup tooling is shipped; the
+  runbook makes failure/staleness monitoring, authenticated off-host custody,
+  and recorded restore verification deployment acceptance conditions.
 
-The full Phase 1 → Phase 2 transition plan lives in `roadmap.md`. (A per-finding security register — e.g. the SEC-012 split cited in the key-rotation runbook — is not yet part of it; see the open questions.)
+### Account and security TODOs
+
+- [ ] Resolve unverified local email reservations when a legitimate federated user claims the address, without transferring an attacker-selected password.
+- [ ] **Registration verification:** Require mailbox proof before choosing the account password; a verification link must not activate a password set by someone else.
+- [ ] **Account deletion:** Add authenticated self-service deletion and audited administrator removal, including session and token revocation and retention-aware data handling.
+- [ ] Keep reset, verification and email-change capability tokens out of URL paths that can reach application and edge error logs.
+
+**Release gate:** Do not expose local registration to untrusted users until the registration verification change is complete. Track this unresolved work in [roadmap.md](roadmap.md).
+
+The full Phase 1 → Phase 2 transition plan lives in `roadmap.md`.
 
 ---
 
 ## License
 
-Copyright (c) 2026 
+Copyright (c) 2026

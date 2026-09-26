@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% set active_page = "admin" %}
+{% block title %}Authenticator Recovery Code — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+
+  <h1>Authenticator Recovery Authorized</h1>
+  <div class="auth-success">
+    The old authenticator and all sessions for
+    <strong>{{ authorization.display_name or authorization.email }}</strong>
+    have been revoked.
+  </div>
+
+  <div class="auth-section">
+    <h2>One-Time Recovery Code</h2>
+    <p>
+      Copy this code now and give it only to the verified account holder.
+      The plaintext code is not stored and cannot be shown again.
+    </p>
+
+    <p><code class="totp-key">{{ authorization.recovery_code }}</code></p>
+
+    <p class="form-hint">
+      Expires: <strong>{{ authorization.expires_at | utc_datetime }}</strong>
+    </p>
+  </div>
+
+  <div class="auth-error">
+    Do not put this code in logs, tickets, or ordinary email. If it is exposed
+    or lost, return to user management and issue a replacement; doing so
+    invalidates this code and any recovery session created from it.
+  </div>
+
+  <p class="auth-link"><a href="{{ admin_return_url }}">Return to user management</a></p>
+
+</section>
+{% endblock %}

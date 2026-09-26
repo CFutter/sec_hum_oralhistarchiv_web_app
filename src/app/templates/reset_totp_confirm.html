@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% set active_page = "account" %}
+{% block title %}Confirm New Authenticator — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+
+  <a href="{{ path_for(request, 'reset_totp_page') }}" class="back-link">← Restart authenticator change</a>
+
+  <h1>Confirm New Authenticator</h1>
+  <p class="auth-intro">
+    Add the replacement account to your authenticator, then enter its current
+    code. Your existing authenticator remains active until confirmation succeeds.
+  </p>
+
+  {% if error %}
+  <div class="auth-error" role="alert">{{ error }}</div>
+  {% endif %}
+
+  {% if new_totp_secret and totp_qr_data %}
+  <div class="auth-section">
+    <h2>Scan the Replacement Key</h2>
+    <div class="totp-setup">
+      <div class="totp-qr">
+        <img
+          src="data:image/png;base64,{{ totp_qr_data }}"
+          alt="Scan this QR code with your new authenticator app"
+          width="200"
+          height="200"
+        >
+      </div>
+      <div class="totp-manual">
+        <p class="form-hint">Can't scan? Enter this key manually:</p>
+        <code class="totp-key">{{ new_totp_secret }}</code>
+        <p class="form-hint warning">
+          This key is shown once. Treat it like a password. Do not share it,
+          screenshot it, or store it with your password.
+        </p>
+      </div>
+    </div>
+  </div>
+  {% else %}
+  <div class="auth-section">
+    <p class="form-hint warning">
+      For security, the replacement key is not displayed again. Use the account
+      you already added to your authenticator, or restart the change to create a
+      new key after authenticating again.
+    </p>
+  </div>
+  {% endif %}
+
+  <form class="auth-form" action="{{ path_for(request, 'reset_totp_confirm') }}" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+
+    <div class="form-group">
+      <label for="new_totp_code">New Authenticator Code</label>
+      <input
+        type="text"
+        id="new_totp_code"
+        name="new_totp_code"
+        required
+        maxlength="6"
+        pattern="[0-9]{6}"
+        placeholder="6-digit code"
+        autocomplete="one-time-code"
+        inputmode="numeric"
+      >
+    </div>
+
+    <button type="submit" class="btn btn-primary">Confirm and Change Authenticator</button>
+  </form>
+
+</section>
+{% endblock %}

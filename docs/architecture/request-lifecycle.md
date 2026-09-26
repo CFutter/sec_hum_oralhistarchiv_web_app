@@ -1,16 +1,16 @@
 # Request Lifecycle
 
-This page traces a single request end-to-end. We use a representative example: an authenticated user clicks a search result and lands on the detail page of a dataset that is restricted to the *registered* tier.
+Example: a registered user with a full session requests a dataset whose `visibility_tier` is `registered`.
 
 ## The example request
 
-```
+```http
 GET /dataset/4711 HTTP/1.1
 Host: archive.example.uzh.ch
-Cookie: oha_session=eyJ...; csrf_token=qDk...
+Cookie: oha_session=<signed-session-id>
 ```
 
-The user is logged in. Their session cookie holds a signed session ID. They have already enrolled their authenticator app, so they have a `purpose=full` session. The dataset they are requesting has `visibility_tier='registered'` and they have `access_tier='registered'` — so they should see the full metadata.
+`oha_session` is the default configurable cookie name. The signed raw token identifies a hashed PostgreSQL session row. A full local session must also satisfy current account, verification, TOTP, and recovery-state checks.
 
 ## Step 1 — nginx
 
@@ -18,96 +18,74 @@ In production, nginx terminates TLS, serves `/static/` directly, writes its own 
 
 ## Step 2 — gunicorn → FastAPI
 
-Gunicorn hands the raw ASGI scope to a uvicorn worker, which calls into the FastAPI application object exported by `src/app/main.py`. The middleware stack runs with the **last-registered middleware outermost**. The effective inbound order is: TrustedHost → Session → Audit → rate limiting → security headers → TOTP/purpose gate → CSRF cookie → route. We follow that order below.
+Gunicorn's Uvicorn worker invokes `app.main.app`. Inbound application middleware order is TrustedHost → optional CORS → audit → database-capacity handling → rate admission → session resolution → security headers → CSRF cookies. Route dependencies run after routing.
 
 ## Step 3 — TrustedHost middleware
 
 `TrustedHostMiddleware` is outermost. It checks the `Host` header against `ALLOWED_HOSTS` and rejects anything unexpected before any other layer runs — defense in depth alongside nginx's default-reject server block. Our `Host` is allowed, so it passes.
 
-## Step 4 — Session middleware
+## Step 4 — Audit logging middleware
 
-`SessionResolutionMiddleware` is where authentication resolves, and it runs early so that every downstream layer (including audit logging) can read `request.state.user`. It does the following:
+Audit assigns a 16-character request ID before admission and session lookup. It adds `X-Request-ID` and logs status, duration in milliseconds, scrubbed path/query, client IP, and the resolved user ID. Unhandled inner errors produce `request_error` before re-raising. Successful `/health` and `/static/` responses omit the request log; their errors remain logged.
 
-1. Initialise `request.state.user`, `session_purpose`, `session_id`, and the flash fields to their empty defaults.
-2. Check whether the path is in `_SESSION_SKIP_PREFIXES` (`/static`, `/health`, matched exact-or-slash so `/healthiness` would not qualify). For these it skips session resolution entirely. Our path `/dataset/4711` is not in this list.
-3. Read the `oha_session` cookie and verify its signature and maximum age with `itsdangerous.URLSafeTimedSerializer`. If the cookie is missing, tampered, or expired, the request proceeds as a guest (and a stale cookie is cleared on the way out).
-4. With a valid session ID, call `get_session_user(pool, session_id)`, which looks up the (hashed) session row, checks `expires_at`, joins to `users`, requires `is_active`, and returns a parsed `User` together with the session purpose and a flash-present flag.
-5. Set `request.state.user`, `request.state.session_purpose`, and `request.state.session_id`, and — only if a flash is pending — read-and-consume it into `request.state.flash`.
+## Step 5 — Admission
 
-This middleware only *resolves*. The TOTP and purpose gates used to live here but have moved into their own middleware (step 8), so that the redirects they issue pass through the security-headers and audit layers.
+`DatabaseCapacityMiddleware` catches pool acquisition timeouts or an exhausted wait queue and returns 503 with `Retry-After: 5`.
 
-For our example, the cookie is valid and the user resolves with `purpose=full`.
+Inside it, `BoundedRateLimitMiddleware` evaluates policies before session lookup using bounded, serialized worker capacity. An exceeded limit returns 429; unavailable storage or admission capacity returns retryable 503. Hardened environments require `RATE_LIMIT_REDIS_URL`; development may use general Redis or process-local memory. Unmatched routes are marked to skip session lookup; read-only static requests bypass rate admission.
 
-## Step 5 — Audit logging middleware
+`get_client_ip()` trusts forwarded IP headers only when enabled and received from a configured trusted peer or recognized Unix-socket connection. The socket's permissions and proxy configuration are part of that trust boundary.
 
-`AuditLoggingMiddleware` assigns a 16-character hex `request_id`, records the start time, and stashes the ID on `request.state` so downstream code (and exception handlers) can include it. After the response comes back, it logs a structured JSON record with the request ID, client IP, method, scrubbed path, scrubbed query string, status code, duration, and (because session ran first) the user ID. It also sets the `X-Request-ID` response header. The log goes to stdout, captured by systemd-journald in production.
+## Step 6 — Session resolution
 
-## Step 6 — Rate limiting (`SlowAPIMiddleware`)
+`SessionResolutionMiddleware` initializes request state, then skips lookup for marked unmatched/static requests and its exact probe/asset exceptions. Otherwise it verifies the configured cookie's signature and age and resolves the hashed database session. Invalid or expired cookies yield guest state without passive cookie deletion.
 
-The slowapi middleware extracts the client IP using `get_client_ip()`, which honours `X-Real-IP` / `X-Forwarded-For` only when `RATE_LIMIT_TRUST_PROXY=true` *and* the request arrived through a trusted upstream — either the TCP peer is in `TRUSTED_PROXY_IPS`, or the connection came in over the Unix socket (which, in this deployment, only nginx can reach). It checks the IP's counters in its store (in-memory by default, Redis when `REDIS_ENABLED=true`) and either rejects with 429 or lets it through. Our example user is within the limits, so it passes. Because rate limiting sits inside the audit layer, even a 429 still produces an audit record.
+A valid lookup supplies the user, purpose, session ID, and flash-present flag. Federated sessions additionally require current approved status and issuer trust; rejected federated sessions are deleted. Pending flashes are consumed only on GET and restored if that GET redirects without a newer flash.
 
-## Step 7 — Security headers middleware
+Recovery-purpose sessions may reach only their exact enrollment/logout method/path inventory; other requests redirect to setup before routing. Remaining authorization belongs to route dependencies.
 
-This is the bare `@app.middleware("http")` function in `main.py`. It calls the next layer first, then on the way back out applies the headers configured by `build_secure_headers()`:
+## Step 7 — Security headers
 
-- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'` (and several other explicit directives)
-- `Strict-Transport-Security: max-age=31536000; includeSubDomains; preload` *(production only)*
-- `X-Frame-Options: DENY`
-- `X-Content-Type-Options: nosniff`
-- `Referrer-Policy: strict-origin-when-cross-origin`
-- `Permissions-Policy: ...`
+On return from the inner application, `set_secure_headers` applies the CSP, frame/content-type/referrer protections, and disabled browser-feature policy from `build_secure_headers`. Production adds one-year HSTS with `includeSubDomains; preload`.
 
-It then checks whether `request.state.user` is set and the path is not under `/static/`. Both are true for our example, so it adds:
+Paths outside `/static/` receive `Cache-Control: no-store`, including anonymous responses. Reset, verification, and email-confirmation paths also receive `Referrer-Policy: no-referrer`. Early admission refusals apply their own security headers.
 
-- `Cache-Control: no-store`
+## Step 8 — CSRF cookies
 
-This prevents browsers and intermediate caches from holding authenticated content. Static assets are excluded so fonts and CSS still cache normally.
+For GETs or requests whose session resolution completed, middleware maintains a session/pre-session identifier and its HMAC-bound CSRF cookie. It skips responses explicitly marked as unresolved probes/static traffic. Mutation verification runs in route dependencies.
 
-## Step 8 — TOTP / purpose gate middleware
+## Step 9 — Exact route policy
 
-`TotpGateMiddleware` enforces two access restrictions, unless the path is one of the exempt prefixes (`/setup-totp`, `/logout`, `/verify-email`):
+`GET /dataset/{dataset_id}` uses the public policy: guests may browse, but a presented authenticated user must satisfy full-session checks. Setup sessions redirect to enrollment. Our registered full-session user proceeds.
 
-1. **Purpose gate.** A `purpose='totp_setup'` session is redirected to `/setup-totp` for any non-exempt path.
-2. **Mandatory-enrolment gate.** A local-auth user with TOTP not yet configured is likewise redirected to `/setup-totp` — a defense-in-depth backup to the purpose gate.
-
-The gate is registered *inside* the security-headers and audit layers precisely so that its 303 redirects pick up the standard security headers and land in the audit log. It reads the state that the (outer) session middleware has already set.
-
-For our example, the session is `purpose=full` and the user has TOTP enabled, so both gates pass.
-
-## Step 9 — CSRF cookie middleware
-
-The CSRF middleware only acts on GETs. It ensures the visitor has an identifier (the session ID if logged in, otherwise a pre-session cookie) and that the `csrf_token` cookie equals `HMAC(session_secret, identifier)`. Our request already has the right cookie, so it is left alone. The middleware does **not** verify the token here — CSRF verification is a route-level dependency, only triggered on POST handlers (see [Authentication & Sessions](auth.md#csrf)).
+`SecureAPIRouter` installs policy dependencies and mutation Content-Type/CSRF checks. Startup rejects unclassified routes and deviations from reviewed route inventories; only the two signed email-confirmation POSTs omit CSRF.
 
 ## Step 10 — The route handler
 
-Routing matches `GET /dataset/{dataset_id}` to `routes.pages.detail`, with `dataset_id=4711`. The handler does:
+`routes.pages.detail` reads the pool and viewer tier, then calls `get_dataset_by_id`. Missing rows render 404. Existing rows are redacted in the service before return according to the viewer tier; this registered viewer receives the registered dataset in full.
 
-1. Read `pool` from `request.app.state.db_pool`.
-2. Determine the user's effective tier via `_get_user_tier(request)` — `request.state.user.access_tier` for logged-in users, or `"public"` for guests. Our user gets `"registered"`.
-3. Call `get_dataset_by_id(pool, 4711, "registered")`. The service queries `oral_history_datasets`, parses the row into a `Dataset`, and **applies the tier redaction itself** via `filter_for_tier` before returning — no caller can obtain an unredacted row. Inside, `can_view_full` compares the user's tier rank (`registered=1`) to the dataset's required rank (`registered=1`); greater-than-or-equal, so the dataset comes back unchanged. If the dataset does not exist, the handler renders a 404 error page instead.
-4. Because this dataset is restricted (`visibility_tier != "public"`), emit a structured `dataset_access` audit event with the dataset ID/UUID, the dataset's visibility tier, the user's tier, and whether access was granted (re-derived via `can_view_full` — the returned dataset keeps its `visibility_tier` precisely so this audit decision can still be made).
-5. Render `detail.html` with the dataset.
-
-If the user had been a guest (tier `public`), `get_dataset_by_id` would have returned an already-redacted `Dataset` with all sensitive fields nulled out, and the template would have shown only the title and access level with an explanation of why the rest is hidden.
+Non-public datasets emit `dataset_access` with dataset identifiers, required/viewer tiers, and the full-access decision. `detail.html` then renders the returned record. A guest still sees the public discovery envelope and record existence; see [Access Control](access-control.md).
 
 ## Step 11 — The template
 
-`detail.html` extends `base.html`. The base template renders the navigation header (Login replaced by the user's name and a Logout button, plus an Admin link when `user.is_admin`), the page body, and the footer. All output is auto-escaped by Jinja2, so any `<script>` in metadata is rendered as text.
+`detail.html` extends `base.html` for navigation and layout. Jinja2 escapes ordinary interpolated values; URL filters separately validate metadata links. Template authors must preserve these boundaries when adding fields or using `safe`.
 
 ## Step 12 — On the way out
 
-The response bubbles back up through the stack: the CSRF middleware leaves the already-fresh cookie alone, the TOTP gate passes it through, security headers are applied (including `Cache-Control: no-store`), the rate limiter records the request, audit logging logs the response with its duration, and the session middleware finishes. The HTTP response goes back through gunicorn → nginx → browser.
+The inner response receives cookie and privacy headers, session redirect-flash handling, and the audit request ID/event before returning through the server and proxy. Rate-limit counters were evaluated during admission, before the handler.
 
 ## Where things can fail
 
-| Stage | What can go wrong | What the user sees |
-|---|---|---|
-| TrustedHost | Unexpected `Host` header | Request rejected before routing |
-| Session middleware | Tampered or expired cookie | Treated as guest; `request.state.user = None`, stale cookie cleared |
-| Rate limit | Too many requests in a window | 429 error page |
-| TOTP/purpose gate | `totp_setup` session, or local user without TOTP, on a non-exempt path | 303 redirect to `/setup-totp` |
-| Route handler | Dataset ID does not exist | 404 error page |
-| Route handler | Database query fails | 500 error page from `unhandled_exception_handler` |
-| Tier check | User tier below dataset tier | The detail page renders with redacted fields |
+| Condition | Outcome |
+|---|---|
+| Disallowed Host | Rejected before inner middleware |
+| Invalid/expired session | Guest state |
+| Rate limit exceeded | 429 |
+| Rate storage/admission unavailable or database pool exhausted | Retryable 503 |
+| Session fails the route policy | Policy-specific redirect, 403, or cloaked 404 |
+| Missing dataset | 404 |
+| Viewer below dataset tier | Redacted detail page |
+| Invalid request parameters | 422 |
+| Unhandled handler failure | Logged 500 |
 
-The custom exception handlers in `main.py` ensure that 404, 422 (validation errors), 429, and any uncaught `Exception` produce a clean HTML error page rather than a stack trace, with structured logging for the 422, 429, and 500 cases including the request ID.
+Custom handlers render application errors as HTML; admission/capacity failures can return their own responses. Invalid route inventories prevent startup.

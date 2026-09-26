@@ -11,7 +11,7 @@
 
   <div class="auth-section">
     <p>Didn't receive the email?</p>
-    <form action="{{ request.url_for('send_verification_submit') }}" method="post" class="inline-form">
+    <form action="{{ path_for(request, 'send_verification_submit') }}" method="post" class="inline-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
       <input type="hidden" name="email" value="{{ email }}">
       <button type="submit" class="btn btn-secondary">Resend verification email</button>

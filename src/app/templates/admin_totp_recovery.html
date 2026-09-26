@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% set active_page = "admin" %}
+{% block title %}Authorize Authenticator Recovery — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+
+  <a href="{{ admin_return_url }}" class="back-link">← Back to user management</a>
+
+  <h1>{{ 'Reissue' if target.recovery_required else 'Authorize' }} Authenticator Recovery</h1>
+  <p class="auth-intro">
+    Use this only after independently verifying the account holder's identity.
+    The account holder must already possess one of the recovery codes saved
+    during authenticator setup. You will not see or transmit that credential.
+  </p>
+
+  {% if error %}
+  <div class="auth-error">{{ error }}</div>
+  {% endif %}
+
+  <div class="auth-section">
+    <h2>Target Account</h2>
+    <dl class="meta-list">
+      <dt>Name</dt>
+      <dd>{{ target.display_name or '—' }}</dd>
+      <dt>Email</dt>
+      <dd>{{ target.email }}</dd>
+      <dt>Recovery status</dt>
+      <dd>
+        {% if target.recovery_authorization_active %}
+          Recovery is already authorized until
+          {{ target.recovery_expires_at | utc_datetime }}. Continuing replaces
+          that authorization and revokes any restricted recovery session.
+        {% elif target.recovery_required %}
+          Authenticator enrollment is already required. Continuing revokes any
+          recovery session and creates a replacement authorization.
+        {% else %}
+          No recovery is currently active.
+        {% endif %}
+      </dd>
+    </dl>
+  </div>
+
+  <div class="auth-error">
+    <strong>This action takes effect immediately.</strong>
+    It removes the target's current authenticator, signs the target out
+    everywhere, invalidates pending password and email actions, and requires a
+    new authenticator enrollment. It cannot be undone with the old device.
+  </div>
+
+  <form class="auth-form"
+        action="{{ path_for(request, 'admin_authorize_totp_recovery', user_id=target.user_id) }}"
+        method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+    <input type="hidden" name="page" value="{{ current_page }}">
+    <input type="hidden" name="page_size" value="{{ page_size }}">
+
+    <div class="form-group">
+      <label for="admin_totp_code">Your Current Administrator Code</label>
+      <input
+        type="text"
+        id="admin_totp_code"
+        name="admin_totp_code"
+        required
+        maxlength="6"
+        pattern="[0-9]{6}"
+        inputmode="numeric"
+        autocomplete="one-time-code"
+        placeholder="6-digit code"
+      >
+      <span class="form-hint">
+        This must be a fresh code from your own authenticator. A code already
+        consumed during login cannot be reused.
+      </span>
+    </div>
+
+    <div class="form-group">
+      <label>
+        <input type="checkbox" name="confirm_reset" value="true" required>
+        I verified this account holder's identity and understand that the old
+        authenticator and all current sessions will be revoked immediately.
+      </label>
+    </div>
+
+    <button type="submit" class="btn btn-danger">
+      Reset Authenticator and Authorize Recovery
+    </button>
+  </form>
+
+  <p class="form-hint">
+    The authorization expires after
+    {{ recovery_authorization_lifetime_minutes }} minutes.
+  </p>
+
+</section>
+{% endblock %}

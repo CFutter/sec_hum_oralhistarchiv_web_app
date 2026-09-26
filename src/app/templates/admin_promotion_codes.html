@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% set active_page = "account" %}
+{% block title %}Save Administrator Recovery Codes — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+  <h1>Save Your Administrator Recovery Codes</h1>
+
+  <div class="auth-section">
+    <p>
+      Store every code somewhere offline and separate from your authenticator
+      device. Each code can be used once after another administrator authorizes
+      recovery. These plaintext values are not stored and cannot be shown again.
+    </p>
+
+    <ol class="recovery-code-list">
+      {% for recovery_code in prepared.recovery_codes %}
+      <li><code>{{ recovery_code }}</code></li>
+      {% endfor %}
+    </ol>
+
+    <p class="form-hint">
+      Invitation expires:
+      {{ prepared.invitation_expires_at | utc_datetime }}
+    </p>
+    <p class="form-hint warning">
+      This prepared code set must be confirmed by
+      {{ prepared.preparation_expires_at | utc_datetime }}.
+      Leaving this page loses this display. If the preparation deadline passes
+      while the invitation is still valid, generate a fresh set; once the
+      invitation expires, ask an administrator to reissue it.
+    </p>
+
+    <form class="auth-form"
+          action="{{ path_for(request, 'admin_promotion_accept') }}"
+          method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <div class="form-group">
+        <label for="recovery_code">Confirm One Recovery Code</label>
+        <input
+          type="text"
+          id="recovery_code"
+          name="recovery_code"
+          required
+          maxlength="{{ recovery_code_max_chars }}"
+          autocomplete="off"
+          autocapitalize="characters"
+          spellcheck="false"
+          placeholder="XXXXX-XXXXX-XXXXX-XXXXX"
+        >
+        <span class="form-hint">
+          Re-enter any one code from the list. It remains available for a future recovery.
+        </span>
+      </div>
+      <button type="submit" class="btn btn-primary">Save Codes and Accept</button>
+    </form>
+
+    <form class="auth-form"
+          action="{{ path_for(request, 'admin_promotion_decline') }}"
+          method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <button type="submit" class="btn btn-secondary">Decline Invitation</button>
+    </form>
+  </div>
+</section>
+{% endblock %}

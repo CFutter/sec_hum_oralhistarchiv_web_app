@@ -6,7 +6,7 @@
 {% set can_view = can_view_full(dataset, user_tier) %}
 <section class="container detail-page">
 
-  <a href="{{ request.url_for('search_page') }}" class="back-link">← Back to search</a>
+  <a href="{{ path_for(request, 'search_page') }}" class="back-link">← Back to search</a>
 
   <div class="detail-header">
     <span class="card-access {{ dataset.access_level }}">{{ dataset.access_level }}</span>
@@ -36,7 +36,11 @@
       <h2>Keywords</h2>
       <div class="card-topics">
         {% for keyword in dataset.keywords %}
-        <a href="{{ request.url_for('search_page') }}?keyword={{ keyword|urlencode }}" class="tag">{{ keyword }}</a>
+        {% if keyword|length <= facet_label_max_chars %}
+        <a href="{{ path_for(request, 'search_page') }}?keyword={{ keyword|urlencode }}" class="tag">{{ keyword }}</a>
+        {% else %}
+        <span class="tag">{{ keyword }}</span>
+        {% endif %}
         {% endfor %}
       </div>
     
@@ -68,7 +72,7 @@
           <dt>DOI</dt>
           <dd><a href="{{ dataset.doi | doi_url }}">{{ dataset.doi }}</a></dd>
           {% endif %}
-          <dt>Access Level</dt>
+          <dt>Download access</dt>
           <dd><span class="card-access {{ dataset.access_level }}">{{ dataset.access_level }}</span></dd>
           <dt>License</dt>
           <dd>
@@ -80,15 +84,27 @@
           </dd>
           <dt>Download</dt>
           <dd>
-            {% if dataset.source == 'swissubase' and dataset.download_url %}
-              <a href="{{ dataset.download_url | safe_url}}" class="btn btn-primary btn-small">Download Dataset</a>
+            {% if dataset.source == 'swissubase' and dataset.resource_access_url %}
+              <a
+                href="{{ dataset.resource_access_url | safe_url }}"
+                class="btn btn-primary btn-small"
+                target="_blank"
+                rel="noopener"
+              >
+                Access dataset on SWISSUbase
+              </a>
             {% elif dataset.source == 'swissubase' and dataset.landing_page_url %}
-              <a href="{{ dataset.landing_page_url | safe_url}}" class="btn btn-secondary btn-small" target="_blank" rel="noopener">
+              <a
+                href="{{ dataset.landing_page_url | safe_url }}"
+                class="btn btn-secondary btn-small"
+                target="_blank"
+                rel="noopener"
+              >
                 View on SWISSUbase
               </a>
             {% else %}
-              <p class="download-restricted">Available to vetted researchers only.</p>
-              <p class="download-contact">Contact <a href="mailto:{{ contact_email }}">{{ contact_email }}</a> to request access.</p>
+              <p class="download-unavailable">No online resource link is available.</p>
+              <p class="download-contact">Contact <a href="mailto:{{ contact_email }}">{{ contact_email }}</a> for information about accessing this resource.</p>
             {% endif %}
           </dd>
           {% if dataset.project_title %}
@@ -105,9 +121,9 @@
 
   <div class="detail-restricted">
     <h2>Restricted Dataset</h2>
-    <p>This dataset contains metadata classified as <strong>{{ dataset.access_level }}</strong>. Full details are available only to authorized researchers.</p>
+    <p>Full metadata is available to users with <strong>{{ dataset.visibility_tier }}</strong> access or higher.</p>
     {% if not user %}
-    <p><a href="{{ request.url_for('login_page') }}?next={{ request.url.path }}" class="btn btn-primary">Login to view</a></p>
+    <p><a href="{{ path_for(request, 'login_page') }}?next={{ request.url.path }}" class="btn btn-primary">Login to view</a></p>
     {% endif %}
     <p>To request elevated access, contact <a href="mailto:{{ contact_email }}">{{ contact_email }}</a> with your name, institutional affiliation, and research purpose.</p>
   </div>

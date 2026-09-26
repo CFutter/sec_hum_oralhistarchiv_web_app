@@ -1,10 +1,6 @@
 """Application configuration — settings and logging setup."""
 
-from .settings import settings, warn_unconsumed_env_keys
 from .logging import setup_logging
+from .settings import settings, warn_unconsumed_env_keys
 
-__all__ = [
-    "settings", 
-    "warn_unconsumed_env_keys",
-    "setup_logging"
-]
+__all__ = ["settings", "setup_logging", "warn_unconsumed_env_keys"]

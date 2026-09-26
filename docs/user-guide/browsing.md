@@ -17,7 +17,7 @@ The search page has two parts: a sidebar of filters and a results list.
 
 The search box at the top matches your query against the title, description, project title, project description, keywords, and author names of every dataset in one go. Matching is case-insensitive substring search — typing `kassel` will find "Kassel" and "kasseler" alike. You don't need quotes, wildcards, or boolean operators. Special characters in your query are taken literally; you cannot accidentally write a SQL pattern.
 
-One tier-related nuance: for datasets restricted **above your tier**, only the title and access level are searched. Their hidden descriptions and keywords are not matched — so search cannot be used to probe metadata you are not allowed to read, and a restricted dataset only turns up when its *title* matches.
+For datasets above your tier, only title and access level match free text; hidden descriptions, authors, and keywords do not.
 
 ### Filters
 
@@ -31,29 +31,13 @@ Three exact-match filters live in the sidebar:
 
 Filters combine with AND. If you set the language to *German* and the keyword to *Migration*, you only see German-language datasets tagged with Migration. Any free-text query you also typed continues to apply on top.
 
-The keyword list shows only keywords that appear in at least two datasets — this keeps the sidebar manageable when the catalogue is large. Like search, the keyword and language lists (and filters) only cover datasets whose metadata your tier lets you see; the access-level filter works on everything, since that badge is always visible.
+Keyword suggestions require at least two occurrences among sampled recent visible records. Keyword/language suggestions and filters respect your tier; access-level filtering applies to every record. Suggestions are incomplete, so you may type another exact value.
 
 ### Results and pagination
 
-Each result card shows the dataset's title, its authors, a short snippet of the description, and badges for the languages and access level. Datasets restricted above your tier appear with their title and access level only, marked with a tier badge. Click any result to open its detail page.
+Visible results show title, authors, a description snippet, keywords, languages, and access level. Above-tier results show title, access level, and a restricted notice; open the detail page to see the required tier.
 
 The results are paginated. The page size is configured by the operator (default: 20 per page). Pagination links appear at the bottom of the list when there is more than one page.
-
-```mermaid
-flowchart LR
-    A[Free-text query] --> M[Match against<br/>title, descriptions,<br/>authors, keywords<br/>&#40;title only above your tier&#41;]
-    M --> F1{Keyword filter?}
-    F1 -- yes --> G1[Restrict to keyword]
-    F1 -- no --> F2{Language filter?}
-    G1 --> F2
-    F2 -- yes --> G2[Restrict to language]
-    F2 -- no --> F3{Access level filter?}
-    G2 --> F3
-    F3 -- yes --> G3[Restrict to access level]
-    F3 -- no --> R[Apply tier redaction]
-    G3 --> R
-    R --> P[Paginate]
-```
 
 ## The detail page
 
@@ -67,7 +51,7 @@ Clicking a result opens the detail page for one dataset. You'll see:
 - The resource type and version
 - The license and license URL (where present)
 - The DOI and bibliographical citation (where present)
-- A download button, a link to the source repository's landing page, or — for restricted datasets — a note on how to request access
+- A SWISSUbase resource/landing-page link when available, otherwise a contact address
 
 If the dataset is restricted to a tier above yours, the detail page shows only the title and the access level, with a note explaining why other fields are hidden and how to request access.
 
@@ -76,5 +60,12 @@ If the dataset is restricted to a tier above yours, the detail page shows only t
 A few reasons a dataset you saw last week might not show up today:
 
 - **A filter is set you forgot about.** Filters persist as URL parameters, so if you bookmarked a search you may still have the filter applied. Use *Browse all datasets* to start fresh.
-- **The dataset's visibility tier was raised.** Administrators can mark a dataset as restricted at any time. After that, users below the new tier no longer see its content.
-- **The dataset was withdrawn from the source repository.** Deletions the source announces are picked up by the hourly sync; entries that silently vanish upstream are removed by the periodic full rebuild, which runs on a longer schedule.
+- **The source policy or your access tier changed.** Full metadata may become hidden, but the public title/access level remain discoverable.
+- **The source withdrew the dataset.** Announced deletions are processed by incremental sync; silent disappearances require a successful full rebuild. Schedules, source failures, and deletion safeguards can delay removal.
+
+## Filter suggestions and large searches
+
+Each filter suggests up to 50 values from the 200 most recently modified records, limited to the first 100 keywords/languages per record. Hidden fields above your tier are excluded. You can type an exact value outside the suggestions; filtering searches the full catalogue.
+
+Search exposes at most 10,000 numbered pages. If more matches exist, narrow the search; pagination does not link beyond that window.
+

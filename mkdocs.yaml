@@ -41,10 +41,12 @@ nav:
   - Configuration & Operations:
       - Settings Reference: configuration/settings.md
       - Deployment: configuration/deployment.md
+      - Laptop Staging: runbooks/local-staging.md
       - Logging & Audit: configuration/logging.md
       - Runbook — Key Rotation: runbooks/key-rotation.md
   - Code Reference:
       - Application Entry: reference/main.md
+      - Route Security Contract: reference/route-security.md
       - Routes:
           - Pages: reference/routes/pages.md
           - Auth: reference/routes/auth.md

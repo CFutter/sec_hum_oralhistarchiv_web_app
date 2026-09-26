@@ -1,206 +1,387 @@
 """Service layer — re-exports database, sync, user, and session operations."""
-from .access_tiers import AccessTier
 
-from .cache import FacetCache
-
+from .access_tiers import AccessTier, assert_tier_rank_complete
+from .admin_promotion import (
+    ADMIN_PROMOTION_MAX_AGE_SECONDS,
+    ADMIN_PROMOTION_PREPARED_MAX_AGE_SECONDS,
+    AcceptedAdminPromotion,
+    AdminPromotion,
+    AdminPromotionRejected,
+    AdminPromotionRequestResult,
+    PreparedAdminPromotion,
+    accept_admin_promotion,
+    cancel_admin_promotion,
+    decline_admin_promotion,
+    get_admin_promotion,
+    list_admin_promotion_states,
+    prepare_admin_promotion,
+    request_admin_promotion,
+)
+from .audit import audit_admin_action, audit_user_event
+from .authentication import (
+    CREDENTIAL_INTEGRITY_FAULTS,
+    LocalLoginFailure,
+    finalize_local_login,
+    record_login_failure,
+    record_login_failure_cur,
+    verify_dummy,
+    verify_password,
+)
+from .cache import CatalogueStatsCache
+from .credential_attempts import (
+    SessionStepUpAttemptOutcome,
+    reserve_session_step_up_attempt,
+)
+from .crypto import audit_email_hash, get_primary_totp_decryptor
 from .datasets import (
-    Dataset,
+    PUBLIC_DISCOVERY_FIELDS,
+    PUBLIC_SEARCH_FIELDS,
     Author,
-    search_datasets,
-    get_recent_datasets,
-    get_dataset_by_id,
-    get_facets,
-    get_last_full_rebuild_date,
-    get_keyword_count,
+    Dataset,
+    assert_redaction_total,
     can_view_full,
     filter_for_tier,
-    validate_dataset_schema,
+    get_dataset_by_id,
+    get_facets,
+    get_global_catalogue_stats,
+    get_keyword_count,
+    get_last_full_rebuild_date,
+    get_recent_datasets,
+    search_datasets,
     validate_dataset_insert_schema,
-    assert_redaction_total
+    validate_dataset_schema,
 )
-
-from .db import (
-    get_db_cursor, 
-    create_pool
-)
-
+from .db import create_pool, get_db_cursor
 from .db_drift import validate_schema_against_db
-
-from .sync import (
-    run_sync, 
-    run_full_rebuild, 
-)
-
-from .sessions import (
-    SessionPurpose,
-    create_session, 
-    delete_session,
-    delete_user_sessions,
-    get_session_user,
-    cleanup_expired_sessions,
-    upgrade_session_purpose,
-    set_flash,
-    consume_flash
-)
-
-from .scheduler import create_scheduler
-
-
-from .users import (
-    UserAlreadyExistsError,
-    DISPLAY_NAME_MAX_LENGTH,
-    get_user_by_id, 
-    get_user_by_email,
-    create_local_user, 
-    create_shibboleth_user,
-    update_last_login, 
-    update_access_tier, 
-    update_display_name,
-    get_all_users, 
-    set_user_active, 
-    set_user_admin,
-    validate_user_schema,
-    normalize_display_name
-)
-
-from .authentication import (
-    verify_password, 
-    clear_login_failures,
-    record_login_failure,
-    verify_current_password,
-    verify_dummy
-)
-
-from .totp import (
-    TotpDecryptionError,
-    get_totp_secret, 
-    update_totp_secret,
-    store_pending_totp_secret, 
-    get_pending_totp_secret,
-    generate_totp_secret,
-    verify_and_consume_totp,
-    matched_step
-)
-
-from .password_reset import (
-    generate_reset_token, 
-    validate_reset_token,
-    update_password_with_token,
-    store_reset_token_hash, 
-    verify_reset_token_hash
-)
-
-from .password_validation import validate_password_strength
-
-from .email_verification import (
-    generate_verification_token, 
-    store_verification_token_hash, 
-    validate_verification_token, 
-    confirm_email_verification
-)
-
-from .seed_admin import seed_admin_user
-
 from .email import (
-    send_email, 
-    send_password_reset_email, 
-    send_verification_email,
-    send_email_change_verification,
-    send_email_change_notice,
-    send_duplicate_registration_notice,
-    verify_smtp_tls,
-    send_account_locked_notice
+    build_account_credential_fault_notice,
+    build_account_locked_notice,
+    build_duplicate_registration_notice,
+    build_email_change_notice,
+    build_email_change_verification,
+    build_password_reset_email,
+    build_verification_email,
+    send_email,
 )
-
 from .email_change import (
-    generate_email_change_token,
-    validate_email_change_token,
-    store_pending_email,
+    AdminEmailChangeRejected,
+    AdminEmailChangeResult,
+    SelfEmailChangeRejected,
+    SelfEmailChangeResult,
     confirm_email_change,
+    email_change_token_email_metadata,
+    generate_email_change_token,
     pending_email_change_matches,
-    normalize_email
+    stage_admin_email_change,
+    stage_self_email_change,
+    store_pending_email,
+    store_pending_email_cur,
+    validate_email_change_token,
 )
-
+from .email_delivery import deliver_email_outbox_batch
+from .email_outbox import (
+    ClaimedEmail,
+    OutboundEmail,
+    OutboxBodyDecryptionError,
+    OutboxLeaseLostError,
+    claim_due_emails,
+    decrypt_claimed_email_body,
+    enqueue_email_cur,
+    enqueue_outbound_email_cur,
+    mark_email_dead,
+    mark_email_sent,
+    retry_email_later,
+)
+from .email_utils import normalize_email
+from .email_verification import (
+    confirm_email_verification,
+    generate_verification_token,
+    store_verification_token_hash,
+    store_verification_token_hash_cur,
+    validate_verification_token,
+    verification_token_email_metadata,
+)
+from .federated_authentication import (
+    SHIBBOLETH_AFFILIATION_HEADER,
+    SHIBBOLETH_AUTHN_CONTEXT_HEADER,
+    SHIBBOLETH_COUNTRY_HEADER,
+    SHIBBOLETH_DISPLAY_NAME_HEADER,
+    SHIBBOLETH_INTERNAL_AUTH_HEADER,
+    SHIBBOLETH_ISSUER_HEADER,
+    SHIBBOLETH_MAIL_HEADER,
+    SHIBBOLETH_SUBJECT_HEADER,
+    FederatedLoginFailure,
+    FederatedPrincipal,
+    InvalidFederatedPrincipal,
+    build_federated_principal,
+    finalize_shibboleth_login,
+    is_trusted_federated_principal,
+)
+from .federated_session_policy import (
+    FEDERATED_SESSION_POLICY_VERSION,
+    REQUIRED_SHIBBOLETH_AUTHN_CONTEXT,
+    federated_session_policy_fingerprint,
+    reconcile_federated_session_policy,
+)
+from .outbox_maintenance import get_outbox_metrics_cur, outbox_is_degraded
+from .password_reset import (
+    generate_reset_token,
+    reset_token_email_metadata,
+    store_reset_token_hash,
+    store_reset_token_hash_cur,
+    update_password_with_token,
+    validate_reset_token,
+    verify_reset_token_hash,
+)
+from .password_validation import validate_password_strength, warm_password_blocklist
+from .scheduler import RunningJobTracker, create_scheduler
+from .seed_admin import seed_admin_user
+from .session_ids import hash_session_id
+from .session_revocation import (
+    delete_user_sessions,
+    delete_user_sessions_cur,
+    invalidate_pending_authentication_state_cur,
+)
+from .sessions import (
+    SessionNotFoundError,
+    SessionPurpose,
+    cleanup_expired_sessions,
+    consume_flash,
+    create_session,
+    delete_session,
+    get_session_user,
+    restore_flash_if_empty,
+    set_flash,
+    set_flash_if_exists,
+)
+from .sync import (
+    run_full_rebuild,
+    run_sync,
+)
 from .tokens import hash_token
-
-from .audit import audit_admin_action, audit_user_event
-from .crypto import audit_email_hash 
-
+from .totp import (
+    PendingTotpOutcome,
+    PendingTotpPurpose,
+    TotpDecryptionError,
+    TotpEnrollmentOutcome,
+    TotpRotationOutcome,
+    TotpRotationStartOutcome,
+    TotpRotationStartResult,
+    begin_totp_rotation,
+    confirm_totp_rotation,
+    generate_totp_secret,
+    get_or_create_pending_totp_secret,
+    get_pending_totp_secret,
+    get_totp_secret,
+    matched_step,
+    verify_and_consume_totp,
+    verify_and_enroll_totp,
+)
+from .totp_recover import (
+    TOTP_RECOVERY_AUTHORIZATION_MAX_AGE_SECONDS,
+    TOTP_RECOVERY_SESSION_MAX_AGE_SECONDS,
+    TotpRecoveryAuthorization,
+    TotpRecoveryRedemption,
+    TotpRecoveryRedemptionRejected,
+    TotpRecoveryRejected,
+    TotpRecoveryTarget,
+    authorize_totp_recovery,
+    get_totp_recovery_target,
+    redeem_totp_recovery,
+)
+from .totp_recovery_codes import (
+    TOTP_RECOVERY_CODE_MAX_CHARS,
+    TOTP_RECOVERY_PASSWORD_ATTEMPT_LIMIT,
+)
+from .users import (
+    DISPLAY_NAME_MAX_LENGTH,
+    AdminActionRejected,
+    FederatedStatus,
+    User,
+    UserAlreadyExistsError,
+    approve_federated_user,
+    create_shibboleth_user,
+    get_user_by_email,
+    get_user_by_id,
+    list_users,
+    normalize_display_name,
+    set_user_active,
+    set_user_admin,
+    update_access_tier,
+    update_display_name,
+    update_last_login,
+    validate_user_schema,
+)
 
 __all__ = [
-    "SessionPurpose",
-    "AccessTier",
-    "UserAlreadyExistsError",
+    "ADMIN_PROMOTION_MAX_AGE_SECONDS",
+    "ADMIN_PROMOTION_PREPARED_MAX_AGE_SECONDS",
+    "CREDENTIAL_INTEGRITY_FAULTS",
     "DISPLAY_NAME_MAX_LENGTH",
+    "FEDERATED_SESSION_POLICY_VERSION",
+    "PUBLIC_DISCOVERY_FIELDS",
+    "PUBLIC_SEARCH_FIELDS",
+    "REQUIRED_SHIBBOLETH_AUTHN_CONTEXT",
+    "SHIBBOLETH_AFFILIATION_HEADER",
+    "SHIBBOLETH_AUTHN_CONTEXT_HEADER",
+    "SHIBBOLETH_COUNTRY_HEADER",
+    "SHIBBOLETH_DISPLAY_NAME_HEADER",
+    "SHIBBOLETH_INTERNAL_AUTH_HEADER",
+    "SHIBBOLETH_ISSUER_HEADER",
+    "SHIBBOLETH_MAIL_HEADER",
+    "SHIBBOLETH_SUBJECT_HEADER",
+    "TOTP_RECOVERY_AUTHORIZATION_MAX_AGE_SECONDS",
+    "TOTP_RECOVERY_CODE_MAX_CHARS",
+    "TOTP_RECOVERY_PASSWORD_ATTEMPT_LIMIT",
+    "TOTP_RECOVERY_SESSION_MAX_AGE_SECONDS",
+    "AcceptedAdminPromotion",
+    "AccessTier",
+    "AdminActionRejected",
+    "AdminEmailChangeRejected",
+    "AdminEmailChangeResult",
+    "AdminPromotion",
+    "AdminPromotionRejected",
+    "AdminPromotionRequestResult",
     "Author",
+    "CatalogueStatsCache",
+    "ClaimedEmail",
     "Dataset",
-    "FacetCache",
+    "FederatedLoginFailure",
+    "FederatedPrincipal",
+    "FederatedStatus",
+    "InvalidFederatedPrincipal",
+    "LocalLoginFailure",
+    "OutboundEmail",
+    "OutboxBodyDecryptionError",
+    "OutboxLeaseLostError",
+    "PendingTotpOutcome",
+    "PendingTotpPurpose",
+    "PreparedAdminPromotion",
+    "RunningJobTracker",
+    "SelfEmailChangeRejected",
+    "SelfEmailChangeResult",
+    "SessionNotFoundError",
+    "SessionPurpose",
+    "SessionStepUpAttemptOutcome",
     "TotpDecryptionError",
+    "TotpEnrollmentOutcome",
+    "TotpRecoveryAuthorization",
+    "TotpRecoveryRedemption",
+    "TotpRecoveryRedemptionRejected",
+    "TotpRecoveryRejected",
+    "TotpRecoveryTarget",
+    "TotpRotationOutcome",
+    "TotpRotationStartOutcome",
+    "TotpRotationStartResult",
+    "User",
+    "UserAlreadyExistsError",
+    "accept_admin_promotion",
+    "approve_federated_user",
     "assert_redaction_total",
+    "assert_tier_rank_complete",
     "audit_admin_action",
     "audit_email_hash",
     "audit_user_event",
+    "authorize_totp_recovery",
+    "begin_totp_rotation",
+    "build_account_credential_fault_notice",
+    "build_account_locked_notice",
+    "build_duplicate_registration_notice",
+    "build_email_change_notice",
+    "build_email_change_verification",
+    "build_federated_principal",
+    "build_password_reset_email",
+    "build_verification_email",
     "can_view_full",
+    "cancel_admin_promotion",
+    "claim_due_emails",
     "cleanup_expired_sessions",
-    "clear_login_failures",
     "confirm_email_change",
     "confirm_email_verification",
+    "confirm_totp_rotation",
     "consume_flash",
-    "create_local_user",
     "create_pool",
     "create_scheduler",
     "create_session",
     "create_shibboleth_user",
+    "decline_admin_promotion",
+    "decrypt_claimed_email_body",
     "delete_session",
     "delete_user_sessions",
+    "delete_user_sessions_cur",
+    "deliver_email_outbox_batch",
+    "email_change_token_email_metadata",
+    "enqueue_email_cur",
+    "enqueue_outbound_email_cur",
+    "federated_session_policy_fingerprint",
     "filter_for_tier",
+    "finalize_local_login",
+    "finalize_shibboleth_login",
     "generate_email_change_token",
     "generate_reset_token",
     "generate_totp_secret",
     "generate_verification_token",
-    "get_all_users",
+    "get_admin_promotion",
     "get_dataset_by_id",
     "get_db_cursor",
     "get_facets",
-    "verify_password", 
-    "get_last_full_rebuild_date",
+    "get_global_catalogue_stats",
     "get_keyword_count",
+    "get_last_full_rebuild_date",
+    "get_or_create_pending_totp_secret",
+    "get_outbox_metrics_cur",
     "get_pending_totp_secret",
+    "get_primary_totp_decryptor",
     "get_recent_datasets",
     "get_session_user",
+    "get_totp_recovery_target",
     "get_totp_secret",
     "get_user_by_email",
     "get_user_by_id",
+    "hash_session_id",
     "hash_token",
+    "invalidate_pending_authentication_state_cur",
+    "is_trusted_federated_principal",
+    "list_admin_promotion_states",
+    "list_users",
+    "mark_email_dead",
+    "mark_email_sent",
     "matched_step",
     "normalize_display_name",
     "normalize_email",
+    "outbox_is_degraded",
     "pending_email_change_matches",
+    "prepare_admin_promotion",
+    "reconcile_federated_session_policy",
     "record_login_failure",
+    "record_login_failure_cur",
+    "redeem_totp_recovery",
+    "request_admin_promotion",
+    "reserve_session_step_up_attempt",
+    "reset_token_email_metadata",
+    "restore_flash_if_empty",
+    "retry_email_later",
     "run_full_rebuild",
     "run_sync",
     "search_datasets",
     "seed_admin_user",
-    "send_account_locked_notice",
-    "send_duplicate_registration_notice",
     "send_email",
-    "send_email_change_notice",
-    "send_email_change_verification",
-    "send_password_reset_email",
-    "send_verification_email",
     "set_flash",
+    "set_flash_if_exists",
     "set_user_active",
     "set_user_admin",
+    "stage_admin_email_change",
+    "stage_self_email_change",
     "store_pending_email",
-    "store_pending_totp_secret",
+    "store_pending_email_cur",
     "store_reset_token_hash",
+    "store_reset_token_hash_cur",
     "store_verification_token_hash",
+    "store_verification_token_hash_cur",
     "update_access_tier",
     "update_display_name",
     "update_last_login",
     "update_password_with_token",
-    "update_totp_secret",
-    "upgrade_session_purpose",
     "validate_dataset_insert_schema",
     "validate_dataset_schema",
     "validate_email_change_token",
@@ -209,10 +390,11 @@ __all__ = [
     "validate_schema_against_db",
     "validate_user_schema",
     "validate_verification_token",
+    "verification_token_email_metadata",
     "verify_and_consume_totp",
-    "verify_current_password",
+    "verify_and_enroll_totp",
     "verify_dummy",
     "verify_password",
     "verify_reset_token_hash",
-    "verify_smtp_tls"
+    "warm_password_blocklist",
 ]

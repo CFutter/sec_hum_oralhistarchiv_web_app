@@ -3,131 +3,84 @@
 The visibility model is small enough to summarise in three sentences:
 
 1. Every user has an `access_tier` of `public`, `registered`, or `vetted`, ranked low to high.
-2. Every dataset has a `visibility_tier` of `public`, `registered`, or `vetted`, set at ingest by the source's policy ceiling and adjustable per dataset by an administrator.
-3. A user whose tier rank is at least the dataset's visibility tier rank sees the full dataset; everyone else sees a redacted version with little more than the title and access level.
+2. Every dataset has a `visibility_tier` of `public`, `registered`, or `vetted`, initially supplied or constrained by its source policy. An administrator may raise the stored tier; synchronization preserves the stricter of the stored and incoming tiers.
+3. A user whose tier rank is at least the dataset's visibility tier rank sees the full dataset; everyone else sees the deliberately public discovery envelope in `PUBLIC_DISCOVERY_FIELDS` — `id`, `uuid`, `title`, `access_level`, `version`, `source`, `visibility_tier` — with every other field redacted. (`assert_redaction_total()` enforces that this set plus the redacted set exactly partitions the Dataset fields.)
 
-This page explains how that simple rule is enforced, where the redaction happens, and why the system distinguishes `visibility_tier` from `access_level`.
 
 ## The tier hierarchy
 
-Tiers form a strict total order:
-
-```text
-public  <  registered  <  vetted
-```
-
-In code (`services/access_tiers.py`):
-
-```python
-_TIER_RANK = {"public": 0, "registered": 1, "vetted": 2}
-
-def can_access(user_tier, required_tier):
-    return _TIER_RANK[user_tier] >= _TIER_RANK[required_tier]
-```
-
-A vetted user can see everything. A registered user can see public and registered content. A public (or guest) user can see only public content. There is no orthogonal capability — only this single ladder. `can_view_full(dataset, user_tier)` in `datasets.py` is a thin wrapper that calls `can_access(user_tier, dataset.visibility_tier)`, and `tier_rank()` supplies the same numeric ranking to the SQL queries.
+`public < registered < vetted`, ranked 0, 1, and 2 in `services/access_tiers.py`. `can_access()` compares ranks; `can_view_full()` applies that comparison to `dataset.visibility_tier`. An unknown tier raises `ValueError`. User metadata tiers are independent of administrator privileges.
 
 ## Where the check runs
 
-Visibility filtering is enforced in the **service layer** — partly inside the SQL queries themselves, partly in `filter_for_tier` — not in the routes and not in the templates. Routes only pass the user's tier down:
+Routes resolve `request.state.user.access_tier`, defaulting guests to `public`, and pass it to dataset services. `search_datasets`, `get_recent_datasets`, and `get_dataset_by_id` redact before returning. Internal database rows are unredacted, so new callers must use these tier-aware services or call `filter_for_tier` before exposing data.
 
-```python
-user_tier = _get_user_tier(request)   # request.state.user.access_tier or "public"
-results, total = await search_datasets(pool, user_tier, ...)   # already redacted
-dataset = await get_dataset_by_id(pool, dataset_id, user_tier) # already redacted
-```
+### Search and facets
 
-`search_datasets`, `get_recent_datasets`, and `get_dataset_by_id` all apply `filter_for_tier` to every row **before returning**, so no caller can ever hold an unredacted dataset for a below-tier viewer. The template never sees the hidden fields and never has to know about tiers. A future template change cannot accidentally leak a sensitive field — the field literally is not in the object the template was given.
+- Public title/access-level text is searchable on every record; full-text metadata matches only records visible at the user's tier.
+- Keyword/language filters and suggestions are tier-gated; access-level filtering is public.
+- Suggestions come from a bounded recent-record sample, not a complete catalogue vocabulary. Home language/keyword counts are tier-scoped aggregates.
 
-The `_get_user_tier` helper defaults to `"public"` for unauthenticated requests, so the same code path serves guests and authenticated public-tier users without branching.
-
-### Search cannot be used as an oracle
-
-Redacting the *returned* fields is not enough — a below-tier user could otherwise probe hidden metadata by watching which filters *match*. The queries close this:
-
-- **Free-text search** matches two trigger-maintained columns. `search_text_public` (title + access level — exactly what survives redaction) is matched on **every** dataset, keeping the catalogue browsable. `search_text_full` (descriptions, project fields, keywords, authors) is matched **only** on datasets the user's tier permits.
-- **The `keyword` and `language` filters** are tier-gated in SQL for the same reason: those values are redacted for below-tier users, so an un-gated filter would confirm a guessed keyword or language on a hidden dataset by presence/absence.
-- **The `access_level` filter is deliberately *not* gated** — access level is shown even on redacted rows, so filtering on it reveals nothing the user cannot already see.
-- **Facet lists and the home-page keyword count** are tier-scoped in SQL as well, so the sidebar cannot enumerate values that occur only in datasets above the user's tier.
+Templates receive redacted fields as `None`/empty lists, but still use the visibility tier to present restricted-detail notices.
 
 ## What gets redacted
 
-When the user's tier is insufficient, `filter_for_tier` returns a fresh `Dataset` in which only the bare minimum needed to acknowledge the dataset's existence survives:
+When the user's tier is insufficient, `filter_for_tier` returns a fresh `Dataset` containing the application's explicit public discovery envelope:
 
 | Survives redaction | Removed by redaction |
 |---|---|
 | `id`, `uuid` | `description`, `resource_description` |
 | `title` | `project_title`, `project_description` |
 | `access_level` | `authors`, `keywords`, `languages` |
-| `version` | `download_url`, `landing_page_url`, `resource_proxies` |
+| `version` | `resource_access_url`, `landing_page_url`, `resource_proxies` |
 | `source`, `visibility_tier` | `license_val`, `license_url`, `doi`, `resource_type`, `bibliographical_citation` |
 
-That is the complete list — `access_level` and `version` survive (so the UI can still show whether the materials are restricted and which version exists), but the landing page URL, license, resource type, and every descriptive field are removed. The redacted `Dataset` is a fresh dataclass instance, not a wrapper or proxy: the sensitive fields literally hold `None` or `[]`, so there is no `__getattr__` trick to subvert. A startup check (`assert_redaction_total`) verifies that every `Dataset` field is classified into exactly one of the two columns above, so a newly added field cannot silently slip through unclassified.
+That is the complete list. Every surviving value, the fact that the record exists, and the fields considered in combination must be safe for unrestricted public disclosure. In particular, titles are deliberately displayed and searchable; `uuid` must be a public dataset identifier rather than a participant identifier, private lookup key, or credential. The redacted `Dataset` is a fresh dataclass instance, not a wrapper or proxy: the sensitive fields literally hold `None` or `[]`, so there is no `__getattr__` trick to subvert. A startup check (`assert_redaction_total`) verifies that every `Dataset` field is classified into exactly one of the two columns above and that `PUBLIC_SEARCH_FIELDS` remains inside the public envelope.
+
+This is a semantic source contract as well as a code-level field set. Automated tests can prove which values the application releases, but they cannot decide whether a human-language title identifies a participant. Source A relies on its upstream open-metadata policy and upstream correction/withdrawal. Source B must independently adopt and validate the [Source B Ingestion Contract](source-b-ingestion-contract.md) before it is implemented or enabled.
 
 ## Why `visibility_tier` and `access_level` are different
 
-This is the part most people get wrong on first reading. The `Dataset` dataclass carries two fields that look similar:
-
-| Field | Set by | Question it answers |
+| Field | Meaning | Authority |
 |---|---|---|
-| `visibility_tier` | Ingest policy ceiling; administrators can override per dataset (in the DB) | "Who can read about this dataset?" |
-| `access_level` | Sync layer (derived from upstream license) | "Who can download the actual materials?" |
+| `visibility_tier` | Minimum tier for full metadata | Source classification constrained by `SourcePolicy` |
+| `access_level` | Displayed classification of material access | Source-specific classifier |
 
-Conflating them would force a single yes/no decision on a question that has two independent answers. Examples:
-
-- A dataset of public-domain transcripts: both fields are `public`. Anyone can read about it and anyone can download it.
-- A dataset whose materials require a request to the source repository, but whose metadata is freely browsable: `access_level='restricted'`, `visibility_tier='public'`. The whole point of having metadata in the archive is to help researchers discover what exists and decide whether to make a request.
-- A dataset whose materials are technically public-domain audio, but whose metadata names interview subjects who later asked to be unlisted: `access_level='public'`, `visibility_tier='vetted'`. The metadata is sensitive, the materials are not.
-
-`access_level` controls download. `visibility_tier` controls metadata visibility. The redaction logic only touches `visibility_tier`. Whether a user can actually fetch the materials behind `download_url` is governed by the source repository, plus the application's `access_level` display, plus future Phase 2 enforcement.
+Only `visibility_tier` gates metadata. `access_level` is a public label/filter, not an application download permission. SWISSUbase resource/landing links are displayed when full metadata and a URL are available, regardless of that label; the external repository enforces material access. Public discovery fields remain visible even for vetted metadata, so they must never contain confidential identifiers or titles.
 
 ## How `access_level` gets set
 
-During sync, `services/sync.py:_classify_access_level` looks at the upstream license string:
-
-```python
-def _classify_access_level(license_val, source):
-    if source != "swissubase":
-        raise NotImplementedError(...)   # each source must define its own gating
-    if (license_val or "").lower().startswith("restricted access"):
-        return "restricted"
-    return "public"
-```
-
-That is the entire rule today. SWISSUbase uses free-text license fields, and the only label they use to mark restriction is `Restricted access...`. If they ever change their convention, this is the single function to update — every other access-level handling reads from `Dataset.access_level`. The classifier is deliberately **fail-open for Source A only** (SWISSUbase omits restricted download links upstream, so a misclassification cannot expose a link); the guard clause forces any future source to make its own explicit access-level decision rather than inheriting this rule.
+`services/sync.py:_classify_swissubase_access()` returns `restricted` when the lowercased license starts with `restricted access`; every other value, including missing or whitespace-prefixed labels, becomes `public`. This is a fail-open display classification, not proof that downloading is permitted. The repository does not establish that upstream always omits protected links; validate the source contract operationally. Every future `SourcePolicy` must supply its own classifier.
 
 ## How `visibility_tier` gets set
 
-At ingest, the tier is resolved through a **source policy**, never hardcoded. Each ingest source is bound to a `SourcePolicy` whose `max_visibility` is the most *permissive* tier that source's records may be published at. For SWISSUbase the ceiling comes from the `SWISSUBASE_MAX_VISIBILITY` setting (the code default is the most restrictive, `vetted`; a deployment ingesting only a public catalogue sets it to `public` — see `.env.example`). `resolve_tier(record_tier, policy)` then takes the more restrictive of the record's own tier claim and the ceiling; a record with no tier, or an unrecognised value, gets the ceiling.
+At ingest, every source is bound to a `SourcePolicy` whose `max_visibility` is the most *permissive* tier at which its records may be published. Source A is an open SWISSUbase OAI catalogue and does not carry an application tier per record; `resolve_tier(None, policy)` therefore supplies `SWISSUBASE_MAX_VISIBILITY` for new records. For an existing `(source, uuid)`, the upsert atomically retains the more restrictive of its stored `visibility_tier` and the incoming policy-resolved tier. Incremental sync and full rebuild use this same rule, so synchronization may tighten a classification but never lower it. The ordering remains `public < registered < vetted`, defined by `_TIER_RANK` in `services/access_tiers.py`.
 
-After ingest, administrators can change a dataset's tier per record — today by editing the database directly; there is not yet an admin UI for per-dataset tier editing. Mock restricted datasets are seeded in debug mode by `services/seed_mock_data.py` (with `source="mock"`, `visibility_tier="vetted"`) so the tier filtering can be exercised without sensitive data.
+Source B is different: every record must carry a source-owned canonical tier, and every value in its public discovery envelope must be approved as unrestricted-public metadata. Its future adapter must validate both boundaries before persistence and call `resolve_required_source_tier()`, which rejects missing and unknown tiers rather than defaulting them, then applies the application ceiling only to make a tier more restrictive. The shared upsert also preserves any stricter stored classification. The complete, transport-independent acceptance criteria are in the [Source B Ingestion Contract](source-b-ingestion-contract.md).
 
-In Phase 2, when Source B (sensitive metadata) lands, it will get its own `SourcePolicy` with an appropriately restrictive ceiling, likely with a per-field visibility matrix layered on top of the per-dataset tier.
+Phase 1 dataset administration uses direct database updates by an authorised operator, scoped to the exact `(source, uuid)`. For example, replace the example UUID below with the reviewed upstream identifier and verify that exactly one row is returned:
+
+```sql
+UPDATE oral_history_datasets
+SET visibility_tier = 'vetted'
+WHERE source = 'swissubase' AND uuid = 'oai:swissubase.ch:example'
+RETURNING id, source, uuid, visibility_tier;
+```
+
+Record the decision and verify anonymous detail and search responses after committing. The admin dashboard manages user access tiers and does not change dataset classifications. Tier-sensitive reads query the database directly, so a dataset-tier change needs no cache invalidation.
+
+The existing `visibility_tier` stores the effective classification, so preserving its stricter value needs no new column or migration. It does not separately record whether a restriction came from an administrator or an earlier source policy. Consequently, a more permissive source revision or configuration does not automatically lower an existing tier. Genuine withdrawals and stale-row deletion still remove the row; a later reintroduction or a new UUID is a new insert and receives the then-current source-policy tier.
+
+Metadata corrections and withdrawals remain upstream responsibilities. An operator may delete an exact `(source, uuid)` as documented in the [Emergency Dataset Withdrawal](../runbooks/emergency-dataset-withdrawal.md), but ingestion must remain paused until the authoritative source is fixed or the row may return. Raising a tier still exposes the public discovery envelope and is insufficient when that envelope itself must disappear. Mock restricted rows seeded in non-production exercise presentation-layer tier filtering only; they do not implement or test the Source B ingestion contract.
 
 ## What gets logged
 
-When a route serves a dataset whose `visibility_tier` is anything other than `public`, the page handler emits a structured `dataset_access` audit event regardless of whether access was granted:
+The dataset detail handler emits `dataset_access` when `visibility_tier != public`, including dataset ID/UUID/tier, user ID/tier, and `access_granted`; request ID and client IP come from the audit helper. Search/home cards do not emit this dataset-level event. Audit output goes through configured logging; the supplied deployment captures stdout with journald, not a separate `audit.log`.
 
-```text
-event_type: dataset_access
-dataset_id: 4711
-dataset_uuid: ...
-dataset_visibility_tier: registered
-user_id: 42            # null for guests
-user_tier: registered
-access_granted: true
-```
+## Administrative user access
 
-This is the audit hook for restricted-content access. Combined with the audit middleware's per-request log, every restricted-content request is traceable to a request ID, an IP, a user, and an outcome. These records go to stdout and are captured by systemd-journald (and optionally forwarded off-host by a host-level rsyslog agent); there is no separate `audit.log` file. (The redacted `Dataset` deliberately keeps its `visibility_tier` so this audit decision can still be derived after redaction.)
+`is_admin` is independent of `access_tier`. Admin routes require an eligible full-session administrator, and local administrators also need usable recovery codes. Missing/nonadmin principals receive 404. Admin write services recheck current authority/session under locks. Administrator status does not grant vetted metadata access; an administrator must assign that tier separately.
 
-## Admin overrides
+## Limitations
 
-Administrators are authorised independently of the visibility tier system, via the `is_admin` boolean on `users`. The `require_admin` dependency on `/admin/*` routes checks that flag (raising 404 for non-admins, so the area is not even revealed) and is unrelated to `access_tier`. An administrator who is not also `vetted` does not gain vetted-tier visibility — they would have to assign themselves the tier explicitly.
-
-## Things this model does *not* do today
-
-- **Per-field visibility.** A dataset is either fully visible or reduced to the surviving minimum. There is no "show authors but hide subjects". The Phase 2 visibility matrix will introduce that.
-- **Time-bound access.** Vetted access is granted permanently until an administrator removes it. There is no automatic expiry.
-- **Per-dataset access requests.** Users cannot request access to a specific dataset through the application. Requests go via email to the administrators.
-- **An admin UI for dataset tiers.** Per-dataset tier changes are made directly in the database.
-- **PostgreSQL Row-Level Security.** Today, enforcement is at the application layer. Phase 2 will add PostgreSQL RLS as a defense-in-depth layer so that even a compromised application database account cannot bypass tier restrictions through direct SQL.
+There is no per-field visibility, access expiry, in-app per-dataset request workflow, or PostgreSQL row-level security. Administrators assign user tiers manually; sources own dataset classification. Emergency removal is temporary unless the source is corrected or ingestion stays paused. Application tier checks do not protect direct SQL access by the database role.

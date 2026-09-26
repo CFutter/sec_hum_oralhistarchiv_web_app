@@ -6,11 +6,11 @@ You do not need an account to browse and search the public part of the archive. 
 
 | Tier | How you get it | What it grants |
 |---|---|---|
-| **Public** | The default for everyone, including users who are not logged in | Full metadata of public-tier datasets; title and access level only for restricted-tier datasets |
-| **Registered** | Create an account, verify your email, enrol an authenticator app | Everything *Public* sees, plus full metadata of registered-tier datasets |
-| **Vetted** | Submit an access request to the archive administrators after registering | Everything *Registered* sees, plus full metadata of vetted-tier datasets — including strictly confidential fields |
+| **Public** | Default for guests and new local accounts | Full public-tier metadata; discovery details for higher-tier datasets |
+| **Registered** | Administrator approval after account setup | Full public and registered metadata |
+| **Vetted** | Administrator approval after review | Full metadata at every tier |
 
-The tier system is enforced on the server. Restricted fields are removed from the response *before* the page is rendered, so it is not possible to inspect the page source to recover hidden values.
+Creating, verifying, or enrolling an account does not change its tier. Hidden metadata is removed before rendering and is absent from page source.
 
 ## Registering for an account
 
@@ -22,43 +22,56 @@ Click **Login** in the navigation, then **Register**. You will be asked for:
 - Your country (optional)
 - A password
 
-The password must be at least 12 characters long. The system additionally rejects passwords that appear in a list of the 10 000 most commonly compromised passwords, and passwords that contain your email address or display name. Choose something memorable but not guessable — a passphrase of four random words is a good starting point.
+Use 12–200 characters. Passwords are rejected if they match the common-password list or contain your email local part or a display-name word of at least four characters, ignoring case.
 
-Submitting the form creates the account and shows a "check your inbox" page — you are **not** logged in yet. A verification email is sent to the address you provided; you must click the link in that email before you can log in at all. (If the address was already registered, the page looks exactly the same and the existing account owner is notified by email instead — so the form cannot be used to find out whether an address has an account.)
+Submitting the form shows a generic “check your inbox” page without logging you in. A new account receives queued verification mail; an existing account receives a notice instead. Open the link and press its confirmation button before logging in. Registration may be disabled by the operator.
 
-If your deployment has **SWITCH edu-ID** login enabled, you can use that instead of registering locally; edu-ID users skip the local password and authenticator setup, since the second factor is handled by your identity provider.
+If **SWITCH edu-ID** login is enabled, use your institutional identity and its required MFA. First sign-in creates a pending account for administrator review, not a session. After approval, sign in again with the same institutional identity; the archive does not require local password/TOTP setup. Matching email addresses never merge institutional and local accounts.
 
 ## Verifying your email
 
-The verification link is valid for 24 hours. Clicking it shows a confirmation page with a button — the address is only marked verified when you press it, so an email scanner following the link cannot use it up. If the link expires, you can request a new one from the login page ("Need a new verification email?"). Accounts that are never verified are automatically removed after a few days.
+Verification links last 24 hours. Open the link and press the confirmation button; opening it alone does not consume it. Request a replacement through **Need a new verification email?** on the login page. Unverified local accounts are normally removed after seven days; the operator can change that period.
 
 ## Setting up two-factor authentication
 
-Once your email is verified, log in with your email and password. Because your account has no authenticator yet, this first login takes you straight to the two-factor setup page — until enrolment is complete, your session can only reach that page (and logout). You will need an authenticator app on your phone — Google Authenticator, Microsoft Authenticator, Aegis, 1Password, Bitwarden, and most password managers all work. The setup page shows:
+After email verification, log in with email/password to open setup. Use a TOTP-compatible authenticator to scan the QR, save the ten recovery codes separately from that device, then submit a six-digit authenticator code and one recovery code. The confirming recovery code remains usable.
 
-1. A QR code. Scan it with your authenticator app.
-2. A six-digit code field. Enter the current code from your authenticator app to confirm enrolment.
-
-Once confirmed, your session is upgraded to a full session and you can use the rest of the site. You will be asked for a code from your authenticator app on every login from then on.
-
-> :material-information-outline: **Why is TOTP mandatory?**
-> The archive is being prepared for Phase 2, when it will host metadata about sensitive research data. Building the habit of two-factor authentication into Phase 1 means there is no migration when sensitive data arrives — and it protects your account against credential stuffing today.
+The pending seed lasts ten minutes. Refreshing setup replaces the recovery codes: save the newly displayed set before confirming. Until setup finishes, the session has restricted access. Completion opens the account page; future local logins require password and a fresh authenticator code. Setup does not raise your metadata tier.
 
 ## Forgotten passwords
 
-On the login page, click **Forgot password?**. Enter your email address. If an account exists for that address, the system sends a reset email containing a single-use link, valid for a short time (typically 30 minutes). Clicking the link takes you to a form where you can set a new password — the same strength rules apply, and you cannot reuse your current password.
+Choose **Forgot password?** and submit your email. Active local accounts receive a queued single-use link valid for 30 minutes. Open it and choose a new password that meets the normal rules and differs from your current one. Completion ends all account sessions; log in again with the new password and authenticator.
 
-The system does not reveal whether an email address is registered. The success message is the same whether or not the address exists, so the reset flow cannot be used to enumerate accounts.
+The request response does not reveal account eligibility; processing time may differ. Institutional passwords are managed by the identity provider.
 
 ## Changing your authenticator
 
-If you still have access to your current authenticator, you can switch to a new one from your account page. The change requires a current code *and* a code from the new authenticator, so only someone holding the existing device can do it.
+If you still have access to your current authenticator, you can switch to a new
+one from your account page. First submit your password and a current code. The
+site displays a new QR code; scan it and confirm a code from the new authenticator within five minutes. Your old authenticator remains active until confirmation. Success ends all sessions, so log in again; your saved recovery codes remain valid. Too many invalid confirmations discard only the pending change.
 
-If your authenticator is lost entirely — so you cannot supply a current code — there is no self-service recovery. Contact the archive administrators; recovery is handled out of band.
+If your authenticator is lost entirely, contact an archive administrator. A
+different local administrator must verify your identity and authorize a
+30-minute recovery window; the administrator cannot see or generate your saved
+codes. Then use **Recover authenticator** on the login page and enter your
+email, password, and one saved recovery code. Successful recovery creates a
+15-minute setup session. Enrol the replacement and confirm a fresh recovery-code set; the old codes are replaced and all sessions end, requiring a new login.
+
+Each saved code is one-time and allows at most three password attempts. After
+three wrong passwords that code can no longer be used, but your other unused
+codes remain available. Unknown codes do not lock your account. The page always
+uses the same error for an incorrect email, password, or code. A temporary lock
+caused by ordinary sign-in failures does not block an administrator-authorized
+recovery; successful recovery clears that stale lock state.
+
+Sensitive account actions share a small attempt allowance for the current
+session. Successful submissions count as well as rejected ones. If you exhaust
+it, only that browser session ends and you must log in again; your account and
+sessions on other devices remain active.
 
 ## Requesting a higher access tier
 
-After you have registered and verified your account, you can request *vetted* status by writing to the archive administrators at the email address shown on the *About* page. Include:
+After account setup, request **registered** or **vetted** access using the contact address on **Account** or **About**. Include:
 
 - Your name, affiliation, and the email address tied to your account
 - A short description of the research project the access is for
@@ -70,8 +83,13 @@ Vetted access is granted by an administrator after manual review. There is no au
 
 Sessions last up to 8 hours from login by default, after which you are asked to log in again. You can log out manually at any time using the **Logout** link in the navigation. Logging out removes the session from the server, not just the cookie from your browser — so logging out from one device cannot be undone by re-using the cookie elsewhere.
 
+When institutional login is enabled, logout also passes through the archive's Shibboleth service provider, even for local accounts. Wider identity-provider logout depends on the provider. On shared computers, also sign out there and close every browser window.
+
 If your account is deactivated by an administrator, all of its sessions end immediately as part of the deactivation.
 
 ## Your account page
 
-Once logged in, the **Account** link in the navigation takes you to a page showing your email, display name, affiliation, country, current access tier, the date your account was created, and the date of your most recent login, and confirming that two-factor authentication is enabled. From the account area you can also update your display name, change your email address (a confirmation link is sent to the new address before the change takes effect), and rotate your authenticator.
+**Account** shows your profile, authentication method, tier, join date, and last login. Local users can edit their display name, request an email change after proving their password, and change their authenticator. Institutional names/emails are managed by the institution.
+
+Email changes send confirmation to the new address and a notice to the old address. Confirm within one hour; success changes the verified address and ends all account sessions. Password reset, account deactivation, or administrator unlock can invalidate a pending change.
+

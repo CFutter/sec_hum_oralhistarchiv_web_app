@@ -1,55 +1,50 @@
-""" Middleware components — security headers, sessions, CSRF, rate limiting, and audit logging.
+"""Middleware components — headers, sessions, CSRF, rate limiting, and audit."""
 
-As a convention, the route Dependency ordering is 
-dependencies=[Depends(validate_form_content_type), Depends(verify_csrf), ...]
-so the cheapest, most general rejection comes first.
-"""
-
-from .security_headers import build_secure_headers 
-from .rate_limiting import setup_rate_limiting, limiter
-from .validators import validate_security_settings
 from .audit_logging import setup_audit_logging
-from .utils import get_client_ip
-
-from .session import (
-    setup_session_middleware,
-    setup_totp_gate_middleware,
-    set_session_cookie,
-    clear_session_cookie,
-    require_login,
-    require_admin
-    )
-
+from .content_type import validate_form_content_type
+from .cookies import get_session_id_from_cookie
 from .csrf import (
     CSRF_COOKIE_NAME,
-    setup_csrf_middleware, 
-    verify_csrf, 
     get_csrf_token,
-    rotate_csrf_cookie
-    )
-
-from .content_type import validate_form_content_type
-
-from .cookies import get_session_id_from_cookie
+    setup_csrf_middleware,
+    verify_csrf,
+)
+from .database_capacity import setup_database_capacity_middleware
+from .rate_limiting import limiter, setup_rate_limiting
+from .security_headers import build_secure_headers
+from .session import (
+    clear_session_cookie,
+    require_admin,
+    require_full_session,
+    require_local_auth,
+    require_login,
+    require_public_or_full_session,
+    require_totp_enrollment_session,
+    set_session_cookie,
+    setup_session_middleware,
+)
+from .validators import validate_security_settings
 
 __all__ = [
     "CSRF_COOKIE_NAME",
     "build_secure_headers",
     "clear_session_cookie",
-    "get_client_ip",
     "get_csrf_token",
     "get_session_id_from_cookie",
     "limiter",
     "require_admin",
+    "require_full_session",
+    "require_local_auth",
     "require_login",
-    "rotate_csrf_cookie",
+    "require_public_or_full_session",
+    "require_totp_enrollment_session",
     "set_session_cookie",
     "setup_audit_logging",
     "setup_csrf_middleware",
+    "setup_database_capacity_middleware",
     "setup_rate_limiting",
     "setup_session_middleware",
-    "setup_totp_gate_middleware",
     "validate_form_content_type",
     "validate_security_settings",
-    "verify_csrf"
-    ]
+    "verify_csrf",
+]

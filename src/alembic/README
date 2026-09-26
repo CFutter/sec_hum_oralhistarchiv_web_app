@@ -1,1 +1,5 @@
-Generic single-database configuration.
+# Database migrations
+
+The sole revision, `4f73ae3ff827`, creates the current schema in a fresh database. It does not upgrade databases from earlier migration histories or backfill existing rows. Use the migration owner credentials and the commands in [Deployment](../../Deployment.md); runtime roles cannot run DDL.
+
+Downgrading to `base` deletes all application data and removes `pg_trgm`.

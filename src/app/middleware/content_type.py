@@ -1,32 +1,41 @@
-"""Content-Type validation for POST requests.
+"""Form Content-Type validation installed on every mutation route.
 
-Rejects requests with unexpected Content-Type headers as defense
-in depth — FastAPI's form parsing already provides partial protection,
-but explicit validation prevents content-type confusion attacks.
+``SecureAPIRouter`` applies this dependency to every method except GET, HEAD,
+and OPTIONS. It rejects non-form bodies before FastAPI parses handler fields.
 """
 
 import logging
 
-from fastapi import Request, HTTPException, status
+from fastapi import HTTPException, Request, status
+
+from ..request_utils import safe_request_path
 
 logger = logging.getLogger(__name__)
+_ALLOWED_FORM_CONTENT_TYPES = frozenset(
+    {
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+    }
+)
 
 
 async def validate_form_content_type(request: Request) -> None:
-    """FastAPI dependency that rejects unexpected Content-Type headers.
+    """Raise HTTPException(415) unless Content-Type is URL-encoded or multipart form data.
 
-    Usage:
-        @router.post("/submit", dependencies=[Depends(validate_form_content_type)])
+    Ignore parameters and case; log only header presence on rejection.
     """
-    content_type = request.headers.get("Content-Type", "")
-    if not content_type.lower().startswith((
-        "application/x-www-form-urlencoded",
-        "multipart/form-data",
-    )):
+    raw_content_type = request.headers.get("Content-Type", "")
+    media_type = raw_content_type.partition(";")[0].strip().lower()
+
+    if media_type not in _ALLOWED_FORM_CONTENT_TYPES:
         logger.warning(
-            "Rejected Content-Type: %s on %s",
-            content_type, request.url.path,
-            extra={"request_id": getattr(request.state, "request_id", "unknown")},
+            "Rejected form Content-Type",
+            extra={
+                "request_id": getattr(request.state, "request_id", "unknown"),
+                "path": safe_request_path(request),
+                # Record only whether it existed—not the attacker-controlled value.
+                "content_type_present": bool(raw_content_type),
+            },
         )
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,

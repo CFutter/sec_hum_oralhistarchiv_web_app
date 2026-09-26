@@ -1,19 +1,34 @@
 [Unit]
 Description=Oral History Archive — Background Scheduler
-After=network.target postgresql.service redis.service oralhistarchiv.service
-Wants=postgresql.service redis.service
+# The scheduler never receives RATE_LIMIT_REDIS_URL and therefore has no
+# dependency on the security-counter service. General cache/pub-sub Redis is
+# optional best-effort state configured through common.env.
+After=network-online.target postgresql.service oralhistarchiv.service
+Wants=network-online.target postgresql.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-User=oralhistarchiv
-Group=oralhistarchiv
-WorkingDirectory=/opt/oralhistarchiv/src
-EnvironmentFile=/opt/oralhistarchiv/.env
-Environment="PYTHONPATH=/opt/oralhistarchiv/src"
+# This UID and group must remain distinct from the web process and proxy group.
+User=oralhistarchiv-scheduler
+Group=oralhistarchiv-scheduler
+UMask=0077
+WorkingDirectory=/opt/oralhistarchiv
+# Deliberately does not load the web-only shibboleth.env impersonation secret.
+EnvironmentFile=/etc/oralhistarchiv/common.env
+EnvironmentFile=/etc/oralhistarchiv/scheduler.env
+ExecStartPre=/usr/bin/test ${ENV_STATE} = production
+UnsetEnvironment=PYTHONPATH PYTHONHOME VIRTUAL_ENV RATE_LIMIT_REDIS_URL RATE_LIMIT_MONITOR_REDIS_URL
 
-ExecStart=/opt/oralhistarchiv/.venv/bin/python /opt/oralhistarchiv/run_scheduler.py
+ExecStart=/usr/bin/flock --shared --no-fork /run/lock/oralhistarchiv-deploy.lock /opt/oralhistarchiv/.venv/bin/python -I /opt/oralhistarchiv/run_scheduler.py
 
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oralhistarchiv-scheduler
+
+TimeoutStopSec=330s
+KillMode=mixed
+SendSIGKILL=yes
 Restart=on-failure
 RestartSec=10
 
@@ -21,13 +36,14 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/oralhistarchiv/data /run/oralhistarchiv
+# Deny traversal even if an operator accidentally adds the scheduler to the
+# proxy group. The leading '-' permits startup before the web runtime exists.
+InaccessiblePaths=-/run/oralhistarchiv
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-
 MemoryMax=256M
 
 [Install]

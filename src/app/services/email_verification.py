@@ -1,136 +1,153 @@
-"""Email verification tokens — signed, time-limited, single-use.
+"""Issue SECRET_KEY-signed, 24-hour email-verification capabilities.
 
-Mirrors the password_reset module: itsdangerous for signing,
-SHA-256 hash stored on the user record for single-use enforcement.
-
-Flow:
-1. User registers → generate_verification_token() creates a signed token →
-   store_verification_token_hash() saves its hash on the user record →
-   verification email sent (or link logged in dev mode)
-2. User clicks the link → validate_verification_token() checks signature
-   and expiry → confirm_email_verification() atomically verifies the
-   stored hash and marks the user as verified
-3. After verification, the user can proceed to TOTP enrollment
-
-Security:
-- Tokens are HMAC-signed with SECRET_KEY
-- Tokens expire after 24 hours
-- Tokens are single-use: confirm_email_verification() clears the stored
-  hash atomically with the verification flag, so a second click fails
-- Only one outstanding token per user: generating a new token overwrites
-  the previous hash, invalidating any earlier link
+Persist token hashes with their queued mail in one transaction. A new hash
+replaces the previous capability; confirmation atomically clears it.
 """
-import logging
 
-from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+import logging
+import secrets
+from datetime import timedelta
+from typing import Any
+
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from psycopg import AsyncCursor
 from psycopg_pool import AsyncConnectionPool
 
 from config import settings
+
 from .db import get_db_cursor
+from .email_outbox import cancel_pending_action_emails_cur
+from .tokens import (
+    VERIFICATION_TOKEN_MAX_AGE_SECONDS,
+    ActionEmailMetadata,
+    EmailUserPayload,
+    as_email_user_payload,
+    hash_token,
+)
 
 logger = logging.getLogger(__name__)
 
 _SALT = "email-verification"
-VERIFICATION_TOKEN_MAX_AGE_SECONDS = 86400  # 24 hours
 
 
-
-
-def generate_verification_token(email: str, user_id: int) -> str:
-    """Generate a signed, time-limited email verification token.
-
-    Args:
-        email: The user's email address.
-        user_id: The user's database ID.
-
-    Returns:
-        A URL-safe signed token string. The caller is responsible for
-        storing hash_token(token) on the user record via
-        store_verification_token_hash().
-    """
+def generate_verification_token(user_id: int, email: str) -> str:
+    """Sign a nonce-bearing URL-safe email/user_id token; caller must store its hash."""
     signer = URLSafeTimedSerializer(settings.secret_key.get_secret_value())
-    return signer.dumps({"email": email, "user_id": user_id}, salt=_SALT)
+    return signer.dumps(
+        {"email": email, "user_id": user_id, "nonce": secrets.token_urlsafe(16)},
+        salt=_SALT,
+    )
 
 
-def validate_verification_token(token: str) -> dict | None:
-    """Validate a verification token's signature and expiry.
+def verification_token_email_metadata(
+    token: str,
+) -> ActionEmailMetadata:
+    """Return the token hash and signed UTC issue time plus its 24-hour lifetime.
 
-    This checks only that the token is well-formed, correctly signed,
-    and not expired. The caller must also call confirm_email_verification()
-    to enforce single-use against the stored hash.
+    Invalid/expired signatures propagate itsdangerous exceptions.
+    """
+    signer = URLSafeTimedSerializer(
+        settings.secret_key.get_secret_value(),
+    )
 
-    Args:
-        token: The signed token string from the verification URL.
+    _, issued_at = signer.loads(
+        token,
+        salt=_SALT,
+        max_age=VERIFICATION_TOKEN_MAX_AGE_SECONDS,
+        return_timestamp=True,
+    )
 
-    Returns:
-        A dict with "email" and "user_id" keys, or None if invalid/expired.
+    return ActionEmailMetadata(
+        token_hash=hash_token(token),
+        expires_at=issued_at
+        + timedelta(
+            seconds=VERIFICATION_TOKEN_MAX_AGE_SECONDS,
+        ),
+    )
+
+
+def validate_verification_token(token: str) -> EmailUserPayload | None:
+    """Return email/user_id for a valid unexpired signature and payload, else None.
+
+    No database check is performed; confirm_email_verification enforces
+    single-use against the stored hash. Invalid signatures are logged.
     """
     signer = URLSafeTimedSerializer(settings.secret_key.get_secret_value())
     try:
-        return signer.loads(
-            token, salt=_SALT, max_age=VERIFICATION_TOKEN_MAX_AGE_SECONDS
+        return as_email_user_payload(
+            signer.loads(token, salt=_SALT, max_age=VERIFICATION_TOKEN_MAX_AGE_SECONDS)
         )
     except (BadSignature, SignatureExpired) as e:
         logger.warning("Invalid or expired verification token: %s", e)
         return None
 
 
-async def store_verification_token_hash(pool: AsyncConnectionPool, user_id: int, token_hash: str) -> None:
-    """Store a hashed verification token on the user record.
+async def store_verification_token_hash_cur(
+    cur: AsyncCursor[Any],
+    user_id: int,
+    token_hash: str,
+    *,
+    expected_email: str,
+) -> None:
+    """Replace the verification hash/time and cancel pending verification mail.
 
-    Overwrites any previous token — only one outstanding verification
-    token per user is allowed. The raw token is never stored; only its
-    SHA-256 hash.
+    The caller owns the transaction. Raise ValueError if the user is absent,
+    already verified, or expected_email differs case-insensitively.
+    """
+    await cur.execute(
+        """
+        UPDATE users
+        SET email_verification_token_hash = %s,
+            email_verification_created_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+          AND NOT email_verified
+          AND LOWER(email) = LOWER(%s)
+        RETURNING id
+        """,
+        (token_hash, user_id, expected_email),
+    )
+    if await cur.fetchone() is None:
+        raise ValueError(
+            f"User {user_id} is missing, already verified, or its email address changed"
+        )
+    await cancel_pending_action_emails_cur(
+        cur,
+        user_id=user_id,
+        message_type="email_verification",
+    )
 
-    Args:
-        pool: Database connection pool.
-        user_id: The user being verified.
-        token_hash: SHA-256 hex digest of the raw verification token.
+
+async def store_verification_token_hash(
+    pool: AsyncConnectionPool,
+    user_id: int,
+    token_hash: str,
+    *,
+    expected_email: str,
+) -> None:
+    """Commit store_verification_token_hash_cur, including its eligibility checks.
+
+    To queue replacement mail atomically, use that cursor helper instead.
     """
     async with get_db_cursor(pool) as cur:
-        await cur.execute(
-            """UPDATE users
-               SET email_verification_token_hash = %s,
-                   email_verification_created_at = CURRENT_TIMESTAMP
-               WHERE id = %s""",
-            (token_hash, user_id),
+        await store_verification_token_hash_cur(
+            cur,
+            user_id,
+            token_hash,
+            expected_email=expected_email,
         )
 
 
 async def confirm_email_verification(
     pool: AsyncConnectionPool,
     user_id: int,
-    token_hash: str,
     expected_email: str,
+    token_hash: str,
 ) -> bool:
-    """Atomically verify the token and mark the user as verified.
+    """Consume a matching hash and mark the account verified in one transaction.
 
-    Combines four checks into a single SQL statement:
-    
-    1. user ID matches
-    2. token hash matches the stored hash (single-use enforcement)
-    3. token was issued within the last VERIFICATION_TOKEN_MAX_AGE_SECONDS
-       (defense-in-depth against itsdangerous validation bypass)
-    4. user's current email matches the token's signed email
-       (prevents stale tokens from verifying a changed email address)
-    
-    The single statement prevents a TOCTOU race where two concurrent
-    clicks on the same link could both pass a separate verify step
-    before either cleared the stored hash.
-
-    Args:
-        pool: Database connection pool.
-        user_id: The user whose email to verify.
-        token_hash: SHA-256 hex digest of the incoming token.
-        expected_email: The email address the token was issued for.
-            Compared against the user's current email — if the user
-            changed their email after the token was issued, the stale
-            token should not verify the new email.
-
-    Returns:
-        True if all checks passed and the user was marked verified.
-        False if any check failed (already used, expired, replaced by
-        a newer token, or email no longer matches).
+    Return False unless the user, case-insensitive expected_email, hash, and
+    stored timestamp within 24 hours match. The caller must validate the signed
+    token separately; concurrent consumption succeeds at most once.
     """
     async with get_db_cursor(pool) as cur:
         await cur.execute(
@@ -141,7 +158,7 @@ async def confirm_email_verification(
                WHERE id = %s
                  AND email_verification_token_hash = %s
                  AND LOWER(email) = LOWER(%s)
-                 AND email_verification_created_at > CURRENT_TIMESTAMP 
+                 AND email_verification_created_at > CURRENT_TIMESTAMP
                                                      - %s * INTERVAL '1 second'
                RETURNING id""",
             (

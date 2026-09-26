@@ -1,47 +1,42 @@
-"""Entry point for the application server.
+"""Development Uvicorn launcher; deployed services use systemd (Deployment.md)."""
 
-In development (is_production == False): runs uvicorn with auto-reload.
-In production: runs gunicorn with the production config file.
-"""
-
-import sys
 import logging
+import sys
+
 import uvicorn
-import gunicorn.app.wsgiapp
 
 from config import settings
-from app.paths import GUNICORN_CONF
+
 
 def start_server() -> None:
-    """Launch the appropriate server based on environment."""
+    """Run the reload-enabled server using FASTAPI_HOST/PORT; exit 1 outside dev."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     logger = logging.getLogger(__name__)
 
-
-    if settings.is_production:
-        logger.info("Starting production server via Gunicorn")
-        sys.argv = [
-            "gunicorn",
-            "--config", str(GUNICORN_CONF),
-            "app.main:app",
-        ]
-        gunicorn.app.wsgiapp.run()
-
-    else:
-        logger.info(
-            "Starting development server on %s:%s",
-            settings.fastapi_host, settings.fastapi_port,
+    if settings.is_hardened:
+        logger.error(
+            "run.py is a dev-only launcher (ENV_STATE=%s). Follow Deployment.md's reviewed "
+            "migration workflow, then start oralhistarchiv.service and "
+            "oralhistarchiv-scheduler.service via systemd.",
+            settings.env_state,
         )
-        uvicorn.run(
-            "app.main:app",
-            host=settings.fastapi_host,
-            port=settings.fastapi_port,
-            reload=True,
-        )
-        
+        sys.exit(1)
+
+    logger.info(
+        "Starting development server on %s:%s",
+        settings.fastapi_host,
+        settings.fastapi_port,
+    )
+    uvicorn.run(
+        "app.main:app",
+        host=settings.fastapi_host,
+        port=settings.fastapi_port,
+        reload=True,
+    )
+
 
 if __name__ == "__main__":
     start_server()

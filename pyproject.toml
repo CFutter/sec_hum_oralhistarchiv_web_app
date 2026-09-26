@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 
 dependencies = [
     "APScheduler==3.11.2",
+    "anyio==4.14.2",
     "alembic==1.18.4",
     "email-validator==2.3.0",
     "fastapi==0.136.3",
@@ -23,9 +24,9 @@ dependencies = [
     "pyotp==2.9.0",
     "python-multipart==0.0.32",
     "argon2-cffi==25.1.0",
-    "cryptography==49.0.0",
+    "cryptography==50.0.0",
     "qrcode[pil]==8.0",
-    "gunicorn==23.0.0",
+    "gunicorn==26.2.0",
     "redis==7.4.0",
     "SQLAlchemy==2.0.50"
 ]
@@ -36,45 +37,136 @@ dev = [
     "pytest-asyncio==1.3.0",
     "pytest-cov==7.0.0",
     "httpx==0.28.1",
-    "ruff==0.15.6",
+    "ruff==0.15.22",
     "bandit==1.9.2",
     "pip-audit==2.9.0",
-    "mypy==2.1.0",
-    "types-gunicorn==26.0.0.20260518",
+    "mypy==2.3.0",
+    "types-gunicorn==26.2.0.20260827",
     "types-requests==2.32.4.20250611", 
     "lxml-stubs==0.5.1",
-    "types-qrcode==8.2.0.20260518"
+    "types-qrcode==8.2.0.20260518",
+    "pytest-randomly==5.0.0",
+    "pytest-xdist==3.8.0",
+    "time-machine==3.5.1"
 ]
 
 doc = [
-    "mkdocs-material==9.7.6",
+    "mkdocs-material==9.7.7",
     "mkdocstrings-python==2.0.3",
     "mkdocs-mermaid2-plugin==1.2.3"
 ]
 
+[tool.coverage.run]
+branch = true
+source = [
+    "src/app", 
+    "src/config"
+]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
+
+[tool.ruff]
+line-length = 100          # Accommodate email-body strings.
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W", "B", "UP",
+    "SIM", "C4", "RUF", "PL",
+    "DTZ", "RET", "ARG", "I",
+    "ASYNC", "LOG", "G", "TRY", 
+    "PERF", "PTH",
+]
+ignore = [
+    "TRY003",  # Settings errors include operator remediation.
+    "TRY300",  # Preserve the established try/return structure.
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "config"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Form", 
+    "fastapi.Query", 
+    "fastapi.Depends"
+]
+
+[tool.ruff.lint.pylint]
+max-args = 8
+max-statements = 60
+max-branches = 16
+max-returns = 9
+
+[tool.ruff.lint.per-file-ignores]
+"src/tests/**/*.py" = [
+    "PLR2004", "PLR0913", "E501",
+    "ASYNC109",  # Test helpers accept explicit timeout budgets.
+    "ASYNC110",  # Poll state changed by other threads or external services.
+    "ASYNC251",  # Timing regressions sometimes require real-time waits.
+]
+"src/app/main.py" = ["ARG001"]
+"src/app/services/sync.py" = ["E501"]
+"src/app/services/scheduler.py" = ["ASYNC109"]        # timeout is implemented via asyncio.timeout        
+"src/app/routes/health.py" = ["ARG001"]           
+"src/app/services/seed_mock_data.py" = ["E501"]  
+"src/app/services/email.py" = ["E501"]          
+
 [tool.mypy]
 python_version = "3.11"
 plugins = ["pydantic.mypy"]
+disallow_any_generics = true
+disallow_untyped_defs = true         
+disallow_incomplete_defs = true
+no_implicit_reexport = true
+strict_equality = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unused_ignores = true
+warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["apscheduler.*"]
+module = ["apscheduler.*"]     
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false  
+warn_return_any = false    
+no_implicit_reexport = false       
+
 
 [tool.pytest.ini_options]
 testpaths = ["src/tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+# Fail on marker/configuration typos that could silently remove test coverage.
+addopts = "--strict-markers --strict-config"
+# A newly passing expected failure requires removal of its strict xfail marker.
+xfail_strict = true
 markers = [
     "integration: end-to-end tests that require a real PostgreSQL database (Tier 2)",
+    "known_defect: regression for behavior requiring an implementation fix",
+    "unimplemented: regression for a contract not yet implemented",
 ]
 filterwarnings = [
     "ignore::starlette.exceptions.StarletteDeprecationWarning",
-    "ignore:Redis is disabled in production:RuntimeWarning",
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/app", "src/config"]
+
+# Keep one source migration repository; install its assets inside app.
+[tool.hatch.build.targets.wheel.force-include]
+"src/alembic" = "app/_migration_assets/alembic"
+"src/alembic.ini" = "app/_migration_assets/alembic.ini"
+
+# The build backend needs these inputs when building a wheel from an sdist.
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/pyproject.toml", "/README.md", "/uv.lock"]
