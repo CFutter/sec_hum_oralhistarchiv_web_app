@@ -119,6 +119,10 @@ async def test_scheduler_executes_session_cleanup_against_real_db(
             await _wait_until_session_gone(expired_raw)
         finally:
             sched.shutdown(wait=False)
+            await asyncio.wait_for(
+                running_jobs.wait_until_empty(),
+                timeout=5.0,
+            )
 
     assert running_jobs.active_job_ids == ()
     assert not _session_exists(expired_raw), (
