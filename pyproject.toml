@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "APScheduler==3.11.2",
     "anyio==4.14.2",
-    "alembic==1.18.4",
+    "alembic==1.20.0",
     "email-validator==2.3.0",
     "fastapi==0.136.3",
     "uvicorn==0.40.0",
