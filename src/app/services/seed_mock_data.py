@@ -1,26 +1,22 @@
-"""Mock data seeder — inserts sample restricted datasets for development.
+"""Seed restricted demonstration records in development or staging.
 
-Invoked from the application lifespan when FASTAPI_DEBUG is true; there
-is no standalone CLI entry point. seed_mock_data(pool) refuses to run
-in production.
-
-These records simulate Phase 2 "Source B" data with restricted access
-levels, allowing development and testing of the tiered visibility
-system without requiring the actual sensitive data source.
+SEED_MOCK_DATA enables calls from the development web lifespan or
+staging scheduler after preflight; staging web workers do not write them.
 """
 
 import logging
+from datetime import datetime
+from typing import Any, cast
 
-from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import tuple_row
-from typing import cast
+from psycopg_pool import AsyncConnectionPool
 
-from .db import get_db_cursor
-from .access_tiers import AccessTier
-
-# Internal function import, for seed_mock_data.py will be deleted before prod.
-from .sync import _build_record_params, _upsert_dataset
 from config import settings
+
+from .access_tiers import AccessTier
+from .db import get_db_cursor
+from .schema import PARSER_OWNED, build_record_params
+from .sync import upsert_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +30,13 @@ MOCK_RESTRICTED_DATASETS = [
         "languages": ["German", "Russian", "Spanish"],
         "project_description": "A research project documenting the long-term psychological and social impact of forced migration on displaced communities.",
         "authors": ["Dr. Alice Meier", "Prof. Peter Muster"],
-        "keywords": ["forced migration", "displacement", "trauma", "identity", "refugees"],
+        "keywords": [
+            "forced migration",
+            "displacement",
+            "trauma",
+            "identity",
+            "refugees",
+        ],
         "resource_proxies": [],
         "license_val": "Restricted access — ethics board approval required",
         "license_url": None,
@@ -47,6 +49,7 @@ MOCK_RESTRICTED_DATASETS = [
         "bibliographical_citation": "Meier, A. & Muster, P. (2025). Memories of Forced Migration (Version 1.0) [Data set].",
         "source": "mock",
         "visibility_tier": "vetted",
+        "upstream_modified_at": "2025-05-24T08:55:33Z",
     },
     {
         "uuid": "mock:restricted:002",
@@ -57,7 +60,7 @@ MOCK_RESTRICTED_DATASETS = [
         "languages": ["German", "Swiss German"],
         "project_description": "An oral history documentation project preserving the voices of surviving  commissioned by the Independent Expert Commission on Administrative Coercion.",
         "authors": ["Anonymous"],
-        "keywords": [ "institutional abuse", "Swiss history", "coerced labor"],
+        "keywords": ["institutional abuse", "Swiss history", "coerced labor"],
         "resource_proxies": [],
         "license_val": "Restricted access — vetted researchers only",
         "license_url": None,
@@ -70,6 +73,7 @@ MOCK_RESTRICTED_DATASETS = [
         "bibliographical_citation": "Anonymous (2024). Voices from ... (Version 2.0) [Data set].",
         "source": "mock",
         "visibility_tier": "vetted",
+        "upstream_modified_at": "2024-01-08T07:53:15Z",
     },
     {
         "uuid": "mock:restricted:003",
@@ -93,27 +97,36 @@ MOCK_RESTRICTED_DATASETS = [
         "bibliographical_citation": "Doe, R. & Meier, H. (2023). Holocaust Survivor Testimonies — Zurich Collection (Version 3.0) [Data set].",
         "source": "mock",
         "visibility_tier": "vetted",
+        "upstream_modified_at": "2023-11-17T14:45:53Z",
     },
 ]
 
 
 async def seed_mock_data(pool: AsyncConnectionPool) -> int:
-    """Insert mock restricted datasets into the database."""
+    """Upsert the mock records atomically and return the number processed, including updates.
+
+    Raise RuntimeError in production; validation and database errors
+    propagate. The caller controls whether SEED_MOCK_DATA enables this call.
+    """
 
     if settings.is_production:
-        raise RuntimeError("seed_mock_data is dev-only; refusing to run in production")
+        raise RuntimeError("seed_mock_data is dev or staging only; refusing to run in production")
 
     count = 0
 
     async with get_db_cursor(pool, row_factory=tuple_row) as cur:
         for record in MOCK_RESTRICTED_DATASETS:
-            params = _build_record_params(
-                record,
+            parsed: dict[str, Any] = {key: record[key] for key in PARSER_OWNED}
+            parsed["upstream_modified_at"] = datetime.fromisoformat(
+                cast(str, parsed["upstream_modified_at"])
+            )
+            params = build_record_params(
+                parsed,
                 access_level=cast(str, record["access_level"]),
                 source="mock",
                 visibility_tier=cast(AccessTier, record.get("visibility_tier", "vetted")),
             )
-            await _upsert_dataset(cur, params)
+            await upsert_dataset(cur, params)
             count += 1
     logger.info("Seeded/refreshed %d mock restricted datasets.", count)
 

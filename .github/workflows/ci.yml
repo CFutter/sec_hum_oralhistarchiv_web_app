@@ -1,6 +1,4 @@
-# CI quality gates: lint, types, security, tests.
-# Save as .github/workflows/ci.yml
-#
+# CI gates; a manual main-branch dispatch builds a release after all required jobs pass.
 name: CI
 
 on:
@@ -21,53 +19,104 @@ jobs:
     name: ruff
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install uv
         uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
         with:
+          version: "0.12.11"
           python-version: "3.11"
       - name: Install dependencies
         run: uv sync --locked --extra dev
       - name: Ruff lint
         run: uv run ruff check .
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+  opaque-references:
+    name: no opaque references
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reject opaque references and warn on planning vocabulary
+        run: bash scripts/check-no-opaque-refs.sh
 
   typecheck:
     name: mypy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install uv
         uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
         with:
+          version: "0.12.11"
           python-version: "3.11"
       - name: Install dependencies
         run: uv sync --locked --extra dev
-      # Application code only — excludes src/tests and src/alembic.
-      - name: Mypy type check
-        run: uv run mypy src/app src/config run.py run_scheduler.py
+      - name: Mypy (application) — blocking
+        run: uv run mypy src/app src/config run.py run_scheduler.py scripts gunicorn.conf.py
+      - name: Mypy (tests) — advisory
+        run: uv run mypy src/tests
+        continue-on-error: true
 
   security:
     name: security
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install uv
         uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
         with:
+          version: "0.12.11"
           python-version: "3.11"
       - name: Install dependencies
         run: uv sync --locked --extra dev
       - name: Bandit
-        run: uv run bandit -r src/app src/config run.py run_scheduler.py gunicorn.conf.py
-      # Audit the exact locked dependency set for known vulnerabilities.
+        run: uv run bandit -r src/app src/config run.py run_scheduler.py gunicorn.conf.py scripts
       - name: Export locked requirements
         run: uv export --locked --no-emit-project --no-hashes -o requirements-runtime.txt
       - name: pip-audit
         run: uv run pip-audit --disable-pip --no-deps -r requirements-runtime.txt
 
-  tests:
-    name: pytest
+  wheel-smoke:
+    name: installed wheel smoke
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+        with:
+          version: "0.12.11"
+          python-version: "3.11"
+      - name: Build and check a non-editable installation
+        run: uv run --no-project --python 3.11 python scripts/run_wheel_smoke.py
+
+  tests:
+    # Each ordering gets fresh services; xdist workers use separate DB names
+    # and Redis databases. Rerun random-order failures with --randomly-seed=N
+    # from the pytest header. Redis allocation supports at most 15 workers
+    # with the default TEST_RATE_LIMIT_REDIS_DB=0; -n auto may exceed that.
+    name: pytest (${{ matrix.order }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - order: fixed order
+            pytest_flags: -p no:randomly
+          - order: random order
+            pytest_flags: -p randomly
+          - order: parallel workers
+            pytest_flags: -n auto
     services:
       postgres:
         image: postgres:16-alpine
@@ -82,16 +131,139 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       DATABASE_URL: postgresql://test:test@localhost:5432/oralhistarchiv_test
       REQUIRE_DB: "1"
+      REDIS_URL: redis://localhost:6379/0
+      REQUIRE_REDIS: "1"
+      REQUIRE_NGINX: "1"
+      # Integration skips fail an otherwise-passing pytest run; the separate
+      # summary gate rejects every skip under CI=true.
+      CI: "true"
+      # Separate overall and security-module branch-coverage thresholds.
+      COVERAGE_FLOOR: "89"
+      SECURITY_COVERAGE_FLOOR: "90"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install nginx and redis-server binaries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends nginx redis-server
+          # Keep port 6379 for the service container; tests start private Redis on free ports.
+          sudo systemctl disable --now redis-server || true
       - name: Install uv
         uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
         with:
+          version: "0.12.11"
           python-version: "3.11"
       - name: Install dependencies
         run: uv sync --locked --extra dev
-      - name: Run test suite
-        run: uv run pytest
+      - name: Run test suite (${{ matrix.order }})
+        shell: bash
+        env:
+          PYTEST_FLAGS: ${{ matrix.pytest_flags }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086  # the flags are meant to split into words
+          uv run pytest $PYTEST_FLAGS \
+            -rs --no-fold-skipped \
+            --cov=src/app --cov=src/config --cov-branch \
+            --cov-fail-under="$COVERAGE_FLOOR" \
+            2>&1 | tee pytest-output.log
+      - name: Every skip is an expected one (none under CI)
+        run: bash scripts/check-skips-are-expected.sh pytest-output.log
+      - name: Security modules meet their own coverage floor
+        run: >-
+          uv run coverage report --fail-under="$SECURITY_COVERAGE_FLOOR"
+          --include='src/app/middleware/*,src/app/route_security.py,src/app/request_utils.py,src/app/url_safety.py,src/app/cookie_contract.py,src/app/credentials.py,src/app/services/access_tiers.py,src/app/services/admin_promotion.py,src/app/services/audit.py,src/app/services/authentication.py,src/app/services/credential_attempts.py,src/app/services/crypto.py,src/app/services/email_change.py,src/app/services/email_verification.py,src/app/services/federated_*,src/app/services/password_*,src/app/services/registration.py,src/app/services/session*,src/app/services/tokens.py,src/app/services/totp*,src/app/services/users.py,src/app/routes/auth/*,src/config/settings.py,src/config/secret_strength.py,src/config/logging.py'
+
+  release:
+    name: reviewed production release
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: [lint, opaque-references, typecheck, security, wheel-smoke, tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and Python 3.11
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0
+        with:
+          version: "0.12.11"
+          python-version: "3.11"
+      - name: Build the reviewed release payload
+        run: >-
+          uv run --no-project --python 3.11 python scripts/build_release.py
+          --commit-sha "$GITHUB_SHA"
+          --output-dir dist/release
+      - name: Verify required deployment assets are in the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          release_archives=(dist/release/oralhistarchiv-release-*.tar.gz)
+          test "${#release_archives[@]}" -eq 1
+          release_archive="${release_archives[0]}"
+          test -f dist/release/install_release.py
+          test -f dist/release/ARTIFACT.txt
+          (
+            cd dist/release
+            sha256sum --check --strict ARTIFACT.txt
+          )
+          release_root="$(tar -tzf "$release_archive" | sed -n '1{s#/.*##;p}')"
+          test -n "$release_root"
+
+          required_paths=(
+            oralhistarchiv.service
+            oralhistarchiv-scheduler.service
+            oralhistarchiv-migrate.service
+            deploy/bootstrap-database-roles.sql
+            deploy/database-runtime-grants.sql
+            deploy/verify-runtime-database-access.sql
+            deploy/nginx.conf.example
+            deploy/nginx-ordinary-proxy-headers.conf.example
+            deploy/nginx-shibboleth-phase2.conf.example
+            deploy/nginx-shibboleth-secret.conf.example
+          )
+          for relative_path in "${required_paths[@]}"; do
+            tar -tzf "$release_archive" \
+              "${release_root}/${relative_path}" >/dev/null
+          done
+      - name: Upload the reviewed release payload
+        id: upload_release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: oralhistarchiv-release-${{ github.sha }}
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Record release identity
+        env:
+          ARTIFACT_DIGEST: ${{ steps.upload_release.outputs.artifact-digest }}
+        run: |
+          test "${#ARTIFACT_DIGEST}" -eq 64
+          test -f dist/release/ARTIFACT.txt
+          {
+            echo '## Production release'
+            echo
+            echo "Source commit: \`${GITHUB_SHA}\`"
+            echo
+            echo "GitHub artifact SHA-256: \`${ARTIFACT_DIGEST}\`"
+            echo
+            echo 'Inner payload:'
+            echo '```text'
+            cat dist/release/ARTIFACT.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

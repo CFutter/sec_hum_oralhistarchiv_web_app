@@ -1,65 +1,65 @@
-"""Cookie signing and identifier helpers for sessions and CSRF.
+"""Signed session-token extraction and anonymous identifiers for CSRF binding.
 
-Provides the itsdangerous signer for the session cookie, extraction/
-validation of the session ID from the request, generation of anonymous
-pre-session IDs, and resolution of the "current identifier" (session ID
-if logged in, else pre-session ID) used to bind CSRF tokens.
+The signer captures SESSION_SECRET at import; settings changes require restart.
 """
 
 import secrets
+
 from fastapi import Request
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from config import settings
 
-PRE_SESSION_COOKIE_NAME = "pre_session_id"
+from ..cookie_contract import PRE_SESSION_COOKIE_NAME
+
+__all__ = [
+    "PRE_SESSION_COOKIE_NAME",
+    "SESSION_SIGNER",
+    "generate_pre_session_id",
+    "get_current_identifier",
+    "get_session_id_from_cookie",
+]
 
 
 def _get_signer() -> URLSafeTimedSerializer:
-    """Create a signer for session cookie values.
-
-    Uses itsdangerous to sign the session ID so clients cannot
-    forge or tamper with the cookie value.
-    """
+    """Build a timed serializer with SESSION_SECRET and the session-cookie-v1 salt."""
     return URLSafeTimedSerializer(
         settings.session_secret.get_secret_value(),
         salt="session-cookie-v1",
     )
 
+
 SESSION_SIGNER = _get_signer()
 
-def get_current_identifier(request: Request) -> str | None:
-    """Return the identifier to use for CSRF binding.
 
-    Prefers the real session ID if the user is authenticated; otherwise
-    returns the pre-session ID cookie. Returns None whenever neither a valid session 
-    cookie nor a pre-session cookie is present.
+def get_current_identifier(request: Request) -> str | None:
+    """Prefer a valid signed cookie token, otherwise return the raw pre-session cookie or None.
+
+    Does not verify database session existence or authentication.
     """
     session_id = get_session_id_from_cookie(request)
     if session_id is not None:
         return session_id
 
-    # Fall back to pre-session
     return request.cookies.get(PRE_SESSION_COOKIE_NAME)
 
 
 def generate_pre_session_id() -> str:
-    """Generate a random pre-session identifier for anonymous visitors.
-    Used to bind a CSRF token before the visitor has a real session."""
+    """Return a URL-safe identifier containing 32 random bytes."""
     return secrets.token_urlsafe(32)
 
 
 def get_session_id_from_cookie(request: Request) -> str | None:
-    """Extract and validate the session ID from the request cookie.
+    """Return the string token from a valid signed, unexpired session cookie, otherwise None.
 
-    Returns the session ID if the cookie is valid and not expired,
-    or None if missing/invalid/expired.
+    Use SESSION_COOKIE_NAME and SESSION_MAX_AGE_SECONDS; no database lookup.
     """
     cookie_value = request.cookies.get(settings.session_cookie_name)
     if not cookie_value:
         return None
 
     try:
-        return SESSION_SIGNER.loads(cookie_value, max_age=settings.session_max_age_seconds)
+        session_id = SESSION_SIGNER.loads(cookie_value, max_age=settings.session_max_age_seconds)
     except (BadSignature, SignatureExpired):
         return None
+    return session_id if isinstance(session_id, str) else None

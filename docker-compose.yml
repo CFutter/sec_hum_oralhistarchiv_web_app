@@ -1,0 +1,29 @@
+# Disposable integration PostgreSQL/Redis; fixtures truncate tables and reset counters.
+# Never store valuable data here. Persistent dev data uses .devcontainer/docker-compose.yaml.
+# Start: docker compose up -d db redis
+# Run: REQUIRE_DB=1 REQUIRE_REDIS=1 uv run pytest
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: oralhistarchiv_test
+    ports: ["127.0.0.1:5432:5432"]
+
+  redis:
+    image: redis:7-alpine
+    # noeviction prevents quota refunds under pressure; test state needs no persistence.
+    # Production requires AOF: deploy/redis-security.conf.example.
+    command:
+      - redis-server
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports: ["127.0.0.1:6379:6379"]

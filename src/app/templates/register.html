@@ -12,7 +12,7 @@
   <div class="auth-error">{{ error }}</div>
   {% endif %}
 
-  <form class="auth-form" action="{{ request.url_for('register_submit') }}" method="post">
+  <form class="auth-form" action="{{ path_for(request, 'register_submit') }}" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
 
     <div class="form-group">
@@ -57,7 +57,7 @@
     <button type="submit" class="btn btn-primary">Create Account</button>
   </form>
 
-  <p class="auth-link">Already have an account? <a href="{{ request.url_for('login_page') }}">Login</a></p>
+  <p class="auth-link">Already have an account? <a href="{{ path_for(request, 'login_page') }}">Login</a></p>
 
 </section>
 {% endblock %}

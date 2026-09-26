@@ -1,0 +1,11 @@
+# Local skip allowlist: <node id> - <reason>, matching pytest -rs --no-fold-skipped.
+# Blank/comment lines are ignored; missing expected skips are allowed.
+# scripts/check-skips-are-expected.sh uses an empty allowlist when CI is active
+# (anything except unset/empty, 0, false, or no, case-insensitive).
+# This list covers only the entries below; other local service/binary skips fail.
+
+# Preserve an existing developer database instead of recreating it for the probe.
+src/tests/integration/test_deployed_preflight_db.py::test_runtime_preflight_with_actual_deployed_role_login_defaults - Existing oralhistarchiv database must not be altered by a deployment probe
+
+# Permit the syntax probe to skip without local nginx; REQUIRE_NGINX=1 fails instead.
+src/tests/unit/test_nginx_contract.py::test_ordinary_proxy_include_parses_with_nginx - nginx is not installed in this development environment

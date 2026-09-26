@@ -17,11 +17,11 @@
   <p class="auth-intro"><strong>{{ new_email }}</strong></p>
 
   <div class="auth-section">
-    <form class="auth-form" action="{{ request.url_for('confirm_email_submit') }}" method="post">
+    <form class="auth-form" action="{{ path_for(request, 'confirm_email_submit') }}" method="post">
       <input type="hidden" name="token" value="{{ token }}">
       <button type="submit" class="btn btn-primary">Confirm Change</button>
     </form>
-    <p class="auth-link"><a href="{{ request.url_for('account_page') }}">Cancel</a></p>
+    <p class="auth-link"><a href="{{ path_for(request, 'account_page') }}">Cancel</a></p>
   </div>
 
 </section>

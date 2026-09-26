@@ -1,24 +1,26 @@
 # Auth Routes
 
-The authentication subsystem is split across eight route modules under `app.routes.auth`, plus a small `helpers` module. Each module owns one cohesive slice of the auth flow.
+Authentication routes live in ten modules under `app.routes.auth`, with shared helpers.
 
 For the conceptual model — sessions, TOTP enforcement, email verification, password-reset enumeration protection, CSRF wiring — see [Architecture → Authentication & Sessions](../../architecture/auth.md).
 
 ## Module map
 
-| Module | Routes | Purpose |
-|---|---|---|
-| `login` | `GET/POST /login`, `POST /logout`, `GET /auth/shibboleth/callback` | Local login, logout, Shibboleth callback |
-| `register` | `GET/POST /register`, `GET/POST /send_verification` | Local account creation and verification-email resend |
-| `verify_email` | `GET /verify-email/{token}`, `POST /verify-email` | Confirm an email address: the GET is safe (shows a confirm page without consuming the token); the POST consumes it |
-| `totp` | `GET/POST /setup-totp`, `GET/POST /account/reset-totp` | TOTP enrollment and authenticator change |
-| `password_reset` | `GET/POST /forgot-password`, `GET/POST /reset-password/{token}` | Password reset flow |
-| `account` | `GET /account`, `POST /account/change-name` | Account page and self-service display-name change |
-| `email_change` | `GET/POST /account/change-email`, `GET /account/confirm-email/{token}`, `POST /account/confirm-email` | Self-service email change (same safe-GET / consuming-POST pattern as verification) |
-| `admin` | `GET /admin`, `POST /admin/users/{id}/...` | Admin dashboard and user management |
-| `helpers` | — | Shared helpers (`safe_redirect_url`, `generate_totp_qr`, `require_local_auth`) |
+| Module | Routes |
+|---|---|
+| `login` | `GET/POST /login`, `POST /logout`, `GET /auth/shibboleth/callback` |
+| `register` | `GET/POST /register`, `GET/POST /send_verification` |
+| `verify_email` | `GET /verify-email/{token}`, `POST /verify-email` |
+| `totp` | `GET/POST /setup-totp`, `GET/POST /account/reset-totp`, `POST /account/reset-totp/confirm` |
+| `totp_recover` | `GET/POST /recover-totp` |
+| `password_reset` | `GET/POST /forgot-password`, `GET /reset-password/{token}`, `POST /reset-password` |
+| `account` | `GET /account`, `POST /account/change-name` |
+| `admin_promotion` | `GET /account/admin-promotion`; `POST /account/admin-promotion/prepare`, `/accept`, `/decline` |
+| `email_change` | `GET/POST /account/change-email`, `GET /account/confirm-email/{token}`, `POST /account/confirm-email` |
+| `admin` | `GET /admin`; `GET/POST /admin/users/{user_id}/totp-recovery`; `POST /admin/users/{user_id}/approve-federated`, `/set-active`, `/set-tier`, `/set-admin`, `/cancel-admin-promotion`, `/change-email` |
+| `helpers` | No routes; redirect validation and QR generation |
 
-The individual routers are combined in `app.routes.auth.__init__` into a single `auth_router` that is mounted on the application in `main.py`. (`logout` is a POST so it is CSRF-protected; the Shibboleth callback is a GET on `/auth/shibboleth/callback` that the nginx SP layer targets. The two token-consuming confirm POSTs — `/verify-email` and `/account/confirm-email` — deliberately skip `verify_csrf`, because the signed single-use token itself is the capability and the click may come from a device with no app cookies; see the source comments.)
+`SecureAPIRouter` supplies exact-route access policies and mutation defaults. `app.routes.auth.routers` feeds the validated application collection. Only `POST /verify-email` and `POST /account/confirm-email` omit CSRF; form-content validation remains. Token GETs do not consume capabilities. See [Authentication & Sessions](../../architecture/auth.md) for federation and credential-state contracts.
 
 ## `app.routes.auth.login`
 
@@ -55,3 +57,11 @@ The individual routers are combined in `app.routes.auth.__init__` into a single 
 ## `app.routes.auth.helpers`
 
 ::: app.routes.auth.helpers
+
+## `app.routes.auth.admin_promotion`
+
+::: app.routes.auth.admin_promotion
+
+## `app.routes.auth.totp_recover`
+
+::: app.routes.auth.totp_recover

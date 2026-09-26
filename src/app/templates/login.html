@@ -8,6 +8,14 @@
   <div class="auth-success">Your email was changed. Please log in with your new address.</div>
   {% endif %}
 
+  {% if request.query_params.get('totp_changed') == '1' %}
+  <div class="auth-success">Your authenticator was changed. Wait for its next code, then sign in again.</div>
+  {% endif %}
+
+  {% if request.query_params.get('resubmit') == '1' %}
+  <p class="auth-intro">Your form was not submitted because your session ended.
+    Sign in, then open the form and submit it again.</p>
+  {% endif %}
   <h1>Login</h1>
   <p class="auth-intro">Sign in to access extended metadata and restricted datasets.</p>
 
@@ -19,7 +27,12 @@
   <div class="auth-section">
     <h2>Institutional Login</h2>
     <p>Authenticate with your university account via SWITCH edu-ID.</p>
-    <a href="/Shibboleth.sso/Login?target={{ request.url_for('shibboleth_callback').path }}" class="btn btn-primary btn-institutional">
+    <p class="form-hint">Your first institutional sign-in creates a pending access request. An administrator must approve the account and its access tier before you can sign in.</p>
+    {% set shib_target = path_for(request, 'shibboleth_callback') %}
+    {% if request.query_params.get('next') %}
+      {% set shib_target = shib_target ~ '?next=' ~ (request.query_params.get('next') | urlencode) %}
+    {% endif %}
+    <a href="/Shibboleth.sso/Login?target={{ shib_target | urlencode }}&amp;authnContextClassRef={{ required_shibboleth_authn_context | urlencode }}&amp;authnContextComparison=exact&amp;forceAuthn=true" class="btn btn-primary btn-institutional">
       Login with SWITCH edu-ID
     </a>
   </div>
@@ -29,7 +42,9 @@
 
   <div class="auth-section">
     <h2>Local Account</h2>
-    <form class="auth-form" action="{{ request.url_for('login_submit') }}" method="post">
+    <form class="auth-form"
+      action="{{ path_for(request, 'login_submit') }}{% if request.query_params.get('next') %}?next={{ request.query_params.get('next') | urlencode }}{% endif %}"
+      method="post">
       <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
       <div class="form-group">
         <label for="email">Email</label>
@@ -51,10 +66,12 @@
       </div>
       <button type="submit" class="btn btn-primary">Login</button>
     </form>
-
-    <p class="auth-link">Don't have an account? <a href="{{ request.url_for('register_page') }}">Register</a></p>
-    <p class="auth-link"><a href="{{ request.url_for('forgot_password_page') }}">Forgot your password?</a></p>
-    <p class="auth-link"><a href="{{ request.url_for('send_verification_page') }}">Need a new verification email?</a></p>
+    {% if local_registration_enabled %}
+    <p class="auth-link">Don't have an account? <a href="{{ path_for(request, 'register_page') }}">Register</a></p>
+    {% endif %}
+    <p class="auth-link"><a href="{{ path_for(request, 'forgot_password_page') }}">Forgot your password?</a></p>
+    <p class="auth-link"><a href="{{ path_for(request, 'totp_recovery_page') }}">Lost access to your authenticator?</a></p>
+    <p class="auth-link"><a href="{{ path_for(request, 'send_verification_page') }}">Need a new verification email?</a></p>
   </div>
 
 </section>

@@ -1,7 +1,9 @@
 # Datasets Service
 
-The dataset service layer is the only thing that route handlers should call when they need dataset data. It owns the `Dataset` and `Author` dataclasses, the SQL queries, the parsing of database rows into Python objects, the per-tier visibility filter, and the schema invariant check.
+`datasets` provides parsed dataset records, search, statistics, and tier redaction.
 
-For the visibility model and the search semantics — the two tier-gated search columns, the tier-gated keyword/language filters, ILIKE escaping, and tier-scoped facets — see [Architecture → Access Control & Visibility](../../architecture/access-control.md). For the underlying columns, triggers, and trigram indexes, see [Architecture → Data Model](../../architecture/data-model.md).
+See [Access Control](../../architecture/access-control.md) for disclosure rules and [Data Model](../../architecture/data-model.md) for schema contracts.
 
 ::: app.services.datasets
+
+Suggestions sample 200 recent rows, inspect at most 100 keywords/languages per row, and return up to 50 values per category. Keywords/languages are tier-gated; access levels remain public. Keywords require two occurrences in the sampled arrays. Exact filters query the full catalogue.

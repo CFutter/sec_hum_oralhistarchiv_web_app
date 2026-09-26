@@ -7,7 +7,10 @@
 # Required edits:
 #   - server_name:                your domain
 #   - ssl_certificate paths:      your TLS cert and key
-#   - X-Internal-Auth value:      must match SHIBBOLETH_INTERNAL_SECRET in .env
+#
+# Required companion file:
+#   - Copy nginx-ordinary-proxy-headers.conf.example to
+#     /etc/nginx/snippets/oralhistarchiv-ordinary-proxy-headers.conf.
 #
 # Site-specific configuration. See also /etc/nginx/nginx.conf for
 # global hardening directives:
@@ -15,11 +18,36 @@
 #   - client_body_timeout 10s
 #   - client_header_timeout 10s
 #   - send_timeout 10s
-    
+
+# Defined at http context: this file is included from nginx.conf's http block.
+# Deliberately excludes URI, query arguments, Referer, and arbitrary headers.
+log_format oralhistarchiv_safe escape=json
+    '{"time":"$time_iso8601",'
+    '"remote_addr":"$remote_addr",'
+    '"method":"$request_method",'
+    '"status":$status,'
+    '"bytes_sent":$body_bytes_sent,'
+    '"request_time":"$request_time",'
+    '"request_id":"$sent_http_x_request_id"}';
 
 upstream oralhistarchiv {
     server unix:/run/oralhistarchiv/gunicorn.sock;
 }
+
+# Coarse per-client edge backstop, independent of the application's own
+# per-route limiter. Slow or incomplete clients are handled by the
+# client_*_timeout directives in nginx.conf, not by these limits.
+# Tune rate/burst to real traffic before relying on them.
+limit_req_zone  $binary_remote_addr zone=oralhistarchiv_req:10m rate=20r/s;
+limit_conn_zone $binary_remote_addr zone=oralhistarchiv_conn:10m;
+
+# Separate, small budget for /health so monitoring behind a shared NAT
+# address never competes with ordinary traffic from that address.
+limit_req_zone  $binary_remote_addr zone=oralhistarchiv_health_req:1m rate=2r/s;
+limit_conn_zone $binary_remote_addr zone=oralhistarchiv_health_conn:1m;
+
+limit_req_status  429;
+limit_conn_status 429;
 
 # Redirect plain HTTP to HTTPS
 # --- Default reject for unknown Host headers ---
@@ -27,6 +55,7 @@ server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
+    access_log /var/log/nginx/oralhistarchiv_access.log oralhistarchiv_safe;
     return 444;
 }
 
@@ -34,6 +63,7 @@ server {
     listen 80;
     listen [::]:80;
     server_name <archive.example.uzh.ch>;
+    access_log /var/log/nginx/oralhistarchiv_access.log oralhistarchiv_safe;
     return 301 https://$server_name$request_uri;
 }
 
@@ -42,6 +72,7 @@ server {
     listen 443 ssl http2 default_server;
     listen [::]:443 ssl http2 default_server;
     server_name _;
+    access_log /var/log/nginx/oralhistarchiv_access.log oralhistarchiv_safe;
 
     # Need a cert because TLS handshake completes before nginx sees the Host
     ssl_certificate     /etc/ssl/certs/<archive.example.uzh.ch>.pem;
@@ -54,6 +85,7 @@ server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name <archive.example.uzh.ch>;
+    access_log /var/log/nginx/oralhistarchiv_access.log oralhistarchiv_safe;
 
     # --- TLS ---
     ssl_certificate     /etc/ssl/certs/<archive.example.uzh.ch>.pem;
@@ -65,8 +97,7 @@ server {
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 1d;
 
-    # HSTS is also sent by the app (see security_headers.py), but nginx
-    # as the first hop can set it too — no harm in both.
+    # Cover edge responses too; review every subdomain before enabling preload.
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
 
     # --- Request size limits ---
@@ -78,92 +109,59 @@ server {
     # Adjust the alias to match your deployment path.
     location /static/ {
         alias /opt/oralhistarchiv/src/app/static/;
-        expires 7d;
-        add_header Cache-Control "public, max-age=604800";
+        expires off;
+        add_header Cache-Control "public, no-cache";
     }
 
     # --- Optional hardening: IP-restrict /health/detail ------------------
     # Extra layer on top of the app's bearer-token check. Uncomment and set
     # your monitoring range(s). Leave commented if you have no stable
     # internal range — the bearer token (404 on failure) still protects it.
+    # This sibling block has no rate/connection limits; add reviewed limits
+    # before enabling it. It does not inherit limits from location /.
     #location = /health/detail {
     #    allow 10.0.0.0/8;      # your monitoring range
     #    deny  all;
     #    proxy_pass http://oralhistarchiv;
-    #    proxy_set_header Host      $host;
-    #    proxy_set_header X-Real-IP $remote_addr;
+    #    include /etc/nginx/snippets/oralhistarchiv-ordinary-proxy-headers.conf;
     #}
 
-    # --- Shibboleth callback — defense-in-depth secret header ---
-    # Kept above `location /` for readability. Correctness does NOT depend
-    # on file order: the `=` exact-match has priority over prefix locations
-    # wherever it appears. What IS load-bearing is the header hygiene —
-    # this is the only location that may set X-Internal-Auth and the
-    # Shibboleth attribute headers, and `location /` below must keep
-    # clearing them.
-    #
-    # The X-Internal-Auth value must match SHIBBOLETH_INTERNAL_SECRET
-    # in /opt/oralhistarchiv/.env exactly. Generate with:
-    #   python -c 'import secrets; print(secrets.token_urlsafe(32))'
+    # --- Shibboleth callback — Phase 1 fail-closed gate ---
+    # Replace this entire block with the complete SP-authorized proxy block
+    # from Deployment.md only after shibd, the FastCGI authorizer, attribute
+    # mapping, and SHIBBOLETH_INTERNAL_SECRET have been verified. Keeping the
+    # callback closed prevents an application flag flip from trusting
+    # client-supplied identity headers before the SP exists.
     location = /auth/shibboleth/callback {
-        proxy_pass http://oralhistarchiv;
-        proxy_http_version 1.1;
-
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Defense-in-depth: paired with settings.shibboleth_internal_secret
-        proxy_set_header X-Internal-Auth "<paste-SHIBBOLETH_INTERNAL_SECRET-here>";
-
-        # --- Phase 2 (Shibboleth SP) — commented out on purpose -------------
-        # The $shib_* variables below only exist once the third-party
-        # nginx-http-shibboleth module is loaded and shib_request_set
-        # directives populate them (see Deployment.md §9). Active but
-        # unwired, they make `nginx -t` fail with:
-        #   unknown "shib_remote_user" variable
-        # Leave them commented for a Phase-1 deployment; uncomment only
-        # after the SP layer (shibd + FastCGI authorizer) is in place.
-        #proxy_set_header REMOTE_USER       $shib_remote_user;
-        #proxy_set_header mail              $shib_mail;
-        #proxy_set_header displayName       $shib_display_name;
-        #proxy_set_header affiliation       $shib_affiliation;
-        # Country attribute: the app's code default header name is
-        # schacHomeOrganizationCountry, but .env.example overrides it to
-        # "country" — pick ONE name, forward it here, and strip the SAME
-        # name in `location /` below.
-        #proxy_set_header schacHomeOrganizationCountry $shib_country;
+        return 404;
     }
 
     # --- Main application ---
     location / {
         proxy_pass http://oralhistarchiv;
-        proxy_http_version 1.1;
-
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Strip any client-supplied X-Internal-Auth so it can only be set
-        # by the Shibboleth callback location above.
-        proxy_set_header X-Internal-Auth "";
-        proxy_set_header REMOTE_USER "";
-        proxy_set_header mail "";
-        proxy_set_header displayName "";
-        proxy_set_header affiliation "";
-        proxy_set_header schacHomeOrganizationCountry "";
+        # Load-bearing header hygiene. This include forwards ordinary request
+        # metadata but clears every application-facing federation header. It
+        # must be present in every location that proxies an untrusted request
+        # to the application.
+        include /etc/nginx/snippets/oralhistarchiv-ordinary-proxy-headers.conf;
 
         proxy_connect_timeout 10s;
         proxy_read_timeout    30s;
         proxy_send_timeout    30s;
+
+        limit_req  zone=oralhistarchiv_req burst=40 nodelay;
+        limit_conn oralhistarchiv_conn 20;
     }
 
     # --- Health check for external monitoring ---
-    # Public endpoint, no auth, no rate limiting upstream.
+    # Public, no auth. The app exempts /health from its own limiter,
+    # so the edge limit below is its only admission control.
     location = /health {
-        proxy_pass http://oralhistarchiv;
-        access_log off;
-    }
+            proxy_pass http://oralhistarchiv;
+            include /etc/nginx/snippets/oralhistarchiv-ordinary-proxy-headers.conf;
+            access_log off;
+
+            limit_req  zone=oralhistarchiv_health_req burst=10 nodelay;
+            limit_conn oralhistarchiv_health_conn 5;
+        }
 }

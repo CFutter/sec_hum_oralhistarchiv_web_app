@@ -1,41 +1,42 @@
-"""Database connection management with connection pooling.
+"""Async PostgreSQL pools and transactional cursors.
 
-Uses psycopg_pool.AsyncConnectionPool to reuse connections instead of opening
-a new connection per request. The pool is created (unopened) via create_pool
-and opened/closed by the application lifespan with `await pool.open()` /
-`await pool.close()`.
+Callers open and close pools in their event loop. Database errors propagate.
 """
 
 import logging
-from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
 
 from psycopg import AsyncConnection, AsyncCursor, sql
-from psycopg.rows import dict_row, tuple_row
-from psycopg_pool import AsyncConnectionPool, PoolTimeout
-from typing import Any
+from psycopg.rows import AsyncRowFactory, dict_row, tuple_row
+from psycopg_pool import AsyncConnectionPool, PoolTimeout, TooManyRequests
 
 from config import settings
 
 logger = logging.getLogger(__name__)
 
+_POOL_ACQUIRE_TIMEOUT = 10.0
+Database = AsyncConnectionPool | AsyncConnection
 
-def create_pool(application_name: str = "oralhistarchiv-web") -> AsyncConnectionPool:
-    """Create (but do not open) the async connection pool.
 
-    The caller opens it with `await pool.open()` inside the event loop
-    (the web/scheduler lifespan) and closes it with `await pool.close()`.
+def create_pool(
+    application_name: str = "oralhistarchiv-web", statement_timeout: str | None = None
+) -> AsyncConnectionPool:
+    """Create an unopened pool from DATABASE_URL and DATABASE_POOL_* settings.
 
-    Args:
-        application_name: Identifier shown in pg_stat_activity, to distinguish
-            web from scheduler connections. The scheduler passes
-            "oralhistarchiv-scheduler" explicitly.
+    The caller must await open() and close(). Acquisition times out after
+    10 seconds. application_name labels sessions in pg_stat_activity;
+    statement_timeout is a PostgreSQL duration string, or None to use
+    DB_STATEMENT_TIMEOUT. Each connection receives both settings.
     """
+    timeout = statement_timeout if statement_timeout is not None else settings.db_statement_timeout
     logger.info(
         "Creating database connection pool "
-        "(max_size=%d, statement_timeout=%s, app=%s).",
+        "(max_size=%d, max_waiting=%d, statement_timeout=%s, app=%s).",
         settings.database_pool_size,
-        settings.db_statement_timeout,
+        settings.database_pool_max_waiting,
+        timeout,
         application_name,
     )
 
@@ -46,43 +47,49 @@ def create_pool(application_name: str = "oralhistarchiv-web") -> AsyncConnection
             await conn.execute(
                 sql.SQL("SET application_name = {}").format(sql.Literal(application_name))
             )
-            await conn.execute(
-                sql.SQL("SET statement_timeout = {}").format(
-                    sql.Literal(settings.db_statement_timeout)
-                )
-            )
+            await conn.execute(sql.SQL("SET statement_timeout = {}").format(sql.Literal(timeout)))
         finally:
             await conn.set_autocommit(False)
 
     return AsyncConnectionPool(
         conninfo=settings.database_url.get_secret_value(),
-        min_size=2,
+        min_size=min(2, settings.database_pool_size),
         max_size=settings.database_pool_size,
-        timeout=10.0,
+        max_waiting=settings.database_pool_max_waiting,
+        timeout=_POOL_ACQUIRE_TIMEOUT,
         configure=configure,
-        open=False,   # opened by the lifespan via `await pool.open()`
+        open=False,  # opened by the lifespan via `await pool.open()`
     )
 
 
 @asynccontextmanager
 async def get_db_cursor(
-    pool: AsyncConnectionPool, row_factory: Any = dict_row
+    pool: Database, row_factory: AsyncRowFactory[Any] | None = dict_row
 ) -> AsyncIterator[AsyncCursor[Any]]:
-    """Yield an async cursor from the pool.
+    """Yield a cursor in a transaction; commit on success and roll back on error.
 
-    row_factory defaults to dict_row (rows as dicts). Pass tuple_row for
-    positional tuple rows. row_factory=None is normalized to tuple_row, so
-    the row shape never depends on any connection-level default set in
-    create_pool.
+    Accepts a pool or an existing connection; the latter uses a transaction
+    or nested savepoint without acquiring another session. None selects
+    tuple rows; the default selects dictionaries. Pool admission failures
+    are logged and re-raised; other database errors also propagate.
     """
     factory = row_factory if row_factory is not None else tuple_row
+    if isinstance(pool, AsyncConnection):
+        # Sync uses its advisory-lock-owning session for every transaction.
+        # Losing that session fences writes: never acquire a replacement here.
+        async with pool.transaction(), pool.cursor(row_factory=factory) as cur:
+            yield cur
+        return
     try:
-        async with pool.connection() as conn:
-            async with conn.cursor(row_factory=factory) as cur:
-                yield cur
-    except PoolTimeout as e:
+        async with pool.connection() as conn, conn.cursor(row_factory=factory) as cur:
+            yield cur
+    except (PoolTimeout, TooManyRequests) as error:
         logger.warning(
-            "DB pool exhausted (max_size=%d, timeout=10s): %s",
-            settings.database_pool_size, e,
+            "Database pool admission rejected "
+            "(max_size=%d, max_waiting=%d, timeout=%.0fs, reason=%s)",
+            settings.database_pool_size,
+            settings.database_pool_max_waiting,
+            _POOL_ACQUIRE_TIMEOUT,
+            type(error).__name__,
         )
         raise

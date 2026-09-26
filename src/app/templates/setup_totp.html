@@ -6,14 +6,17 @@
 <section class="container auth-page">
 
   <h1>Set Up Two-Factor Authentication</h1>
-  <p class="auth-intro">Scan the QR code below with your authenticator app (e.g., Google Authenticator, Authy), then enter the 6-digit code to confirm.</p>
+  <p class="auth-intro">
+    Scan the QR code with your authenticator app, save the recovery codes
+    offline, and confirm both before completing setup.
+  </p>
 
   {% if error %}
   <div class="auth-error">{{ error }}</div>
   {% endif %}
 
   <div class="auth-section">
-    <form class="auth-form" action="{{ request.url_for('setup_totp_submit') }}" method="post">
+    <form class="auth-form" action="{{ path_for(request, 'setup_totp_submit') }}" method="post">
       <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
 
       <div class="totp-setup">
@@ -32,10 +35,46 @@
       </div>
 
       <div class="form-group">
+        <h2>Save Your Recovery Codes</h2>
+        <p>
+          Each code can be used once after an administrator authorizes recovery.
+          Store them somewhere separate from your authenticator device. They
+          will not be shown again.
+        </p>
+        <ol class="recovery-code-list">
+          {% for recovery_code in recovery_codes %}
+          <li><code>{{ recovery_code }}</code></li>
+          {% endfor %}
+        </ol>
+        <p class="form-hint warning">
+          Refreshing this page replaces this displayed set. Previously displayed
+          codes will not become active.
+        </p>
+      </div>
+
+      <div class="form-group">
         <label for="totp_code">Verification Code</label>
         <input type="text" id="totp_code" name="totp_code" required maxlength="6"
                pattern="[0-9]{6}" placeholder="6-digit code from your authenticator app"
                autocomplete="off" inputmode="numeric">
+      </div>
+
+      <div class="form-group">
+        <label for="recovery_code_confirmation">Confirm One Recovery Code</label>
+        <input
+          type="text"
+          id="recovery_code_confirmation"
+          name="recovery_code_confirmation"
+          required
+          maxlength="{{ recovery_code_max_chars }}"
+          autocomplete="off"
+          autocapitalize="characters"
+          spellcheck="false"
+          placeholder="XXXXX-XXXXX-XXXXX-XXXXX"
+        >
+        <span class="form-hint">
+          Re-enter any one code from the list to confirm that you retained it.
+        </span>
       </div>
 
       <button type="submit" class="btn btn-primary">Verify and Complete Setup</button>

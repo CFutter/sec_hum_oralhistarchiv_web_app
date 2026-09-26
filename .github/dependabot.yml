@@ -1,16 +1,13 @@
-# Save as .github/dependabot.yml
-# Weekly PRs for outdated/vulnerable dependencies. Complements pip-audit:
-# pip-audit *blocks* on known CVEs, Dependabot *proposes* the fix PRs.
+# Review weekly dependency and Action updates; retain full Action SHAs and
+# same-line release comments, and verify upstream commits before merging.
 
 version: 2
 updates:
-  # Keep the pinned action SHAs current (updates SHA + version comment)
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
 
-  # Updates pyproject.toml pins and uv.lock
   - package-ecosystem: "uv"
     directory: "/"
     schedule:

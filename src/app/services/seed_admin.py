@@ -1,23 +1,25 @@
-"""Seed initial admin account from environment variables.
+"""Bootstrap the first local administrator from configured seed credentials.
 
-Creates the first admin user on startup if:
-1. ADMIN_SEED_EMAIL and ADMIN_SEED_PASSWORD are set
-2. No admin user exists yet in the database
-
-Once any admin exists, seeding is skipped — the env vars become inert.
-This avoids re-seeding on every restart and allows safe removal of the
-env vars after initial setup.
+Startup supplies ADMIN_SEED_EMAIL/PASSWORD. Any existing administrator skips
+policy validation and hashing. An advisory transaction lock serializes
+seeders; remove the seed credentials after successful bootstrap.
 """
 
 import logging
 
 from psycopg_pool import AsyncConnectionPool
 
+from app.credentials import validate_seed_credentials
+
+from .crypto import password_hasher
 from .db import get_db_cursor
-from .users import create_local_user
 from .password_validation import validate_password_strength
+from .password_work import run_password_work
 
 logger = logging.getLogger(__name__)
+
+# Any stable, app-unique bigint; serializes concurrent seeders only.
+_SEED_ADMIN_LOCK_KEY = 0x5EED_AD01
 
 
 async def seed_admin_user(
@@ -25,45 +27,22 @@ async def seed_admin_user(
     email: str,
     password: str,
 ) -> None:
-    """Seed an admin user if no admin exists yet.
+    """Create a public-tier, verified local administrator if none exists.
 
-    The seeded user is created with:
-    - auth_method: local
-    - access_tier: public (access tier can't be set on user creation, only by admin intervention)
-    - is_admin: True
-    - TOTP: not configured (must be set up on first login)
-    
-    Refuses to elevate existing users — use the admin UI for that.
-
-    Args:
-        pool: Database connection pool.
-        email: Admin email address from ADMIN_SEED_EMAIL.
-        password: Admin password from ADMIN_SEED_PASSWORD.
-    
-    Raises:
-        RuntimeError: If a user with the seed email already exists, or
-            if the password fails strength validation.
+    TOTP must be enrolled at first login. Existing administrators skip credential
+    checks; concurrent seeders recheck under an advisory transaction lock.
+    Raises RuntimeError for invalid seed credentials/password strength or an
+    existing seed email; never elevates an existing user. Logs the new address.
     """
     async with get_db_cursor(pool) as cur:
         await cur.execute("SELECT 1 FROM users WHERE is_admin = true LIMIT 1")
-        if await cur.fetchone():
-            logger.debug("Admin user already exists — skipping seed.")
+        if await cur.fetchone() is not None:
             return
-        
-        await cur.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(%s)", (email,))
-        existing = await cur.fetchone()
 
-    if existing:
-        raise RuntimeError(
-            f"User {email} already exists; refusing to promote via seed. "
-            f"Use the admin UI to grant admin status to existing users, "
-            f"or set ADMIN_SEED_EMAIL to a fresh email address."
-        )
-
-    if len(password) < 12:
-        raise RuntimeError(
-            "ADMIN_SEED_PASSWORD must be at least 12 characters long."
-        )
+    try:
+        email = validate_seed_credentials(email, password)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     password_error = validate_password_strength(password, email=email)
     if password_error:
         raise RuntimeError(
@@ -71,17 +50,31 @@ async def seed_admin_user(
             "Choose a stronger password and restart."
         )
 
-    user = await create_local_user(
-        pool,
-        email=email.strip().lower(),
-        display_name="Admin",
-        password=password,
-    )
+    # Hash BEFORE taking the lock — argon2 is deliberately slow, and the
+    # advisory lock should be held only for the two SELECTs and the INSERT.
+    password_hash = await run_password_work(password_hasher.hash, password)
 
     async with get_db_cursor(pool) as cur:
+        await cur.execute("SELECT pg_advisory_xact_lock(%s)", (_SEED_ADMIN_LOCK_KEY,))
+
+        await cur.execute("SELECT 1 FROM users WHERE is_admin = true LIMIT 1")
+        if await cur.fetchone():
+            logger.debug("Admin user already exists — skipping seed.")
+            return
+
+        await cur.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(%s)", (email,))
+        if await cur.fetchone():
+            raise RuntimeError(
+                f"User {email} already exists; refusing to promote via seed. "
+                f"Use the admin UI to grant admin status to existing users, "
+                f"or set ADMIN_SEED_EMAIL to a fresh email address."
+            )
+
         await cur.execute(
-            "UPDATE users SET is_admin = true, email_verified = true WHERE id = %s",
-            (user.id,),
+            """INSERT INTO users (email, display_name, password_hash, auth_method,
+                                  access_tier, is_admin, email_verified)
+               VALUES (%s, 'Admin', %s, 'local', 'public', true, true)""",
+            (email, password_hash),
         )
 
     logger.warning(

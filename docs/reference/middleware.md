@@ -1,22 +1,21 @@
 # Middleware
 
-The middleware stack is the sequence of pre- and post-processing layers that every HTTP request passes through before reaching a route handler. The order of registration in `main.py` matters: the **last** middleware added wraps the rest and runs **outermost**. The effective inbound order is `TrustedHost` → `Session` → `Audit` → rate limiting → security headers → TOTP/purpose gate → `CSRF` cookie → CORS (if enabled) → route. This is deliberate: session runs early so audit can record `user_id`; rate limiting sits inside session/audit so even 429 responses are audited; and the TOTP gate sits *inside* security headers and audit so its redirects carry the standard headers and appear in the audit log.
+Inbound order: TrustedHost → optional CORS → audit → database-capacity handling → bounded rate admission → session resolution → security headers → CSRF cookies → route dependencies. Registration in `main.py` wraps the last-added middleware outermost. See [Request Lifecycle](../architecture/request-lifecycle.md).
 
-For the conceptual tour of what each layer protects against and why, see [Architecture → Security Layers](../architecture/security.md).
+## Responsibilities
 
-## Module map
+| Module | Responsibility |
+|---|---|
+| `session` | Identity/flash resolution, recovery-session restriction, and route access dependencies |
+| `audit_logging` | Request IDs and scrubbed outcome/error events |
+| `database_capacity` | Retryable 503 responses for exhausted database pools |
+| `rate_limiting` | Bounded admission before session lookup; memory or Redis policies |
+| `security_headers` | Header configuration applied by `main.py` and early refusals |
+| `csrf`, `cookies` | Signed session/pre-session identifiers, CSRF cookies, and verification |
+| `content_type` | Form-content validation for mutations |
+| `validators` | Startup security checks |
 
-| Module | Purpose | Style |
-|---|---|---|
-| `session` | Two middlewares: `SessionResolutionMiddleware` reads the session cookie and populates `request.state.user` / `session_purpose` (resolution only); `TotpGateMiddleware` enforces the TOTP-enrolment and `purpose` gates (exempting `/setup-totp`, `/logout`, `/verify-email`) | `BaseHTTPMiddleware` × 2 |
-| `audit_logging` | Per-request structured log line with request ID, IP, status, duration | `BaseHTTPMiddleware` |
-| `rate_limiting` | slowapi setup with per-minute / per-hour / per-day limits (memory or Redis backend) | slowapi middleware |
-| `security_headers` | Builds the `Secure` header set; the bare `@app.middleware` in `main.py` applies it and adds `Cache-Control: no-store` for authenticated responses | Helper called from `main.py` |
-| `csrf` | Sets/refreshes the HMAC-bound CSRF cookie on GETs; provides the `verify_csrf` dependency for POST routes | Middleware + dependency |
-| `cookies` | itsdangerous signer for the session cookie, session-ID extraction, pre-session IDs, and the "current identifier" used to bind CSRF tokens | Helpers |
-| `content_type` | `validate_form_content_type` dependency rejecting non-form POST bodies | Dependency |
-| `validators` | `validate_security_settings()` startup check; not a runtime middleware | Startup function |
-| `utils` | `get_client_ip` shared by audit logging and rate limiting | Helper |
+`SecureAPIRouter` owns exact route authorization and mutation dependencies; see [Route Security](route-security.md).
 
 ## `app.middleware.session`
 
@@ -50,6 +49,8 @@ For the conceptual tour of what each layer protects against and why, see [Archit
 
 ::: app.middleware.validators
 
-## `app.middleware.utils`
+## Database capacity and package exports
 
-::: app.middleware.utils
+::: app.middleware.database_capacity
+
+::: app.middleware

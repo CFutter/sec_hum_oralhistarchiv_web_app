@@ -1,0 +1,28 @@
+# Install at /etc/oralhistarchiv-rate-limit-redis/redis.conf for the dedicated unit.
+# Loopback TCP 6380, database 0 only; ACL credentials are read from users.acl.
+# stdout logging and foreground execution are supervised by systemd. The state
+# directory holds AOF persistence, fsynced each second; recent counters may be
+# lost on a crash. Truncated AOF is rejected; recovery needs operator review.
+# Rewrite after 100% growth and at least 64 MiB. Memory above 128 MiB rejects
+# writes rather than evicting security counters, causing application admission 503s.
+#
+# Dedicated security-counter store. Never merge into a general Redis instance.
+# Generate /etc/oralhistarchiv-rate-limit-redis/users.acl and the matching
+# root-only web.env credential as described in Deployment.md before starting.
+bind 127.0.0.1
+protected-mode yes
+port 6380
+daemonize no
+supervised no
+logfile ""
+dir /var/lib/oralhistarchiv-rate-limit-redis
+aclfile /etc/oralhistarchiv-rate-limit-redis/users.acl
+databases 1
+save ""
+appendonly yes
+appendfsync everysec
+aof-load-truncated no
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+maxmemory 128mb
+maxmemory-policy noeviction

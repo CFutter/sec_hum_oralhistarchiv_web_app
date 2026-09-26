@@ -1,71 +1,108 @@
 # Security Layers
 
-This page is the security tour of the application. It is organised by *layer*, from the network edge inwards, because that is the order in which a request encounters protections — and the order in which an attacker would have to defeat them. (Note that this conceptual edge-inward ordering is not identical to the literal middleware execution order; see [Request Lifecycle](request-lifecycle.md) for the exact order.)
-
-The companion pages [Authentication & Sessions](auth.md) and [Access Control & Visibility](access-control.md) cover their respective subsystems in more depth. This page focuses on the cross-cutting controls and how they fit together.
+These controls protect different boundaries; their order here is conceptual. See [Request Lifecycle](request-lifecycle.md) for middleware order, [Authentication](auth.md) for account transitions, and [Access Control](access-control.md) for metadata disclosure.
 
 ## Layer 0 — Configuration validators
 
-The first thing the application does on startup is validate its own configuration. If anything is dangerous, the application refuses to start.
+Settings construction and startup checks reject invalid configurations. `validate_security_settings()` checks `SECRET_KEY`, `SESSION_SECRET`, all TOTP/outbox encryption keys, optional health tokens, and configured federation secrets through the appropriate activation policy. Length, diversity, entropy, blocklist, and template-default checks reject obvious weaknesses; they do not prove randomness. Generate keys using the documented CSPRNG commands.
 
-`validate_security_settings()` checks **every configured secret** — `SECRET_KEY`, `SESSION_SECRET`, each entry of `TOTP_ENCRYPTION_KEYS`, and (when set) `HEALTH_DETAIL_TOKEN` and `SHIBBOLETH_INTERNAL_SECRET` — and enforces, per secret:
+Ordinary startup blockers are fatal in staging/production and warnings in development; individual Settings validators may still reject development input. Hardened checks cover secure public URLs/cookies, disabled debug, trusted hosts/proxies, upstream HTTPS, SMTP policy, dedicated limiter storage, and credentialed CORS. See [Settings](../configuration/settings.md) for exact conditions.
 
-- Not one of the hardcoded template defaults.
-- At least 43 characters (the length of `secrets.token_urlsafe(32)` — anything shorter physically cannot hold 256 bits), with a warning below the recommended `token_urlsafe(64)` length.
-- Above a Shannon-entropy floor and a minimum count of distinct characters (rejects repeated patterns like `abababab…`).
-- Not containing a blocklisted string (`password`, `admin`, `12345678`, …).
-
-It additionally blocks (in staging/production) a non-`https://` `SWISSUBASE_OAI_PMH_URL`, rate limiting enabled in production without `RATE_LIMIT_TRUST_PROXY=true` (per-IP limits would collapse onto nginx's single IP), and credentialed CORS combined with wildcard or non-HTTPS origins.
-
-Pydantic model validators on `Settings` add more: `validate_cors_settings` and `validate_allowed_hosts` (no `*`, no empty lists, no localhost origins outside dev); `validate_database_url` (must be a PostgreSQL URL with a database name); `_require_https_in_prod` (`PUBLIC_BASE_URL` must be a non-localhost `https://` URL outside dev); `validate_cookies_secure` and `validate_debug_only_in_dev` (`COOKIES_SECURE=true` and `FASTAPI_DEBUG=false` enforced outside dev); `require_smtp_in_prod`, `validate_smtp_settings`, `validate_smtp_tls_in_prod`, and `validate_smtp_auth_pair` (SMTP required in production, with TLS, matching user/password pairs, and no placeholder values); `require_health_token_in_prod`; `validate_redis_url_required`; a format check on `DB_STATEMENT_TIMEOUT` (rejects anything that isn't an interval literal); and `validate_shibboleth_settings`, which requires the internal secret whenever Shibboleth is enabled — **in every environment**, not just production.
-
-The dev/production split runs on `ENV_STATE`, not the debug flag: in `dev`, blocking findings are logged as warnings so local development is not painful; in `staging` and `production` they raise and the process exits before binding any socket. This layer exists because the most common security incidents are not exotic exploits — they are deployments with default secrets, wide-open CORS, or the wrong database.
+Federation activation is strict in every environment: require an independent strong internal secret, exact HTTPS trusted issuers, a non-localhost HTTPS public origin, secure cookies, and a valid host allowlist. The callback accepts only the compiled REFEDS MFA context. Construction and final startup share that activation policy. Configuration changes require restart.
 
 ## Layer 1 — Network edge (nginx)
 
-In production, nginx terminates TLS and forwards to Gunicorn over a Unix socket. The application itself never sees a plaintext external connection.
+The reference deployment terminates external TLS at nginx and forwards locally to Gunicorn over a Unix socket. This requires the deployment and socket controls below.
 
 nginx handles:
 
 - TLS 1.2+ with strong cipher suites
 - HTTP-to-HTTPS redirect and a default-reject server block for unknown `Host` headers
 - Serving `/static/` directly, with long-lived cache headers
-- Optional Shibboleth SP integration at the nginx layer (shibd + FastCGI via the nginx-http-shibboleth module), injecting attribute headers (and the `X-Internal-Auth` secret) only on the callback path and stripping them everywhere else
+- Optional Shibboleth SP integration at the nginx layer (shibd + FastCGI via
+  the nginx-http-shibboleth module). Phase 1 returns `404` at the callback. In
+  Phase 2 the authorized location overwrites the fixed `X-OHA-Shib-*` headers
+  and `X-OHA-Internal-Auth` from SP-controlled values; ordinary proxy
+  locations clear both those names and the legacy Shibboleth names.
 - Setting `X-Real-IP` / `X-Forwarded-For` for client IP attribution
 
 (Restricting `/health/detail` to internal IP ranges at the nginx layer is a recommended extra hardening on top of the application's bearer-token check — a commented snippet ships in `deploy/nginx.conf.example`; uncomment it and set your monitoring ranges if your network layout allows.)
 
-The application is bound to a local socket and is not directly reachable from the network. The `TrustedHostMiddleware` rejects unknown `Host` headers as a further backstop.
+The application is bound to a local socket and is not directly reachable from
+the network. That statement depends on deployment state, not merely on using a
+Unix pathname: the parent directory must be `0750`, owned by
+`oralhistarchiv:oralhistarchiv-proxy`; Gunicorn must create its socket as `0660`
+with the same ownership; only nginx's service account may be an additional
+member of `oralhistarchiv-proxy`; the scheduler must run as the distinct
+`oralhistarchiv-scheduler` account with `/run/oralhistarchiv` inaccessible; and
+Gunicorn must have no TCP listener. The nginx account must not be a generic UID
+also used by PHP-FPM or unrelated services; inventory every live process under
+it or use a dedicated worker identity/instance. Verify those facts after every
+deployment as described in [Deployment](../configuration/deployment.md). The `TrustedHostMiddleware` rejects unknown `Host`
+headers as a further backstop, but it is not a substitute for this filesystem
+boundary.
+
+The Shibboleth callback also requires an exact trusted absolute HTTPS issuer and the compiled
+REFEDS MFA context before it touches an account. A new trusted identity is
+stored only as a pending, inactive, public, non-admin, unverified row; no
+session is issued until an administrator uses the dedicated exact-pair
+approval action, which records actor/time, assigns the reviewed tier, bumps
+`auth_revision`, and deletes every target session atomically. Because anyone
+who can both reach the socket and obtain the internal secret could otherwise
+forge the entire assertion, nginx-only socket permissions and secret custody
+are authentication controls, not optional hardening.
 
 ## Layer 2 — Rate limiting
 
-If `RATE_LIMIT_ENABLED=true`, slowapi applies three default limits per client IP:
+When enabled, fixed-window limits use keyed identities for IPv4 addresses or IPv6 /64 networks. Defaults are 100/minute, 1,000/hour, and 10,000/day per endpoint; registered decorators control endpoint-specific limits. Forwarding headers require `RATE_LIMIT_TRUST_PROXY` and a trusted TCP peer or the reviewed Unix-socket boundary. Raw addresses do not enter Redis keys.
 
-- `RATE_LIMIT_PER_MINUTE` (default 100)
-- `RATE_LIMIT_PER_HOUR` (default 1000)
-- `RATE_LIMIT_PER_DAY` (default 10000)
+Staging/production requires dedicated shared `RATE_LIMIT_REDIS_URL`. Development may select general Redis or memory at startup; runtime failures never switch to memory. Startup probes required backend operations. Dynamic admission fails with 503 on unavailable storage or saturated admission; static GET/HEAD and decorated exemptions bypass checks. Unknown paths/methods share one coarse bucket and skip session lookup.
 
-plus tighter explicit limits on sensitive auth routes (login, register, reset, TOTP, verification). The client IP is extracted by `get_client_ip()`, which trusts `X-Real-IP` / `X-Forwarded-For` only when `RATE_LIMIT_TRUST_PROXY=true` *and* the request arrived through a trusted upstream — either the TCP peer is in `TRUSTED_PROXY_IPS`, or the connection came in over the Unix socket, which in this deployment only nginx can reach. Otherwise any client could spoof their IP.
+Checks run in a serialized worker with at most eight active/waiting admissions and a 0.25-second admission wait by default. Redis connect/read timeouts are 0.5 seconds with no retries. A one-second evaluation budget only logs slow work; it does not terminate it. `REDIS_ENABLED` controls optional cache/pub-sub, separately from hardened limiting. Secret-key rotation changes limiter identities and requires a coordinated restart.
 
-The storage backend is in-process memory by default — meaning per-worker counters under multiple Gunicorn workers — or Redis when `REDIS_ENABLED=true`, which makes the limits global across workers. The gunicorn config therefore caps the deployment at a single worker when Redis is disabled, keeping the limits correct at the cost of throughput; a settings validator warns about that configuration in production.
+### Credential attempt budgets
+
+Per-IP limits are a secondary control for credential proofs because a caller can
+change source addresses. PostgreSQL holds the authoritative budgets:
+
+- TOTP rotation start, self-service email change, admin promotion preparation
+  and acceptance, and administrator recovery authorization share a counter on
+  the exact full session. Every reserved submission, including a successful
+  one, commits before expensive verification. The first request beyond the
+  configured allowance expires only that session, leaving the account and its
+  other sessions untouched. Scheduled cleanup later deletes the expired row.
+- TOTP rotation confirmation has its own staged challenge counter. Exhaustion
+  deletes only the pending challenge.
+- Public TOTP recovery first matches an unused high-entropy recovery code
+  in the same nonlocking query shape used for an unknown code. Only a match can
+  commit one of the three password attempts on that exact code before Argon2
+  runs. Unknown codes receive dummy Argon2 work; exhausting one code leaves the
+  other codes usable. Ordinary login lockout cannot block this
+  administrator-authorized recovery path.
+
+Authenticated step-up operations honor an active account-wide login lock, but
+their counters never increment or extend it. Database errors abort the
+operation, so loss of the durable counter store cannot turn the controls off.
 
 ## Layer 3 — CORS
 
-CORS is **disabled by default**. The archive is a single-origin server-rendered application; no client-side JavaScript needs to call it from a different origin. With CORS disabled, the browser's same-origin policy provides strong cross-origin guarantees for free. If a deployment does enable CORS, the staging/production startup validators block unsafe configurations (wildcards, empty origin lists, localhost origins, and any credentialed configuration without concrete HTTPS origins).
+CORS is disabled by default. If enabled, hardened Settings reject empty/wildcard/localhost origins; credentialed CORS also requires concrete HTTPS origins. CORS governs browser cross-origin response access and does not replace authentication or CSRF protection.
 
-## Layer 4 — CSRF
+## Layer 4 — Fail-closed route and mutation contract
 
-CSRF protection is an **HMAC-bound double-submit cookie**, enforced as a route-level dependency rather than global middleware.
+Every application HTTP route is created by `SecureAPIRouter` with exactly one `RouteAccess` class: public, open during enrolment, capability, TOTP enrolment, full session, local full session, or admin. The router installs the corresponding dependency itself. Public/open/capability/enrolment policies additionally use exact method/path allowlists; `/admin` can only use the admin policy. `validate_route_security_contract()` runs after registration and at startup and rejects plain or forged routes, missing dependencies, new allowlisted-surface keys, duplicate keys, unknown mounts or Starlette routes, and WebSockets.
 
-1. The CSRF cookie middleware sets a `csrf_token` cookie on GET responses. The token is not random — it is `HMAC(SESSION_SECRET, identifier)`, where `identifier` is the session ID (or a per-visitor pre-session ID for anonymous visitors). The cookie is `HttpOnly` and `SameSite=Strict`; templates read the token server-side via `{{ csrf_token(request) }}`, so JavaScript never needs access to it.
-2. Templates embed the token as a hidden field in every form.
-3. POST routes declare `Depends(verify_csrf)`, which checks that the cookie and form field are both present, match (`hmac.compare_digest`), and equal the HMAC recomputed from the request's current identifier. Any failure returns 403.
+A public route permits a guest but calls `require_full_session` when a user is present, so a partial session cannot fall back to anonymous authority. Full-session policy requires an active `purpose='full'` session and the completed authentication policy: verified email plus enrolled TOTP for local users, or approved federated state for Shibboleth users. TOTP enrolment is an exact policy for exact `/setup-totp` routes, not a prefix exemption.
 
-Because the token is HMAC-bound to the session, a stolen cookie is useless without the matching session, and the token rotates automatically when the identifier changes (and explicitly on logout). Because verification is a route dependency, *which routes are protected is visible in the route signatures* — a new POST route missing `Depends(verify_csrf)` stands out in review. `SameSite=Strict` on both the session and CSRF cookies is the second independent layer. (The two token-consuming confirm POSTs — email verification and email change — deliberately skip `verify_csrf`; there the signed single-use token itself is the capability, and the click may come from a device with no app cookies.)
+### CSRF
+
+The double-submit token is a SHA-256 HMAC of the signed session token or anonymous pre-session identifier, using a domain-separated key derived from `SESSION_SECRET`. Cookie middleware prepares matching template state and HttpOnly, SameSite=Strict cookies for resolved form requests, including POST rerenders. DB-free/unmatched requests and responses that explicitly replace the session cookie skip passive cookie writes.
+
+`SecureAPIRouter` installs `verify_csrf` for methods other than GET/HEAD/OPTIONS, except exact `POST /verify-email` and `POST /account/confirm-email`. Those capabilities are signed, single-use, and email-bound. Verification requires matching string cookie/form values and a valid recomputed HMAC; failures return 403. This proves token binding, not account authorization.
 
 ## Layer 5 — Content-Type validation
 
-The `validate_form_content_type` dependency rejects POST requests that do not declare `application/x-www-form-urlencoded` or `multipart/form-data`, a small defense against content-type confusion. Like CSRF, it is a route-level dependency, so its application is visible per route.
+For every method except `GET`, `HEAD`, and `OPTIONS`, `SecureAPIRouter` also installs `validate_form_content_type`, which accepts only `application/x-www-form-urlencoded` or `multipart/form-data`. Route modules do not opt into this protection, and a future non-POST mutation receives the same defaults.
 
 ## Layer 6 — Sessions
 
@@ -76,42 +113,78 @@ The session middleware reads the `oha_session` cookie and looks up the session i
 - Session expiry is enforced server-side; a tampered cookie cannot extend it.
 - A new session ID is issued on every login and the prior session is revoked, eliminating session fixation.
 
-See [Authentication & Sessions](auth.md) for the lifecycle and the `purpose` column that gates `totp_setup` sessions (enforced by the dedicated TOTP-gate middleware).
+Shibboleth sessions have an additional live authorization check on every
+lookup: federation must still be enabled, the account active and explicitly
+approved, and its exact issuer still trusted. Failure deletes the presented
+session. Startup also compares a persisted fingerprint over the flag, sorted
+issuer set, fixed MFA context, policy version, and callback secret; a missing or
+changed value revokes all federated sessions transactionally before requests
+are accepted. Session issuance and approval take a shared lock and require an
+exact policy-row match before any identity write, closing both concurrency
+orders with reconciliation. Local sessions are outside that revocation
+predicate.
+
+See [Authentication & Sessions](auth.md) for the session lifecycle and the exact route dependencies that consume the `purpose` column. Session middleware resolves state; it does not authorize path prefixes.
 
 ## Layer 7 — Security headers
-
-The `secure` library builds a `Secure` instance once at startup, applied to every response by an `@app.middleware("http")` function.
 
 | Header | Value |
 |---|---|
 | `Content-Security-Policy` | `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'` (plus other explicit directives) |
 | `X-Frame-Options` | `DENY` |
 | `X-Content-Type-Options` | `nosniff` |
-| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin`; overridden with `no-referrer` on action-capability pages |
 | `Permissions-Policy` | restrictive defaults |
 | `Strict-Transport-Security` (production only) | `max-age=31536000; includeSubDomains; preload` |
 
-The CSP is intentionally strict. There is **no `unsafe-inline`** for either scripts or styles, so inline `<script>` blocks and inline `style="..."` attributes are rejected by the browser and templates use external CSS only. The same function adds **`Cache-Control: no-store`** to responses for authenticated requests (identified by `request.state.user` being set), preventing browsers and proxies from caching restricted-tier metadata; static assets are excluded so fonts and CSS still cache.
+The CSP is intentionally strict. There is **no `unsafe-inline`** for either scripts or styles, so inline `<script>` blocks and inline `style="..."` attributes are rejected by the browser and templates use external CSS only. The same function adds **`Cache-Control: no-store`** to responses for authenticated requests (identified by `request.state.user` being set), preventing browsers and proxies from caching restricted-tier metadata; static assets are excluded so fonts and CSS still cache. Anonymous password-reset, email-verification, and email-change confirmation pages also receive `Cache-Control: no-store` and `Referrer-Policy: no-referrer` because their URLs or bodies contain live action capabilities.
 
 ## Layer 8 — Application code
 
-By the time a request reaches a route handler it has been host-checked, session-resolved, audited, rate-limited, and is about to be wrapped in security headers on the way out. Further protections live in the application code:
+SQL binds values as parameters and uses reviewed SQL identifiers/fragments where composition is needed. Free-text search escapes backslash, `%`, and `_` for literal substring matching. `filter_for_tier()` redacts restricted metadata before query results reach templates; SQL also gates matching and facet disclosure. Resource/license URLs are validated during parsing and rendering uses the `safe_url` filter. These controls require new fields, queries, and routes to preserve their contracts.
 
-- **Parameterised SQL.** Every query uses `psycopg.sql.SQL`, `Identifier`, and `Placeholder` composables — no f-string SQL anywhere. The `test_schema.py` invariant test guards against column-list drift between Python and SQL. <!-- TODO(tests-rework): update this section once the new test suite lands -->
-- **ILIKE wildcard escaping.** Free-text search escapes `\`, `%`, and `_` in user input before interpolating into the ILIKE pattern, so a query cannot inject a wildcard pattern.
-- **Tier-based output filtering.** `filter_for_tier()` redacts sensitive fields in the service layer before a dataset reaches the template, so a buggy template cannot leak data — and the search, filter, and facet queries are tier-gated in SQL, so match/no-match behaviour cannot be used to probe redacted values either. See [Access Control & Visibility](access-control.md).
-- **URL scheme validation.** Upstream URLs are validated to `http(s)` during parsing, and a `safe_url` Jinja filter is a last line of defense before any URL is rendered into an `href`.
-
-Admin routes are gated by `require_admin`, which returns 404 (not 403) for non-admins so the admin area is not revealed.
+Admin dependencies return 404 for missing/non-admin principals. Existing admins must also satisfy full-session and recovery-code requirements, which can redirect or return 403. See [Access Control](access-control.md) and [Authentication](auth.md).
 
 ## Layer 9 — Audit logging
 
-Every request is logged with a unique 16-character request ID, client IP, method, scrubbed path, scrubbed query string, status code, duration, and user ID (if any). The `audit` logger is a separate channel from the application logger, but both write to stdout — there is no separate audit file. systemd-journald captures both streams and handles rotation/retention. Token segments in sensitive paths (`/reset-password/<token>`, `/verify-email/<token>`, `/account/confirm-email/<token>`) and non-allowlisted query parameters are scrubbed before logging.
+Audited requests receive a 16-hex correlation ID, client attribution, safe path/query structure, status, elapsed time, and resolved user ID. Statuses below 400 on exact `/health` and `/static/` paths are skipped; earlier middleware rejection can also bypass request auditing. Query values are omitted. Route templates replace matched paths; unmatched paths receive only known action-token scrubbing and can retain other attacker-controlled text.
 
-Sensitive values are stripped by a redaction filter built from Pydantic field metadata: any `SecretStr` field on `Settings` (or any field marked `sensitive=True`) has its actual value replaced with a `[REDACTED:...]` marker wherever it appears, plus a static `Bearer <token>` pattern. This prevents accidental credential leakage even if a developer logs a `repr()` of an object that happens to contain a secret. One deliberate asymmetry: the **application** log additionally auto-redacts anything that looks like an email address; the **audit** channel does not apply that email pattern — audit events never carry raw addresses in the first place, using the keyed `audit_email_hash` where correlation is needed (see [Logging & Audit](../configuration/logging.md)).
+Application and audit output goes to stdout; audit stays JSON. Filters redact configured secrets of at least eight characters and recognized runtime-secret shapes; audit email-pattern matches become keyed markers. Pattern coverage is finite. Exception diagnostics omit messages/arguments but retain bounded frames and categories, with redaction applied afterward.
 
-Off-host audit copies are shipped by a host-level rsyslog agent over RELP/TLS (reliable, encrypted, mutually authenticated) reading from journald — see the deployment runbook.
+Host journald owns retention; the shipped rsyslog example forwards selected service units over RELP/TLS when configured. Verify actual collection and delivery. See [Logging & Audit](../configuration/logging.md).
 
-## What this composition gives you
+## Operational boundary — database backups
 
-No single layer is novel. The point is the *composition*: an attacker has to defeat startup validators, network controls, host checks, rate limiting, session integrity, HMAC-bound CSRF, a strict CSP, parameterised SQL, **and** the per-tier output filter to extract information they should not see. Each layer is a few hundred lines of well-tested code; together they form a defense-in-depth posture appropriate for a system that will, in Phase 2, hold sensitive research data about real people.
+Database backups bypass every request-time tier and presentation control. The
+reference deployment therefore runs `pg_dump` under the distinct
+`oralhistarchiv_backup` OS/PostgreSQL identity, not under the web or scheduler
+identity. That database role has bulk read and `BYPASSRLS` solely so a recovery
+archive remains complete when Source B row-level policies arrive; it has no
+write privilege and must never be reused by application processes.
+
+The systemd oneshot creates a `0700` persistent state directory, enforces
+`UMask=0077`, allows only the local PostgreSQL Unix socket, and cannot read
+`/etc/oralhistarchiv` or either application environment file. After checking
+the configured database, role, Alembic state,
+and critical tables, it streams `pg_dump` directly through `age`; no plaintext
+dump is written to a filesystem. A hidden `0600` ciphertext is synced and
+atomically renamed only when both pipeline members succeed, and failure cleanup
+runs before any retention deletion. The corresponding private `age` identity
+stays off the database host and archive store. Recipient encryption protects
+confidentiality and detects modification during decryption, but does not
+authenticate the producer; provenance comes from the separately authenticated,
+versioned or immutable off-host transfer/store. A database/VM snapshot that
+contains both data and `/etc/oralhistarchiv/common.env` does not preserve the same
+separation and needs its own independently controlled encryption and access
+policy.
+
+Archive decryption and application-field decryption are separate recovery
+dependencies. Historical backups can still require old
+`TOTP_ENCRYPTION_KEYS` and `OUTBOX_ENCRYPTION_KEYS` after the live database has
+been rotated. The deployment and key-rotation runbooks define custody,
+retirement, failure-injection and isolated-restore checks; repository tests
+cannot prove those host-side facts.
+
+## Extension and deployment assumptions
+
+New routes must use the route policy, new catalogue fields need disclosure classification, and new credentials must remain out of logs. Database backups, privileged operators, upstream metadata trust, and socket/secret custody sit outside request-time redaction. Review those boundaries using the linked runbooks; startup checks and repository tests cannot establish host configuration or upstream correctness.

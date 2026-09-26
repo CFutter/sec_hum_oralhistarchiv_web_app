@@ -13,73 +13,68 @@
 
 [Unit]
 Description=Oral History Archive (Gunicorn/Uvicorn)
-After=network.target postgresql.service redis.service
-Wants=postgresql.service redis.service
+# The reference deployment adds a web-only Requires/After drop-in for its
+# local dedicated limiter. Keeping that host-specific dependency outside this
+# base unit preserves support for an institutionally managed external endpoint.
+# Hardened web startup still functionally probes RATE_LIMIT_REDIS_URL.
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
 
 [Service]
-# --- User & Group ---
-# Run as a dedicated non-root user for security.
-# Create with: sudo useradd --system --no-create-home --shell /usr/sbin/nologin oralhistarchiv
+# The service user owns the socket; the primary group is shared only with the
+# dedicated nginx worker identity. Do not add interactive users or unrelated
+# services to oralhistarchiv-proxy.
 User=oralhistarchiv
-Group=oralhistarchiv
+Group=oralhistarchiv-proxy
+UMask=0077
 
-# --- Working directory ---
-# Adjust to your installation path
-WorkingDirectory=/opt/oralhistarchiv/src
+# /opt/oralhistarchiv is a root-managed symlink created by install_release.py.
+WorkingDirectory=/opt/oralhistarchiv
 
-# --- Environment ---
-# Load environment variables from the .env file
-EnvironmentFile=/opt/oralhistarchiv/.env
+# systemd's root manager reads common.env, web.env, and optional shibboleth.env.
+# Each must be root:root 0600 in root-controlled /etc/oralhistarchiv.
+# Import application code only from the installed wheel in this release's venv,
+# and never expose the monitor-only Redis credential to the web process.
+UnsetEnvironment=PYTHONPATH PYTHONHOME VIRTUAL_ENV RATE_LIMIT_MONITOR_REDIS_URL
 
-# Ensure Python can find the application packages
-Environment="PYTHONPATH=/opt/oralhistarchiv/src"
-
-# --- Runtime directory for the Unix socket ---
-# systemd creates /run/oralhistarchiv/ with correct permissions on start
+# systemd owns the parent directory boundary; Gunicorn's `umask = 0o117`
+# independently produces a 0660 socket inode.
 RuntimeDirectory=oralhistarchiv
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0750
 
-# --- Log output ---
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=oralhistarchiv
 
-# --- Prestart command ---
-ExecStartPre=/opt/oralhistarchiv/.venv/bin/python -m alembic -c /opt/oralhistarchiv/src/alembic.ini upgrade head
 
-# --- Start command ---
-ExecStart=/opt/oralhistarchiv/.venv/bin/gunicorn \
-    -c /opt/oralhistarchiv/gunicorn.conf.py \
-    app.main:app
+EnvironmentFile=/etc/oralhistarchiv/common.env
+EnvironmentFile=/etc/oralhistarchiv/web.env
+EnvironmentFile=-/etc/oralhistarchiv/shibboleth.env
+ExecStartPre=/usr/bin/test ${ENV_STATE} = production
+ExecStart=/usr/bin/flock --shared --no-fork /run/lock/oralhistarchiv-deploy.lock /opt/oralhistarchiv/.venv/bin/python -I -m gunicorn -c /opt/oralhistarchiv/gunicorn.conf.py app.main:app
 
-# --- Restart policy ---
 Restart=on-failure
 RestartSec=5
 
-# --- Resource limits ---
-# Prevent runaway memory usage
-# Monitor Memory usage and change according to demand
 MemoryMax=1024M
 
 # File descriptor limit (connections + file handles)
 LimitNOFILE=4096
 
-# --- Security hardening ---
-# Restrict filesystem access
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/oralhistarchiv/data /run/oralhistarchiv
+ReadWritePaths=/run/oralhistarchiv
 
-# Restrict kernel capabilities
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 
-# Restrict network (allow outbound for OAI-PMH sync and SMTP)
+# Permit Unix/TCP address families; this does not restrict destination hosts.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]

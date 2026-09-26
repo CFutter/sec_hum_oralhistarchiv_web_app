@@ -1,0 +1,15 @@
+# Enable this timer after provisioning oralhistarchiv-backup.service. Schedule
+# daily at 02:00 UTC with up to 15 minutes randomized delay and one-minute
+# accuracy; Persistent catches a missed activation after downtime.
+[Unit]
+Description=Run the Oral History Archive encrypted backup daily
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 UTC
+RandomizedDelaySec=15m
+AccuracySec=1m
+Persistent=true
+Unit=oralhistarchiv-backup.service
+
+[Install]
+WantedBy=timers.target

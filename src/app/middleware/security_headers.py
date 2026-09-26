@@ -1,41 +1,25 @@
-"""
-=============================================================================
-Security Headers Configuration
-=============================================================================
-Using explicit configuration for audit clarity.
-
-Note: The secure library documents SecureASGIMiddleware, but it is not
-present in PyPI release 1.0.1. Using set_headers_async() as the documented
-alternative. See: https://github.com/TypeError/secure
-"""
+"""Build the response security-header policy; applying it is the caller's responsibility."""
 
 from secure import Secure
 from secure.headers import (
     ContentSecurityPolicy,
-    StrictTransportSecurity,
+    PermissionsPolicy,
     ReferrerPolicy,
+    StrictTransportSecurity,
     XContentTypeOptions,
     XFrameOptions,
-    PermissionsPolicy, 
 )
 
 _HSTS_MAX_AGE = 31536000  # 1 year in seconds
 
 
 def build_secure_headers(is_production: bool) -> Secure:
-    """Build the security headers configuration.
+    """Return CSP, framing, MIME, referrer, and browser-permission headers.
 
-    Configures Content-Security-Policy, X-Frame-Options, Referrer-Policy,
-    X-Content-Type-Options, and Permissions-Policy for all responses.
-    HSTS is added only in production.
-
-    Note: Cache-Control: no-store for authenticated responses is handled
-    separately in the security headers middleware (main.py), since it
-    must not apply to static assets.
+    Production adds one-year HSTS with subdomains and preload. Cache-Control
+    and action-page referrer overrides are applied separately by main.py.
     """
-    # CSP — explicit directives rather than relying on default-src fallback.
-    # Future browser CSP changes may add directives that don't inherit from
-    # default-src; specifying each one explicitly insulates against that.
+    # Explicit directives keep each allowed resource category reviewable.
     csp = (
         ContentSecurityPolicy()
         .default_src("'self'")
@@ -55,25 +39,12 @@ def build_secure_headers(is_production: bool) -> Secure:
     )
 
     if is_production:
-        # WARNING: This sets the `preload` directive on the HSTS header, signaling
-        # eligibility for the HSTS preload list. The header alone is harmless — only
-        # an explicit submission at https://hstspreload.org adds the domain to
-        # browsers' built-in preload lists. Serving the domain over HTTP again 
-        # (development, debugging, transition), would be blocked by the 
-        # preload list.
-        hsts = (
-            StrictTransportSecurity()
-            .max_age(_HSTS_MAX_AGE)
-            .include_subdomains()
-            .preload()
-        )
+        # HSTS also applies to subdomains; preload-list enrollment is external.
+        hsts = StrictTransportSecurity().max_age(_HSTS_MAX_AGE).include_subdomains().preload()
     else:
         hsts = None
 
-    # Permissions-Policy — disable browser features the app doesn't use.
-    # Defense-in-depth: even if compromised content is injected, these
-    # features can't be triggered. Each directive is "no origin allowed"
-    # (empty allowlist).
+    # Disable unused browser capabilities with empty allowlists.
     permissions = (
         PermissionsPolicy()
         .accelerometer()
@@ -88,7 +59,7 @@ def build_secure_headers(is_production: bool) -> Secure:
         .usb()
     )
 
-    secure_headers = Secure(
+    return Secure(
         csp=csp,
         hsts=hsts,
         referrer=ReferrerPolicy().strict_origin_when_cross_origin(),
@@ -96,5 +67,3 @@ def build_secure_headers(is_production: bool) -> Secure:
         xfo=XFrameOptions().deny(),
         permissions=permissions,
     )
-
-    return secure_headers

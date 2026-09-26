@@ -6,11 +6,11 @@
   <p>Click below to verify this email address: {{ email }}</p>
 
   <div class="auth-section">
-    <form class="auth-form" action="{{ request.url_for('verify_email_submit') }}" method="post">
+    <form class="auth-form" action="{{ path_for(request, 'verify_email_submit') }}" method="post">
       <input type="hidden" name="token" value="{{ token }}">
       <button type="submit" class="btn btn-primary">Confirm Email</button>
     </form>
-    <p class="auth-link"><a href="{{ request.url_for('login_page') }}">Cancel</a></p>
+    <p class="auth-link"><a href="{{ path_for(request, 'login_page') }}">Cancel</a></p>
   </div>
 </section>
 {% endblock %}

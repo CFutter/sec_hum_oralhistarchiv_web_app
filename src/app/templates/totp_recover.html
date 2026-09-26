@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% set active_page = "login" %}
+{% block title %}Recover Authenticator — Oral History Archive{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+  <h1>Recover Authenticator</h1>
+  <p class="auth-intro">
+    After an administrator verifies your identity, enter the one-time recovery
+    code you saved during authenticator setup together with your current
+    account password. You will then have a short time to enroll a replacement
+    authenticator.
+  </p>
+
+  {% if error %}
+  <div class="auth-error">{{ error }}</div>
+  {% endif %}
+
+  <div class="auth-section">
+    <form class="auth-form" action="{{ path_for(request, 'totp_recovery_submit') }}" method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+
+      <div class="form-group">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" required maxlength="200"
+               value="{{ email | default('', true) }}" autocomplete="email">
+      </div>
+
+      <div class="form-group">
+        <label for="password">Current Password</label>
+        <input type="password" id="password" name="password" required maxlength="200"
+               autocomplete="current-password">
+      </div>
+
+      <div class="form-group">
+        <label for="recovery_code">Saved Recovery Code</label>
+        <input type="text" id="recovery_code" name="recovery_code" required
+               maxlength="{{ recovery_code_max_chars }}"
+               autocomplete="one-time-code" spellcheck="false">
+        <span class="form-hint">
+          Each saved code can be used once. Administrator authorization expires
+          after {{ recovery_authorization_lifetime_minutes }} minutes.
+        </span>
+      </div>
+
+      <button type="submit" class="btn btn-primary">Continue to Authenticator Setup</button>
+    </form>
+
+    <p class="auth-link"><a href="{{ path_for(request, 'login_page') }}">Back to login</a></p>
+  </div>
+</section>
+{% endblock %}

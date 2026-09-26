@@ -1,62 +1,52 @@
-"""Dataset data service — abstraction layer between routes and data.
+"""Query PostgreSQL catalogue metadata and redact it for the caller's tier.
 
-Reads from the PostgreSQL oral_history_datasets table. The public API
-functions (search_datasets, get_facets, etc.) are used by routes; internal
-helpers (prefixed _) should not be accessed directly.
+Database errors propagate. Public query helpers apply metadata visibility;
+access_level describes upstream resource access and does not authorize it.
 """
-import logging
-from datetime import timezone
 
-from dataclasses import dataclass, field, fields as dataclass_fields
-from psycopg import sql
-from psycopg_pool import AsyncConnectionPool
-from psycopg.rows import tuple_row
-from psycopg.sql import Composable
+import logging
+from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
+from datetime import UTC, datetime
 from typing import Any
 
+from psycopg import sql
+from psycopg.rows import tuple_row
+from psycopg.sql import Composable
+from psycopg_pool import AsyncConnectionPool
 
-from .access_tiers import AccessTier, can_access, tier_rank
+from .access_tiers import TIER_CASE_SQL, AccessTier, can_access, tier_rank
 from .db import get_db_cursor
+from .parsed_record import ParsedRecord
 from .schema import (
-    DATASET_SELECT_SQL, 
-    DATASET_SELECT_COLUMNS, 
-    DATASET_COMPUTED_FIELDS, 
-    DATASET_INSERT_COLUMNS, 
-    DATASET_COLUMNS
+    DATASET_COMPUTED_FIELDS,
+    DATASET_INSERT_COLUMNS,
+    DATASET_SELECT_COLUMNS,
+    DATASET_SELECT_SQL,
+    PARSER_OWNED,
+    build_record_params,
 )
+from .schema_invariants import assert_columns_match_dataclass
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# Data models
-# =============================================================================
 
 @dataclass
 class Author:
-    """A dataset author (single name field)."""
+    """An author's display name."""
+
     name: str
+
 
 @dataclass
 class Dataset:
-    """A single oral history dataset record.
+    """Catalogue metadata with independent resource and metadata access fields.
 
-    Authorization uses two independent fields:
-
-    - access_level: Download restriction from the upstream source
-      (e.g., "public", "restricted"). Set automatically during sync
-      based on the OAI-PMH license field. Controls whether a user
-      can access the actual resource (recordings, transcripts).
-
-    - visibility_tier: Metadata visibility level ("public",
-      "registered", "vetted"). Set per-dataset by administrators.
-      Controls which metadata fields are shown to a given user —
-      users below the required tier see a redacted view
-      (title and access_level only, via filter_for_tier).
-
-    These are intentionally orthogonal: a dataset can be publicly
-    visible (metadata browsable by anyone) but restricted for
-    download, or vice versa.
+    access_level describes upstream resource restrictions for display and
+    filtering; visibility_tier controls local metadata disclosure. The
+    upstream service enforces resource access.
     """
+
     id: int
     uuid: str
     title: str
@@ -68,7 +58,7 @@ class Dataset:
     authors: list[Author] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
     resource_proxies: list[dict[str, Any]] = field(default_factory=list)
-    download_url: str | None = None
+    resource_access_url: str | None = None
     landing_page_url: str | None = None
     license_val: str | None = None
     license_url: str | None = None
@@ -79,17 +69,16 @@ class Dataset:
     bibliographical_citation: str | None = None
     source: str = "swissubase"
     visibility_tier: AccessTier = "vetted"
-    
 
-# =============================================================================
-# Internal: load and parse
-# =============================================================================
 
 def _parse_dataset(row: dict[str, Any]) -> Dataset:
-    """Parse a DB row (dict) into a Dataset dataclass."""
+    """Build a Dataset from every DATASET_SELECT_COLUMNS key; missing keys raise KeyError.
+
+    Normalize empty fields, log and skip malformed authors, and derive access
+    and landing URLs from the first truthy matching resource-proxy references.
+    """
     row_authors = row.get("authors") or []
     parsed_authors = []
-    license_val = row.get("license_val") or ""
 
     for a in row_authors:
         if isinstance(a, str):
@@ -97,49 +86,41 @@ def _parse_dataset(row: dict[str, Any]) -> Dataset:
         elif isinstance(a, dict) and "name" in a:
             parsed_authors.append(Author(name=a["name"]))
         else:
-            logger.warning("Skipping malformed author entry: %r", a) 
+            logger.warning("Skipping malformed author entry: %r", a)
             continue
 
     proxies = row.get("resource_proxies") or []
-    download_url = None
+    resource_access_url = None
     landing_page_url = None
     if isinstance(proxies, list):
         for proxy in proxies:
             if isinstance(proxy, dict):
                 proxy_type = proxy.get("type") or ""
-                if proxy_type == "Resource" and not download_url:
-                    download_url = proxy.get("ref")
+                if proxy_type == "Resource" and not resource_access_url:
+                    resource_access_url = proxy.get("ref")
                 elif proxy_type == "LandingPage" and not landing_page_url:
                     landing_page_url = proxy.get("ref")
 
-    return Dataset(
-        id=row["id"],
-        uuid=row["uuid"],
-        title=row["title"] or "(untitled)",
-        project_title=row.get("project_title"),
-        description=row.get("description"),
-        resource_description=row.get("resource_description"),
-        languages=row.get("languages") or [],
-        project_description=row.get("project_description"),
+    # Derive forwarding from the SELECT contract: new selected fields cannot
+    # disappear behind dataclass defaults, and incomplete rows fail here.
+    values = {name: row[name] for name in DATASET_SELECT_COLUMNS}
+    values.update(
+        title=values["title"] or "(untitled)",
         authors=parsed_authors,
-        keywords=row.get("keywords") or [],
-        resource_proxies=row.get("resource_proxies") or [],
-        download_url=download_url,
+        languages=values["languages"] or [],
+        keywords=values["keywords"] or [],
+        resource_proxies=values["resource_proxies"] or [],
+        access_level=values["access_level"] or "restricted",
+        source=values["source"] or "swissubase",
+        visibility_tier=values["visibility_tier"] or "vetted",
+        resource_access_url=resource_access_url,
         landing_page_url=landing_page_url,
-        license_val=license_val,
-        license_url=row.get("license_url"),
-        access_level=row.get("access_level") or "restricted",
-        version=row.get("version"),
-        doi=row.get("doi"),
-        resource_type=row.get("resource_type"),
-        bibliographical_citation=row.get("bibliographical_citation"),
-        source=row.get("source") or "swissubase",
-        visibility_tier=row.get("visibility_tier") or "vetted",
     )
+    return Dataset(**values)
 
-# =============================================================================
-# Public API
-# =============================================================================
+
+_DATASET_ORDER_SQL = sql.SQL("upstream_modified_at DESC NULLS LAST, id DESC")
+
 
 async def search_datasets(
     pool: AsyncConnectionPool,
@@ -151,50 +132,27 @@ async def search_datasets(
     page: int = 1,
     page_size: int = 20,
 ) -> tuple[list[Dataset], int]:
-    """Search datasets with substring matching and exact-match filters.
+    """Return a redacted page and matching count, newest upstream timestamp first.
 
-    Every filter is tier-aware: a user only matches metadata on a dataset
-    whose ``visibility_tier`` their tier permits. The sole exception is the
-    always-public blob (title + access level), matchable on every dataset
-    so the catalogue stays browsable.
+    search_text is a trimmed, case-insensitive literal substring: title and
+    access level always match, other indexed metadata only at an allowed
+    tier. Nonempty keyword/language filters require exact array membership
+    and allowed visibility; access_level is an exact, ungated match. Empty
+    filters impose no restriction. page is one-based; callers must provide
+    a positive page and page_size. Ties sort by descending ID, NULL dates last.
 
-    - Free-text search matches the public blob (title + access level) on
-      every dataset, and the full blob (description, project fields,
-      keywords, authors) only on datasets the user may fully see.
-    - The ``keyword`` and ``language`` filters match ONLY on datasets the
-      user may fully see. Those fields are redacted by ``filter_for_tier``
-      for below-tier users, so an un-gated filter would leak their values
-      as a presence/absence oracle (a below-tier user could confirm a
-      hidden dataset carries a guessed keyword/language). Gating them here
-      closes that oracle while leaving redacted browse-by-title intact.
-    - The ``access_level`` filter is deliberately NOT tier-gated: access
-      level is shown on every dataset (including redacted ones), so
-      filtering on it reveals nothing the user cannot already see.
-
-    This function governs which rows *match* — the part that determines what
-    the result set and its ``total_count`` disclose. Restricted fields on the
-    returned rows are redacted via ``filter_for_tier``.
+    An empty later page triggers a separate count query that can observe
+    concurrent changes. page_size=0 on page 1 returns zero without counting.
     """
     offset = (page - 1) * page_size
-    rank = tier_rank(user_tier)  
+    rank = tier_rank(user_tier)
     fts_clause: Composable
 
-    visible_to_user = sql.SQL(
-        """(CASE visibility_tier
-                WHEN 'public'     THEN 0
-                WHEN 'registered' THEN 1
-                WHEN 'vetted'     THEN 2
-                ELSE 99
-            END) <= %(rank)s"""
-    )
-    
-    if search_text.strip():
-        escaped = (
-            search_text
-            .replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
+    visible_to_user = sql.SQL("""{tier_case} <= %(rank)s""").format(tier_case=TIER_CASE_SQL)
+
+    term = search_text.strip()
+    if term:
+        escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped}%"
         fts_clause = sql.SQL(
             "(search_text_public ILIKE %(pattern)s"
@@ -204,38 +162,24 @@ async def search_datasets(
         pattern = None
         fts_clause = sql.SQL("TRUE")
 
-    # PERF TODO (LOW, pre-Phase-2): this ends `ORDER BY last_modified DESC LIMIT`,
-    # which is a full-table sort — unindexed today. Add in the next migration:
-    #   CREATE INDEX ix_datasets_last_modified ON oral_history_datasets (last_modified DESC);   
-    # Additionally `%s = ANY(keywords)` is a seq-scan per filter, and a
-    # plain GIN index does NOT serve `= ANY` (only @> / <@ / && / =). To index this, BOTH:
-    #   (1) migration: CREATE INDEX ... USING GIN (keywords);  (and languages)
-    #   (2) rewrite this to `keywords @> ARRAY[%s]` (semantically identical for single
-    #       values, and @> is GIN-served). The index alone does nothing without the rewrite.
-    # Fine at current catalogue size; a cost cliff at Source-B scale.
+    where_clause = sql.SQL("""
+            {fts}
+            AND (%(keyword)s = ''  OR (keywords  @> ARRAY[%(keyword)s]  AND {visible}))
+            AND (%(language)s = '' OR (languages @> ARRAY[%(language)s] AND {visible}))
+            AND (%(access_level)s = '' OR access_level = %(access_level)s)
+    """).format(fts=fts_clause, visible=visible_to_user)
 
     sql_query = sql.SQL("""
         SELECT {columns}, COUNT(*) OVER() AS total_count
         FROM oral_history_datasets
-        WHERE
-            {fts}
-            -- keyword/language: only match rows the user may fully see, so the
-            -- filter can't probe redacted facet values (see docstring).
-            AND (%(keyword)s = ''  OR (%(keyword)s = ANY(keywords)  AND {visible}))
-            AND (%(language)s = '' OR (%(language)s = ANY(languages) AND {visible}))
-            -- access_level is visible on redacted rows; no tier gate needed.
-            AND (%(access_level)s = '' OR access_level = %(access_level)s)
-        ORDER BY last_modified DESC
+        WHERE {where}
+        ORDER BY {order}
         LIMIT %(limit)s OFFSET %(offset)s
-    """).format(
-        columns=DATASET_SELECT_SQL,
-        fts=fts_clause,
-        visible=visible_to_user,
-    )
+    """).format(columns=DATASET_SELECT_SQL, where=where_clause, order=_DATASET_ORDER_SQL)
 
     params = {
         "rank": rank,
-        "pattern": pattern,         
+        "pattern": pattern,
         "keyword": keyword,
         "language": language,
         "access_level": access_level,
@@ -248,160 +192,208 @@ async def search_datasets(
         rows = await cur.fetchall()
 
     if not rows:
-        return [], 0
+        if offset == 0:
+            return [], 0
+        count_query = sql.SQL("SELECT COUNT(*) FROM oral_history_datasets WHERE {where}").format(
+            where=where_clause
+        )
+        async with get_db_cursor(pool, row_factory=tuple_row) as cur:
+            await cur.execute(count_query, params)
+            row = await cur.fetchone()
+        return [], (row[0] if row else 0)
 
     total_count = rows[0]["total_count"]
     datasets = [filter_for_tier(_parse_dataset(row), user_tier) for row in rows]
     return datasets, total_count
 
 
-async def get_collection_datasets(
-    pool: AsyncConnectionPool, 
-    user_tier: AccessTier, 
-    limit: int = 50
-) -> list[Dataset]:
-    """Return tier-visible datasets that share a keyword with at least one other.
+async def get_global_catalogue_stats(
+    pool: AsyncConnectionPool,
+) -> tuple[int, datetime | None]:
+    """Return (dataset count, UTC rebuild time or None) from one statement snapshot.
 
-    Currently unused: no route calls this function and it is not exported
-    from app.services. Results are limited to datasets whose
-    visibility_tier the given user_tier permits, redacted via
-    filter_for_tier.
-
-    TODO: Support filtering by predefined collection IDs. Currently the
-    implicit "shared keywords" collection (keywords appearing in at least
-    two visible records) is the only grouping. Planned for a next step.
+    Raises RuntimeError if no row is returned and TypeError for unexpected
+    count or timestamp types.
     """
-    rank = tier_rank(user_tier)
-    query = sql.SQL("""
-        WITH visible AS (
-            SELECT * FROM oral_history_datasets
-            WHERE (CASE visibility_tier WHEN 'public' THEN 0
-                WHEN 'registered' THEN 1 WHEN 'vetted' THEN 2 ELSE 99 END) <= %(rank)s
-        ),
-        shared_keywords AS (
-            SELECT kw FROM (SELECT DISTINCT id, unnest(keywords) AS kw FROM visible) t
-            GROUP BY kw HAVING count(*) >= 2
-        )
-        SELECT {fields} FROM visible
-        WHERE keywords && (SELECT coalesce(array_agg(kw), '{{}}') FROM shared_keywords)
-        ORDER BY last_modified DESC
-        LIMIT %(limit)s
-    """).format(fields=DATASET_SELECT_SQL)
-
-    async with get_db_cursor(pool) as cur:
-        await cur.execute(query, {"rank": rank, "limit": limit})
-        return [filter_for_tier(_parse_dataset(row), user_tier) for row in await cur.fetchall()]
-
-
-async def get_recent_datasets(pool: AsyncConnectionPool, user_tier: AccessTier, limit: int = 3) -> tuple[list[Dataset], int]:
-    """Returns (recent_datasets, total_count) without loading the full table."""
-    async with get_db_cursor(pool) as cur:
-        await cur.execute("SELECT COUNT(*) AS cnt FROM oral_history_datasets")
-        row = await cur.fetchone()
-        total = row["cnt"] if row else 0
-
-        await cur.execute(
-            sql.SQL("SELECT {} FROM oral_history_datasets ORDER BY last_modified DESC LIMIT %s")
-            .format(DATASET_SELECT_SQL),
-            (limit,),
-        )
-        datasets = [filter_for_tier(_parse_dataset(row), user_tier) for row in await cur.fetchall()]
-
-    return datasets, total
-
-async def get_keyword_count(pool: AsyncConnectionPool, user_tier: AccessTier) -> int:
-    """True count of distinct keywords visible at this tier.
-
-    Unlike get_facets (which drops singletons to de-noise the sidebar), this
-    counts every distinct keyword — for the home-page stat. Still tier-scoped,
-    so it never reveals keywords from datasets above the user's tier.
-    """
-    rank = tier_rank(user_tier)
     async with get_db_cursor(pool, row_factory=tuple_row) as cur:
         await cur.execute(
             """
+            SELECT
+                (SELECT COUNT(*) FROM oral_history_datasets) AS total_datasets,
+                (
+                    SELECT last_full_rebuild_date
+                    FROM sync_status
+                    WHERE id = 1
+                ) AS last_full_rebuild
+            """
+        )
+        row = await cur.fetchone()
+
+    if row is None:
+        raise RuntimeError("Global catalogue-statistics query returned no row")
+
+    total_datasets, last_full_rebuild = row
+
+    if not isinstance(total_datasets, int):
+        raise TypeError("Global catalogue-statistics count has an invalid type")
+    if last_full_rebuild is not None and not isinstance(last_full_rebuild, datetime):
+        raise TypeError("Global catalogue-statistics timestamp has an invalid type")
+
+    return (
+        total_datasets,
+        last_full_rebuild.astimezone(UTC) if last_full_rebuild is not None else None,
+    )
+
+
+async def get_total_dataset_count(pool: AsyncConnectionPool) -> int:
+    """Return the tier-independent dataset count, or zero if no aggregate row arrives."""
+    async with get_db_cursor(pool, row_factory=tuple_row) as cur:
+        await cur.execute("SELECT COUNT(*) FROM oral_history_datasets")
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+
+async def get_recent_datasets(
+    pool: AsyncConnectionPool, user_tier: AccessTier, limit: int = 3
+) -> list[Dataset]:
+    """Return up to nonnegative limit redacted rows, newest upstream timestamp first.
+
+    NULL dates sort last; ties sort by descending ID.
+    """
+
+    async with get_db_cursor(pool) as cur:
+        await cur.execute(
+            sql.SQL("""
+            SELECT {}
+                FROM oral_history_datasets
+                ORDER BY {} LIMIT %s
+            """).format(DATASET_SELECT_SQL, _DATASET_ORDER_SQL),
+            (limit,),
+        )
+        rows = await cur.fetchall()
+
+    return [filter_for_tier(_parse_dataset(row), user_tier) for row in rows]
+
+
+async def get_keyword_count(pool: AsyncConnectionPool, user_tier: AccessTier) -> int:
+    """Count distinct nonempty keywords in datasets visible to user_tier."""
+    rank = tier_rank(user_tier)
+    async with get_db_cursor(pool, row_factory=tuple_row) as cur:
+        await cur.execute(
+            sql.SQL("""
             SELECT COUNT(DISTINCT kw) FROM (
                 SELECT unnest(keywords) AS kw
                 FROM oral_history_datasets
-                WHERE (CASE visibility_tier WHEN 'public' THEN 0
-                       WHEN 'registered' THEN 1 WHEN 'vetted' THEN 2
-                       ELSE 99 END) <= %(rank)s
+                WHERE {tier_case} <= %(rank)s
             ) t
             WHERE kw IS NOT NULL AND kw <> ''
-            """,
+            """).format(tier_case=TIER_CASE_SQL),
             {"rank": rank},
         )
         row = await cur.fetchone()
         return row[0] if row else 0
 
-async def get_facets(pool: AsyncConnectionPool, user_tier: AccessTier ) -> dict[str, list[str]]:
-    """Fetch unique keywords, languages, and access levels in one round-trip.
 
-    Tier-scoped: only datasets at or below the user's visibility tier
-    contribute facet values, so the sidebar can't enumerate keywords or
-    languages that occur only in datasets the user can't see.
+async def get_home_metadata_counts(
+    pool: AsyncConnectionPool,
+    user_tier: AccessTier,
+) -> tuple[int, int]:
+    """Return (distinct nonempty languages, keywords) for visible datasets.
 
-    Keywords are filtered to those appearing in at least two datasets
-    to reduce noise in the search sidebar. This threshold can be adjusted
-    in the HAVING clause below.
+    Raises RuntimeError if the aggregate returns no row.
+    """
+    async with get_db_cursor(pool, row_factory=tuple_row) as cur:
+        await cur.execute(
+            sql.SQL("""
+                WITH visible AS MATERIALIZED (
+                    SELECT languages, keywords FROM oral_history_datasets
+                    WHERE {tier_case} <= %(rank)s
+                )
+                SELECT
+                    (SELECT COUNT(DISTINCT value) FROM visible,
+                     LATERAL unnest(languages) AS value WHERE value <> ''),
+                    (SELECT COUNT(DISTINCT value) FROM visible,
+                     LATERAL unnest(keywords) AS value WHERE value <> '')
+            """).format(tier_case=TIER_CASE_SQL),
+            {"rank": tier_rank(user_tier)},
+        )
+        row = await cur.fetchone()
+    if row is None:
+        raise RuntimeError("Home metadata aggregate returned no row")
+    return int(row[0]), int(row[1])
+
+
+FACET_SAMPLE_SIZE = 200
+FACET_OPTION_LIMIT = 50
+
+
+async def get_facets(pool: AsyncConnectionPool, user_tier: AccessTier) -> dict[str, list[str]]:
+    """Return sorted keywords, languages, and access_levels suggestions.
+
+    Use the newest 200 rows and first 100 keyword/language entries per row,
+    then keep at most 50 values per facet. Keyword/language values require
+    allowed visibility; access levels do not. Keywords require at least two
+    occurrences, including duplicates within one row. Exact search filters
+    are not limited to this sample.
     """
     rank = tier_rank(user_tier)
-    query = """
-        SELECT facet, value FROM (
+    query = sql.SQL("""
+        WITH recent AS MATERIALIZED (
+            SELECT keywords[1:100] AS keywords, languages[1:100] AS languages,
+                   access_level, visibility_tier
+            FROM oral_history_datasets
+            ORDER BY upstream_modified_at DESC NULLS LAST, id DESC
+            LIMIT %(sample_size)s
+        ), combined AS (
             SELECT 'keyword' AS facet, unnest(keywords) AS value
-                FROM oral_history_datasets
-                WHERE (CASE visibility_tier WHEN 'public' THEN 0
-                    WHEN 'registered' THEN 1 WHEN 'vetted' THEN 2
-                    ELSE 99 END) <= %(rank)s
+                FROM recent WHERE {tier_case} <= %(rank)s
             UNION ALL
-            SELECT 'language', unnest(languages) 
-                FROM oral_history_datasets
-                WHERE (CASE visibility_tier WHEN 'public' THEN 0
-                        WHEN 'registered' THEN 1 WHEN 'vetted' THEN 2
-                        ELSE 99 END) <= %(rank)s
+            SELECT 'language', unnest(languages)
+                FROM recent WHERE {tier_case} <= %(rank)s
             UNION ALL
-            SELECT 'access_level', access_level 
-                FROM oral_history_datasets
-                WHERE (CASE visibility_tier WHEN 'public' THEN 0
-                       WHEN 'registered' THEN 1 WHEN 'vetted' THEN 2
-                       ELSE 99 END) <= %(rank)s
-        ) AS combined_facets
-        WHERE value IS NOT NULL AND value != ''
-        GROUP BY facet, value
-        HAVING facet != 'keyword' OR COUNT(*) >= 2
+            SELECT 'access_level', access_level FROM recent
+        ), ranked AS (
+            SELECT facet, value,
+                   ROW_NUMBER() OVER (PARTITION BY facet ORDER BY value) AS position
+            FROM combined WHERE value IS NOT NULL AND value != ''
+            GROUP BY facet, value
+            HAVING facet != 'keyword' OR COUNT(*) >= 2
+        )
+        SELECT facet, value FROM ranked WHERE position <= %(option_limit)s
         ORDER BY facet, value
-    """
-    
+        """).format(tier_case=TIER_CASE_SQL)
+
     facets: dict[str, list[str]] = {
         "keywords": [],
         "languages": [],
         "access_levels": [],
     }
-    
+
     async with get_db_cursor(pool, row_factory=tuple_row) as cur:
-        await cur.execute(query, {"rank": rank})
+        await cur.execute(
+            query,
+            {"rank": rank, "sample_size": FACET_SAMPLE_SIZE, "option_limit": FACET_OPTION_LIMIT},
+        )
         for facet, value in await cur.fetchall():
-            if facet == 'keyword':
+            if facet == "keyword":
                 facets["keywords"].append(value)
-            elif facet == 'language':
+            elif facet == "language":
                 facets["languages"].append(value)
-            elif facet == 'access_level':
+            elif facet == "access_level":
                 facets["access_levels"].append(value)
-                    
+
     return facets
 
 
-async def get_dataset_by_id(pool: AsyncConnectionPool, dataset_id: int, user_tier: AccessTier) -> Dataset | None:
-    """Fetch a dataset by id, already redacted for `user_tier`.
-
-    Returns a tier-filtered Dataset (below-tier callers get title + access_level
-    only) or None if no row exists. Redaction is applied here so no caller can
-    render an unredacted row. `visibility_tier` is preserved on the result, so
-    callers can still audit the access decision via can_view_full().
-    """
+async def get_dataset_by_id(
+    pool: AsyncConnectionPool, dataset_id: int, user_tier: AccessTier
+) -> Dataset | None:
+    """Return the tier-redacted dataset, or None when its ID is absent."""
     async with get_db_cursor(pool) as cur:
         await cur.execute(
-            sql.SQL("SELECT {} FROM oral_history_datasets WHERE id = %s").format(DATASET_SELECT_SQL),
+            sql.SQL("SELECT {} FROM oral_history_datasets WHERE id = %s").format(
+                DATASET_SELECT_SQL
+            ),
             (dataset_id,),
         )
         row = await cur.fetchone()
@@ -410,154 +402,136 @@ async def get_dataset_by_id(pool: AsyncConnectionPool, dataset_id: int, user_tie
         return filter_for_tier(_parse_dataset(row), user_tier)
 
 
-async def get_last_full_rebuild_date(pool: AsyncConnectionPool) -> str | None:
-    """Get the last *full rebuild* date, formatted for display.
-
-    This is when the dataset table was last fully reconciled against the 
-    upstream source (stale versions removed), so it is the meaningful
-    "data complete and consistent as of" marker. Incremental syncs run
-    more often but cannot detect in-place upstream updates, so they are
-    tracked separately as sync_status.last_harvest_date.
-
-    Returns None if a full rebuild has not completed yet.
-    """
+async def get_last_full_rebuild_date(pool: AsyncConnectionPool) -> datetime | None:
+    """Return the stored last-full-rebuild timestamp in UTC, or None if absent."""
     async with get_db_cursor(pool, row_factory=tuple_row) as cur:
         await cur.execute("SELECT last_full_rebuild_date FROM sync_status WHERE id = 1")
         row = await cur.fetchone()
-        if not row or not row[0]:
+        if not row:
             return None
-        return row[0].astimezone(timezone.utc).strftime('%d %B %Y, %H:%M UTC')
+        rebuilt_at: datetime | None = row[0]
+        if rebuilt_at is None:
+            return None
+        return rebuilt_at.astimezone(UTC)
+
 
 def validate_dataset_schema() -> None:
-    """Verify that DATASET_SELECT_COLUMNS and Dataset fields are in sync.
+    """Raise AssertionError if Dataset fields differ from the select/computed contract."""
+    assert_columns_match_dataclass(
+        Dataset,
+        DATASET_SELECT_COLUMNS,
+        DATASET_COMPUTED_FIELDS,
+        columns_label="DATASET_SELECT_COLUMNS",
+        dataclass_label="Dataset",
+    )
 
-    Catches drift between the SQL column list and the Python dataclass.
-    Raises AssertionError with a clear message if they diverge.
-    """
-    dataclass_field_names = {
-        f.name for f in dataclass_fields(Dataset)
-    } - DATASET_COMPUTED_FIELDS
-
-    select_columns = set(DATASET_SELECT_COLUMNS)
-
-    missing_from_dataclass = select_columns - dataclass_field_names
-    missing_from_select = dataclass_field_names - select_columns
-
-    errors = []
-    if missing_from_dataclass:
-        errors.append(
-            f"Columns in SELECT but not on Dataset: {missing_from_dataclass}"
-        )
-    if missing_from_select:
-        errors.append(
-            f"Fields on Dataset but not in SELECT: {missing_from_select}"
-        )
-
-    if errors:
-        raise AssertionError(
-            "DATASET_SELECT_COLUMNS / Dataset mismatch: "
-            + "; ".join(errors)
-        )
 
 def validate_dataset_insert_schema() -> None:
-    """Verify INSERT column list matches what _build_record_params emits.
-
-    Catches drift between DATASET_INSERT_COLUMNS and the record-to-tuple
-    construction in sync.py. Runs at startup so ordering bugs fail loudly.
-    """
-    expected_trailing = ["data", "last_modified"]
-    if DATASET_INSERT_COLUMNS[:len(DATASET_COLUMNS)] != DATASET_COLUMNS:
+    """Raise AssertionError on parser/insert-column drift using one synthetic record."""
+    if set(ParsedRecord.model_fields) - {"visibility_tier"} != PARSER_OWNED:
+        raise AssertionError("ParsedRecord and parser-owned SQL columns differ")
+    synthetic: dict[str, Any] = dict.fromkeys(PARSER_OWNED)
+    synthetic.update(uuid="startup-check", title="Schema check")
+    for name in (
+        "languages",
+        "authors",
+        "keywords",
+        "institutions",
+        "main_disciplines",
+        "resource_proxies",
+    ):
+        synthetic[name] = []
+    params = build_record_params(
+        synthetic,
+        access_level="public",
+        source="startup-check",
+        visibility_tier="public",
+    )
+    if len(params) != len(DATASET_INSERT_COLUMNS):
         raise AssertionError(
-            "DATASET_INSERT_COLUMNS must start with DATASET_COLUMNS in order."
-        )
-    if DATASET_INSERT_COLUMNS[len(DATASET_COLUMNS):] != expected_trailing:
-        raise AssertionError(
-            f"DATASET_INSERT_COLUMNS must end with {expected_trailing}, "
-            f"got {DATASET_INSERT_COLUMNS[len(DATASET_COLUMNS):]}"
+            f"build_record_params emitted {len(params)} values for "
+            f"{len(DATASET_INSERT_COLUMNS)} insert columns — record→tuple drift."
         )
 
-# =============================================================================
-# Access-tier visibility
-# =============================================================================
 
 def can_view_full(dataset: Dataset, user_tier: AccessTier) -> bool:
-    """Check if a user's access tier allows full metadata visibility.
-
-    Compares the user's tier against the dataset's visibility_tier.
-    The visibility_tier is set per-dataset in the database, allowing
-    fine-grained control independent of access_level (download restrictions).
-    """
+    """Return whether user_tier permits dataset.visibility_tier."""
     return can_access(user_tier, dataset.visibility_tier)
 
 
-_TIER_VISIBLE_FIELDS = frozenset({
-    "id", "uuid", "title", "access_level", "version", "source", "visibility_tier",
-})
+# Security boundary: every value in these fields is deliberately disclosed to
+# anonymous users for every dataset, including records whose full metadata
+# requires the registered or vetted tier. Sources must guarantee that the
+# values are safe for unrestricted publication both individually and in
+# combination. Changing this set is a policy decision, not a presentation tweak.
+PUBLIC_DISCOVERY_FIELDS = frozenset(
+    {
+        "id",
+        "uuid",
+        "title",
+        "access_level",
+        "version",
+        "source",
+        "visibility_tier",
+    }
+)
 
-def _redacted_values() -> dict:
-    """Return the redacted value for every non-visible Dataset field.
+# Only this subset participates in ungated free-text search for above-tier
+# records. The database trigger that builds search_text_public is pinned to
+# this exact set by the tier tests and by the runtime schema contract.
+PUBLIC_SEARCH_FIELDS = frozenset({"title", "access_level"})
 
-    A function rather than a module constant so each redacted Dataset gets
-    its own fresh list objects — a shared [] would be aliased across every
-    redacted dataset, so an in-place mutation on one would leak onto all.
-    Keys are the authoritative set of redacted fields (see assert_redaction_total).
-    """
+
+def _redacted_values() -> dict[str, Any]:
+    """Return redaction defaults with fresh lists; keys define the redacted-field policy."""
     return {
-        "project_title": None, 
-        "description": None, 
+        "project_title": None,
+        "description": None,
         "resource_description": None,
-        "languages": [], 
-        "project_description": None, 
-        "authors": [], 
+        "languages": [],
+        "project_description": None,
+        "authors": [],
         "keywords": [],
-        "resource_proxies": [], 
-        "download_url": None, 
+        "resource_proxies": [],
+        "resource_access_url": None,
         "landing_page_url": None,
-        "license_val": None, 
-        "license_url": None, 
+        "license_val": None,
+        "license_url": None,
         "doi": None,
-        "resource_type": None, 
+        "resource_type": None,
         "bibliographical_citation": None,
     }
 
+
 def filter_for_tier(dataset: Dataset, user_tier: AccessTier) -> Dataset:
-    """Return a copy of the dataset with restricted fields redacted.
+    """Return dataset itself when allowed, otherwise a new redacted Dataset.
 
-    If the user's tier is sufficient, the dataset is returned unchanged.
-    Otherwise a new Dataset is built from two sources: the tier-visible
-    fields (_TIER_VISIBLE_FIELDS) copied from the original, and every other
-    field reset to its redacted value (_redacted_values()). A below-tier viewer
-    keeps only id, uuid, title, access_level, version, source and
-    visibility_tier.
-
-    Every Dataset field must appear in exactly one of those two sets;
-    assert_redaction_total() enforces this at startup, so a newly added field
-    fails fast rather than silently leaking or vanishing.
+    The copy retains PUBLIC_DISCOVERY_FIELDS and resets every other field
+    using _redacted_values(), including fresh lists.
     """
     if can_view_full(dataset, user_tier):
         return dataset
-    visible = {name: getattr(dataset, name) for name in _TIER_VISIBLE_FIELDS}
+    visible = {name: getattr(dataset, name) for name in PUBLIC_DISCOVERY_FIELDS}
     return Dataset(**visible, **_redacted_values())
 
 
 def assert_redaction_total() -> None:
-    """Verify every Dataset field is classified as visible or redacted, exactly once.
+    """Raise AssertionError unless every Dataset field has exactly one disclosure policy.
 
-    Builds the classified set from _TIER_VISIBLE_FIELDS and the keys of
-    _redacted_values() and compares it against the Dataset dataclass
-    fields. A field in neither set would silently leak (or vanish) after
-    redaction; a field in both signals a contradictory classification. Runs
-    at startup so a newly added field fails fast.
-
-    Raises:
-        AssertionError: If any field is unclassified or appears in both sets.
+    Reject unknown policy fields and PUBLIC_SEARCH_FIELDS outside
+    PUBLIC_DISCOVERY_FIELDS.
     """
-    classified = _TIER_VISIBLE_FIELDS | _redacted_values().keys()
+    classified = PUBLIC_DISCOVERY_FIELDS | _redacted_values().keys()
     all_fields = {f.name for f in dataclass_fields(Dataset)}
     missing = all_fields - classified
-    overlap = _TIER_VISIBLE_FIELDS & _redacted_values().keys()
-    if missing or overlap:
+    overlap = PUBLIC_DISCOVERY_FIELDS & _redacted_values().keys()
+    unknown = classified - all_fields
+    unapproved_search = PUBLIC_SEARCH_FIELDS - PUBLIC_DISCOVERY_FIELDS
+    if missing or overlap or unknown or unapproved_search:
         raise AssertionError(
             f"filter_for_tier classification incomplete — "
-            f"unclassified fields: {sorted(missing)}; in both sets: {sorted(overlap)}"
+            f"unclassified fields: {sorted(missing)}; in both sets: {sorted(overlap)}; "
+            f"not Dataset fields: {sorted(unknown)}; "
+            f"publicly searchable but not public-discovery fields: "
+            f"{sorted(unapproved_search)}"
         )

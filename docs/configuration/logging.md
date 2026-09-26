@@ -1,52 +1,36 @@
 # Logging & Audit
 
-The application produces two distinct streams of log output: an **application log** for ordinary operational visibility, and an **audit log** for compliance-grade request tracking. They share infrastructure but have different purposes and consumers.
+Application and audit loggers write to stdout. Audit events support request and security review; their completeness and retention depend on application coverage and host configuration.
 
 Both streams go to stdout, captured by systemd-journald in production. journald handles rotation and retention.
 
 ## The two streams
 
-| | Application log | Audit log |
+| | Application | Audit |
 |---|---|---|
-| **Logger name** | module-scoped (`app.routes.pages`, etc.) | `audit` |
-| **What goes in** | Anything `logger.info()`/`warning()`/`error()` from application code | One structured record per HTTP request, plus per-event records |
-| **Format** | JSON (production) / text (development) | Same formatter as the application log |
-| **Destination** | stdout → systemd-journald | stdout → systemd-journald |
-| **Retention** | Managed by journald (`MaxRetentionSec` in journald.conf) | Same |
-| **Consumer** | Operators, developers debugging incidents | Compliance, security review, incident response |
-| **Remote shipping** | No | Optional, via a host-level rsyslog agent reading journald (see `deploy/rsyslog-oralhistarchiv.conf.example` and Deployment.md §12) — not an application setting |
+| Logger | Module name | `audit` |
+| Format | `LOG_FORMAT=json` selects JSON; other values select text | Always JSON |
+| Minimum level | `LOG_LEVEL` | INFO |
+| Content | Operational events | Audited requests and explicit security events |
+| Destination | stdout | stdout, without root propagation |
 
-Both streams pass through a `SensitiveDataFilter` that replaces any configured secret value with a `[REDACTED:<field_name>]` marker (details below). One deliberate difference: the **application** log's filter additionally auto-redacts anything matching an email-address pattern; the **audit** channel's filter does not, because audit events never carry raw addresses in the first place — where an email must be correlated, the code logs the keyed, truncated `audit_email_hash(...)` instead (an HMAC under a `SECRET_KEY`-derived key, so log holders cannot precompute a lookup table).
+`setup_logging()` replaces existing root/audit handlers. Both channels redact configured secret values and recognized runtime-secret shapes. Application output redacts email-pattern matches; audit filtering first converts matching address values to keyed markers, or redacts them before a hasher is registered. Matching is heuristic; never intentionally log credentials or private content. Host forwarding can include both streams.
 
 ## Why stdout instead of files?
 
-Earlier versions used `TimedRotatingFileHandler` for both streams. This is **not** multi-process safe — when gunicorn workers rotate at midnight simultaneously, log entries can be corrupted or lost. The Python stdlib documentation explicitly warns against using rotating file handlers across multiple processes.
-
-systemd-journald is designed for multi-process log collection. It handles rotation, retention, and indexing reliably across all workers.
+The application leaves collection, rotation, retention, and forwarding to systemd-journald and the host agent. It does not coordinate shared file rotation. Python StreamHandler has no cross-process atomic-write guarantee; verify collected records under the deployed worker configuration.
 
 ## Audit log fields
 
-Every per-request audit log line carries a consistent set of fields:
+Per-request records include UTC timestamp, logger/level/message, source module/function/line, `request_id`, `event_type`, client IP, method, safe path, scrubbed query structure, status, elapsed milliseconds, and resolved user ID or null. The 16-hex request ID is attached to request state and returned responses as `X-Request-ID`; requests rejected before this middleware may have neither.
 
-| Field | Description |
-|---|---|
-| `timestamp` | ISO 8601 UTC |
-| `level` | `INFO` for successful requests, `WARNING` for 4xx, `ERROR` for 5xx |
-| `request_id` | 16-character hex, also exposed on `request.state.request_id` and in the `X-Request-ID` response header; used as a correlation key across application logs |
-| `event_type` | `request`, `request_error`, `dataset_access`, `login_success`, etc. |
-| `client_ip` | Real client IP (`X-Real-IP` / `X-Forwarded-For` are honoured only when `RATE_LIMIT_TRUST_PROXY=true` and the request arrived through a trusted upstream — an allowlisted TCP peer or the Unix socket) |
-| `method` | HTTP method |
-| `path` | URL path (scrubbed for token segments — see *Sensitive data redaction* below) |
-| `query_string` | Query string (scrubbed for non-allowlisted parameters) |
-| `status_code` | HTTP status code |
-| `duration_ms` | Wall-clock duration of the request |
-| `user_id` | Authenticated user's database ID, or `null` for guests |
+Status below 400 logs INFO, 4xx WARNING, and 5xx ERROR. Exact `/health` and `/static/` paths skip statuses below 400, including redirects; `/health/detail` and errors remain audited. Escaping Exceptions log `request_error` with status 500 and are re-raised. Elapsed time ends when downstream returns a response, before streaming completes.
 
-A handful of route handlers emit additional structured `event_type` records on top of the per-request line. The most important is `dataset_access`, emitted whenever a restricted-tier dataset detail page is rendered (whether or not access was granted). It carries `dataset_id`, `dataset_uuid`, `dataset_visibility_tier`, `user_id`, `user_tier`, and `access_granted`. This is the record you would consult during a privacy investigation: who looked at which restricted dataset, when, and whether they were authorised at the time.
+Client IP uses the trusted-proxy policy in `request_utils.py`; safe deployment of Unix-socket attribution requires the filesystem boundary in [Deployment](../configuration/deployment.md). `dataset_access` is emitted for non-public-tier dataset detail rendering and includes IDs, user/dataset tiers, and `access_granted`; it records metadata access, not upstream downloads.
 
 ## Rotation and retention
 
-Rotation is handled by journald. Configure in `/etc/systemd/journald.conf.d/oralhistarchiv.conf`:
+Configure journald on the host, for example in `/etc/systemd/journald.conf.d/oralhistarchiv.conf`:
 
 ```ini
 [Journal]
@@ -55,83 +39,52 @@ SystemMaxFileSize=128M
 MaxRetentionSec=30day
 ```
 
-Apply with `sudo systemctl restart systemd-journald`.
+Apply with `sudo systemctl restart systemd-journald`. Application and audit events share the journal quota; 30 days is an upper retention limit, not a guarantee when storage pressure removes older entries. Use the shipped rsyslog forwarding example and a separately managed collector policy when longer retention is required. No periodic export job is supplied.
 
-**Retention shift from earlier versions:** the previous file-based setup retained audit logs for 365 days. Under journald, both application and audit logs share the same retention pool (30 days by default in the shipped config). Options for longer audit retention:
+## Remote stream identity
 
-1. Increase `MaxRetentionSec` and `SystemMaxUse` in journald.conf
-2. Ship audit records off-host with the rsyslog agent (`deploy/rsyslog-oralhistarchiv.conf.example`) and apply the collector's retention policy
-3. Periodic export-to-disk via cron (Phase 2)
+The web, scheduler, backup, and migration systemd units set the stable journal
+identifiers `oralhistarchiv`, `oralhistarchiv-scheduler`,
+`oralhistarchiv-backup`, and `oralhistarchiv-migrate`.
+The rsyslog forwarding rule does not trust those process-visible strings as
+its selector: it selects the trusted journald `_SYSTEMD_UNIT` values
+`oralhistarchiv.service`, `oralhistarchiv-scheduler.service`,
+`oralhistarchiv-backup.service`, and `oralhistarchiv-migrate.service`. The
+identifiers remain useful as stable collector fields. Remote shipping is not
+an active security control until a
+real event from every unit—not a synthetic `logger -t` event—has been observed
+at the collector and action suspension/queue growth are monitored.
 
 ## Sensitive data redaction
 
-Three layers of redaction operate before logs are written:
+`app/request_utils.py` supplies `safe_request_path` and `scrub_sensitive_query`. After routing, paths use the route template; otherwise known action-token path segments are scrubbed. Unmatched concrete paths can still contain attacker-chosen text. Query logging retains at most 20 components: known `q`, `page`, `keyword`, `language`, and `access_level` names become `name=<present>`; other names/values become generic markers. No query values are preserved.
 
-**Path token scrubbing.** Sensitive route prefixes have their token segments replaced before logging: `/reset-password/abc123...`, `/verify-email/abc123...`, and `/account/confirm-email/abc123...` all become `/<prefix>/<token>`. See `_scrub_path` and `_TOKEN_PATH_REGEX` in `app/middleware/audit_logging.py`. If you add new token-bearing routes, update the regex.
+`SensitiveDataFilter` recursively redacts messages/extras using actual Settings values whose annotations contain `SecretStr` or whose metadata marks them sensitive. Rules also match known Fernet tokens, image data URIs, TOTP seeds, displayed recovery codes, action-token paths, and Bearer tokens. Values shorter than eight characters warn and are skipped. Patterns are built lazily and cached; changing settings requires restart. Unmatched secrets, alternate encodings, and address forms can remain, so filters do not make arbitrary object logging safe.
 
-**Query parameter scrubbing.** Query parameters use an allowlist — only the known-safe categorical parameters `page`, `keyword`, `language`, and `access_level` appear verbatim. Anything else is logged as `<key>=<redacted>`, so free-text search queries (`q=`), email addresses, and tokens never reach the logs. See `_scrub_query` and `_SAFE_QUERY_PARAMS` in `app/middleware/audit_logging.py`. If you add new safe parameters, update the allowlist.
+Audit email filtering hashes matching message/extra values before formatting; callers should still use `audit_email_hash` explicitly. Dictionary keys are not hashed by that filter, although final formatting applies application redaction.
 
-**SecretStr field redaction.** The `SensitiveDataFilter` (in `config/logging.py`) collects, from `Settings.model_fields`, every field that is a `SecretStr` or marked `json_schema_extra={"sensitive": True}`. For each such field, the filter compiles a regex from the actual current value and applies it to the message and to every non-standard extra field of every log record, replacing matches with `[REDACTED:<field_name>]`. A static pattern also strips `Bearer <token>` values, and the application-log instance adds the email pattern. This means a developer can `logger.info("Got %s", some_object)` without remembering whether `some_object` happens to contain a secret — if it does, the secret is redacted before it hits the log. (The pattern set is built lazily on first use, after settings are loaded.)
-
-Two limitations to know about:
-
-- **Values shorter than 8 characters cannot be reliably redacted** (the substring is too likely to appear in unrelated text). The filter emits a warning for any such sensitive field and skips it.
-- **Redaction is value-based, not field-based.** If two settings happen to share the same value, both occurrences are redacted, which is the right behaviour.
-
-Each of the two stdout handlers (application and audit) carries its own filter instance, so redaction is formatter-independent and applies to both streams — including any rsyslog-forwarded copy, which reads the already-redacted journald output.
+Formatters omit exception messages/arguments and render bounded diagnostic trees: at most 16 nodes, truncation at depth four, and 25 frames per node, with exception type, integer errno, and valid SQLSTATE. Frames include filenames and source lines and are redacted afterward. Cached exception text is omitted. Do not place secrets in source literals or log message arguments.
 
 ## Operator queries
 
-A few common things to do with the logs.
-
-**Recent application logs:**
+Inspect or follow web logs:
 
 ```bash
 sudo journalctl -u oralhistarchiv -n 100
 sudo journalctl -u oralhistarchiv -f
-sudo journalctl -u oralhistarchiv --since "1 hour ago"
 ```
 
-**Audit events only (filter for the `event_type` field):**
+Parse JSON lines while ignoring application text and host messages:
 
 ```bash
-sudo journalctl -u oralhistarchiv -o cat | jq 'select(.event_type)'
+sudo journalctl -u oralhistarchiv -o cat | jq -R 'fromjson? | select(.logger == "audit")'
+sudo journalctl -u oralhistarchiv -o cat | jq -R 'fromjson? | select(.event_type == "dataset_access" and .user_id == 42)'
+sudo journalctl -u oralhistarchiv -o cat | jq -R 'fromjson? | select(.request_id == "a1b2c3d4e5f6a7b8")'
+sudo journalctl -u oralhistarchiv -o cat | jq -R 'fromjson? | select(.path == "/login" and .status_code == 401)'
 ```
 
-**Specific event type:**
+`event_type` also appears on operational application events, so use `logger == "audit"` to select the audit stream. Add the scheduler or other unit with `-u` when investigating those processes. These commands require host journal access and `jq`.
 
-```bash
-sudo journalctl -u oralhistarchiv -o cat | jq 'select(.event_type == "login_success")'
-```
+## Logging boundaries
 
-**Every restricted-dataset access by user 42:**
-
-```bash
-sudo journalctl -u oralhistarchiv -o cat | jq 'select(.event_type == "dataset_access" and .user_id == 42)'
-```
-
-**Trace a specific request across all logs:**
-
-```bash
-sudo journalctl -u oralhistarchiv -o cat | jq 'select(.request_id == "a1b2c3d4e5f6a7b8")'
-```
-
-The request ID is the same key used in both streams and is also exposed in the response via the `X-Request-ID` header.
-
-**Failed login attempts:**
-
-```bash
-sudo journalctl -u oralhistarchiv -o cat | jq 'select(.path == "/login" and .status_code == 401)'
-```
-
-## What is *not* in the logs
-
-To keep the audit story clean and the privacy story defensible, the following are deliberately absent:
-
-- Request bodies. Form fields are never logged, so passwords, TOTP codes, and reset tokens cannot leak via logs.
-- Response bodies. The HTML rendered to the user is not captured.
-- Cookie values. The session ID is never logged in raw form (only the 8-character prefix for correlation).
-- Raw email addresses in the audit channel — where correlation is needed, the keyed `audit_email_hash` appears instead.
-- The values of any `SecretStr` setting, ever, even in tracebacks (see redaction above).
-
-If you need any of these for debugging, the right path is to reproduce the issue in development with `LOG_LEVEL=DEBUG`, not to capture it in production logs.
+Request audit middleware does not capture bodies or cookies. This is not a blanket guarantee for every application or dependency log call: fields explicitly logged elsewhere pass through finite redaction patterns. Never log passwords, session/action tokens, factor secrets, recovery codes, private metadata, or complete request/response objects. Debug level does not disable redaction or authorize collecting those values.

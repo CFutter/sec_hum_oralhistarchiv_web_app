@@ -1,254 +1,133 @@
 # Authentication & Sessions
 
-This page describes the full authentication subsystem: how passwords are stored, how sessions work, how TOTP enrolment and email verification are enforced, how the password reset flow protects against enumeration, and how CSRF is wired up. It is the longest of the architecture pages because authentication is where most of the security-sensitive code lives.
+Local accounts use verified email, password, and TOTP; federated accounts use a trusted institutional assertion. Both use PostgreSQL sessions. Deployment and recovery procedures are in [Deployment](../../Deployment.md).
 
-## Design choices in one sentence each
+## Security boundaries
 
-- **Server-side sessions, not JWT.** The cookie holds only a signed random ID; the actual session lives in PostgreSQL, which means logout and admin revocation are real, immediate events.
-- **Email verification is required for local users.** A new local account cannot complete login or TOTP setup until the email is verified, and unverified accounts are reaped after a configurable number of days.
-- **TOTP is mandatory for local users.** A verified local account cannot reach the application until the second factor is enrolled.
-- **TOTP secrets are encrypted at rest.** A database compromise alone does not let an attacker generate valid codes.
-- **TOTP codes cannot be replayed.** A verified code's time-step is consumed atomically, so a captured code is single-use.
-- **Passwords use argon2id.** With the strong defaults from `argon2-cffi`, and rehash-on-login when parameters change.
-- **Account lockout.** After a configurable number of failed logins, the account is locked for a configurable window (and the owner is notified by email).
-- **Common-password blocklist.** SecLists 10k, plus contextual checks against the user's email and display name, plus a 12-character minimum.
-- **CSRF is a route-level dependency.** You can see which POST routes are protected by reading their signatures.
-- **Reset, verification, and email-change tokens are hashed in the database.** A database dump does not expose live links.
-- **No account enumeration.** Login, registration, verification resend, and password reset all return identical responses for the "exists" and "does not exist" cases where it matters.
+- Cookies contain signed random session tokens; PostgreSQL stores their SHA-256 hashes and authority state.
+- Local registration and authentication do not grant a higher metadata tier. Administrators assign registered/vetted access.
+- TOTP secrets and queued email bodies use separate encryption key rings. Keep keys outside database backups.
+- Login failures, session step-up submissions, and recovery-code password attempts have distinct durable budgets.
+- `SecureAPIRouter` installs exact-route access policies and mutation protections; startup validates the contract.
+- Mail-request success responses conceal account eligibility, but server work and latency can differ.
+
+See the sections below for each enforcement path.
+
+## Local sign-in and registration policy
+
+`LOCAL_REGISTRATION_ENABLED` controls new local registration, not existing login. Local users start at public tier. The bootstrap administrator is local; federated approval requires an existing administrator, and promotion accepts only local targets. Disabling registration therefore does not disable local administration.
 
 ## Sessions
 
 ### What's in the cookie
 
-The session cookie is named `oha_session` (configurable). Its value is the session ID — a 32-byte URL-safe random token — wrapped in `itsdangerous.URLSafeTimedSerializer`, which signs and timestamps it with `SESSION_SECRET`. The serializer rejects tampered cookies and cookies older than `SESSION_MAX_AGE_SECONDS` (default 8 hours).
+`SESSION_COOKIE_NAME` defaults to `oha_session`. Its value is a URL-safe token generated from 32 random bytes, signed/timestamped with `SESSION_SECRET` using the `session-cookie-v1` salt. Cookie validation enforces `SESSION_MAX_AGE_SECONDS` (default 28,800 seconds); database expiry may be earlier.
 
-The cookie is set with `HttpOnly`, `Secure` (in production), `SameSite=Strict`, and a `Path=/` scope. `SameSite=Strict` means the browser never attaches the cookie to a request that originated from another site — including top-level navigations — which is a strong anti-CSRF baseline. The HMAC-bound CSRF token (below) is the second, independent layer.
+Cookies use `HttpOnly`, `SameSite=Strict`, `Path=/`, and `Secure=COOKIES_SECURE` (default true; hardened environments require it). Cross-site navigation can omit the session cookie. CSRF protection also verifies an identifier-bound HMAC.
 
 ### What's in the database
 
-`sessions` is a thin table:
+`sessions` stores the hashed token ID, user ID, creation/expiry timestamps, IP address, purpose, step-up attempt count, and optional flash message/category. User deletion cascades to sessions; session deletion cascades to its rotation challenge. Purposes are `full`, `totp_setup`, and `totp_recovery`.
 
-```text
-id            text       primary key (sha256 of the session token)
-user_id       int        references users(id) on delete cascade
-purpose       text       'full' | 'totp_setup'
-flash_message text       nullable
-flash_category text      nullable ('success' | 'error' | 'info')
-ip_address    text
-created_at    timestamptz
-expires_at    timestamptz
-```
-
-The stored `id` is the SHA-256 of the random token; the cookie carries the signed plaintext token. The `purpose` column is the cornerstone of the TOTP enforcement story (see below). The `flash_message` / `flash_category` columns carry one-shot status messages across redirects (e.g. "Display name updated") so the application does not depend on query strings or in-memory storage; `consume_flash` reads and clears them atomically.
+Flash consumption atomically clears one stored message. Concurrent readers cannot consume the same stored value; this is not a guarantee that the browser receives it.
 
 ### Lifecycle
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant L as Login route
-    participant S as sessions service
-    participant DB as PostgreSQL
+Login commits a fresh session before setting its cookie. Revoking a token supplied with the login request is best-effort; if that deletion fails, the previous session remains valid until expiry or later revocation. Session middleware resolves the token against its database row and current account; hourly cleanup deletes expired rows in bounded batches.
 
-    U->>L: POST /login (email, password, totp)
-    L->>S: verify_password()
-    S->>DB: SELECT users WHERE LOWER(email)
-    S-->>L: User
-    L->>S: create_session(purpose='full')
-    S->>DB: INSERT INTO sessions (sha256(id), ...)
-    S-->>L: session token
-    L->>S: delete_session(previous token, if any)
-    L->>U: 303 redirect, Set-Cookie (signed token)
+Local sessions require an active account and matching recovery state. Federated sessions additionally require `full` purpose, enabled federation, approved/active status, and an exact trusted issuer. Disallowed federated or mismatched recovery rows are deleted to prevent revival after later state changes.
 
-    Note over U: ...subsequent requests...
+At startup, `reconcile_federated_session_policy()` locks the singleton policy row. A missing/changed fingerprint atomically deletes every federated session and records the new digest; local sessions remain. The fingerprint covers enabled state, sorted issuers, the fixed MFA context, policy version, and internal callback secret. Federated login/approval hold a shared policy lock and reject a mismatched fingerprint, preventing stale workers from recreating authority after reconciliation.
 
-    U->>L: GET /account (Cookie: oha_session=...)
-    L->>S: get_session_user()
-    S->>DB: SELECT sessions JOIN users WHERE is_active
-    S-->>L: (User, purpose)
-    L->>U: 200 account page
-
-    U->>L: POST /logout
-    L->>S: delete_session()
-    S->>DB: DELETE FROM sessions
-    L->>U: clear cookie + rotate CSRF, 303 redirect
-```
-
-A new random session ID is issued on every login, and any prior session presented with the login request is revoked — so there is no session-fixation window. The scheduler process runs `cleanup_expired_sessions` every hour, deleting rows where `expires_at < now()`.
+Logout deletes the presented application session and clears cookies. Whenever federation is enabled, it also redirects through the fixed local SP logout handler, including for local or already-expired sessions. No request parameter chooses that destination. The institutional-login link requests `forceAuthn=true`; actual SP/IdP logout and fresh authentication require deployment acceptance tests. On shared browsers, users must also sign out at the IdP and close the browser.
 
 ## Local-account login
 
-`POST /login` does the following (after the `verify_csrf` and `validate_form_content_type` dependencies run):
+After form-content and CSRF checks, `POST /login`:
 
-1. Look up the user and verify the password in one call to `verify_password()`, which uses argon2 verification and rehashes if the stored parameters are out of date. A non-existent user, wrong auth method, inactive account, or currently locked account all run a dummy verify so the timing is not informative.
-2. If the account is locked (`locked_until` in the future), reject with the **same generic 401 message** used for every other failure — the lock expiry is written to the audit log (`login_blocked_locked`), never shown to the client.
-3. On a wrong password (for a local account), increment the failure counter via `record_login_failure`, which locks the account once the threshold is reached; audit `login_failed` (and `account_locked` if this attempt crossed the threshold, which also emails the owner a lockout notice).
-4. If the user has TOTP configured, verify the submitted six-digit code with `verify_and_consume_totp` — a one-step window for clock skew, and the matched time-step is atomically consumed so the same code cannot be replayed. A wrong code is treated like a wrong password for lockout/audit purposes.
-5. Clear the failure counter on success. If the local user's email is not verified, refuse login with a message pointing to the send_verification page (audit `login_blocked_unverified`).
-6. Create a session — `purpose='full'` if TOTP is configured, otherwise `purpose='totp_setup'` — revoke any prior session, set the cookie, and redirect: to `/setup-totp` if TOTP is not yet configured, otherwise to the validated `next` URL (`safe_redirect_url` blocks open redirects).
-7. On any failure the login page is re-rendered with a **generic** 401 error ("Invalid email, password, or authentication code"), identical for wrong password, wrong TOTP, unknown user, locked account, and inactive account.
+1. Reads the local password hash and `auth_revision`, then verifies Argon2 without holding a database connection. Unusable/missing hashes receive dummy work. Successful rehash writes compare both old hash and revision.
+2. Records counted failures against that revision. `LOGIN_FAILURE_THRESHOLD` defaults to 10 and `LOGIN_LOCKOUT_MINUTES` to 15. Active locks neither increment nor extend; the first failure after expiry starts a new streak at one and clears the notice marker. A threshold transition and its once-per-streak outbox notice share a transaction.
+3. On a matching password, locks the user and rechecks local/active/verified state, revision, recovery requirement, and lockout. Configured TOTP must match within one adjacent 30-second step and be newer than the last consumed step. Failed TOTP commits failure/notice state; successful login resets it, updates `last_login`, and commits a fresh `full` or `totp_setup` session.
+4. Sets the cookie after commit and redirects to setup or a validated same-origin `next` path.
+
+Ordinary credential failures use a generic 401 response. A verified password for an unverified account returns verification instructions; required authenticator recovery redirects to `/recover-totp`. Undecryptable TOTP produces support guidance. Dummy work reduces hash-timing differences but does not make complete requests constant-time.
 
 ## Registration and email verification
 
-Registration is a multi-step flow that prevents the application from being usable without a verified email and an enrolled second factor. Importantly, **registration itself creates no session** — the account only becomes usable through the normal login path.
+`POST /register` validates credentials and atomically inserts a public-tier unverified local user, verification-token hash, and encrypted outbox message. It creates no session. Duplicate registration uses the same success page and queues a notice to the existing address.
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant R as /register
-    participant V as /verify-email
-    participant L as /login
-    participant T as /setup-totp
-    participant DB as PostgreSQL
+Verification tokens are signed with `SECRET_KEY`, nonce-bearing, and valid for 24 hours. `GET /verify-email/{token}` renders confirmation without consuming the token; `POST /verify-email` checks the signature, matching stored hash, age, and current email before atomically verifying and clearing the hash. The POST is CSRF-exempt because the signed token is its capability; form-content checks remain. `/send_verification` replaces a pending token/mail and returns a generic success response irrespective of account eligibility.
 
-    U->>R: POST /register (email, password, ...)
-    R->>R: validate_password_strength()
-    R->>DB: INSERT INTO users (totp_secret=NULL, email_verified=false)
-    R->>DB: store_verification_token_hash()
-    R->>U: send verification email (link to /verify-email/<token>)
-    R-->>U: "check your inbox" page (no session, no cookie)
+After verification, password login creates a `totp_setup` session. `GET /setup-totp` is an authenticated state-changing GET: it reuses a decryptable pending seed younger than ten minutes or replaces it, and always replaces pending recovery codes. Refreshing therefore invalidates previously displayed recovery codes. `POST /setup-totp` requires both a current TOTP code and one staged recovery code. It activates both, advances `auth_revision`, clears pending capabilities, and upgrades the supplied session to `full`.
 
-    U->>V: GET /verify-email/<token>
-    V-->>U: confirm page (SAFE — token not consumed)
-    U->>V: POST /verify-email (token)
-    V->>DB: confirm_email_verification() (atomic, single-use)
-    V-->>U: 303 redirect to /login
+The hourly reaper deletes local unverified nonadmin accounts older than `UNVERIFIED_REAP_AFTER_DAYS` (default seven), at most 1,000 per run. Neither verification nor enrollment changes the metadata tier.
 
-    U->>L: POST /login (email, password — no TOTP yet)
-    L->>DB: INSERT INTO sessions (purpose='totp_setup')
-    L-->>U: 303 redirect to /setup-totp + cookie
+## Route authorization
 
-    U->>T: GET /setup-totp
-    T->>DB: mint + store pending secret (encrypted, 10 min TTL)
-    T-->>U: QR + verification form
-    U->>T: POST /setup-totp (six-digit code)
-    T->>DB: UPDATE users SET totp_secret = encrypt(secret)
-    T->>DB: UPDATE sessions SET purpose='full'
-    T-->>U: 303 redirect to /account
-```
+`SecureAPIRouter` installs one `RouteAccess` policy after exact route selection. Full local sessions require active status, verified email, and configured TOTP. Public catalogue routes permit guests but reject a presented partial session. Setup/recovery sessions receive only their exact allowlisted routes; path prefixes grant no authority. Capability routes use their signed link, health credential, or authenticated proxy assertion.
 
-Properties of this flow:
-
-- The account is created immediately with `totp_secret = NULL` and `email_verified = false`, but **no session is created and no cookie is set** — the response is the generic "check your inbox" page. A duplicate registration renders the *identical* page (the existing address receives an email notice instead), so the form cannot be used to enumerate accounts.
-- The verification **GET is side-effect-free**: it only validates the token and shows a confirm button, so mail-gateway scanners and link prefetchers cannot burn the single-use token. The **POST consumes it**. That POST deliberately skips `verify_csrf` — the link may be clicked on a device with no app session or CSRF cookie, and the signed, single-use, email-bound token *is* the capability.
-- Verification tokens are itsdangerous-signed (24-hour expiry), stored only as a SHA-256 hash on the user row, and confirmed atomically: `confirm_email_verification` sets `email_verified=true` and clears the hash in a single `UPDATE` that also checks the token age and that the current email still matches the token's email, so a second click fails and a stale token cannot verify a changed address.
-- `/send_verification` issues a fresh link for an unverified account but always shows the same generic success message, so it cannot be used to enumerate accounts either.
-- Logging in with password only (TOTP not yet enrolled) yields a `purpose='totp_setup'` session. The gate middleware restricts that purpose to the exempt prefixes `/setup-totp`, `/logout`, and `/verify-email` — anything else redirects back to `/setup-totp`.
-- `/setup-totp` shows a "verify your email" page until `email_verified` is true; only then does it present the QR code. The GET deliberately *writes* (mints and stores an encrypted pending secret with a 10-minute TTL) — a documented exception to GET-safety, accepted because the secret must exist server-side before the QR encoding it can be rendered, the write is authenticated, and it overwrites rather than accumulates.
-- The pending TOTP secret is stored server-side keyed by user ID (never trusted from a hidden form field), so the POST handler retrieves it by user ID. On success, `update_totp_secret` writes the Fernet ciphertext (and records the just-used code's time-step so it cannot be replayed as a login), and `upgrade_session_purpose` bumps the session to `full`.
-- Unverified local accounts older than `UNVERIFIED_REAP_AFTER_DAYS` are deleted by the scheduler's `reap_unverified` job.
-
-## TOTP enforcement: belt and braces
-
-Two independent checks protect the application from local users who have not configured TOTP. Both live in `TotpGateMiddleware` — a dedicated middleware registered *inside* the security-headers and audit layers, so its redirects carry the standard security headers and appear in the audit log. It reads the state that the (outer) session-resolution middleware has already populated:
-
-1. **Purpose gate.** A `purpose='totp_setup'` session can only reach the exempt prefixes. This is the primary control.
-2. **Mandatory enrolment gate.** Even on a `purpose='full'` session, a local user with `totp_secret=NULL` is redirected to `/setup-totp` until enrolment completes. This is a defense-in-depth backup — if some future code path created a `full` session before TOTP was set up, this gate would still catch it.
-
-The two gates are different code paths and would have to be broken simultaneously to bypass TOTP. That redundancy is intentional and called out in the source comments.
+`validate_route_security_contract()` runs after registration and at startup. It rejects undeclared routes, unexpected public/exception keys, missing access/mutation dependencies, duplicate route keys, unsupported mounts/Starlette routes, and WebSockets. Extend the central policy/allowlist alongside any new endpoint.
 
 ## Changing the authenticator
 
-Logged-in local users can rotate their authenticator at `/account/reset-totp`. This is **self-service** and requires proving control of the current authenticator: the form takes the current six-digit code *and* a code from the new secret, and the new secret is only promoted if both verify (the current code is also replay-consumed). There is no admin-driven TOTP reset route; a user who has lost their authenticator outright (and so cannot supply a current code) must contact an administrator.
+`GET /account/reset-totp` only renders a form. Its protected POST spends a session step-up attempt, verifies the password off-connection, then locks/rechecks user, credentials/revision, exact full session, lockout, and fresh current TOTP. It consumes that step and replaces the session-bound encrypted five-minute challenge; only this response contains the replacement seed/QR.
 
-## Password reset
+`POST /account/reset-totp/confirm` rechecks user/session/revision/expiry and spends the challenge's `TOTP_ROTATION_CONFIRMATION_ATTEMPT_LIMIT` budget (default five). Invalid final attempts delete the challenge, leaving the active factor unchanged. Success changes TOTP, advances `auth_revision`, clears pending capabilities, and deletes every user session atomically. Active recovery codes remain; all devices must log in again.
 
-The reset flow is designed so that **the email address is not enumerable** and **a database dump does not expose live reset links**.
+## Credential attempt budgets
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant W as /forgot-password
-    participant E as Email
-    participant R as /reset-password
-    participant DB as PostgreSQL
+`SESSION_STEP_UP_ATTEMPT_LIMIT` (default five) is shared by rotation start, self-service email changes, promotion preparation/acceptance, and admin recovery authorization. Each raw full-session reservation commits before proof work; successes and later failures spend it. The first excess request expires only that session and clears its flash. Expiration avoids additional cascading locks; cleanup deletes it later. Existing login locks block reservations, but step-up failures never increment or extend account lockout.
 
-    U->>W: POST /forgot-password (email)
-    W->>DB: SELECT users WHERE LOWER(email)
-    alt active local user
-        W->>W: token = generate_reset_token()
-        W->>DB: store_reset_token_hash(sha256(token)) on users row
-        W->>E: send_password_reset_email(reset link)
-    else otherwise
-        Note over W: do nothing
-    end
-    W-->>U: "If an account exists, an email is on its way" (always)
+Rotation confirmation instead uses its own challenge counter. Public recovery uses three password attempts per matching retained code, requires current admin authorization, and bypasses ordinary login locks. Unknown codes receive dummy work without changing account/code state. Successful redemption clears login lockout. Storage errors propagate; a later failure cannot refund a previously committed reservation. Per-IP limits supplement these budgets.
 
-    U->>R: GET /reset-password/<token>
-    R->>R: validate_reset_token(token)
-    R->>DB: verify_reset_token_hash(sha256(token))
-    alt valid + not expired
-        R-->>U: form to set new password
-    else
-        R-->>U: error page
-    end
+## Password reset and email changes
 
-    U->>R: POST /reset-password/<token> (new password)
-    R->>R: update_password_with_token() (atomic)
-    R->>DB: UPDATE users SET password_hash, clear token, clear lockout
-    R->>DB: DELETE FROM sessions WHERE user_id
-    R-->>U: 303 redirect → /login
-```
+`POST /forgot-password` queues a nonce-bearing, 30-minute signed link only for an active local account. Hash replacement, prior-mail cancellation, and encrypted outbox insertion commit together. Every valid-email request returns the same success status/body; work and latency may differ, and queue failures are logged. Raw links are present in encrypted outbox bodies, not plaintext database columns.
 
-Key properties:
+`GET /reset-password/{token}` checks signature and stored capability without consumption. `POST /reset-password` submits the token as a form field. It validates password strength and nonreuse from a snapshot, then atomically rechecks the active local account, case-insensitive email, hash, and age. Success changes the password, advances `auth_revision`, clears failure/lockout state, and revokes sessions and pending capabilities.
 
-- **Tokens live as hashed columns on `users`**, not in a separate table. `store_reset_token_hash` writes `password_reset_token_hash` + `password_reset_created_at`; issuing a new token overwrites the old one, so only one reset link is ever valid.
-- **The plaintext token only exists in the email.** What is stored is `sha256(token)`. A read-only DB compromise yields hashes, which cannot be used to reset anyone.
-- **The success message is identical** for "we sent you a mail" and "no such user / inactive / federated account", preventing enumeration.
-- **`update_password_with_token` is atomic and defense-in-depth:** it re-validates password strength, rejects reuse of the current password, and performs the update in a single `UPDATE ... WHERE` that checks the token hash and a DB-level age window. On success it clears the token, resets the failed-login counter and lockout, and deletes all of the user's sessions.
+Self-service email changes spend a session step-up attempt and verify a password snapshot off-connection. Under user/session locks, staging rechecks password hash/revision and current eligibility, then commits a one-hour signed revision-bound token, confirmation to the new address, and notice to the old address. It does not reveal destination membership; delivery and confirmation check availability. Administrator staging uses the current-admin/session guard and can reject an occupied address.
+
+Email-change GETs do not consume the capability. The confirmation POST validates the signature then atomically matches active/local state, exact pending address/hash/revision, age, and uniqueness. Success verifies the new email, advances revision, and revokes sessions/pending capabilities. Reset, email confirmation, deactivation, and revoke-all retain current recovery codes and the recovery-required flag.
+
+Administrator activation/unlock also advances revision, preventing older password checks from re-locking the account. It preserves existing sessions but clears staged email changes; request those links again.
 
 ## Password storage and validation
 
-Passwords are hashed with argon2id via `argon2-cffi`'s `PasswordHasher()` defaults. `verify_password` rehashes on a successful login if `check_needs_rehash` reports stale parameters, so the cost factors can be raised over time without a migration.
+Local email validation accepts internationalized domains with ASCII local parts; SMTP converts domains to IDNA. Legacy Unicode local parts require SMTPUTF8 at the relay.
 
-Strength validation lives entirely in `password_validation.validate_password_strength()`:
+`argon2-cffi.PasswordHasher()` supplies Argon2id defaults. Login rehashes stale parameters using a compare-and-update. Hash/verify/dummy work uses `run_password_work`, limited by `PASSWORD_WORK_CONCURRENCY` per event loop; cancellation waits for the worker thread. See [Deployment](../../Deployment.md) before changing worker counts.
 
-1. A **12-character minimum** (`_MIN_PASSWORD_LENGTH`). The form layer only bounds the maximum length — the minimum is enforced here. Twelve characters alone eliminate almost the entire SecLists 10k list by length.
-2. The lower-cased password is checked against the SecLists 10k blocklist (lazy-loaded once into a `frozenset`).
-3. Passwords containing the user's email local part or a word from the display name (length ≥ 4) are rejected.
+Passwords must contain 12–200 characters, avoid case-insensitive membership in the bundled common-password list, and omit the email local part or display-name words of at least four characters. Registration/reset apply supplied profile context; seeding checks email context. The list is cached, warmed at startup, and a read failure is fatal in hardened environments (empty-list fallback in development).
 
-The same rules apply to registration, password reset, and the admin-seed password.
+## CSRF and mutation defaults
 
-## CSRF
+CSRF tokens are HMAC-SHA256 of the raw session/pre-session identifier using a domain-separated key derived from `SESSION_SECRET`. Forms receive the middleware's outgoing token; verification uses incoming cookies. Cookie flags follow `COOKIES_SECURE`, `HttpOnly`, `SameSite=Strict`, and `Path=/`. Middleware can prepare cookies for GET and resolved POST responses, including failed form renders; explicit session-cookie transitions own their response cookies.
 
-CSRF protection follows the **double-submit cookie** pattern, hardened by binding the token to the session:
-
-1. The CSRF cookie middleware sets a `csrf_token` cookie on GET responses. The token is not random — it is `HMAC(SESSION_SECRET, identifier)`, where `identifier` is the session ID for logged-in users or a per-visitor pre-session ID for anonymous visitors. The cookie is `HttpOnly` and `SameSite=Strict`; templates obtain the value server-side via `{{ csrf_token(request) }}`, so JavaScript never needs to read it.
-2. Templates with forms emit the token as a hidden input.
-3. POST handlers depend on `verify_csrf`, which requires: the cookie and form field are both present, the form value is a string, the two match (`hmac.compare_digest`), a current identifier exists, and the cookie equals the HMAC recomputed from that identifier. Any failure returns 403.
-
-Because the token is HMAC-bound to the identifier, a stolen cookie is useless without the matching session, and the token rotates automatically when the identifier changes (pre-session → session). Explicit rotation also happens on logout. Because verification is a route dependency rather than global middleware, you can grep for `verify_csrf` to enumerate every protected endpoint. (Two deliberate exceptions skip it: the verification and email-change **confirm POSTs**, where the signed single-use token itself is the capability and the click may come from a device with no app cookies — see the source comments on those routes.)
+Every method except GET/HEAD/OPTIONS receives form-content validation then CSRF verification. Verification requires matching cookie/form values and the expected identifier-bound HMAC; failure returns 403. Exact `POST /verify-email` and `POST /account/confirm-email` omit CSRF because they consume signed email-bound capabilities, but retain content-type checks. Exception keys are centralized and validated at startup.
 
 ## Admin actions
 
-`routes/auth/admin.py` mounts everything under `/admin` with `Depends(require_admin)` at the *router* level, so every handler beneath inherits the check. `require_admin` checks `request.state.user.is_admin` and raises `HTTPException(404)` (not 403) for everyone else, so the existence of the admin area is not revealed.
+`routes/auth/admin.py` uses `RouteAccess.ADMIN`. Its dependency enforces a full session/admin flag and, for local admins, a usable active recovery-code generation; missing/nonadmin principals receive 404. Each mutation also rechecks current authority and the exact full session under the shared admin-action advisory lock. Role changes do not grant metadata tiers.
 
-Admin actions include:
+Administrators can review federated identities, change tiers/active status, demote users, invite local promotions, authorize local recovery, and stage email changes. Self-demotion/deactivation and removal of the last active admin are rejected. Activation clears lockout and pending email changes; deactivation revokes sessions/pending capabilities. Pending/legacy federated identities require the dedicated approval path. Successful actions emit structured audit events; form mutations receive CSRF/content-type checks.
 
-- Listing all users
-- Changing a user's `access_tier`
-- Toggling `is_active` (deactivation also deletes the user's sessions immediately; reactivation clears lockout but does not restore sessions)
-- Toggling `is_admin` (admins cannot demote or deactivate themselves)
-- Staging an email change for a user (a confirmation link is sent to the new address and a notice to the old one; the change commits only when the link is clicked)
+Promotion invitations last seven days. The target proves password/fresh TOTP in a full session and receives a new recovery-code set. Within fifteen minutes and invitation expiry, confirming one code activates the set and admin role, advances revision, removes the invitation/pending capabilities, and revokes target sessions. The confirming code remains unused. Cancellation/decline removes staged codes, preserving the active set.
 
-All POST actions are CSRF-protected and content-type-checked, set a flash message on the admin's own session, and are recorded to the audit channel (`audit_admin_action`) with the acting admin, the target user, and old/new values.
+Recovery requires a different eligible local administrator, fresh admin TOTP, and an unused, unexhausted target recovery code. A 30-minute authorization removes the old factor and sessions but exposes no target credential. The owner presents password plus a saved code; each matching code allows three committed password attempts. Redemption atomically consumes code/authorization, clears lockout, and issues one 15-minute `totp_recovery` session. Replacement setup confirms a fresh seed/code set, clears recovery state, and revokes all sessions; the owner then logs in again.
 
 ## Federated (Shibboleth) login
 
-The `GET /auth/shibboleth/callback` route is implemented. When `SHIBBOLETH_ENABLED=true`, the nginx SP layer (shibd) forwards attribute headers (`REMOTE_USER`, `mail`, `displayName`, `affiliation`, and the configured country header) on this path — and strips them on every other path.
+Federation defaults off. The shipped Phase 1 nginx callback returns 404; enabling `SHIBBOLETH_ENABLED` alone does not install an SP. Complete [Deployment](../../Deployment.md)'s SP, identity, MFA, header, socket, and logout acceptance steps before enabling it.
 
-The route's trust model is **not** an IP allowlist:
+The callback requires a Unix-socket peer, the configured `SHIBBOLETH_INTERNAL_SECRET`, an exact HTTPS issuer from `SHIBBOLETH_TRUSTED_ISSUERS`, and `https://refeds.org/profile/mfa`. Fixed private headers are `X-OHA-Shib-Subject`, `Issuer`, `Mail`, `Display-Name`, `Affiliation`, `Country`, and `Authn-Context` (each with the `X-OHA-Shib-` prefix), plus `X-OHA-Internal-Auth`. The SP-authorized proxy must replace them; ordinary proxy locations clear private and legacy assertion headers. The secret alone does not prove SAML/MFA.
 
-1. Gunicorn binds only a Unix socket, so there is no TCP listener to reach; the route additionally *refuses* any request that arrives with a TCP peer (that would mean the app was accidentally exposed on a port).
-2. nginx injects an `X-Internal-Auth` header on this location only, and the route requires it to match `SHIBBOLETH_INTERNAL_SECRET` in constant time. The settings validator makes this secret mandatory **whenever Shibboleth is enabled, in every environment** — there is no "optional in dev" mode.
+Identity is the exact `(issuer, subject)` pair. Operators must establish a stable, non-reassigned subject contract with each IdP. Email never links accounts; a collision rejects login. First assertion creates a public, inactive, unverified, nonadmin `pending` user without a session. Dedicated admin approval rechecks the reviewed identity, current policy/admin session, and pending state, then assigns tier, activates, records approver/time, advances revision, and deletes old sessions. A later trusted assertion can issue `full` access without local TOTP.
 
-On a trusted request, the route validates the forwarded email and auto-provisions or updates the user (`create_shibboleth_user`): `auth_method='shibboleth'`, `access_tier='registered'`, auto-`email_verified`, attributes refreshed on each login. If the email already belongs to a **local** account, the upsert deliberately refuses to merge and the login is rejected with an account-conflict error — a federated login can never take over a password account. A `full` session is then created (Shibboleth users are exempt from the local TOTP requirement; their second factor is the IdP's concern).
+Only active approved identities refresh mutable profile fields; absent optional attributes preserve old values. An email change clears mailbox verification and pending email/reset tokens. Disabled identities remain unchanged until admin reactivation. Legacy sentinel identities require authoritative issuer/subject reconciliation back to public/inactive/nonadmin/unverified pending state before dedicated approval; never activate them through generic controls.
 
-The remaining Phase 2 work is the nginx SP deployment (shibd + FastCGI via the nginx-http-shibboleth module) and SWITCH AAI registration, not application code.
+Federation-policy reconciliation and live session checks are described under [Lifecycle](#lifecycle). Browser/SP/IdP behavior remains an operational verification requirement.
 
-## What is *not* implemented yet
+## Limitations
 
-- **Password rotation reminders.** No "your password is 365 days old" prompt.
-- **Self-service recovery without an authenticator.** Rotating TOTP at `/account/reset-totp` requires the current code, so a user who has lost their authenticator entirely must contact an administrator. There is no admin UI button to clear a TOTP secret — recovery currently means an out-of-band/database intervention.
-- **Field-level visibility.** Redaction is all-or-nothing per dataset (see [Access Control & Visibility](access-control.md)); the per-field matrix and PostgreSQL Row-Level Security are Phase 2.
-- **Shibboleth SP deployment.** The callback and user model are in place; the nginx SP plumbing (shibd + FastCGI) and federation registration are Phase 2.
+There is no password-age reminder, self-authorized lost-admin-factor recovery, per-field visibility, or database row-level security. Lost-factor recovery needs another eligible administrator and a retained code; otherwise use the controlled operator procedure in [Deployment](../../Deployment.md). SP installation, federation registration, and real-browser MFA/logout checks are deployment work, not application guarantees.

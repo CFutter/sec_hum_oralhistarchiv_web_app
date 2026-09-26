@@ -7,6 +7,17 @@
 
   <h1>User Management</h1>
 
+  <div class="admin-toolbar">
+    <span>Per page:</span>
+    {% for size in page_size_options %}
+      {% if size == page_size %}
+        <span class="page-size active">{{ size }}</span>
+      {% else %}
+        <a class="page-size" href="{{ url_for_query(request, page_size=size, page=None) }}">{{ size }}</a>
+      {% endif %}
+    {% endfor %}
+  </div>
+
   <div class="admin-table-wrap">
     <table class="admin-table">
       <thead>
@@ -14,6 +25,7 @@
           <th>Email</th>
           <th>Name</th>
           <th>Method</th>
+          <th>Federated Identity</th>
           <th>Tier</th>
           <th>Admin</th>
           <th>Active</th>
@@ -23,14 +35,33 @@
       </thead>
       <tbody>
         {% for u in users %}
+        {% set federated_pending = u.auth_method == 'shibboleth' and u.federated_status == 'pending' %}
+        {% set federated_managed = u.auth_method == 'shibboleth' and u.federated_status in ['approved', 'disabled'] %}
+        {% set membership_controls_allowed = u.auth_method == 'local' or federated_managed %}
+        {% set admin_promotion_state = admin_promotion_states.get(u.id) %}
         <tr class="{% if not u.is_active %}row-inactive{% endif %}">
           <td>{{ u.email }}</td>
           <td>{{ u.display_name or '—' }}</td>
           <td>{{ u.auth_method }}</td>
+          <td class="federated-identity">
+            {% if u.auth_method == 'shibboleth' %}
+              <span class="form-hint">Issuer</span>
+              <code>{{ u.shibboleth_issuer or '—' }}</code><br>
+              <span class="form-hint">Subject</span>
+              <code>{{ u.shibboleth_subject_id or '—' }}</code><br>
+              <span class="form-hint">Status</span>
+              <strong>{{ u.federated_status or 'invalid / unclassified' }}</strong>
+            {% else %}
+              —
+            {% endif %}
+          </td>
         
           <td>
-            <form action="{{ request.url_for('admin_set_tier', user_id=u.id) }}" method="post" class="inline-form">
+            {% if membership_controls_allowed %}
+            <form action="{{ path_for(request, 'admin_set_tier', user_id=u.id) }}" method="post" class="inline-form">
               <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+              <input type="hidden" name="page" value="{{ current_page }}">
+              <input type="hidden" name="page_size" value="{{ page_size }}">              
               <select name="access_tier">
                 {% for tier in ['public', 'registered', 'vetted'] %}
                 <option value="{{ tier }}" {% if u.access_tier == tier %}selected{% endif %}>{{ tier }}</option>
@@ -38,49 +69,123 @@
               </select>
               <button type="submit" class="btn-save">Save</button>
             </form>
-          </td>
-        
-          <td>
-            {# Admin toggle — was removed; restored here #}
-            {% if u.id == user.id %}
-              <span class="badge-admin">you</span>
-            {% elif u.is_admin %}
-              <form action="{{ request.url_for('admin_set_admin', user_id=u.id) }}" method="post" class="inline-form">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-                <input type="hidden" name="is_admin" value="false">
-                <button type="submit" class="btn-toggle active" title="Revoke admin">✓</button>
-              </form>
             {% else %}
-              <form action="{{ request.url_for('admin_set_admin', user_id=u.id) }}" method="post" class="inline-form">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-                <input type="hidden" name="is_admin" value="true">
-                <button type="submit" class="btn-toggle" title="Grant admin">—</button>
-              </form>
+              <span>{{ u.access_tier }}</span>
             {% endif %}
           </td>
         
           <td>
-            {% if u.is_active %}
+            {% if not membership_controls_allowed %}
+              —
+            {% elif u.id == user.id %}
+              <span class="badge-admin">you</span>
+            {% elif u.is_admin %}
+              <form action="{{ path_for(request, 'admin_set_admin', user_id=u.id) }}" method="post" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="page" value="{{ current_page }}">
+                <input type="hidden" name="page_size" value="{{ page_size }}">
+                <input type="hidden" name="is_admin" value="false">
+                <button type="submit" class="btn-toggle active" title="Revoke admin">✓</button>
+              </form>
+            {% elif admin_promotion_state %}
+              <span class="badge-inactive">
+                invite {{ admin_promotion_state }}
+              </span>
+              <form action="{{ path_for(request, 'admin_set_admin', user_id=u.id) }}"
+                    method="post" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="page" value="{{ current_page }}">
+                <input type="hidden" name="page_size" value="{{ page_size }}">
+                <input type="hidden" name="is_admin" value="true">
+                <button type="submit" class="btn btn-small">Reissue Invite</button>
+              </form>
+              <form action="{{ path_for(request, 'admin_cancel_admin_promotion', user_id=u.id) }}"
+                    method="post" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="page" value="{{ current_page }}">
+                <input type="hidden" name="page_size" value="{{ page_size }}">
+                <button type="submit" class="btn btn-small">Cancel Invite</button>
+              </form>
+            {% elif u.auth_method == 'local'
+                    and u.is_active
+                    and u.email_verified
+                    and u.totp_configured
+                    and not u.totp_recovery_required %}
+              <form action="{{ path_for(request, 'admin_set_admin', user_id=u.id) }}" method="post" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="page" value="{{ current_page }}">
+                <input type="hidden" name="page_size" value="{{ page_size }}">
+                <input type="hidden" name="is_admin" value="true">
+                <button type="submit" class="btn btn-small" title="Invite as administrator">
+                  Invite
+                </button>
+              </form>
+            {% else %}
+              <span class="form-hint">Not eligible for local administrator invitation.</span>
+            {% endif %}
+          </td>
+        
+          <td>
+            {% if federated_pending %}
+              <span class="badge-inactive">pending review</span>
+            {% elif u.auth_method == 'shibboleth' and u.federated_status == 'legacy_quarantined' %}
+              <span class="badge-inactive">legacy quarantine</span>
+            {% elif u.auth_method == 'shibboleth' and not federated_managed %}
+              <span class="badge-inactive">invalid federation state</span>
+            {% elif u.is_active %}
               <span class="badge-active">active</span>
             {% else %}
               <span class="badge-inactive">inactive</span>
             {% endif %}
           </td>
         
-          <td>{{ u.last_login.strftime('%d %b %Y, %H:%M') if u.last_login else '—' }}</td>
+          <td>{{ u.last_login | utc_datetime }}</td>
         
           <td>
-            {# Actions — was duplicated; deduplicated and email form added #}
-            {% if u.id != user.id %}
-              {% if u.is_active %}
-              <form action="{{ request.url_for('admin_set_active', user_id=u.id) }}" method="post" class="inline-form">
+            {% if federated_pending %}
+              <form action="{{ path_for(request, 'admin_approve_federated', user_id=u.id) }}"
+                    method="post" class="inline-form federated-approval-form">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="page" value="{{ current_page }}">
+                <input type="hidden" name="page_size" value="{{ page_size }}">
+                <input type="hidden" name="expected_issuer" value="{{ u.shibboleth_issuer }}">
+                <input type="hidden" name="expected_subject_id" value="{{ u.shibboleth_subject_id }}">
+                <label>
+                  Approval tier
+                  <select name="access_tier">
+                    {% for tier in ['public', 'registered', 'vetted'] %}
+                    <option value="{{ tier }}" {% if tier == 'public' %}selected{% endif %}>{{ tier }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <button type="submit" class="btn btn-small btn-secondary">Approve identity</button>
+              </form>
+            {% elif u.auth_method == 'shibboleth' and not federated_managed %}
+              <strong>Manual identity reconciliation required.</strong>
+            {% elif u.id != user.id %}
+              {% if u.is_active %}
+              {% if u.auth_method == 'local' %}
+              <form action="{{ path_for(request, 'admin_set_active', user_id=u.id) }}"
+                    method="post" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="page" value="{{ current_page }}">
+                <input type="hidden" name="page_size" value="{{ page_size }}">
+                <input type="hidden" name="is_active" value="true">
+                <button type="submit" class="btn btn-small btn-secondary">Unlock</button>
+              </form>
+              {% endif %}
+              <form action="{{ path_for(request, 'admin_set_active', user_id=u.id) }}" method="post" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="page" value="{{ current_page }}">
+                <input type="hidden" name="page_size" value="{{ page_size }}">                
                 <input type="hidden" name="is_active" value="false">
                 <button type="submit" class="btn btn-small btn-danger">Deactivate</button>
               </form>
               {% else %}
-              <form action="{{ request.url_for('admin_set_active', user_id=u.id) }}" method="post" class="inline-form">
+              <form action="{{ path_for(request, 'admin_set_active', user_id=u.id) }}" method="post" class="inline-form">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+                <input type="hidden" name="page" value="{{ current_page }}">
+                <input type="hidden" name="page_size" value="{{ page_size }}">
                 <input type="hidden" name="is_active" value="true">
                 <button type="submit" class="btn btn-small btn-secondary">Reactivate</button>
               </form>
@@ -91,9 +196,31 @@
               {% endif %}
         
             {% if u.auth_method == 'local' %}
-            <form action="{{ request.url_for('admin_change_email', user_id=u.id) }}"
+            {% if u.totp_recovery_required %}
+            <span class="badge-inactive">authenticator recovery required</span>
+            {% endif %}
+
+            {% if user.auth_method == 'local' and user.totp_configured %}
+              {% if u.id != user.id and u.is_active and u.email_verified
+                    and (u.totp_configured or u.totp_recovery_required) %}
+              <form action="{{ path_for(request, 'admin_totp_recovery_page', user_id=u.id) }}"
+                    method="get" class="inline-form">
+                <input type="hidden" name="page" value="{{ current_page }}">
+                <input type="hidden" name="page_size" value="{{ page_size }}">
+                <button type="submit" class="btn btn-small btn-danger">
+                  {{ 'Reauthorize Recovery' if u.totp_recovery_required else 'Recover Authenticator' }}
+                </button>
+              </form>
+              {% elif u.id == user.id and (u.totp_configured or u.totp_recovery_required) %}
+              <span class="form-hint">A different administrator must authorize recovery.</span>
+              {% endif %}
+            {% endif %}
+
+            <form action="{{ path_for(request, 'admin_change_email', user_id=u.id) }}"
                   method="post" class="inline-form admin-email-form">
               <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+              <input type="hidden" name="page" value="{{ current_page }}">
+              <input type="hidden" name="page_size" value="{{ page_size }}">
               <input type="email" name="new_email" placeholder="new@address" maxlength="200" required>
               <button type="submit" class="btn btn-small">Change Email</button>
             </form>
@@ -103,12 +230,28 @@
             {% endif %}
           </td>
         </tr>
+        {% else %}
+        <tr><td colspan="9" class="empty-state">No users to show.</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
 
-  <p class="admin-count">{{ users | length }} user{{ 's' if users | length != 1 }} total</p>
+  {% if total_pages > 1 %}
+  <nav class="pagination" aria-label="User list pages">
+    {% if current_page > 1 %}
+      <a href="{{ url_for_query(request, page=current_page - 1) }}">Previous</a>
+    {% endif %}
+    <span>Page {{ current_page }} of {{ total_pages }}</span>
+    {% if current_page < total_pages %}
+      <a href="{{ url_for_query(request, page=current_page + 1) }}">Next</a>
+    {% endif %}
+  </nav>
+  {% endif %}
+
+  <p class="admin-count">
+    Showing {{ users | length }} of {{ total_users }} user{{ 's' if total_users != 1 }}
+  </p>
 
 </section>
 {% endblock %}

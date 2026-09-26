@@ -30,13 +30,32 @@ coverage.xml
 htmlcov/
 pytest_results.txt
 requirements-runtime.txt
+/pytest-of-root/
 
 # =============================================================================
 # Local data & databases
 # =============================================================================
 /data/
-.postgres_data/
+.postgres_data*/
 *.sql.out
+.dev-mailbox/
+
+# Database backups and private recovery identities. Encrypted archives remain
+# sensitive and must go to the approved backup store, never source control.
+/backups/
+*.dump
+*.dump.*
+*.backup
+*.backup.*
+*.sql.gz
+*.sql.age
+*.agekey
+*.agekey.*
+.oralhistarchiv-encrypted.*
+.pgpass
+pgpass.conf
+.postgres_data.before-idx-reset-20260915120914
+
 
 # =============================================================================
 # Docs build output (mkdocs)

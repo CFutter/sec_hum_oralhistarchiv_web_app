@@ -7,10 +7,27 @@
 
   <h1>Your Account</h1>
 
+  {% if admin_promotion %}
+  <div class="account-card">
+    <h2>Administrator Invitation</h2>
+    {% if admin_promotion.expired %}
+    <p>This invitation expired. You can decline it or ask an administrator to reissue it.</p>
+    {% else %}
+    <p>
+      You have been invited to become an administrator. Access is granted only
+      after you reauthenticate and save a fresh recovery-code set.
+    </p>
+    {% endif %}
+    <a href="{{ path_for(request, 'admin_promotion_page') }}" class="btn btn-primary">
+      Review Invitation
+    </a>
+  </div>
+  {% endif %}
+
   <div class="account-card">
     <h2>Display Name</h2>
     {% if user.auth_method == 'local' %}
-    <form action="{{ request.url_for('change_display_name') }}" method="post" class="inline-edit-form">
+    <form action="{{ path_for(request, 'change_display_name') }}" method="post" class="inline-edit-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
       <label for="display_name" class="sr-only">Display name</label>
       <input
@@ -34,7 +51,7 @@
     <h2>Email Address</h2>
     <p>{{ user.email }}</p>
     {% if user.auth_method == 'local' %}
-    <a href="{{ request.url_for('change_email_page') }}" class="btn btn-secondary">Change Email</a>
+    <a href="{{ path_for(request, 'change_email_page') }}" class="btn btn-secondary">Change Email</a>
     {% else %}
     <p class="form-hint">Your email address is managed by your institution and cannot be changed here.</p>
     {% endif %}
@@ -59,10 +76,10 @@
       <dd><span class="card-access {{ user.access_tier }}">{{ user.access_tier }}</span></dd>
 
       <dt>Member Since</dt>
-      <dd>{{ user.created_at.strftime('%d %B %Y') if user.created_at else '—' }}</dd>
+      <dd>{{ user.created_at | utc_datetime }}</dd>
 
       <dt>Last Login</dt>
-      <dd>{{ user.last_login.strftime('%d %B %Y, %H:%M UTC') if user.last_login else '—' }}</dd>
+      <dd>{{ user.last_login | utc_datetime }}</dd>
     </dl>
   </div>
 
@@ -71,10 +88,10 @@
     <h2>Two-Factor Authentication</h2>
     {% if user.totp_configured %}
     <p>Your authenticator app is configured and active.</p>
-    <a href="{{ request.url_for('reset_totp_page') }}" class="btn btn-secondary">Change Authenticator</a>
+    <a href="{{ path_for(request, 'reset_totp_page') }}" class="btn btn-secondary">Change Authenticator</a>
     {% else %}
     <p>Two-factor authentication is not yet configured. Please set it up to secure your account.</p>
-    <a href="{{ request.url_for('setup_totp_page') }}" class="btn btn-primary">Set Up 2FA</a>
+    <a href="{{ path_for(request, 'setup_totp_page') }}" class="btn btn-primary">Set Up 2FA</a>
     {% endif %}
   </div>
   {% endif %}
@@ -94,7 +111,7 @@
   {% endif %}
 
   <div class="account-actions">
-    <form action="{{ request.url_for('logout') }}" method="post">
+    <form action="{{ path_for(request, 'logout') }}" method="post">
       <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
       <button type="submit" class="btn btn-secondary">Logout</button>
     </form>

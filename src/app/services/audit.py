@@ -1,4 +1,3 @@
-# app/services/audit.py
 """Structured audit logging helpers for security-relevant events.
 
 The application has an audit log channel separate from the regular
@@ -20,38 +19,47 @@ from typing import Any
 
 from fastapi import Request
 
-from ..middleware import get_client_ip
+from ..request_utils import get_client_ip
 
 audit_logger = logging.getLogger("audit")
 
 
 def audit_user_event(
+    level: int,
     request: Request,
     event_type: str,
     user_id: int | None,
+    exc_info: bool = False,
     **fields: Any,
 ) -> None:
     """Record an audit event for an action a user performs on their own account.
 
-    Examples: login_success, login_failed, password_reset_requested,
-    totp_configured, email_verified.
+    Examples:
+        login_success, login_failed, password_reset_requested,
+        totp_configured, email_verified.
 
     Args:
+        level: The log level the event should be logged as.
         request: The current request, used for IP and request_id.
         event_type: A stable, machine-readable event name (snake_case).
-                    Used by SIEM rules to filter; never change for an
-                    existing event without a migration plan.
+            Used by SIEM rules to filter; never change for an
+            existing event without a migration plan.
         user_id: The user being acted on. May be None for failed events
-                 where the email didn't match a registered user.
+            where the email didn't match a registered user.
+        exc_info: If True, appends the active exception context (error type,
+            message, and full traceback) to the log output. Defaults to False.
         **fields: Additional structured fields specific to this event
-                  (e.g., reason="wrong_password", failed_count=3).
+            (e.g., reason="wrong_password", failed_count=3).
     """
-    audit_logger.info(
+    audit_logger.log(
+        level,
         event_type,
+        exc_info=exc_info,
+        stacklevel=2,
         extra={
             "event_type": event_type,
             "user_id": user_id,
-            "ip": get_client_ip(request),
+            "client_ip": get_client_ip(request),
             "request_id": getattr(request.state, "request_id", None),
             **fields,
         },
@@ -59,9 +67,11 @@ def audit_user_event(
 
 
 def audit_admin_action(
+    level: int,
     request: Request,
     event_type: str,
     target_user_id: int,
+    exc_info: bool = False,
     **fields: Any,
 ) -> None:
     """Record an audit event for an admin action on another user's account.
@@ -70,11 +80,14 @@ def audit_admin_action(
     admin_user_admin_changed.
 
     Args:
+        level: The level, the event should be loged as.
         request: The current request — request.state.user must be the
                  acting admin.
         event_type: A stable event name (snake_case, prefixed admin_).
         target_user_id: The user whose account was modified. Distinct
                         from request.state.user.id, which is the admin.
+        exc_info: Defaults to False, if set to True, exception information
+                  can be added to the logging message.
         **fields: Additional structured fields, typically including
                   old_value and new_value for the modified attribute.
     """
@@ -84,23 +97,27 @@ def audit_admin_action(
         # If it does, log a critical-level event for investigation.
         audit_logger.critical(
             "admin_action_no_actor",
+            stacklevel=2,
             extra={
                 "event_type": "admin_action_no_actor",
                 "attempted_event": event_type,
                 "target_user_id": target_user_id,
-                "ip": get_client_ip(request),
+                "client_ip": get_client_ip(request),
                 "request_id": getattr(request.state, "request_id", None),
             },
         )
         return
 
-    audit_logger.info(
+    audit_logger.log(
+        level,
         event_type,
+        exc_info=exc_info,
+        stacklevel=2,
         extra={
             "event_type": event_type,
             "actor_admin_id": admin.id,
             "target_user_id": target_user_id,
-            "ip": get_client_ip(request),
+            "client_ip": get_client_ip(request),
             "request_id": getattr(request.state, "request_id", None),
             **fields,
         },

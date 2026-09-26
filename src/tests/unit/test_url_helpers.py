@@ -2,17 +2,20 @@
 
 Pins the behavior of:
 - app.routes.auth.helpers.safe_redirect_url — the open-redirect guard on the
-  post-login `next` parameter, including the path-internal-colon regression
-  (the old blanket ':' ban rejected legitimate '/search?q=time:1990' targets).
+  post-login `next` parameter, including path-internal colons: a same-site
+  target such as '/search?q=time:1990' must be allowed, so the guard is
+  structural (no scheme, no netloc), not a blanket ':' ban.
 - app.url_safety.is_safe_http_url — the single-source http(s) scheme allowlist
   shared by ingest and render.
 - app.template_setup.safe_url_filter — the render-time last-line XSS guard.
 - app.jinja_helpers.url_for_query — filter/pagination link builder, including
   the reset-pagination contract (page=None drops the key).
 
-doi_url_filter is covered elsewhere (backlog §3.9) and intentionally skipped.
+doi_url_filter is covered by test_templates.py and test_record_parsing.py, not here.
 """
+
 from types import SimpleNamespace
+from typing import Any
 from urllib.parse import parse_qs, urlencode
 
 import pytest
@@ -21,12 +24,12 @@ from fastapi import Request
 from app.jinja_helpers import url_for_query
 from app.routes.auth.helpers import safe_redirect_url
 from app.template_setup import safe_url_filter
-from app.url_safety import is_safe_http_url
-
+from app.url_safety import is_safe_http_url, parse_http_url
 
 # ---------------------------------------------------------------------------
 # Request builders
 # ---------------------------------------------------------------------------
+
 
 def _request(query_string: bytes = b"") -> Request:
     """A real fastapi Request built from a minimal ASGI scope.
@@ -50,7 +53,7 @@ def _request_with_next(value: str) -> Request:
     return _request(urlencode({"next": value}).encode())
 
 
-def _page_request(path: str = "/search", params: dict | None = None):
+def _page_request(path: str = "/search", params: dict[str, Any] | None = None):
     """Duck-typed request for url_for_query: only .url.path and .query_params
     (dict-convertible) are read by the helper."""
     return SimpleNamespace(url=SimpleNamespace(path=path), query_params=dict(params or {}))
@@ -59,6 +62,7 @@ def _page_request(path: str = "/search", params: dict | None = None):
 # ---------------------------------------------------------------------------
 # safe_redirect_url — open-redirect guard
 # ---------------------------------------------------------------------------
+
 
 def test_safe_redirect_allows_plain_relative_path():
     """Happy path: a same-site absolute path passes through unchanged."""
@@ -104,9 +108,9 @@ def test_safe_redirect_blocks_crlf_and_null_injection(value):
 
 
 def test_safe_redirect_allows_path_internal_colon():
-    """THE regression this helper exists for: '/search?q=time:1990' must be
-    ALLOWED. The old implementation's blanket ':' ban rejected legitimate
-    same-site search links containing colons; the structural urlsplit check
+    """A same-site target with a colon inside its path or query, such as
+    '/search?q=time:1990', must be ALLOWED. A blanket ':' ban would reject
+    legitimate same-site search links; the structural urlsplit check
     (no scheme, no netloc) lets them through."""
     target = "/search?q=time:1990"
     assert safe_redirect_url(_request_with_next(target)) == target
@@ -125,8 +129,8 @@ def test_safe_redirect_at_sign_in_path_passes_through():
     NOTE: the docstring's "Rejects: URLs with embedded credentials
     (/foo@evil.com)" claim does NOT hold — but the behavior is still safe:
     a Location of '/foo@evil.com' is a same-origin path ('@' is a legal path
-    character), not a redirect to evil.com. Pinning the actual (safe) code
-    behavior; the docstring inaccuracy is reported as a deviation, not a bug.
+    character), not a redirect to evil.com. This pins the actual (safe) code
+    behavior; the production docstring overstates what the guard rejects.
     """
     assert safe_redirect_url(_request_with_next("/foo@evil.com")) == "/foo@evil.com"
 
@@ -138,49 +142,93 @@ def test_safe_redirect_unsafe_value_returns_custom_fallback():
 
 
 # ---------------------------------------------------------------------------
-# is_safe_http_url — scheme allowlist
+# is_safe_http_url — structural HTTP(S) validation
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     "value",
-    ["http://example.com", "https://example.com/page?a=1", "HTTPS://X"],
-    ids=["http", "https", "uppercase-scheme"],
+    [
+        "http://example.com",
+        "https://example.com/page?a=1#section",
+        "https://example.com:8443/resource",
+        "HTTPS://X",
+    ],
+    ids=[
+        "http",
+        "path-query-fragment",
+        "custom-port",
+        "uppercase-scheme",
+    ],
 )
-def test_is_safe_http_url_accepts_http_schemes(value):
-    """http:// and https:// pass; the check lowercases first, so scheme
-    matching is case-insensitive (HTTPS://X is fine)."""
+def test_is_safe_http_url_accepts_absolute_http_urls(value):
     assert is_safe_http_url(value) is True
 
 
 def test_is_safe_http_url_strips_padding_before_check():
-    """' https://x ' -> True: the code strips BEFORE startswith, so leading/
-    trailing whitespace does not defeat the allowlist. Pinned from the code
-    (value.strip().lower().startswith(...))."""
+    """Surrounding whitespace is ignored before structural parsing."""
     assert is_safe_http_url(" https://x ") is True
 
 
 @pytest.mark.parametrize(
     "value",
     [
+        "https://",
+        "http://",
+        "https://?x",
+        "https://#fragment",
+        "https://user@example.com",
+        "https://user:password@example.com",
+        "https://example.com:99999/path",
+        "https:foo",
+        "//example.com/path",
         "javascript:alert(1)",
-        "data:text/html;base64,PGI+",
-        "//host/path",
-        "https:foo",   # scheme-only form without '//' — not an absolute URL
+        "data:text/plain,test",
         "ftp://example.com",
-        None,
         "",
+        None,
     ],
-    ids=["javascript", "data", "protocol-relative", "scheme-only", "ftp", "none", "empty"],
+    ids=[
+        "https-without-host",
+        "http-without-host",
+        "query-without-host",
+        "fragment-without-host",
+        "username",
+        "username-and-password",
+        "invalid-port",
+        "scheme-without-authority",
+        "protocol-relative",
+        "javascript",
+        "data",
+        "ftp",
+        "empty",
+        "none",
+    ],
 )
-def test_is_safe_http_url_rejects_non_http(value):
-    """Everything that isn't an absolute http(s):// URL is False — including
-    None and '' (the `bool(value and ...)` guard)."""
+def test_is_safe_http_url_rejects_unusable_or_unsafe_urls(value):
     assert is_safe_http_url(value) is False
+
+
+def test_parse_http_url_can_require_https():
+    with pytest.raises(ValueError):
+        parse_http_url(
+            "http://example.com",
+            require_https=True,
+        )
+
+    parsed = parse_http_url(
+        "https://example.com:8443/path",
+        require_https=True,
+    )
+
+    assert parsed.hostname == "example.com"
+    assert parsed.port == 8443
 
 
 # ---------------------------------------------------------------------------
 # safe_url_filter — render-time guard
 # ---------------------------------------------------------------------------
+
 
 def test_safe_url_filter_strips_and_returns_safe_url():
     """A safe URL is returned stripped of surrounding whitespace, so padded
@@ -202,6 +250,7 @@ def test_safe_url_filter_returns_empty_for_unsafe(value):
 # ---------------------------------------------------------------------------
 # url_for_query — filter/pagination link builder
 # ---------------------------------------------------------------------------
+
 
 def test_url_for_query_preserves_existing_params():
     """Existing query params survive when a new one is added (active filters

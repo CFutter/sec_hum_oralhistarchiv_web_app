@@ -1,0 +1,16 @@
+# Install as /etc/oralhistarchiv-backup.conf, root:root 0600; systemd reads it.
+# Public age recipient; replace the placeholder. Keep its private identity off-host.
+BACKUP_AGE_RECIPIENT=age1replace_with_public_recipient
+# Decimal days, 1–3650 without leading zeroes. find -mtime +N prunes at N+1 whole
+# days; always retain the new archive and newest prior archive by mtime.
+BACKUP_RETENTION_DAYS=30
+# Existing absolute nonsymlink directory, mode 0700, owned by the backup UID.
+# A custom path also requires corresponding systemd writable-path configuration.
+BACKUP_DIR=/var/lib/oralhistarchiv-backup
+
+# Unix-socket directory (TCP hosts are rejected); peer authentication is configured separately.
+PGHOST=/var/run/postgresql
+# Database to dump; must contain the expected Alembic revision and critical tables.
+PGDATABASE=oralhistarchiv
+# Dedicated read-only role; the connected current/session users must match.
+PGUSER=oralhistarchiv_backup

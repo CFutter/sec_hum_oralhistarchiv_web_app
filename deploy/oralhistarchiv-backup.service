@@ -1,0 +1,55 @@
+# Install with the backup script/config and timer after creating the backup
+# OS/database identity and peer mapping. The root manager reads EnvironmentFile.
+# /etc/oralhistarchiv is not namespace-hidden here: root-only permissions must
+# keep application secrets unreadable. A custom BACKUP_DIR needs matching paths.
+[Unit]
+Description=Oral History Archive encrypted PostgreSQL backup
+Documentation=file:/opt/oralhistarchiv/Deployment.md
+Requires=postgresql.service
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=oralhistarchiv_backup
+Group=oralhistarchiv_backup
+EnvironmentFile=/etc/oralhistarchiv-backup.conf
+ExecStart=/usr/local/libexec/oralhistarchiv-backup
+
+# systemd creates and owns /var/lib/oralhistarchiv-backup before ExecStart.
+StateDirectory=oralhistarchiv-backup
+StateDirectoryMode=0700
+UMask=0077
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oralhistarchiv-backup
+TimeoutStartSec=1h
+Nice=10
+
+# Network families are limited to local Unix sockets; binaries/config remain readable.
+# Do not add PrivateUsers: peer authentication must see oralhistarchiv_backup.
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+ReadWritePaths=/var/lib/oralhistarchiv-backup
+InaccessiblePaths=/opt/oralhistarchiv
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service

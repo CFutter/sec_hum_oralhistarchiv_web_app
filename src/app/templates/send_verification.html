@@ -7,17 +7,14 @@
 
   {% if success %}
     <h1>Check your email</h1>
-    <p class="auth-intro">We've sent a verification link to <strong>{{ email }}</strong>.</p>
-    <p class="form-hint">
-      The link expires in 24 hours. If you don't see it, check your spam folder.
-    </p>
+    <p class="auth-intro">{{ success }}</p>
 
   {% else %}
     <h1>Resend verification</h1>
     <p class="auth-intro">Enter your email address and we'll send you a new verification link.</p>
 
     <div class="auth-section">
-      <form class="auth-form" method="post" action="{{ request.url_for('send_verification_submit') }}">
+      <form class="auth-form" method="post" action="{{ path_for(request, 'send_verification_submit') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
 
         <div class="form-group">
@@ -31,7 +28,7 @@
     </div>
   {% endif %}
 
-  <p class="auth-link"><a href="{{ request.url_for('login_page') }}">Back to login</a></p>
+  <p class="auth-link"><a href="{{ path_for(request, 'login_page') }}">Back to login</a></p>
 
 </section>
 {% endblock %}
