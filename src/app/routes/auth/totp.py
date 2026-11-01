@@ -9,10 +9,10 @@ from starlette.concurrency import run_in_threadpool
 
 from config import settings
 
-from ...credentials import LOCAL_PASSWORD_MAX_CHARS
+from ...credentials import LOCAL_PASSWORD_MAX_CHARS, TOTP_CODE_RAW_MAX_CHARS
 from ...middleware import (
     clear_session_cookie,
-    get_session_id_from_cookie,
+    get_resolved_session_id,
     limiter,
 )
 from ...route_security import RouteAccess, SecureAPIRouter
@@ -42,20 +42,28 @@ full_router = SecureAPIRouter(access=RouteAccess.FULL_SESSION)
 routers = (enrollment_router, full_router)
 
 
-async def _restart_after_completed_setup(request: Request) -> Response:
-    """Best-effort revoke the cookie token, clear cookies, and redirect 303 to login."""
-    session_id = get_session_id_from_cookie(request)
+async def _restart_after_setup_session(
+    request: Request,
+    *,
+    completed: bool,
+) -> Response:
+    """Best-effort revoke setup authority, clear cookies and redirect 303 to login.
+
+    completed selects completion notice; False selects session-expired error.
+    Log deletion failure without preventing the redirect.
+    """
+    session_id = get_resolved_session_id(request)
     if session_id is not None:
         try:
             await delete_session(request.app.state.db_pool, session_id)
         except Exception:
             logger.warning(
-                "Failed to revoke completed TOTP setup session",
+                "Failed to revoke TOTP setup session",
                 exc_info=True,
             )
 
     response = RedirectResponse(
-        url="/login?error=totp_setup_completed",
+        url=("/login?notice=totp_setup_completed" if completed else "/login?error=session_expired"),
         status_code=303,
     )
     clear_session_cookie(response)
@@ -72,7 +80,7 @@ async def _restart_after_recovery_session(
     completed selects login-success guidance; False selects recovery-expired
     guidance. Failed deletion is logged and does not prevent the redirect.
     """
-    session_id = get_session_id_from_cookie(request)
+    session_id = get_resolved_session_id(request)
     if session_id is not None:
         try:
             await delete_session(request.app.state.db_pool, session_id)
@@ -83,7 +91,7 @@ async def _restart_after_recovery_session(
             )
 
     destination = (
-        "/login?error=totp_recovery_completed"
+        "/login?notice=totp_recovery_completed"
         if completed
         else "/recover-totp?error=session_expired"
     )
@@ -118,7 +126,7 @@ async def setup_totp_page(request: Request) -> Response:  # noqa: PLR0911 - type
         if recovery_enrollment:
             return await _restart_after_recovery_session(request, completed=True)
         if request.state.session_purpose == "totp_setup":
-            return await _restart_after_completed_setup(request)
+            return await _restart_after_setup_session(request, completed=True)
         return RedirectResponse(url="/account", status_code=303)
 
     if not user.email_verified:
@@ -140,11 +148,11 @@ async def setup_totp_page(request: Request) -> Response:  # noqa: PLR0911 - type
     if pending.outcome is PendingTotpOutcome.SESSION_EXPIRED:
         if recovery_enrollment:
             return await _restart_after_recovery_session(request, completed=False)
-        return await _restart_after_completed_setup(request)
+        return await _restart_after_setup_session(request, completed=False)
 
     if pending.outcome is PendingTotpOutcome.ALREADY_CONFIGURED:
         if request.state.session_purpose == "totp_setup":
-            return await _restart_after_completed_setup(request)
+            return await _restart_after_setup_session(request, completed=True)
         return RedirectResponse(url="/account", status_code=303)
 
     if pending.outcome is PendingTotpOutcome.INELIGIBLE:
@@ -186,13 +194,13 @@ async def setup_totp_page(request: Request) -> Response:  # noqa: PLR0911 - type
 @limiter.limit("5/minute;20/hour")
 async def setup_totp_submit(  # noqa: PLR0911 - typed state mapping
     request: Request,
-    totp_code: str = Form(..., max_length=16),
+    totp_code: str = Form(..., max_length=TOTP_CODE_RAW_MAX_CHARS),
     recovery_code_confirmation: str = Form(..., max_length=TOTP_RECOVERY_CODE_MAX_CHARS),
 ) -> Response:
     """Enroll with TOTP plus a staged recovery code via verify_and_enroll_totp.
 
-    Success audits and redirects 303 to account; recovery completion clears
-    cookies and redirects to login. Bad codes render 422 with a replacement
+    Success audits, clears authentication cookies and redirects 303 to login.
+    Bad codes render 422 with a replacement
     recovery-code set, invalidating the previous display. Missing seed redirects
     to setup; ineligible state returns 403 or restarts recovery; already-
     configured state returns 409 or restarts a partial session. Expired sessions
@@ -220,13 +228,13 @@ async def setup_totp_submit(  # noqa: PLR0911 - typed state mapping
     if outcome is TotpEnrollmentOutcome.SESSION_EXPIRED:
         if recovery_enrollment:
             return await _restart_after_recovery_session(request, completed=False)
-        return await _restart_after_completed_setup(request)
+        return await _restart_after_setup_session(request, completed=False)
 
     if outcome is TotpEnrollmentOutcome.ALREADY_CONFIGURED:
         if recovery_enrollment:
             return await _restart_after_recovery_session(request, completed=True)
         if request.state.session_purpose == "totp_setup":
-            return await _restart_after_completed_setup(request)
+            return await _restart_after_setup_session(request, completed=True)
         return templates.TemplateResponse(
             request,
             "error.html",
@@ -304,7 +312,7 @@ async def setup_totp_submit(  # noqa: PLR0911 - typed state mapping
             user_id=user.id,
         )
         response = RedirectResponse(
-            url="/login?error=totp_recovery_completed",
+            url="/login?notice=totp_recovery_completed",
             status_code=303,
         )
         clear_session_cookie(response)
@@ -320,7 +328,9 @@ async def setup_totp_submit(  # noqa: PLR0911 - typed state mapping
         user_id=user.id,
     )
 
-    return RedirectResponse(url="/account", status_code=303)
+    response = RedirectResponse(url="/login?notice=totp_setup_completed", status_code=303)
+    clear_session_cookie(response)
+    return response
 
 
 @full_router.get("/account/reset-totp", response_class=HTMLResponse)
@@ -335,12 +345,13 @@ async def reset_totp_page(request: Request) -> Response:
     user = request.state.user
 
     if user.auth_method != "local":
-        session_id = get_session_id_from_cookie(request)
+        session_id = get_resolved_session_id(request)
         if session_id:
             await set_flash_if_exists(
                 pool,
                 session_id,
-                "Two-factor authentication is managed by your identity provider (SWITCH edu-ID).",
+                f"Two-factor authentication for {settings.federated_login_label} "
+                "is managed by your identity provider.",
                 "info",
             )
         return RedirectResponse(url="/account", status_code=303)
@@ -363,7 +374,7 @@ async def reset_totp_page(request: Request) -> Response:
 async def reset_totp_start(
     request: Request,
     current_password: str = Form(..., max_length=LOCAL_PASSWORD_MAX_CHARS),
-    current_totp_code: str = Form(..., max_length=16),
+    current_totp_code: str = Form(..., max_length=TOTP_CODE_RAW_MAX_CHARS),
 ) -> Response:
     """Prove credentials through begin_totp_rotation and render the replacement seed/QR once.
 
@@ -512,7 +523,7 @@ async def reset_totp_start(
 @limiter.limit("5/minute;20/hour")
 async def reset_totp_confirm(
     request: Request,
-    new_totp_code: str = Form(..., max_length=16),
+    new_totp_code: str = Form(..., max_length=TOTP_CODE_RAW_MAX_CHARS),
 ) -> Response:
     """Complete rotation through confirm_totp_rotation, audit, and map its outcome.
 
@@ -566,7 +577,7 @@ async def reset_totp_confirm(
             event_type="totp_changed",
             user_id=user_id,
         )
-        response = RedirectResponse(url="/login?totp_changed=1", status_code=303)
+        response = RedirectResponse(url="/login?notice=totp_changed", status_code=303)
         clear_session_cookie(response)
         return response
 

@@ -5,7 +5,9 @@ import logging
 from fastapi import Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from ...middleware import get_session_id_from_cookie
+from app.service_errors import UserInputRejected, UserNotFound
+
+from ...middleware import get_resolved_session_id
 from ...route_security import RouteAccess, SecureAPIRouter
 from ...services import (
     DISPLAY_NAME_MAX_LENGTH,
@@ -56,11 +58,15 @@ async def change_display_name(
     """
     user = request.state.user
     pool = request.app.state.db_pool
-    session_id = get_session_id_from_cookie(request)
+    session_id = get_resolved_session_id(request)
 
     try:
         await update_display_name(pool, user.id, display_name)
-    except ValueError as e:
+    except UserNotFound:
+        if session_id:
+            await set_flash_if_exists(pool, session_id, "User not found.", "error")
+        return RedirectResponse(url="/account", status_code=303)
+    except UserInputRejected as e:
         if session_id:
             await set_flash_if_exists(pool, session_id, str(e), "error")
         return RedirectResponse(url="/account", status_code=303)

@@ -1,16 +1,43 @@
 {% extends "base.html" %}
-{% block title %}Confirm your email — Oral History Archive{% endblock %}
+{% block title %}Complete your account — {{ site_name }}{% endblock %}
 {% block content %}
 <section class="container auth-page">
-  <h1>Confirm your email</h1>
-  <p>Click below to verify this email address: {{ email }}</p>
-
-  <div class="auth-section">
-    <form class="auth-form" action="{{ path_for(request, 'verify_email_submit') }}" method="post">
-      <input type="hidden" name="token" value="{{ token }}">
-      <button type="submit" class="btn btn-primary">Confirm Email</button>
-    </form>
-    <p class="auth-link"><a href="{{ path_for(request, 'login_page') }}">Cancel</a></p>
-  </div>
+  <h1>Complete your account</h1>
+  <p>Choose a password and profile{% if email %} for <strong>{{ email }}</strong>{% endif %}.</p>
+  {% if request.state.user %}<p>You are already signed in. To use this account after setup, sign out and sign in again with this email address.</p>{% endif %}
+  {% if error %}<div class="auth-error" role="alert">{{ error }}</div>{% endif %}
+  <form class="auth-form" action="{{ path_for(request, 'verify_email_submit') }}" method="post">
+    {% include "action_token_fields.html" %}
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+    <div class="form-group">
+      <label for="display_name">Display name</label>
+      <input type="text" id="display_name" name="display_name" required maxlength="{{ display_name_max_chars }}"
+             value="{{ display_name }}" autocomplete="name">
+    </div>
+    <div class="form-group">
+      <label for="affiliation">Affiliation (optional)</label>
+      <input type="text" id="affiliation" name="affiliation" maxlength="{{ affiliation_max_chars }}"
+             value="{{ affiliation }}" autocomplete="organization">
+    </div>
+    <div class="form-group">
+      <label for="country">Country (optional)</label>
+      <input type="text" id="country" name="country" maxlength="{{ country_max_chars }}"
+             value="{{ country }}" autocomplete="country-name">
+    </div>
+    <div class="form-group">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required minlength="{{ password_min_chars }}"
+             maxlength="{{ password_max_chars }}" autocomplete="new-password">
+      <span class="form-hint">Use {{ password_min_chars }}–{{ password_max_chars }} characters.</span>
+    </div>
+    <div class="form-group">
+      <label for="password_confirm">Confirm password</label>
+      <input type="password" id="password_confirm" name="password_confirm" required
+             maxlength="{{ password_max_chars }}" autocomplete="new-password">
+    </div>
+    <button type="submit" class="btn btn-primary">Complete account setup</button>
+  </form>
+  <p>After setup, sign in to enroll your authenticator and save your recovery codes.</p>
+  <p class="auth-link"><a href="{{ path_for(request, 'login_page') }}">Cancel</a></p>
 </section>
 {% endblock %}

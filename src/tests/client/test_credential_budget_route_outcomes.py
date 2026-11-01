@@ -1,11 +1,4 @@
-"""Client-level route contracts for credential-attempt budgets.
-
-The database and service tiers own the counters.  These tests pin the HTTP
-boundary: an exhausted session-wide step-up budget terminates only the exact
-session, while an exhausted TOTP-rotation challenge leaves that session alive
-and requires a fresh challenge.  Public recovery failures remain deliberately
-indistinguishable.
-"""
+"""Client-level route contracts for credential-attempt budgets."""
 
 import logging
 from unittest.mock import ANY, call, patch
@@ -32,10 +25,12 @@ from tests.fixtures import RAW_SESSION_ID, make_sample_user
 
 
 def _patch_route(module: str, name: str, **kwargs):
+    """Patch an authentication-route collaborator with its real signature."""
     return patch(f"app.routes.auth.{module}.{name}", autospec=True, **kwargs)
 
 
 def _assert_auth_cookies_cleared(response) -> None:
+    """Require deletion headers for the authentication cookies."""
     set_cookie_headers = response.headers.get_list("set-cookie")
     for cookie_name in (settings.session_cookie_name, CSRF_COOKIE_NAME):
         assert any(
@@ -45,6 +40,7 @@ def _assert_auth_cookies_cleared(response) -> None:
 
 
 def _assert_auth_cookies_kept(response, client) -> None:
+    """Require both authentication cookies to remain present and undeleted."""
     set_cookie_headers = response.headers.get_list("set-cookie")
     for cookie_name in (settings.session_cookie_name, CSRF_COOKIE_NAME):
         assert not any(
@@ -66,6 +62,7 @@ def test_totp_rotation_start_session_rejection_clears_exact_session(
     authenticated_client,
     outcome,
 ):
+    """Check TOTP rotation start session rejection clears exact session (HTTP 303)."""
     result = TotpRotationStartResult(outcome)
     with (
         _patch_route("totp", "begin_totp_rotation", return_value=result) as begin,
@@ -103,6 +100,7 @@ def test_totp_rotation_start_session_rejection_clears_exact_session(
 def test_totp_rotation_confirmation_exhaustion_keeps_session_and_restarts(
     authenticated_client,
 ):
+    """Check TOTP rotation confirmation exhaustion keeps session and restarts (HTTP 303)."""
     with (
         _patch_route(
             "totp",
@@ -144,6 +142,7 @@ def test_email_change_session_rejection_clears_session_before_follow_up(
     authenticated_client,
     reason,
 ):
+    """Check email change session rejection clears session before follow up (HTTP 303)."""
     with (
         _patch_route(
             "email_change",
@@ -156,8 +155,9 @@ def test_email_change_session_rejection_clears_session_before_follow_up(
         response = authenticated_client.post(
             "/account/change-email",
             data={
-                "new_email": "alice.new@uzh.ch",
+                "new_email": "alice.new@example.org",
                 "current_password": "correct horse",
+                "totp_code": "111111",
                 "csrf_token": authenticated_client.csrf_token,
             },
             follow_redirects=False,
@@ -171,7 +171,8 @@ def test_email_change_session_rejection_clears_session_before_follow_up(
         user_id=1,
         session_id=RAW_SESSION_ID,
         current_password="correct horse",
-        new_email="alice.new@uzh.ch",
+        new_email="alice.new@example.org",
+        totp_code="111111",
     )
     flash.assert_not_awaited()
     audit.assert_called_once_with(
@@ -217,6 +218,7 @@ def test_admin_promotion_session_rejection_clears_session_without_reload(
     audit_level,
     reason,
 ):
+    """Check admin promotion session rejection clears session without reload (HTTP 303)."""
     with (
         _patch_route(
             "admin_promotion",
@@ -255,10 +257,11 @@ def test_admin_recovery_session_rejection_does_not_reload_target(
     client_builder,
     reason,
 ):
+    """Check admin recovery session rejection does not reload target (HTTP 303)."""
     admin_client = client_builder(
         session_user=make_sample_user(
             id=99,
-            email="admin@uzh.ch",
+            email="admin@example.org",
             display_name="Admin User",
             access_tier="vetted",
             is_admin=True,
@@ -268,7 +271,7 @@ def test_admin_recovery_session_rejection_does_not_reload_target(
     )
     target = TotpRecoveryTarget(
         user_id=7,
-        email="target@uzh.ch",
+        email="target@example.org",
         display_name="Target User",
         auth_method="local",
         is_active=True,
@@ -325,7 +328,7 @@ def test_admin_recovery_final_session_race_clears_cookie(client_builder):
     admin_client = client_builder(
         session_user=make_sample_user(
             id=99,
-            email="admin@uzh.ch",
+            email="admin@example.org",
             display_name="Admin User",
             access_tier="vetted",
             is_admin=True,
@@ -335,7 +338,7 @@ def test_admin_recovery_final_session_race_clears_cookie(client_builder):
     )
     target = TotpRecoveryTarget(
         user_id=7,
-        email="target@uzh.ch",
+        email="target@example.org",
         display_name="Target User",
         auth_method="local",
         is_active=True,
@@ -375,6 +378,7 @@ def test_admin_recovery_final_session_race_clears_cookie(client_builder):
 def test_account_locked_response_is_bounded_and_does_not_reflect_credentials(
     authenticated_client,
 ):
+    """Check account locked response is bounded and does not reflect credentials (HTTP 423)."""
     password_marker = "DO-NOT-REFLECT-PASSWORD-9c37"
     totp_marker = "654321"
     result = TotpRotationStartResult(TotpRotationStartOutcome.ACCOUNT_LOCKED)
@@ -398,6 +402,7 @@ def test_account_locked_response_is_bounded_and_does_not_reflect_credentials(
 
 
 def test_public_recovery_rejection_reasons_have_identical_generic_response(guest_client):
+    """Check public recovery rejection reasons have identical generic response."""
     reasons = (
         "invalid_credentials",
         "account_ineligible",
@@ -418,7 +423,7 @@ def test_public_recovery_rejection_reasons_have_identical_generic_response(guest
                 guest_client.post(
                     "/recover-totp",
                     data={
-                        "email": "target@uzh.ch",
+                        "email": "target@example.org",
                         "password": "DO-NOT-REFLECT-PASSWORD-9c37",
                         "recovery_code": "AAAAA-BBBBB-CCCCC-DDDDD",
                         "csrf_token": guest_client.csrf_token,
@@ -464,9 +469,7 @@ def test_public_recovery_page_renders_without_touching_any_service(guest_client)
 
 
 def test_public_recovery_accepted_redemption_differs_from_every_rejection(guest_client):
-    """Positive control for the six typed-rejection parity proven above: the
-    one accepted redemption produces a status, body, and redirect that are
-    all distinguishable from every rejection's identical generic response."""
+    """Distinguish accepted public recovery from the identical generic rejection responses."""
     redemption = TotpRecoveryRedemption(user_id=7, session_id="fresh-recovery-session")
     with (
         _patch_route("totp_recover", "redeem_totp_recovery", return_value=redemption) as redeem,
@@ -475,7 +478,7 @@ def test_public_recovery_accepted_redemption_differs_from_every_rejection(guest_
         response = guest_client.post(
             "/recover-totp",
             data={
-                "email": "target@uzh.ch",
+                "email": "target@example.org",
                 "password": "correct horse battery staple",
                 "recovery_code": "AAAAA-BBBBB-CCCCC-DDDDD",
                 "csrf_token": guest_client.csrf_token,
@@ -488,7 +491,7 @@ def test_public_recovery_accepted_redemption_differs_from_every_rejection(guest_
     assert "Invalid email, password, or recovery code." not in (response.text or "")
     redeem.assert_awaited_once_with(
         guest_client.mock_pool,
-        email="target@uzh.ch",
+        email="target@example.org",
         password="correct horse battery staple",
         recovery_code="AAAAA-BBBBB-CCCCC-DDDDD",
         ip_address=ANY,

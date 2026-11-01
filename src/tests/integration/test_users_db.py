@@ -1,15 +1,4 @@
-"""Integration tests: user CRUD + TOTP persistence against real PostgreSQL.
-
-Pins the database behaviors the unit tier mocks away: the LOWER(email)
-unique index, UPDATE ... RETURNING existence checks, the asymmetric
-set_user_active counter handling, the SQL-side lockout threshold CASE,
-the last_totp_step replay guard, pending-TOTP TTL/promotion, and the
-fail-closed handling of undecryptable TOTP secrets. It also exercises the
-row-locked concurrent-write behavior of update_access_tier.
-
-The session-bound TOTP rotation protocol (begin_totp_rotation /
-confirm_totp_rotation) has its own module: test_totp_rotation_db.py.
-"""
+"""Integration tests: user CRUD + TOTP persistence against real PostgreSQL."""
 
 import asyncio
 import contextlib
@@ -22,11 +11,11 @@ import pyotp
 import pytest
 import time_machine
 
-from app.services import registration
+from app.service_errors import UserNotFound
+from app.services import registration_setup
 from app.services.authentication import (
     record_login_failure,
 )
-from app.services.crypto import decrypt_value, encrypt_value
 from app.services.totp import (
     PendingTotpOutcome,
     PendingTotpPurpose,
@@ -39,9 +28,9 @@ from app.services.totp import (
     verify_and_consume_totp,
     verify_and_enroll_totp,
 )
+from app.services.totp_crypto import decrypt_value, encrypt_value
 from app.services.users import (
     SetActiveResult,
-    UserAlreadyExistsError,
     get_user_by_email,
     get_user_by_id,
     reap_unverified_accounts,
@@ -49,7 +38,6 @@ from app.services.users import (
     update_access_tier,
     update_display_name,
 )
-from tests.account_setup import create_local_user, store_pending_totp_secret
 from tests.integration.conftest import TEST_DATABASE_URL
 
 
@@ -76,49 +64,64 @@ async def _wait_until_blocked_by(observer, leader_pid):
 
 
 class TestLocalUserCreation:
-    """create_local_user inserts a public-tier, authenticator-free account."""
+    """Registration creates an inactive public shell without credentials or profile."""
 
     async def test_create_local_user_normalizes_email_and_defaults(self, db_pool, sync_conn):
-        """create_local_user strips/lowercases the email before INSERT and the
-        returned User starts with totp_configured=False and tier 'public'
-        (creation can never elevate — the INSERT hardcodes 'public')."""
-        user = await create_local_user(
-            db_pool, email=" Alice@UZH.ch ", display_name="Alice", password="s3cret-Pw!"
+        """Verify create local user normalizes email and defaults."""
+        assert (
+            await registration_setup.begin_local_registration(db_pool, email=" Alice@EXAMPLE.ORG ")
+            is None
         )
-        assert user.email == "alice@uzh.ch"
+        user = await get_user_by_email(db_pool, "alice@example.org")
+        assert user is not None
+        assert user.email == "alice@example.org"
         assert user.totp_configured is False
         assert user.access_tier == "public"
         assert user.auth_method == "local"
+        assert user.is_active is False
+        assert user.email_verified is False
+        assert user.is_admin is False
+        assert user.display_name is user.affiliation is user.country is None
 
-        stored = _fetch_user_row(sync_conn, user.id, ["email", "access_tier"])
-        assert stored["email"] == "alice@uzh.ch"
-        assert stored["access_tier"] == "public"
+        stored = _fetch_user_row(sync_conn, user.id, ["email", "access_tier", "password_hash"])
+        assert stored == {
+            "email": "alice@example.org",
+            "access_tier": "public",
+            "password_hash": None,
+        }
 
-    async def test_create_local_user_duplicate_email_case_insensitive(self, db_pool, user_factory):
-        """The LOWER(email) unique index rejects a duplicate that differs only in
-        case: the UniqueViolation is translated to UserAlreadyExistsError
-        end-to-end (not a raw psycopg error leaking to the route)."""
-        user_factory(email="alice@uzh.ch")
-        with pytest.raises(UserAlreadyExistsError) as exc_info:
-            await create_local_user(
-                db_pool, email="ALICE@uzh.ch", display_name="Impostor", password="s3cret-Pw!"
-            )
-        # The error carries the normalized (lowercased) email.
-        assert exc_info.value.email == "alice@uzh.ch"
+    async def test_create_local_user_duplicate_email_case_insensitive(
+        self, db_pool, user_factory, sync_conn
+    ):
+        """Verify create local user duplicate email case insensitive."""
+        handle = user_factory(email="alice@example.org")
+        before = sync_conn.execute("SELECT * FROM users WHERE id = %s", (handle.id,)).fetchone()
+        sync_conn.commit()
+
+        assert (
+            await registration_setup.begin_local_registration(db_pool, email="ALICE@example.org")
+            is None
+        )
+        user = await get_user_by_email(db_pool, "alice@example.org")
+        assert user is not None and user.id == handle.id
+        assert (
+            sync_conn.execute("SELECT * FROM users WHERE id = %s", (handle.id,)).fetchone()
+            == before
+        )
+        assert (
+            sync_conn.execute(
+                "SELECT user_id, message_type, recipient FROM email_outbox"
+            ).fetchall()
+            == []
+        )
 
     async def test_new_local_account_has_no_active_pending_or_consumed_totp(
         self, db_pool, sync_conn
     ):
-        """POSITIVE CONTROL for the pending/active TOTP columns exercised
-        elsewhere: the raw INSERT that create_local_user issues leaves every
-        authenticator column unset, so a fresh account starts with no second
-        factor configured, staged, or replayed."""
-        user = await create_local_user(
-            db_pool,
-            email="new-person@example.org",
-            display_name="New Person",
-            password="Unrelated-CorrectHorse-4829!",
-        )
+        """Verify new local account has no active pending or consumed TOTP."""
+        await registration_setup.begin_local_registration(db_pool, email="new-person@example.org")
+        user = await get_user_by_email(db_pool, "new-person@example.org")
+        assert user is not None
         assert user.totp_configured is False
         assert sync_conn.execute(
             "SELECT totp_secret, pending_totp_secret, pending_totp_created_at, last_totp_step "
@@ -128,37 +131,30 @@ class TestLocalUserCreation:
 
 
 class TestRegistrationTransaction:
-    """register_local_user commits the account row and its verification email
-    enqueue as one transaction: either both land, or neither does."""
+    """Pending account and verification email commit in one transaction."""
 
     async def test_registration_enqueue_failure_rolls_back_account_and_can_retry(
         self, db_pool, sync_conn
     ):
-        """If enqueueing the verification email raises, the transaction rolls
-        back the whole INSERT with it — no orphaned account survives with no
-        way to receive a verification link. A retry with the same email then
-        succeeds normally, proving the failed attempt left nothing behind to
-        collide with it."""
-        kwargs = {
-            "email": "  AUDIT@UZH.CH  ",
-            "display_name": "New Person",
-            "password": "Vm8!qZ2#rL7@pX9$",
-        }
+        """Verify registration enqueue failure rolls back account and can retry."""
+        email = "  AUDIT@EXAMPLE.ORG  "
         with (
             patch.object(
-                registration,
+                registration_setup,
                 "enqueue_outbound_email_cur",
                 autospec=True,
                 side_effect=RuntimeError("queue failed"),
             ),
             pytest.raises(RuntimeError, match="queue failed"),
         ):
-            await registration.register_local_user(db_pool, **kwargs)
+            await registration_setup.begin_local_registration(db_pool, email=email)
         assert sync_conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0
         assert sync_conn.execute("SELECT count(*) FROM email_outbox").fetchone()[0] == 0
         sync_conn.commit()
-        user = await registration.register_local_user(db_pool, **kwargs)
-        assert user.email == "audit@uzh.ch"
+        await registration_setup.begin_local_registration(db_pool, email=email)
+        user = await get_user_by_email(db_pool, "audit@example.org")
+        assert user is not None
+        assert user.email == "audit@example.org"
         assert sync_conn.execute(
             "SELECT email_verification_token_hash IS NOT NULL FROM users WHERE id=%s", (user.id,)
         ).fetchone()[0]
@@ -182,9 +178,9 @@ class TestDisplayNameAndAccessTierUpdates:
         assert stored["display_name"] == "New Name"
 
     async def test_update_display_name_unknown_user_raises(self, db_pool):
-        """UPDATE ... RETURNING id on a missing user yields no row -> ValueError
+        """UPDATE ... RETURNING id on a missing user yields no row -> UserNotFound
         (guards the existence check the unit tier only mocks)."""
-        with pytest.raises(ValueError, match="not found"):
+        with pytest.raises(UserNotFound, match="not found"):
             await update_display_name(db_pool, 999_999, "Ghost")
 
     async def test_update_access_tier_persists(self, db_pool, user_factory, sync_conn, admin_actor):
@@ -203,8 +199,8 @@ class TestDisplayNameAndAccessTierUpdates:
         assert stored["access_tier"] == "vetted"
 
     async def test_update_access_tier_unknown_user_raises(self, db_pool, admin_actor):
-        """Missing user -> ValueError via the RETURNING existence check."""
-        with pytest.raises(ValueError, match="not found"):
+        """Missing user -> UserNotFound via the RETURNING existence check."""
+        with pytest.raises(UserNotFound, match="not found"):
             await update_access_tier(
                 db_pool,
                 999_999,
@@ -216,17 +212,7 @@ class TestDisplayNameAndAccessTierUpdates:
     async def test_concurrent_tier_writes_capture_committed_old_value(
         self, db_pool, user_factory, admin_actor
     ):
-        """A concurrent admin's write blocks on the`before` CTE's row lock
-        (users.py:353-355, `SELECT access_tier FROMusers WHERE id = %(user_id)s FOR UPDATE`)
-        and its returned old_value iswhat the row held at WRITE time — the first
-        writer's COMMITTED value — never a stale pre-lock snapshot.
-
-        conn1 opens a transaction that rewrites access_tier to 'vetted' but does
-        NOT commit yet; the second writer's update_access_tier(..., 'public')
-        call must block on FOR UPDATE until conn1 commits, then report
-        old_value='vetted' (conn1's committed value), never 'registered' (the
-        seed value a stale read taken before conn1's write would return).
-        """
+        """Verify concurrent tier writes capture committed old value."""
         handle = user_factory(access_tier="registered")
 
         conn1 = await psycopg.AsyncConnection.connect(TEST_DATABASE_URL)
@@ -290,12 +276,7 @@ class TestSetUserActiveAsymmetry:
     async def test_set_user_active_true_clears_lockout_counters(
         self, db_pool, user_factory, sync_conn, admin_actor
     ):
-        """Reactivation is a fresh start: set_user_active(True) clears
-        failed_login_count and locked_until so the user is not still locked
-        out from before deactivation, and returns SetActiveResult with
-        lock_cleared=True (users.py:436-451: before.failed_login_count=5 > 0
-        makes the OR-clause true). _plant_lockout also sets is_active=false,
-        so old_value=False here (deactivated -> reactivated)."""
+        """Verify set user active true clears lockout counters."""
         handle = user_factory()
         _plant_lockout(sync_conn, handle.id)
 
@@ -318,11 +299,7 @@ class TestSetUserActiveAsymmetry:
     async def test_set_user_active_true_on_already_active_locked_user_clears_lockout(
         self, db_pool, user_factory, sync_conn, admin_actor
     ):
-        """Reactivating an ALREADY-ACTIVE, locked-out user still clears
-        the lockout — the write is no longer guarded by a pre-read.
-        old_value=True (not False, unlike the deactivated-then-reactivated case above)
-        pins that the branch fires unconditionally on is_active=True, not only on
-        an is_active flip."""
+        """Verify set user active true on already active locked user clears lockout."""
         handle = user_factory(is_active=True)
         sync_conn.execute(
             """UPDATE users
@@ -352,12 +329,7 @@ class TestSetUserActiveAsymmetry:
     async def test_set_user_active_true_on_expired_lock_still_reports_cleared(
         self, db_pool, user_factory, sync_conn, admin_actor
     ):
-        """Pins the OR in the lock_cleared expression (users.py:449-450:
-        `before.failed_login_count > 0 OR before.locked_until IS NOT NULL`):
-        locked_until IS NOT NULL is true even when the timestamp is already in
-        the PAST (an expired lock no longer actually blocking anyone) —
-        lock_cleared reports "the write reset stale lockout state", not "the
-        user was actively blocked at read time"."""
+        """Verify set user active true on expired lock still reports cleared."""
         handle = user_factory(is_active=True)
         sync_conn.execute(
             """UPDATE users
@@ -383,11 +355,7 @@ class TestSetUserActiveAsymmetry:
     async def test_set_user_active_true_on_clean_active_user_reports_not_cleared(
         self, db_pool, user_factory, admin_actor
     ):
-        """POSITIVE CONTROL for the lock_cleared=True pins above: reactivating an
-        already-active user with NO lockout state (failed_login_count=0,
-        locked_until=NULL, the user_factory defaults) returns lock_cleared=False
-        — proves the OR only fires when there was something to clear, not
-        unconditionally on every reactivation call."""
+        """Verify set user active true on clean active user reports not cleared."""
         handle = user_factory(is_active=True)
 
         result = await set_user_active(
@@ -403,11 +371,7 @@ class TestSetUserActiveAsymmetry:
     async def test_set_user_active_false_preserves_lockout_counters(
         self, db_pool, user_factory, sync_conn, admin_actor
     ):
-        """Deactivation keeps the audit signal: counters and locked_until are
-        NOT cleared when an admin disables the account, and lock_cleared is
-        hard-coded False on the deactivate branch (users.py:452-464) regardless
-        of the prior lockout state — the companion pin to the
-        reactivation-clears-lockout tests above."""
+        """Verify set user active false preserves lockout counters."""
         handle = user_factory()  # is_active=True by default
         sync_conn.execute(
             """UPDATE users
@@ -435,8 +399,8 @@ class TestSetUserActiveAsymmetry:
         assert stored["locked_until"] is not None
 
     async def test_set_user_active_unknown_user_raises(self, db_pool, admin_actor):
-        """Missing user -> ValueError for both directions of the flag."""
-        with pytest.raises(ValueError, match="not found"):
+        """Missing user -> UserNotFound for both directions of the flag."""
+        with pytest.raises(UserNotFound, match="not found"):
             await set_user_active(
                 db_pool,
                 999_999,
@@ -444,7 +408,7 @@ class TestSetUserActiveAsymmetry:
                 actor_id=admin_actor.id,
                 actor_session_id=admin_actor.session_id,
             )
-        with pytest.raises(ValueError, match="not found"):
+        with pytest.raises(UserNotFound, match="not found"):
             await set_user_active(
                 db_pool,
                 999_999,
@@ -460,11 +424,11 @@ class TestUserLookups:
     async def test_get_user_by_email_case_insensitive(self, db_pool, user_factory):
         """get_user_by_email matches via LOWER(email) = LOWER(%s) against the
         real index, regardless of the caller's casing."""
-        handle = user_factory(email="alice@uzh.ch")
-        user = await get_user_by_email(db_pool, "ALICE@UZH.CH")
+        handle = user_factory(email="alice@example.org")
+        user = await get_user_by_email(db_pool, "ALICE@EXAMPLE.ORG")
         assert user is not None
         assert user.id == handle.id
-        assert user.email == "alice@uzh.ch"
+        assert user.email == "alice@example.org"
 
     async def test_get_user_by_id_missing_returns_none(self, db_pool):
         """Unknown id -> None (not an exception)."""
@@ -486,7 +450,7 @@ class TestUnverifiedAccountReaper:
         busy = user_factory(email_verified=False, created_at=datetime(2020, 1, 1, tzinfo=UTC))
         sync_conn.execute(
             "INSERT INTO users (email, display_name, password_hash, auth_method, "
-            "email_verified, created_at) SELECT 'reap' || i || '@uzh.ch', 'Old', "
+            "email_verified, created_at) SELECT 'reap' || i || '@example.org', 'Old', "
             "'unused', 'local', false, '2020-01-01'::timestamptz FROM generate_series(1, 1005) i"
         )
         sync_conn.commit()
@@ -507,12 +471,7 @@ class TestLoginFailureLockout:
     async def test_login_failure_lockout_crossing_and_clear(
         self, db_pool, user_factory, sync_conn, admin_actor
     ):
-        """The SQL CASE locks exactly at the threshold: two failures leave the
-        account unlocked; the third sets locked_until AND reports
-        was_locked_this_call=True only on that crossing call. A fourth
-        failure arrives while the lock is live, so it neither raises the
-        counter nor reports a second crossing. Administrator reactivation
-        resets both columns."""
+        """Verify login failure lockout crossing and clear."""
         handle = user_factory()
 
         count, locked = await record_login_failure(db_pool, handle.id, expected_auth_revision=0)
@@ -550,13 +509,7 @@ class TestTotpReplayGuard:
     """verify_and_consume_totp: a valid current code verifies once; replay and garbage are rejected."""
 
     async def test_totp_code_verifies_once_then_replay_rejected(self, db_pool, user_factory):
-        """A valid current code returns True exactly once.
-
-        Verification reads the current encrypted secret and replay floor under
-        one row lock. The first call advances last_totp_step; replaying that code
-        is rejected. A future-step code inside valid_window=1 still verifies,
-        proving the guard is monotonic rather than a blanket block.
-        """
+        """Verify TOTP code verifies once then replay rejected."""
         secret = pyotp.random_base32()
         handle = user_factory(totp_secret=encrypt_value(secret))
         totp = pyotp.TOTP(secret)
@@ -588,15 +541,19 @@ class TestPendingTotpEnrollment:
     async def test_pending_totp_roundtrip_encrypted_at_rest(
         self, db_pool, user_factory, session_factory, sync_conn
     ):
-        """store_pending_totp_secret encrypts before writing: the raw column
-        value is ciphertext (!= the secret) but decrypt_value recovers it, and
-        get_pending_totp_secret returns the plaintext within the TTL, to the
-        exact session authorizing the enrollment."""
-        secret = pyotp.random_base32()
+        """Production setup stores encrypted pending material; the authorizing
+        session can read the plaintext back within its TTL."""
         handle = user_factory()
         raw_session = session_factory(handle.id, purpose="totp_setup")
-
-        await store_pending_totp_secret(db_pool, handle.id, secret)
+        pending = await get_or_create_pending_totp_secret(
+            db_pool,
+            handle.id,
+            purpose=PendingTotpPurpose.ENROLLMENT,
+            session_id=raw_session,
+        )
+        assert pending.outcome is PendingTotpOutcome.READY
+        assert pending.secret is not None
+        secret = pending.secret
 
         stored = _fetch_user_row(
             sync_conn, handle.id, ["pending_totp_secret", "pending_totp_created_at"]
@@ -621,10 +578,16 @@ class TestPendingTotpEnrollment:
     ):
         """A pending secret aged past the 10-minute TTL is treated as absent:
         the SELECT's created_at window excludes it -> None."""
-        secret = pyotp.random_base32()
         handle = user_factory()
         raw_session = session_factory(handle.id, purpose="totp_setup")
-        await store_pending_totp_secret(db_pool, handle.id, secret)
+        pending = await get_or_create_pending_totp_secret(
+            db_pool,
+            handle.id,
+            purpose=PendingTotpPurpose.ENROLLMENT,
+            session_id=raw_session,
+        )
+        assert pending.outcome is PendingTotpOutcome.READY
+        assert pending.secret is not None
 
         sync_conn.execute(
             """UPDATE users
@@ -720,14 +683,17 @@ class TestPendingTotpEnrollment:
         active_secret = pyotp.random_base32()
         pending_secret = pyotp.random_base32()
 
+        # Deliberately seed stale pending state beside an active authenticator;
+        # production enrollment setup correctly refuses to create this state.
         handle = user_factory(
             email_verified=True,
             is_active=True,
             auth_method="local",
             totp_secret=encrypt_value(active_secret),
             last_totp_step=999999,
+            pending_totp_secret=encrypt_value(pending_secret),
+            pending_totp_created_at=datetime.now(UTC),
         )
-        await store_pending_totp_secret(db_pool, handle.id, pending_secret)
 
         outcome = await verify_and_enroll_totp(
             db_pool,

@@ -1,30 +1,75 @@
-"""Application settings loaded from environment variables."""
+"""Validate configuration and construct the process-wide settings singleton on import.
+
+Require an OS ENV_STATE selection before import. Only dev reads the
+repository-root .env; validators may read an SMTP CA bundle. No database,
+SMTP or Redis connection is opened here.
+"""
 
 import difflib
 import ipaddress
+import json
 import logging
 import os
 import re
 import socket
 import ssl
 import warnings
+from collections.abc import Mapping
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
-from typing import Literal, Self, cast
-from urllib.parse import unquote, urlsplit
+from typing import Annotated, Literal, NoReturn, Self, cast
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    DotEnvSettingsSource,
+    NoDecode,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
+from app import (
+    HOST_CSRF_COOKIE_NAME,
+    HOST_PRE_SESSION_COOKIE_NAME,
+    HOST_SESSION_COOKIE_NAME,
+    resolve_environment,
+    security_cookie_names,
+)
 from app.cookie_contract import CSRF_COOKIE_NAME, PRE_SESSION_COOKIE_NAME
-from app.credentials import normalize_email, validate_seed_credentials
+from app.credentials import check_secret_strength, normalize_email
+from app.duration_contract import (
+    MAX_LOGIN_LOCKOUT_MINUTES,
+    MAX_OUTBOX_STALE_AFTER_SECONDS,
+    MAX_SESSION_MAX_AGE_SECONDS,
+    MAX_UNVERIFIED_REAP_AFTER_DAYS,
+    MIN_SESSION_MAX_AGE_SECONDS,
+    validate_statement_timeout,
+)
+from app.federated_tier_rules import FederatedTierRule
 from app.federation_contract import ISSUER_MAX_LENGTH
 from app.url_safety import parse_http_url
-from config.secret_strength import check_secret_strength
+from config.secret_inventory import collect_secret_inventory
+
+from .redis_policy import redis_url_policy_issues
 
 logger = logging.getLogger(__name__)
 
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+_MAX_SEARCH_BUDGET_FRACTION = 0.5
+_HARDENED_SESSION_MAX_AGE_SECONDS = 8 * 60 * 60
+_RETIRED_SETTING_KEYS = frozenset(
+    {
+        "SEED_MOCK_DATA",
+        "SWISSUBASE_OAI_PMH_URL",
+        "OAI_INSTITUTION_FILTER",
+        "SWISSUBASE_MAX_VISIBILITY",
+        "SYNC_INTERVAL_SECONDS",
+        "FULL_REBUILD_INTERVAL_SECONDS",
+        "OAI_MAX_PAGES",
+        "SYNC_WRITE_TIMEOUT_SECONDS",
+        "LOCAL_AUTH_ENABLED",
+    }
+)
 
 _SHIBBOLETH_INSECURE_DEFAULT = "INSECURE-SHIB-DEV-SECRET-CHANGE-IN-PRODUCTION"
 _SHIBBOLETH_SECRET_MAX_CHARS = 1024
@@ -52,7 +97,7 @@ def _is_syntactically_valid_http_host(host: str | None) -> bool:
 
 
 def _shibboleth_issuer_error(issuer: object) -> str | None:
-    """Return the exact-policy error for one configured or mutated issuer."""
+    """Return a configured-issuer policy error, or None when the exact HTTPS value is valid."""
     if not isinstance(issuer, str) or not issuer:
         return "SHIBBOLETH_TRUSTED_ISSUERS cannot contain blank or non-string entries"
     if issuer != issuer.strip():
@@ -73,7 +118,10 @@ def _shibboleth_issuer_error(issuer: object) -> str | None:
 
 
 def _public_https_origin_error(value: object) -> str | None:
-    """Reject non-public HTTPS origins without performing deployment-time DNS."""
+    """Return an origin error for malformed HTTPS, localhost, loopback or unspecified hosts.
+
+    Return None otherwise; do not resolve DNS or reject other private addresses.
+    """
     message = (
         "SHIBBOLETH_ENABLED=true requires a non-localhost HTTPS PUBLIC_BASE_URL "
         "in every environment"
@@ -124,7 +172,11 @@ def _public_https_origin_error(value: object) -> str | None:
 
 
 def _shibboleth_allowed_hosts_error(allowed_hosts: list[str]) -> str | None:
-    """Require concrete hosts that Starlette will compare without ambiguity."""
+    """Return an error for noncanonical DNS/IPv4 host policies, or None if valid.
+
+    Require a nonempty list without wildcards, localhost, loopback or unspecified
+    IPv4. Canonical non-loopback private IPv4 remains accepted.
+    """
     message = (
         "SHIBBOLETH_ENABLED=true requires a non-empty, non-wildcard ALLOWED_HOSTS "
         "policy containing only canonical DNS names or IPv4 addresses"
@@ -168,7 +220,7 @@ def _shibboleth_internal_secret_error(
     internal_secret: str | None,
     other_secret_values: set[str],
 ) -> str | None:
-    """Validate the bounded, wire-safe, independent callback credential."""
+    """Return an error for missing, weak, non-wire-safe or reused secrets, else None."""
     if internal_secret is None:
         return (
             "SHIBBOLETH_INTERNAL_SECRET must be set whenever SHIBBOLETH_ENABLED=true "
@@ -215,13 +267,11 @@ def shibboleth_activation_blockers(
     allowed_hosts: list[str],
     other_secret_values: set[str],
 ) -> list[str]:
-    """Return every fatal federation activation-policy violation.
+    """Return federation activation errors, or [] when disabled/valid.
 
-    Settings construction and the final pre-bind startup gate both call this
-    pure function. Keeping the authentication anchors and transport contract
-    in one place prevents validator drift and catches unsupported mutations
-    made before startup. Settings mutation after startup is not a supported
-    configuration mechanism; deployment changes require a process restart.
+    Check the independent callback secret, exact HTTPS issuers, HTTPS origin,
+    secure cookies and concrete allowed hosts without DNS/network I/O. Restart
+    processes for configuration changes; post-startup mutation is unsupported.
     """
     if not enabled:
         return []
@@ -262,60 +312,161 @@ def shibboleth_activation_blockers(
 
 
 class Settings(BaseSettings):
-    """Application configuration loaded from environment variables.
+    """Validated settings; init values override OS values, dev .env and file secrets.
 
-    In development (OS-level ENV_STATE unset or "dev"), pydantic-settings
-    additionally reads the repo-root `.env`. Outside dev the file is never
-    read by pydantic — configuration must arrive as real OS environment
-    variables; the production systemd units achieve this by loading the
-    root-owned /etc/oralhistarchiv/common.env and, for the web process only,
-    an optional /etc/oralhistarchiv/shibboleth.env via EnvironmentFile=. The gate below inspects
-    the OS environment deliberately, before parsing, so a .env can neither
-    exempt itself from loading nor smuggle in a non-dev ENV_STATE (see
-    require_os_level_env_state_outside_dev).
+    The OS ENV_STATE selects dotenv policy before parsing: only dev reads the
+    repository-root .env, which cannot change that selection. Source selection
+    is fixed when the class is imported; restart for configuration changes.
+    Validators return their input/self unless they normalize a value, and raise
+    ValueError on refusal (wrapped as ValidationError during construction).
+    SMTP_CA_BUNDLE validation reads certificates; source TOML is read later by
+    runtime startup.
     """
 
-    # Environment
-    env_state: Literal["dev", "staging", "production"] = Field(default="dev")
+    env_state: Literal["dev", "staging", "production"] = Field(...)
+    app_process_role: Literal["web", "scheduler", "maintenance"] = Field(default="web")
+    parser_execution_mode: Literal["service", "local"] = Field(default="service")
 
     model_config = SettingsConfigDict(
-        env_file=str(_ENV_FILE) if os.environ.get("ENV_STATE", "dev") == "dev" else None,
+        env_file=str(_ENV_FILE) if resolve_environment() == "dev" else None,
         env_file_encoding="utf-8",
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
-    # Database settings
-    # Uses SecretStr instead of plain str to prevent credential exposure in
-    # tracebacks, serialization, and debugger output.
-    # Uses SecretStr rather than PostgresDsn because Unix sockets use a path
-    # (e.g. ?host=/tmp/postgres), which PostgresDsn does not support.
-    # Basic format validation is enforced via field_validator below.
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Select OS-controlled dotenv loading and mask retired dotenv values before validation.
+
+        Raise ValueError if .env tries to override ENV_STATE; retain standard source
+        priority and omit dotenv outside dev. Mutate the supplied dotenv source.
+        """
+        mode = resolve_environment()
+        if isinstance(dotenv_settings, DotEnvSettingsSource):
+            dotenv_mode = dotenv_settings.env_vars.get("env_state")
+            if dotenv_mode is not None and dotenv_mode != mode:
+                raise ValueError("A dotenv file cannot change the OS ENV_STATE selection")
+            dotenv_settings.env_vars = {
+                key: "retired-setting-present" if key.upper() in _RETIRED_SETTING_KEYS else value
+                for key, value in dotenv_settings.env_vars.items()
+            }
+
+        sources = super().settings_customise_sources(
+            settings_cls,
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
+        return tuple(source for source in sources if source is not dotenv_settings or mode == "dev")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_retired_settings(cls, values: object) -> object:
+        """Return values or raise ValueError for retired keys in OS/parsed configuration."""
+        provided = {key.upper() for key in os.environ}
+        if isinstance(values, Mapping):
+            provided.update(key.upper() for key in values if isinstance(key, str))
+
+        retired = sorted(provided & _RETIRED_SETTING_KEYS)
+        if "LOCAL_AUTH_ENABLED" in retired:
+            raise ValueError(
+                "LOCAL_AUTH_ENABLED has been removed; set LOCAL_REGISTRATION_ENABLED "
+                "explicitly to control new registration. Existing local login remains available."
+            )
+        if retired:
+            raise ValueError(
+                f"Configuration keys {', '.join(retired)} have been removed; "
+                "delete them and configure sources through SOURCES_CONFIG_FILE."
+            )
+        return values
+
+    # SecretStr masks repr; plain strings support PostgreSQL Unix-socket URLs.
 
     database_url: SecretStr = Field(...)
     database_pool_size: int = Field(default=5, ge=1, le=50)
     database_pool_max_waiting: int = Field(default=32, ge=1, le=1000)
+    search_statement_timeout_ms: int = Field(default=500, ge=1, le=2000)
+    search_operation_timeout_seconds: float = Field(default=1.0, gt=0, le=5, allow_inf_nan=False)
+    search_pool_timeout_seconds: float = Field(default=0.1, gt=0, le=1, allow_inf_nan=False)
+    search_global_rate_per_second: float = Field(default=0.5, gt=0, le=1000, allow_inf_nan=False)
+    search_global_burst: int = Field(default=1, ge=1, le=1000)
+
+    @field_validator(
+        "search_statement_timeout_ms",
+        "search_operation_timeout_seconds",
+        "search_pool_timeout_seconds",
+        "search_global_rate_per_second",
+        "search_global_burst",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_search_budget(cls, value: object) -> object:
+        """Return value unchanged; raise ValueError for boolean search budgets."""
+        if isinstance(value, bool):
+            raise ValueError("Search budgets must be numeric, not boolean")  # noqa: TRY004 - Pydantic validation
+        return value
+
+    @model_validator(mode="after")
+    def validate_search_budgets(self) -> Self:
+        """Return self or raise ValueError for search budgets that exceed allowed headroom.
+
+        Pool/statement waits must be below the operation deadline; hardened modes
+        require burst=1 and rate times operation deadline <= 0.5.
+        """
+        if self.search_pool_timeout_seconds >= self.search_operation_timeout_seconds:
+            raise ValueError(
+                "SEARCH_POOL_TIMEOUT_SECONDS must be below SEARCH_OPERATION_TIMEOUT_SECONDS"
+            )
+        if self.search_statement_timeout_ms / 1000 >= self.search_operation_timeout_seconds:
+            raise ValueError(
+                "SEARCH_STATEMENT_TIMEOUT_MS must be below SEARCH_OPERATION_TIMEOUT_SECONDS"
+            )
+        if self.is_hardened and (
+            self.search_global_burst != 1
+            or self.search_global_rate_per_second * self.search_operation_timeout_seconds
+            > _MAX_SEARCH_BUDGET_FRACTION
+        ):
+            raise ValueError(
+                "Deployed search requires SEARCH_GLOBAL_BURST=1 and a start rate times "
+                "operation deadline no greater than 0.5"
+            )
+        return self
+
     db_statement_timeout: str = Field(
         default="5s",
         description="PostgreSQL statement_timeout. Format: '5s', '500ms', '2min'. "
-        "Set to '0' to disable.",
+        "Use positive ASCII integers without leading zeros, at most 2147483647ms. "
+        "Only bare '0' disables it.",
     )
     scheduler_statement_timeout: str = Field(
         default="5min",
         description="statement_timeout for the scheduler pool. The full rebuild's "
         "source-wide DELETE outgrows the web-tier DB_STATEMENT_TIMEOUT "
-        "at scale. Format: '5s', '300s', '5min', or '0' to disable.",
+        "at scale. Same duration contract as DB_STATEMENT_TIMEOUT; only bare '0' disables it.",
     )
 
-    # Base Url
     public_base_url: str = Field(...)
 
-    # FastAPI settings
+    site_name: str = Field(default="Oral History Archive")
+    institution_name: str = Field(default="Your institution")
+    about_summary: str = Field(
+        default="Search and explore interview metadata from oral history research collections."
+    )
+    federated_login_label: str = Field(default="Institutional login")
+
     fastapi_host: str = Field(default="127.0.0.1")
     fastapi_port: int = Field(default=5000, ge=1, le=65535)
     fastapi_debug: bool = Field(default=False)
     pagination_size: int = Field(default=20, ge=1, le=100)
 
-    # Security settings
     secret_key: SecretStr = Field(
         ...,
         description="Application secret: derives the audit-email HMAC key and "
@@ -325,19 +476,42 @@ class Settings(BaseSettings):
         'Generate: python -c "import secrets; print(secrets.token_urlsafe(64))"',
     )
 
-    # Token for /health/detail endpoint access. Required in production.
-    # In non-production, accessible without a token only when FASTAPI_DEBUG=true;
-    # otherwise requires the token (or returns 404 if unset).
-    # Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
     health_detail_token: SecretStr | None = Field(default=None)
+    backup_status_file: str | None = Field(
+        default=None,
+        strict=True,
+        min_length=1,
+        max_length=4096,
+        description="Optional absolute local backup-publication marker path. Missing or "
+        "invalid marker content reports unknown; no archive or private key access is needed.",
+    )
 
-    # Session settings
-    # Generate with: python -c "import secrets; print(secrets.token_urlsafe(64))"
+    @field_validator("backup_status_file")
+    @classmethod
+    def validate_backup_status_file(cls, value: str | None) -> str | None:
+        """Return None/a canonical absolute path; raise ValueError for ambiguous/unsafe spelling.
+
+        Reject //, empty/dot path segments and nonprintable characters without I/O.
+        """
+        if value is None:
+            return None
+        if (
+            not value.startswith("/")
+            or value.startswith("//")
+            or any(part in {"", ".", ".."} for part in value.split("/")[1:])
+            or not value.isprintable()
+        ):
+            raise ValueError("BACKUP_STATUS_FILE must be an unambiguous absolute local file path")
+        return value
+
     session_secret: SecretStr = Field(...)
-    session_max_age_seconds: int = Field(default=28800, ge=60)  # 8 hours
+    session_max_age_seconds: int = Field(
+        default=28800, ge=MIN_SESSION_MAX_AGE_SECONDS, le=MAX_SESSION_MAX_AGE_SECONDS
+    )  # 8 hours; supported range: 1 minute to 365 days.
+    session_idle_timeout_seconds: int = Field(default=1800, ge=60, le=28800)
+    session_activity_update_interval_seconds: int = Field(default=60, ge=1, le=300)
     session_cookie_name: str = Field(default="oha_session")
 
-    # Cookies settings
     cookies_secure: bool = Field(
         default=True,
         description="Set the Secure flag on session/CSRF cookies. Default True. "
@@ -346,12 +520,10 @@ class Settings(BaseSettings):
         "reachable over a network.",
     )
 
-    # Authentication settings
     local_registration_enabled: bool = Field(default=True)
-    totp_issuer_name: str = Field(default="Oral History Archive UZH")
+    totp_issuer_name: str = Field(default="")
     totp_encryption_keys: list[SecretStr] = Field(
-        ...,
-        min_length=1,
+        default_factory=list,
         description="Fernet key material for TOTP-secret encryption (JSON list). "
         "The FIRST key encrypts; ALL keys can decrypt (enables rotation). "
         'Generate each with: python -c "import secrets; print(secrets.token_urlsafe(64))"',
@@ -365,7 +537,7 @@ class Settings(BaseSettings):
         'Generate each with: python -c "import secrets; print(secrets.token_urlsafe(64))"',
     )
     login_failure_threshold: int = Field(default=10, ge=1)
-    login_lockout_minutes: int = Field(default=15, ge=1)
+    login_lockout_minutes: int = Field(default=15, ge=1, le=MAX_LOGIN_LOCKOUT_MINUTES)
     session_step_up_attempt_limit: int = Field(
         default=5,
         ge=1,
@@ -381,12 +553,17 @@ class Settings(BaseSettings):
     unverified_reap_after_days: int = Field(
         default=7,
         ge=1,
+        le=MAX_UNVERIFIED_REAP_AFTER_DAYS,
         description="Delete unverified local accounts older than this many days.",
     )
 
-    # Shibboleth settings — only relevant behind the nginx SP layer
-    # (shibd + FastCGI; see Deployment.md §9)
+    # Trust these assertions only behind the nginx Shibboleth boundary.
     shibboleth_enabled: bool = Field(default=False)
+    federated_tier_rules: Annotated[tuple[FederatedTierRule, ...], NoDecode] = Field(
+        default=(),
+        description="Ordered JSON array of advisory federated tier rules. "
+        "A rule proposes a tier only; it cannot approve an account or change access.",
+    )
     shibboleth_internal_secret: SecretStr | None = Field(default=None)
     shibboleth_trusted_issuers: list[str] = Field(
         default_factory=list,
@@ -394,22 +571,31 @@ class Settings(BaseSettings):
         "Must be non-empty whenever Shibboleth is enabled.",
     )
 
-    # Nginx settings
     trusted_proxy_ips: list[str] = Field(default_factory=lambda: ["127.0.0.1", "::1"])
 
-    # Redis — shared backend for rate limiting and facet cache invalidation
+    # Optional general Redis for catalogue-statistics cache invalidation.
+    # Hardened web rate limiting uses RATE_LIMIT_REDIS_URL separately.
     redis_enabled: bool = Field(default=False)
     redis_url: SecretStr = Field(default=SecretStr("redis://localhost:6379/0"))
 
-    # Logging settings
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(default="INFO")
     log_format: Literal["json", "text"] = Field(default="json")
 
-    # Rate limiting
     rate_limit_enabled: bool = Field(default=True)
     rate_limit_per_minute: int = Field(default=100, ge=1)
     rate_limit_per_hour: int = Field(default=1000, ge=1)
     rate_limit_per_day: int = Field(default=10000, ge=1)
+    limiter_counter_capacity: int = Field(default=20000, ge=1, le=20000)
+    limiter_cleanup_batch_size: int = Field(default=128, ge=1, le=1024)
+
+    @field_validator("limiter_counter_capacity", "limiter_cleanup_batch_size", mode="before")
+    @classmethod
+    def reject_boolean_limiter_budget(cls, value: object) -> object:
+        """Return value unchanged; raise ValueError for boolean limiter budgets."""
+        if isinstance(value, bool):
+            raise ValueError("Limiter budgets must be integers, not boolean")  # noqa: TRY004 - Pydantic validation
+        return value
+
     rate_limit_trust_proxy: bool = Field(default=False)  # Should be True if behind Nginx
     rate_limit_redis_url: SecretStr = Field(
         default=SecretStr(""),
@@ -418,7 +604,6 @@ class Settings(BaseSettings):
         "then to process-local memory. Database 0 only; no query parameters.",
     )
 
-    # CORS settings
     cors_enabled: bool = Field(default=False)
     cors_origins: list[str] = Field(default_factory=list)
     cors_allow_methods: list[str] = Field(default_factory=lambda: ["GET", "POST"])
@@ -426,39 +611,80 @@ class Settings(BaseSettings):
     cors_allow_credentials: bool = Field(default=False)
     allowed_hosts: list[str]
 
-    # OAI-PMH sync — filters records by institution name
-    oai_institution_filter: str = Field(...)
-    swissubase_oai_pmh_url: str = Field(...)
-
-    # Visibility ceiling — set it in the .env; the code default is the most restrictive.
-    swissubase_max_visibility: Literal["public", "registered", "vetted"] = Field(default="vetted")
-
-    sync_write_timeout_seconds: int = Field(default=120, ge=1, le=3600)
-    sync_interval_seconds: int = Field(default=3600, ge=1)
-    full_rebuild_interval_seconds: int = Field(default=86400, ge=1)
-    oai_max_pages: int = Field(
-        default=500,
-        ge=1,
-        description="Safety cap on OAI-PMH resumption-token pagination. "
-        "Stops the harvest if the upstream returns more pages than this. "
-        "Set well above your expected record count divided by page size.",
+    # Defer source-file validation until runtime source selection.
+    sources_config_file: str | None = Field(
+        default=None,
+        description="Explicit source TOML path required for web and scheduler startup. "
+        "Read and validated during runtime source selection.",
+    )
+    allow_fixture_source: bool = Field(
+        default=False,
+        description="Explicitly permit fixture adapters in production. "
+        "This does not select or bootstrap a fixture source.",
     )
 
-    # Application
-    contact_email: str = Field(default="archive@example.uzh.ch")
+    @field_validator("sources_config_file", mode="before")
+    @classmethod
+    def _normalize_sources_config_file(cls, value: object) -> object:
+        """Map an empty string to None; preserve paths or raise ValueError for outer whitespace."""
+        if isinstance(value, str):
+            if not value:
+                return None
+            if value != value.strip():
+                raise ValueError("SOURCES_CONFIG_FILE must not have surrounding whitespace")
+        return value
+
+    contact_email: str = Field(default="archive@example.org")
+    # Legacy inputs remain visible to rejection and accidental-secret redaction.
     admin_seed_email: str | None = Field(default=None)
     admin_seed_password: SecretStr | None = Field(default=None)
     password_work_concurrency: int = Field(default=1, ge=1, le=2)
+    password_work_admission_timeout_seconds: float = Field(
+        default=1.0,
+        ge=0.01,
+        le=5.0,
+        allow_inf_nan=False,
+        description="Maximum wait for a password-work slot; does not limit running hash work.",
+    )
+
+    @field_validator("password_work_admission_timeout_seconds", mode="before")
+    @classmethod
+    def reject_boolean_password_admission_timeout(cls, value: object) -> object:
+        """Return value unchanged; raise ValueError for boolean admission timeouts."""
+        if isinstance(value, bool):
+            raise ValueError(  # noqa: TRY004 - Pydantic wraps ValueError as a field error.
+                "PASSWORD_WORK_ADMISSION_TIMEOUT_SECONDS must be a number"
+            )
+        return value
 
     # Terminal outbox retention: transaction size is independent of cadence.
     outbox_sent_retention_days: int = Field(default=7, ge=1, le=3650)
     outbox_dead_retention_days: int = Field(default=30, ge=1, le=3650)
     outbox_retention_batch_size: int = Field(default=1000, ge=1, le=5000)
     outbox_retention_interval_seconds: int = Field(default=60, ge=1, le=60)
-    outbox_stale_after_seconds: int = Field(default=600, ge=60)
+    outbox_stale_after_seconds: int = Field(default=600, ge=60, le=MAX_OUTBOX_STALE_AFTER_SECONDS)
 
-    # Email (SMTP)
-    # Required in production for password reset. Disabled by default in dev.
+    @field_validator(
+        "session_max_age_seconds",
+        "session_idle_timeout_seconds",
+        "session_activity_update_interval_seconds",
+        "login_lockout_minutes",
+        "unverified_reap_after_days",
+        "outbox_sent_retention_days",
+        "outbox_dead_retention_days",
+        "outbox_retention_interval_seconds",
+        "outbox_stale_after_seconds",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_integer_duration(cls, value: object, info: ValidationInfo) -> object:
+        """Return value unchanged; raise ValueError for boolean duration values."""
+        if isinstance(value, bool):
+            raise ValueError(  # noqa: TRY004 - Pydantic wraps ValueError as a field error.
+                f"{info.field_name} must be an integer duration, not a boolean"
+            )
+        return value
+
     smtp_enabled: bool = Field(default=False)
     dev_mailbox_dir: str = Field(default=".dev-mailbox", min_length=1)
     smtp_host: str = Field(default="smtp.example.com")
@@ -475,29 +701,20 @@ class Settings(BaseSettings):
         "Unset = use the system trust store.",
     )
 
-    seed_mock_data: bool = Field(
-        default=False,
-        description="Seed the mock restricted datasets at startup. Intended for "
-        "dev and staging demo/presentation environments so all visibility "
-        "tiers are exercisable. Never permitted in production.",
-    )
-
-    # --- Computed fields ---
     @property
     def is_production(self) -> bool:
-        """True when running in production environment."""
+        """Return whether ENV_STATE is production."""
         return self.env_state == "production"
 
     @property
     def is_hardened(self) -> bool:
-        """True for any deployed (non-dev) environment — staging or production.
-
-        Use for security properties that must hold wherever the app is exposed
-        (secure cookies, strong secrets, debug off, protected health detail).
-        Use is_production only for genuinely production-specific operational
-        requirements (e.g. Redis-backed rate limiting, real SMTP).
-        """
+        """Return whether ENV_STATE is staging or production."""
         return self.env_state != "dev"
+
+    @property
+    def dedicated_rate_limit_storage_uri(self) -> str | None:
+        """Return stripped RATE_LIMIT_REDIS_URL, or None when blank."""
+        return self.rate_limit_redis_url.get_secret_value().strip() or None
 
     @property
     def rate_limit_storage_uri(self) -> str | None:
@@ -507,18 +724,39 @@ class Settings(BaseSettings):
         None there makes validate_rate_limit_configuration refuse startup.
         Development may borrow REDIS_URL, otherwise None selects memory storage.
         """
-        dedicated = self.rate_limit_redis_url.get_secret_value().strip()
+        dedicated = self.dedicated_rate_limit_storage_uri
         if dedicated:
             return dedicated
         if not self.is_hardened and self.redis_enabled:
             return self.redis_url.get_secret_value()
         return None
 
-    # --- Validators ---
+    @field_validator("site_name", "institution_name", "about_summary", "federated_login_label")
+    @classmethod
+    def validate_site_identity(cls, value: str, info: ValidationInfo) -> str:
+        """Return stripped nonblank printable display text; otherwise raise ValueError."""
+        value = value.strip()
+        if not value or not value.isprintable():
+            raise ValueError(f"{info.field_name} must be nonblank, single-line text")
+        return value
+
+    @model_validator(mode="after")
+    def resolve_totp_issuer_name(self) -> Self:
+        """Strip/set TOTP issuer (blank: site_name); reject nonprintable text with ValueError."""
+        issuer = self.totp_issuer_name.strip() or self.site_name
+        if not issuer.isprintable():
+            raise ValueError("TOTP_ISSUER_NAME must be single-line text")
+        self.totp_issuer_name = issuer
+        return self
+
     @field_validator("public_base_url")
     @classmethod
     def _normalize_public_base_url(cls, value: str) -> str:
-        """Require an HTTP(S) origin suitable for appending route paths."""
+        """Return normalized scheme://netloc; raise ValueError for non-HTTP(S) origins.
+
+        Strip whitespace; forbid credentials, controls, nonroot paths, queries and
+        fragments. Remove a trailing root slash and lowercase the scheme.
+        """
         candidate = value.strip()
 
         try:
@@ -536,25 +774,10 @@ class Settings(BaseSettings):
 
         return f"{parsed.scheme.casefold()}://{parsed.netloc}"
 
-    @field_validator("oai_institution_filter")
-    @classmethod
-    def _normalize_institution_filter(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError(
-                "OAI_INSTITUTION_FILTER must not be empty — it scopes which datasets are ingested."
-            )
-        return v
-
     @field_validator("shibboleth_internal_secret", mode="before")
     @classmethod
     def _normalize_optional_shibboleth_secret(cls, value: object) -> object:
-        """Treat an empty Phase-1 environment entry as an unset secret.
-
-        ``.env.example`` documents every setting, but Phase 1 must not
-        provision the federation impersonation credential. Normalising only
-        an empty string preserves exact comparison for every real secret.
-        """
+        """Map empty str/SecretStr to None; preserve every nonempty value exactly."""
         if isinstance(value, str) and not value:
             return None
         if isinstance(value, SecretStr) and not value.get_secret_value():
@@ -564,7 +787,7 @@ class Settings(BaseSettings):
     @field_validator("shibboleth_trusted_issuers")
     @classmethod
     def _validate_shibboleth_trusted_issuers(cls, values: list[str]) -> list[str]:
-        """Validate the exact IdP allowlist without rewriting identity values."""
+        """Return exact unique HTTPS issuers, or raise ValueError for invalid/duplicate entries."""
         for issuer in values:
             if error := _shibboleth_issuer_error(issuer):
                 raise ValueError(error)
@@ -573,22 +796,46 @@ class Settings(BaseSettings):
             raise ValueError("SHIBBOLETH_TRUSTED_ISSUERS cannot contain duplicate entries")
         return values
 
+    @field_validator("federated_tier_rules", mode="before")
+    @classmethod
+    def validate_federated_tier_rules(cls, value: object) -> object:
+        """Decode a JSON array or accept list/tuple, even when federation is disabled.
+
+        Raise ValueError for other containers, malformed JSON, duplicate keys or
+        nonfinite constants. Preserve ordering; field validation builds frozen rules.
+        """
+
+        def unique_object(items: list[tuple[str, object]]) -> dict[str, object]:
+            """Build a JSON object; raise ValueError for duplicate keys."""
+            result: dict[str, object] = {}
+            for key, item in items:
+                if key in result:
+                    raise ValueError("FEDERATED_TIER_RULES cannot contain duplicate JSON keys")
+                result[key] = item
+            return result
+
+        def reject_constant(_value: str) -> NoReturn:
+            """Raise ValueError for nonfinite JSON constants."""
+            raise ValueError("FEDERATED_TIER_RULES cannot contain nonfinite JSON constants")
+
+        if isinstance(value, str):
+            try:
+                value = json.loads(
+                    value, object_pairs_hook=unique_object, parse_constant=reject_constant
+                )
+            except json.JSONDecodeError as error:
+                raise ValueError("FEDERATED_TIER_RULES must be an ordered JSON array") from error
+        if type(value) not in (list, tuple):
+            raise ValueError("FEDERATED_TIER_RULES must be an ordered JSON array")
+        return value
+
     @field_validator("trusted_proxy_ips")
     @classmethod
     def _normalize_trusted_proxy_ips(cls, v: list[str]) -> list[str]:
-        """Parse and canonicalize each entry, rejecting anything unparseable.
+        """Strip/canonicalize literal IPv4/IPv6 entries, dropping blanks; reject others.
 
-        get_client_ip compares the TCP peer string against this set verbatim,
-        so an unnormalized entry ("::0001", " 10.0.0.5 ") or a hostname would
-        silently never match: forwarded headers would go untrusted and every
-        request would collapse onto the proxy's own IP for rate-limiting and
-        audit attribution. Under the Unix-socket deployment the socket branch
-        masks that, so the breakage would only surface after a topology change
-        — hence failing here, at startup, with the variable named.
-
-        Hostnames are rejected on purpose: the allowlist is compared against a
-        resolved peer address, and a name would have to be resolved at match
-        time. Resolve it yourself and list the address.
+        Raise ValueError for hostnames/CIDRs/invalid addresses. Preserve order and
+        duplicates; consumers compare peer strings without DNS resolution.
         """
         normalized: list[str] = []
         invalid: list[str] = []
@@ -611,14 +858,10 @@ class Settings(BaseSettings):
     @field_validator("smtp_ca_bundle")
     @classmethod
     def validate_smtp_ca_bundle(cls, v: str | None) -> str | None:
-        """Fail at startup, naming the env var, if the CA bundle can't be loaded.
+        """Return the CA path (empty: None) after loading it into a default TLS context.
 
-        services/email.py builds its TLS context at import time and loads this
-        file unconditionally when set; a bad path or unparseable PEM would
-        otherwise crash that import with a raw traceback before the aggregated
-        validator report can run. Loading it here performs the identical
-        operation on the friendly error path. An empty value is normalized to
-        None, matching the consumer's truthiness check.
+        Read system trust and the supplied PEM file; wrap bundle-load OSError/SSLError
+        as ValueError. No SMTP connection is made.
         """
         if not v:
             return None
@@ -636,10 +879,10 @@ class Settings(BaseSettings):
     @field_validator("database_url", mode="before")
     @classmethod
     def validate_database_url(cls, value: object) -> str:
-        """Basic format check — ensures the URL is a PostgreSQL connection string.
+        """Return the PostgreSQL URL, rewriting postgres:// to postgresql://.
 
-        Runs in 'before' mode so it validates the raw string before
-        Pydantic wraps it in SecretStr.
+        Unwrap SecretStr; raise ValueError for other types, other prefixes or an
+        empty/bare-slash suffix. This does not fully validate or connect to PostgreSQL.
         """
         if isinstance(value, SecretStr):
             value = value.get_secret_value()
@@ -650,11 +893,7 @@ class Settings(BaseSettings):
             database_url = "postgresql://" + database_url[len("postgres://") :]
 
         elif not database_url.startswith(("postgresql://", "postgres://")):
-            scheme = database_url.split("://", 1)[0] if "://" in database_url else database_url[:20]
-            raise ValueError(
-                f"database_url must start with 'postgresql://' or 'postgres://'. "
-                f"Got scheme: '{scheme}'"
-            )
+            raise ValueError("database_url must start with 'postgresql://' or 'postgres://'.")
         stripped = database_url.split("://", 1)[1]
         if not stripped or stripped == "/":
             raise ValueError("database_url must contain a database name or connection path.")
@@ -662,33 +901,57 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_seed_pair(self) -> Self:
-        if bool(self.admin_seed_email) != bool(self.admin_seed_password):
-            raise ValueError("ADMIN_SEED_EMAIL and ADMIN_SEED_PASSWORD must be set together")
-        if self.admin_seed_email and self.admin_seed_password:
-            self.admin_seed_email = validate_seed_credentials(
-                self.admin_seed_email, self.admin_seed_password.get_secret_value()
+        """Return self or raise ValueError if either retired ADMIN_SEED credential is set."""
+        if self.admin_seed_email is not None or self.admin_seed_password is not None:
+            raise ValueError(
+                "ADMIN_SEED_EMAIL and ADMIN_SEED_PASSWORD are no longer service settings; "
+                "remove them and run scripts/bootstrap_admin.py from a protected terminal"
             )
         return self
 
     @model_validator(mode="after")
+    def validate_registration_default(self) -> Self:
+        """Disable hardened-mode registration unless the setting was explicitly supplied."""
+        if self.is_hardened and "local_registration_enabled" not in self.model_fields_set:
+            self.local_registration_enabled = False
+        return self
+
+    @model_validator(mode="after")
+    def validate_session_policy(self) -> Self:
+        """Set the hardened cookie default and reject inconsistent session policy.
+
+        Require __Host- names and at most eight-hour age in hardened modes; __Host-
+        cookies always require Secure. Activity update interval must not exceed idle
+        timeout. Mutate the default name; raise ValueError on refusal and return self.
+        """
+        if self.is_hardened:
+            if "session_cookie_name" not in self.model_fields_set:
+                self.session_cookie_name = HOST_SESSION_COOKIE_NAME
+            if not self.session_cookie_name.startswith("__Host-"):
+                raise ValueError("Hardened SESSION_COOKIE_NAME must use the __Host- prefix")
+            if self.session_max_age_seconds > _HARDENED_SESSION_MAX_AGE_SECONDS:
+                raise ValueError("Hardened SESSION_MAX_AGE_SECONDS must not exceed eight hours")
+        if self.session_cookie_name.startswith("__Host-") and not self.cookies_secure:
+            raise ValueError("COOKIES_SECURE must be True for __Host- cookies")
+        if self.session_activity_update_interval_seconds > self.session_idle_timeout_seconds:
+            raise ValueError("Session activity update interval must not exceed its idle timeout")
+        return self
+
+    @property
+    def csrf_cookie_name(self) -> str:
+        """Return the fixed CSRF cookie name for the selected security mode."""
+        return security_cookie_names(hardened=self.is_hardened)[0]
+
+    @property
+    def pre_session_cookie_name(self) -> str:
+        """Return the fixed anonymous-identifier cookie name for the selected security mode."""
+        return security_cookie_names(hardened=self.is_hardened)[1]
+
+    @model_validator(mode="after")
     def validate_rate_limit_redis_credential_is_independent(self) -> Self:
-        limiter_password = urlsplit(self.rate_limit_redis_url.get_secret_value().strip()).password
-        if not limiter_password:
-            return self
-        other_values = {
-            self.secret_key.get_secret_value(),
-            self.session_secret.get_secret_value(),
-            *(key.get_secret_value() for key in self.totp_encryption_keys),
-            *(key.get_secret_value() for key in self.outbox_encryption_keys),
-        }
-        for optional in (self.health_detail_token, self.shibboleth_internal_secret):
-            if optional is not None:
-                other_values.add(optional.get_secret_value())
-        for url in (self.database_url, self.redis_url):
-            password = urlsplit(url.get_secret_value()).password
-            if password:
-                other_values.add(unquote(password))
-        if unquote(limiter_password) in other_values:
+        """Return self or raise ValueError if the limiter Redis password reuses another secret."""
+        inventory = collect_secret_inventory(self)
+        if set(inventory.rate_limit_redis_url) & inventory.rate_limiter_peers():
             raise ValueError(
                 "RATE_LIMIT_REDIS_URL must not reuse a signing, encryption, session, "
                 "health-detail, federation, database or general Redis secret as its password"
@@ -698,10 +961,16 @@ class Settings(BaseSettings):
     @field_validator("session_cookie_name")
     @classmethod
     def validate_session_cookie_name(cls, value: str) -> str:
-        if not value or value in {CSRF_COOKIE_NAME, PRE_SESSION_COOKIE_NAME}:
+        """Return a valid distinct cookie name; raise ValueError for reserved or __Secure- names."""
+        if not value or value in {
+            CSRF_COOKIE_NAME,
+            PRE_SESSION_COOKIE_NAME,
+            HOST_CSRF_COOKIE_NAME,
+            HOST_PRE_SESSION_COOKIE_NAME,
+        }:
             raise ValueError("SESSION_COOKIE_NAME must be nonempty and distinct from CSRF cookies")
-        if value.startswith(("__Secure-", "__Host-")):
-            raise ValueError("SESSION_COOKIE_NAME does not support __Secure- or __Host- prefixes")
+        if value.startswith("__Secure-"):
+            raise ValueError("SESSION_COOKIE_NAME must use the host-bound __Host- prefix")
         try:
             cookie = SimpleCookie()
             cookie[value] = "probe"
@@ -712,6 +981,7 @@ class Settings(BaseSettings):
     @field_validator("smtp_from_address")
     @classmethod
     def validate_smtp_from_address(cls, value: str) -> str:
+        """Return normalized supported email, or raise ValueError."""
         address = normalize_email(value)
         if address is None:
             raise ValueError("SMTP_FROM_ADDRESS must be a supported email address")
@@ -720,43 +990,24 @@ class Settings(BaseSettings):
     @field_validator("smtp_from_name")
     @classmethod
     def validate_smtp_from_name(cls, value: str) -> str:
+        """Return nonempty printable sender text, or raise ValueError; preserve whitespace."""
         if not value or not value.isprintable():
             raise ValueError("SMTP_FROM_NAME must contain printable characters only")
         return value
 
     @model_validator(mode="after")
-    def require_os_level_env_state_outside_dev(self) -> Self:
-        """The env_file gate reads ENV_STATE from the OS environment BEFORE
-        parsing, so a .env file cannot exempt itself from being loaded. If a
-        non-dev env_state arrives while the OS-level variable is absent and a
-        .env exists, the value was smuggled in via that .env — exactly the
-        deployment mistake the gate exists to prevent."""
-        if self.env_state != "dev" and "ENV_STATE" not in os.environ and _ENV_FILE.exists():
-            raise ValueError(
-                f"ENV_STATE={self.env_state} was read from {_ENV_FILE}, but outside "
-                "dev it must be set as a real OS environment variable (export it, "
-                "or load the file via systemd EnvironmentFile=) so the .env gate "
-                "can see it before parsing."
-            )
-        return self
-
-    @model_validator(mode="after")
-    def validate_seed_mock_data_not_in_production(self) -> Self:
-        if self.is_production and self.seed_mock_data:
-            raise ValueError(
-                "SEED_MOCK_DATA=true is not permitted in production. "
-                "It exists for dev/staging demo environments only."
-            )
-        return self
-
-    @model_validator(mode="after")
     def validate_debug_only_in_dev(self) -> Self:
+        """Return self or raise ValueError if FASTAPI_DEBUG is enabled outside dev."""
         if self.is_hardened and self.fastapi_debug:
             raise ValueError("FASTAPI_DEBUG=true is only permitted when ENV_STATE=dev")
         return self
 
     @model_validator(mode="after")
     def _require_https_in_prod(self) -> Self:
+        """Return self or raise ValueError for non-HTTPS/loopback origins in hardened modes.
+
+        No DNS lookup occurs; this check alone permits other private/unspecified IPs.
+        """
         if not self.is_hardened:
             return self
 
@@ -786,6 +1037,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_cookies_secure(self) -> Self:
+        """Return self or raise ValueError unless hardened modes use Secure cookies."""
         if self.is_hardened and not self.cookies_secure:
             raise ValueError(
                 "COOKIES_SECURE must be True in staging/production. "
@@ -795,16 +1047,18 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def require_smtp_when_hardened(self) -> Self:
+        """Return self or raise ValueError unless SMTP is enabled in hardened modes."""
         if self.is_hardened and not self.smtp_enabled:
             raise ValueError(
-                "SMTP_ENABLED must be true outside dev (staging included) — "
-                "verification, reset, and security notices otherwise report "
-                "success while sending nothing."
+                "SMTP_ENABLED must be true outside dev (staging and production). "
+                "Verification, reset, and security notices require SMTP delivery; "
+                "the private mailbox is available only in dev."
             )
         return self
 
     @model_validator(mode="after")
     def require_health_token_when_hardened(self) -> Self:
+        """Return self or raise ValueError if hardened modes lack HEALTH_DETAIL_TOKEN."""
         if self.is_hardened and self.health_detail_token is None:
             raise ValueError(
                 "HEALTH_DETAIL_TOKEN must be set outside dev (staging and "
@@ -816,12 +1070,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_smtp_settings(self) -> Self:
-        """Require SMTP fields when SMTP is enabled.
+        """Return self or raise ValueError for incomplete enabled SMTP configuration.
 
-        In production, also checks for unmodified placeholder values to catch
-        operators who enabled SMTP without configuring it. In dev/staging,
-        only the empty-field check applies (so MailHog or other local setups
-        aren't blocked by placeholder detection).
+        Require host/sender when enabled; production also rejects the shipped
+        smtp.example.com/noreply@example.com placeholders. No connection is made.
         """
         if not self.smtp_enabled:
             return self
@@ -843,6 +1095,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_smtp_tls_when_hardened(self) -> Self:
+        """Return self or raise ValueError if enabled SMTP lacks STARTTLS in hardened modes."""
         if self.is_hardened and self.smtp_enabled and not self.smtp_use_tls:
             raise ValueError(
                 "SMTP_USE_TLS must be True outside dev (staging and production). "
@@ -853,6 +1106,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_smtp_auth_pair(self) -> Self:
+        """Return self or raise ValueError unless SMTP_USER/password presence agree.
+
+        User presence uses truthiness; password presence means not None.
+        """
         if bool(self.smtp_user) != (self.smtp_password is not None):
             raise ValueError(
                 "SMTP_USER and SMTP_PASSWORD must be set together (provide both or neither)."
@@ -861,20 +1118,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_redis_in_production(self) -> Self:
-        """Warn when Redis is disabled in production.
-
-        Without Redis, the app runs a single gunicorn worker (see
-        gunicorn.conf.py), which keeps slowapi's in-memory rate limiting
-        correct but caps throughput to one worker and disables
-        cross-worker facet-cache invalidation. This is acceptable for
-        low-traffic deployments; enable Redis to scale to multiple workers.
-        """
+        """Warn in production without general Redis invalidation, then return self."""
         if self.is_production and not self.redis_enabled:
             warnings.warn(
-                "Redis is disabled in production. Running a single gunicorn "
-                "worker (rate limiting stays correct, but throughput is capped "
-                "and cross-worker facet-cache invalidation is disabled). "
-                "Enable Redis to run multiple workers.",
+                "General Redis is disabled in production. Cross-worker "
+                "catalogue-statistics invalidation is unavailable; cached "
+                "statistics may remain stale until their TTL expires. "
+                "Hardened web rate limiting still requires RATE_LIMIT_REDIS_URL.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -882,16 +1132,55 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_redis_url_required(self) -> Self:
+        """Return self or raise ValueError for unsafe active/general or configured limiter URLs."""
         if self.redis_enabled and not self.redis_url.get_secret_value():
             raise ValueError("REDIS_URL must be set when REDIS_ENABLED=true")
+        if self.redis_enabled:
+            issues = redis_url_policy_issues(
+                self.redis_url.get_secret_value(), hardened=self.is_hardened
+            )
+            if issues:
+                raise ValueError("REDIS_URL: " + "; ".join(issues))
+        if self.dedicated_rate_limit_storage_uri:
+            issues = redis_url_policy_issues(
+                self.rate_limit_redis_url.get_secret_value(),
+                hardened=self.is_hardened,
+                dedicated=True,
+            )
+            if issues:
+                raise ValueError("RATE_LIMIT_REDIS_URL: " + "; ".join(issues))
+        return self
+
+    @model_validator(mode="after")
+    def require_web_admission(self) -> Self:
+        """Return self; raise ValueError if hardened web processes disable per-client admission."""
+        if self.is_hardened and self.app_process_role == "web" and not self.rate_limit_enabled:
+            raise ValueError("RATE_LIMIT_ENABLED must be true for hardened web processes")
+        return self
+
+    @model_validator(mode="after")
+    def validate_process_totp_keys(self) -> Self:
+        """Return self; raise ValueError for scheduler TOTP keys or absent web/maintenance keys."""
+        if self.app_process_role == "scheduler":
+            if self.totp_encryption_keys:
+                raise ValueError("Scheduler processes must not receive TOTP_ENCRYPTION_KEYS")
+        elif not self.totp_encryption_keys:
+            raise ValueError("TOTP_ENCRYPTION_KEYS must be nonempty for authentication processes")
+        return self
+
+    @model_validator(mode="after")
+    def require_parser_service_outside_development(self) -> Self:
+        """Return self or raise ValueError for local parser execution outside dev."""
+        if self.is_hardened and self.parser_execution_mode != "service":
+            raise ValueError("PARSER_EXECUTION_MODE must be service outside development")
         return self
 
     @model_validator(mode="after")
     def validate_cors_settings(self) -> Self:
-        """Prevent CORS misconfiguration in production and staging.
+        """Validate enabled CORS; return self, warn in dev or raise ValueError in hardened modes.
 
-        Blocks startup if CORS is enabled with unsafe origins.
-        Warns in development for awareness.
+        Reject exact wildcard/empty origins and, in hardened modes, entries containing
+        localhost or 127.0.0.1. Credentialed-CORS HTTPS checks run separately at startup.
         """
         if not self.cors_enabled:
             return self
@@ -920,22 +1209,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_allowed_hosts(self) -> Self:
-        """Reject a wildcard or empty ALLOWED_HOSTS in staging/production.
-
-        TrustedHostMiddleware treats the exact entry "*" as "accept any Host",
-        which disables the app-level Host check. An empty list rejects every
-        request (fail-closed, but a broken deploy). Mirrors validate_cors_settings:
-        block in staging/prod, warn in dev.
-        """
+        """Return self; warn in dev or raise ValueError in hardened modes for an exact * host."""
         issues = []
         if "*" in self.allowed_hosts:
             issues.append(
                 "ALLOWED_HOSTS contains '*', which accepts any Host header and "
                 "disables TrustedHostMiddleware."
             )
-        if not self.allowed_hosts:
-            issues.append("ALLOWED_HOSTS is empty; every request would be rejected.")
-
         if issues and self.is_hardened:
             raise ValueError("ALLOWED_HOSTS misconfiguration blocks startup: " + "; ".join(issues))
         if issues:
@@ -946,10 +1226,17 @@ class Settings(BaseSettings):
     @field_validator("allowed_hosts")
     @classmethod
     def normalize_allowed_hosts(cls, hosts: list[str], info: ValidationInfo) -> list[str]:
+        """Return stripped lowercase ASCII DNS/IPv4 hosts or leading *. patterns.
+
+        Raise ValueError for empty lists or invalid hosts. Enabled federation first
+        requires exact canonical DNS/IPv4 entries without wildcards or local hosts.
+        """
         if info.data.get("shibboleth_enabled") and (
             error := _shibboleth_allowed_hosts_error(hosts)
         ):
             raise ValueError(error)
+        if not hosts:
+            raise ValueError("ALLOWED_HOSTS is empty; every request would be rejected.")
         normalized = []
         for host in hosts:
             candidate = host.strip().lower()
@@ -965,21 +1252,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_shibboleth_settings(self) -> Self:
-        """Require the complete federation activation boundary.
+        """Return self or raise ValueError for federation blockers or origin/host mismatch.
 
-        These checks are deliberately environment-independent. A publicly
-        reachable development/demo deployment has the same federation trust
-        boundary as production once the callback is enabled.
+        Apply enabled federation policy in every mode. Always require the public URL
+        hostname to be ASCII/punycode and match ALLOWED_HOSTS, even when disabled.
         """
-        other_secret_values = {
-            self.secret_key.get_secret_value(),
-            self.session_secret.get_secret_value(),
-            *(key.get_secret_value() for key in self.totp_encryption_keys),
-            *(key.get_secret_value() for key in self.outbox_encryption_keys),
-        }
-        if self.health_detail_token is not None:
-            other_secret_values.add(self.health_detail_token.get_secret_value())
-
         blockers = shibboleth_activation_blockers(
             enabled=self.shibboleth_enabled,
             internal_secret=(
@@ -991,7 +1268,7 @@ class Settings(BaseSettings):
             public_base_url=self.public_base_url,
             cookies_secure=self.cookies_secure,
             allowed_hosts=self.allowed_hosts,
-            other_secret_values=other_secret_values,
+            other_secret_values=set(collect_secret_inventory(self).federation_peers()),
         )
         if blockers:
             raise ValueError("; ".join(blockers))
@@ -1007,40 +1284,26 @@ class Settings(BaseSettings):
 
     @field_validator("db_statement_timeout", "scheduler_statement_timeout")
     @classmethod
-    def validate_timeout_format(cls, v: str, info: ValidationInfo) -> str:
-        """Reject malformed statement_timeout values at startup.
+    def validate_timeout_format(cls, value: str, info: ValidationInfo) -> str:
+        """Return a canonical PostgreSQL timeout ('0' disables); raise ValueError if invalid."""
+        return validate_statement_timeout(value, name=info.field_name or "statement_timeout")
 
-        Allows '0' (no limit), or a positive number followed by unit (ms/s/min).
-        (Injection at the sink is already blocked by sql.Literal in create_pool;
-        this validator exists so a typo fails here, not per-connection at runtime.)
-        """
-        if v == "0":
-            return v
-        if not re.match(r"^\d+(ms|s|min)$", v):
-            raise ValueError(
-                f"{info.field_name} must be '0' or like '5s', '500ms', '2min'. Got: {v!r}"
-            )
-        return v
-
-    # --- Methods ---
     def __repr__(self) -> str:
-        """Prevent leaking database_url in repr/logs."""
+        """Return the environment summary with configuration values redacted."""
         return f"<Settings env_state={self.env_state!r}, database_url=***; ...>"
 
     def __str__(self) -> str:
+        """Return the same redacted summary as repr()."""
         return self.__repr__()
 
 
-settings = Settings()
+settings = Settings(env_state=resolve_environment())
 
 
 def warn_unconsumed_env_keys() -> None:
-    """Warn about keys in the .env file that no Settings field consumes.
+    """In dev, read .env and log unknown field/alias keys with possible spelling suggestions.
 
-    Catches dead config (e.g. CACHE_PATH) and — more importantly — typos of
-    real keys (RATE_LIMIT_ENABELD), which extra='ignore' otherwise swallows
-    silently, starting the app with the default value. Dev-only: the .env
-    file exists only in development; prod reads real OS env vars.
+    No-op outside dev or when absent; filesystem/UTF-8 errors propagate.
     """
     if settings.env_state != "dev":
         return
@@ -1055,13 +1318,12 @@ def warn_unconsumed_env_keys() -> None:
     known: set[str] = set()
     for name, field in Settings.model_fields.items():
         known.add(name.upper())
-        # honor an explicit alias if the field defines one
         alias = getattr(field, "alias", None)
         if alias:
             known.add(alias.upper())
 
     declared: set[str] = set()
-    for line_raw in env_file.read_text().splitlines():
+    for line_raw in env_file.read_text(encoding="utf-8").splitlines():
         line = line_raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue

@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% set active_page = "account" %}
-{% block title %}Set Up Two-Factor Authentication — Oral History Archive{% endblock %}
+{% block title %}Set Up Two-Factor Authentication — {{ site_name }}{% endblock %}
 
 {% block content %}
 <section class="container auth-page">
@@ -54,8 +54,8 @@
 
       <div class="form-group">
         <label for="totp_code">Verification Code</label>
-        <input type="text" id="totp_code" name="totp_code" required maxlength="6"
-               pattern="[0-9]{6}" placeholder="6-digit code from your authenticator app"
+        <input type="text" id="totp_code" name="totp_code" required maxlength="{{ totp_code_raw_max_chars }}"
+               pattern="[0-9\s]{6,{{ totp_code_raw_max_chars }}}" placeholder="6-digit code from your authenticator app"
                autocomplete="off" inputmode="numeric">
       </div>
 

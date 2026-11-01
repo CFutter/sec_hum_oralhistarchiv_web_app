@@ -1,21 +1,4 @@
-"""``get_rate_limit_client_id`` and the storage key it feeds.
-
-Two properties are pinned here:
-
-- ``app.middleware.rate_limiting.get_rate_limit_client_id`` canonicalizes
-  equivalent IP spellings (IPv4-mapped IPv6, zone-scoped IPv6, mixed case)
-  onto one HMAC identity before it ever reaches Redis, so equivalent clients
-  cannot receive independent quotas, and a SECRET_KEY rotation deliberately
-  creates a fresh identity. A native IPv6 client is attributed to its /64
-  rather than to one exact address, because a client holding a routed prefix
-  can otherwise pick a new address per request and start every limit over;
-  IPv4 and IPv4-mapped addresses keep their per-address attribution.
-- The full storage key SlowAPI derives for the sentinel unmatched-route
-  handler (``limit_key`` from the client-identity function, ``limit_scope``
-  from the qualified handler name under ``key_style="endpoint"``) never
-  contains request-supplied text — no raw IP, cookie, query value, email, or
-  concrete path — across a wide corpus of distinct unmatched paths.
-"""
+"""``get_rate_limit_client_id`` and the storage key it feeds."""
 
 import random
 import string
@@ -37,6 +20,7 @@ def _request(
     query_string: bytes = b"",
     headers: list[tuple[bytes, bytes]] | None = None,
 ) -> Request:
+    """Build a GET request with the selected peer, path, headers, and query bytes."""
     return Request(
         {
             "type": "http",
@@ -57,11 +41,13 @@ class TestClientIdentityCanonicalization:
     addresses never do, and the digest never carries the raw address."""
 
     def test_ipv4_mapped_ipv6_shares_the_identity_of_its_ipv4_form(self):
+        """Check ipv4 mapped ipv6 shares the identity of its ipv4 form."""
         mapped = get_rate_limit_client_id(_request(peer="::ffff:203.0.113.5"))
         plain = get_rate_limit_client_id(_request(peer="203.0.113.5"))
         assert mapped == plain
 
     def test_ipv6_case_and_zone_id_variants_share_one_identity(self):
+        """Check ipv6 case and zone ID variants share one identity."""
         lowercase = get_rate_limit_client_id(_request(peer="2001:db8::1"))
         uppercase = get_rate_limit_client_id(_request(peer="2001:DB8:0:0::1"))
         zoned = get_rate_limit_client_id(_request(peer="2001:db8::1%eth0"))
@@ -76,9 +62,7 @@ class TestClientIdentityCanonicalization:
         assert first == second == far_apart
 
     def test_addresses_in_neighbouring_ipv6_prefixes_stay_apart(self):
-        """Positive control for the aggregation above: the next prefix along
-        belongs to a different client and keeps its own allowance, so
-        aggregation cannot silently throttle a whole institution."""
+        """Check addresses in neighbouring ipv6 prefixes stay apart."""
         inside = get_rate_limit_client_id(_request(peer="2001:db8:abcd:1234::1"))
         neighbour = get_rate_limit_client_id(_request(peer="2001:db8:abcd:1235::1"))
         assert inside != neighbour
@@ -100,13 +84,13 @@ class TestClientIdentityCanonicalization:
         assert first != neighbour
 
     def test_distinct_addresses_produce_distinct_identities(self):
-        """Positive control: canonicalization does not collapse everything —
-        genuinely different IPv4 clients still get different identities."""
+        """Check distinct addresses produce distinct identities."""
         first = get_rate_limit_client_id(_request(peer="203.0.113.5"))
         second = get_rate_limit_client_id(_request(peer="203.0.113.6"))
         assert first != second
 
     def test_identity_is_a_full_hmac_digest_with_no_raw_address(self):
+        """Check identity is a full HMAC digest with no raw address."""
         identity = get_rate_limit_client_id(_request(peer="203.0.113.5"))
         assert identity.startswith("ip-v2:")
         digest = identity.removeprefix("ip-v2:")
@@ -127,6 +111,7 @@ class TestClientIdentityCanonicalization:
         assert "abcd:1234" not in identity
 
     def test_untrusted_peer_forwarded_header_does_not_change_the_identity(self, monkeypatch):
+        """Check untrusted peer forwarded header does not change the identity."""
         monkeypatch.setattr(settings, "rate_limit_trust_proxy", True)
         baseline = get_rate_limit_client_id(_request(peer="5.5.5.5"))
         spoofed = get_rate_limit_client_id(
@@ -135,10 +120,7 @@ class TestClientIdentityCanonicalization:
         assert baseline == spoofed
 
     def test_trusted_peer_forwarded_header_changes_the_identity(self, monkeypatch):
-        """Positive control: the same header, from a peer the proxy trust
-        boundary actually admits, does change the derived identity —
-        proving the untrusted case above is a rejection, not a no-op
-        function."""
+        """Check trusted peer forwarded header changes the identity."""
         monkeypatch.setattr(settings, "rate_limit_trust_proxy", True)
         baseline = get_rate_limit_client_id(_request(peer="127.0.0.1"))
         forwarded = get_rate_limit_client_id(
@@ -147,10 +129,7 @@ class TestClientIdentityCanonicalization:
         assert baseline != forwarded
 
     def test_rotating_the_secret_key_changes_every_identity(self, monkeypatch):
-        """SECRET_KEY rotation must deliberately create fresh limiter
-        buckets; the client-identity HMAC key is derived once at import
-        time from settings.secret_key, so this pins the derivation
-        function itself rather than the frozen module-level key."""
+        """Check rotating the secret key changes every identity."""
         request = _request(peer="203.0.113.5")
         before = get_rate_limit_client_id(request)
 
@@ -167,12 +146,10 @@ class TestClientIdentityCanonicalization:
 
 
 class TestSentinelStorageKeyCarriesNoRequestData:
-    """The storage key SlowAPI builds for the unmatched-route sentinel —
-    the client identity plus the qualified sentinel function name — never
-    contains a raw IP, cookie value, query value, email address, or
-    concrete request path, across many distinct unmatched paths."""
+    """Cover sentinel storage key carries no request data."""
 
     def test_two_hundred_random_unmatched_paths_produce_one_sentinel_scope(self, monkeypatch):
+        """Check two hundred random unmatched paths produce one sentinel scope."""
         monkeypatch.setattr(settings, "rate_limit_trust_proxy", False)
         random_generator = random.Random(20260920)
         scopes: set[str] = set()
@@ -218,10 +195,7 @@ class TestSentinelStorageKeyCarriesNoRequestData:
         assert len(keys) <= 256
 
     def test_a_named_route_resolves_to_its_own_scope_not_the_sentinel(self):
-        """Positive control: a genuine full route match is not folded into
-        the sentinel scope — it resolves to the endpoint's own qualified
-        name, proving the corpus above is exercising rejection, not a
-        resolver that always returns the sentinel."""
+        """Check a named route resolves to its own scope not the sentinel."""
         request = Request(
             {
                 "type": "http",

@@ -19,7 +19,10 @@ from .db_schema_contract import (
     TABLE_COLUMN_CONTRACTS,
     TABLE_CONSTRAINT_CONTRACTS,
     TABLE_INDEX_CONTRACTS,
+    TABLE_POLICY_CONTRACTS,
+    TABLE_ROW_SECURITY_CONTRACTS,
     TRIGGER_CONTRACTS,
+    VIEW_CONTRACTS,
     ColumnSpec,
     ConstraintKind,
     ConstraintSpec,
@@ -31,14 +34,21 @@ from .db_schema_contract import (
     IndexKeySpec,
     IndexMethod,
     IndexSpec,
+    PolicyCommand,
+    PolicySpec,
+    RowSecuritySpec,
     TriggerEnabledMode,
     TriggerSpec,
+    ViewSpec,
 )
 
 _CONSTRAINT_ROW_LENGTH = 13
 _INDEX_ROW_LENGTH = 12
 _FUNCTION_ROW_LENGTH = 10
 _TRIGGER_ROW_LENGTH = 7
+_ROW_SECURITY_ROW_LENGTH = 2
+_POLICY_ROW_LENGTH = 6
+_VIEW_ROW_LENGTH = 5
 
 _CONSTRAINT_KINDS: dict[str, ConstraintKind] = {
     "p": "primary_key",
@@ -949,21 +959,199 @@ async def assert_table_trigger_contract(
         raise RuntimeError(f"Schema drift on {table_name!r}: {'; '.join(problems)}")
 
 
+async def _get_table_row_security(
+    pool: AsyncConnectionPool,
+    table_name: str,
+) -> RowSecuritySpec:
+    """Read both row-security flags; absent tables and malformed rows fail closed."""
+    async with get_db_cursor(pool, row_factory=tuple_row) as cur:
+        await cur.execute(
+            """SELECT relation.relrowsecurity, relation.relforcerowsecurity
+               FROM pg_class AS relation
+               JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+               WHERE namespace.nspname = 'public'
+                 AND relation.relname = %s AND relation.relkind = 'r'""",
+            (table_name,),
+        )
+        rows = await cur.fetchall()
+    if (
+        len(rows) != 1
+        or len(rows[0]) != _ROW_SECURITY_ROW_LENGTH
+        or any(type(value) is not bool for value in rows[0])
+    ):
+        raise RuntimeError(f"Missing or malformed row-security flags for {table_name!r}")
+    return RowSecuritySpec(enabled=rows[0][0], forced=rows[0][1])
+
+
+async def _get_table_policy_specs(
+    pool: AsyncConnectionPool,
+    table_name: str,
+) -> dict[str, PolicySpec]:
+    """Read every policy on a managed table, including unexpected permissive policies."""
+    async with get_db_cursor(pool, row_factory=tuple_row) as cur:
+        await cur.execute(
+            """SELECT policy.polname, policy.polcmd, policy.polpermissive,
+                      ARRAY(SELECT CASE WHEN role_oid = 0 THEN 'PUBLIC'
+                                        ELSE pg_get_userbyid(role_oid)::text END
+                            FROM unnest(policy.polroles) AS role_ids(role_oid)
+                            ORDER BY 1),
+                      pg_get_expr(policy.polqual, policy.polrelid, false),
+                      pg_get_expr(policy.polwithcheck, policy.polrelid, false)
+               FROM pg_policy AS policy
+               JOIN pg_class AS relation ON relation.oid = policy.polrelid
+               JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+               WHERE namespace.nspname = 'public' AND relation.relname = %s
+                 AND relation.relkind = 'r'
+               ORDER BY policy.polname""",
+            (table_name,),
+        )
+        rows = await cur.fetchall()
+    result: dict[str, PolicySpec] = {}
+    for row in rows:
+        if len(row) != _POLICY_ROW_LENGTH:
+            raise RuntimeError("Unexpected pg_policy query shape")
+        name, command, permissive, roles, using, with_check = row
+        if (
+            not isinstance(name, str)
+            or name in result
+            or not isinstance(command, str)
+            or command not in {"r", "a", "w", "d", "*"}
+            or type(permissive) is not bool
+            or not isinstance(roles, list)
+            or not roles
+            or any(not isinstance(role, str) for role in roles)
+            or (using is not None and not isinstance(using, str))
+            or (with_check is not None and not isinstance(with_check, str))
+        ):
+            raise RuntimeError("Malformed PostgreSQL policy properties")
+        result[name] = PolicySpec(
+            command=cast(PolicyCommand, command),
+            permissive=permissive,
+            roles=tuple(roles),
+            using=using,
+            with_check=with_check,
+        )
+    return result
+
+
+async def assert_table_row_security_contract(
+    pool: AsyncConnectionPool,
+    table_name: str,
+    expected_flags: RowSecuritySpec,
+    expected_policies: Mapping[str, PolicySpec],
+) -> None:
+    """Require exact flags and policy inventory; no extra policy is allowlisted."""
+    actual_flags = await _get_table_row_security(pool, table_name)
+    actual_policies = await _get_table_policy_specs(pool, table_name)
+    if actual_flags != expected_flags or actual_policies != expected_policies:
+        raise RuntimeError(
+            f"Row-security drift on {table_name!r}: "
+            f"flags expected={expected_flags!r}, found={actual_flags!r}; "
+            f"policies expected={dict(expected_policies)!r}, found={actual_policies!r}"
+        )
+
+
+async def _get_view_spec(
+    pool: AsyncConnectionPool,
+    view_name: str,
+) -> ViewSpec:
+    """Read a managed view's complete projection, options, definition and owner."""
+    async with get_db_cursor(pool, row_factory=tuple_row) as cur:
+        await cur.execute(
+            """SELECT ARRAY(SELECT attribute.attname::text
+                            FROM pg_attribute AS attribute
+                            WHERE attribute.attrelid = relation.oid
+                              AND attribute.attnum > 0 AND NOT attribute.attisdropped
+                            ORDER BY attribute.attnum),
+                      ARRAY(SELECT pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
+                            FROM pg_attribute AS attribute
+                            WHERE attribute.attrelid = relation.oid
+                              AND attribute.attnum > 0 AND NOT attribute.attisdropped
+                            ORDER BY attribute.attnum),
+                      pg_get_viewdef(relation.oid, false),
+                      ARRAY(SELECT option FROM unnest(relation.reloptions) AS options(option)
+                            ORDER BY option),
+                      relation.relowner = (SELECT base.relowner FROM pg_class AS base
+                                           JOIN pg_namespace AS base_namespace
+                                             ON base_namespace.oid = base.relnamespace
+                                           WHERE base_namespace.nspname = 'public'
+                                             AND base.relname = 'oral_history_datasets'
+                                             AND base.relkind = 'r')
+               FROM pg_class AS relation
+               JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+               WHERE namespace.nspname = 'public' AND relation.relname = %s
+                 AND relation.relkind = 'v'""",
+            (view_name,),
+        )
+        rows = await cur.fetchall()
+    if len(rows) != 1 or len(rows[0]) != _VIEW_ROW_LENGTH:
+        raise RuntimeError(f"Missing or malformed managed view {view_name!r}")
+    names, types, definition, options, owner_matches = rows[0]
+    if (
+        not isinstance(names, list)
+        or not isinstance(types, list)
+        or len(names) != len(types)
+        or not names
+        or any(not isinstance(value, str) for value in [*names, *types])
+        or not isinstance(definition, str)
+        or not isinstance(options, list)
+        or any(not isinstance(option, str) for option in options)
+        or type(owner_matches) is not bool
+    ):
+        raise RuntimeError(f"Malformed managed view properties for {view_name!r}")
+    return ViewSpec(
+        columns=tuple(zip(names, types, strict=True)),
+        definition=definition,
+        options=tuple(options),
+        owner_matches_catalogue=owner_matches,
+    )
+
+
+async def assert_view_contract(
+    pool: AsyncConnectionPool,
+    view_name: str,
+    expected: ViewSpec,
+) -> None:
+    """Reject changed definitions, added/reordered columns, options or owner drift."""
+    actual = await _get_view_spec(pool, view_name)
+    if actual != expected:
+        raise RuntimeError(
+            f"Schema drift on view {view_name!r}: expected={expected!r}, found={actual!r}"
+        )
+
+
 async def validate_schema_against_db(
     pool: AsyncConnectionPool,
 ) -> None:
-    """Validate all declared table objects and managed function names.
+    """Validate managed tables, complete row policies, narrow views and functions.
 
-    Raise RuntimeError for unequal contract table sets or live drift. Extra
-    tables and functions with unmanaged names are outside this check.
+    Raise RuntimeError for unequal table-contract sets or live drift. Extra
+    policies are rejected; extra tables and unmanaged function names are
+    outside this schema check and remain subject to runtime-role validation.
     """
     column_tables = set(TABLE_COLUMN_CONTRACTS)
     constraint_tables = set(TABLE_CONSTRAINT_CONTRACTS)
     index_tables = set(TABLE_INDEX_CONTRACTS)
     trigger_tables = set(TRIGGER_CONTRACTS)
+    row_security_tables = set(TABLE_ROW_SECURITY_CONTRACTS)
+    policy_tables = set(TABLE_POLICY_CONTRACTS)
 
-    if not (column_tables == constraint_tables == index_tables == trigger_tables):
-        all_tables = column_tables | constraint_tables | index_tables | trigger_tables
+    if not (
+        column_tables
+        == constraint_tables
+        == index_tables
+        == trigger_tables
+        == row_security_tables
+        == policy_tables
+    ):
+        all_tables = (
+            column_tables
+            | constraint_tables
+            | index_tables
+            | trigger_tables
+            | row_security_tables
+            | policy_tables
+        )
 
         raise RuntimeError(
             "Database contract table sets do not match: "
@@ -974,7 +1162,11 @@ async def validate_schema_against_db(
             "missing index contracts="
             f"{sorted(all_tables - index_tables)}, "
             "missing trigger contracts="
-            f"{sorted(all_tables - trigger_tables)}"
+            f"{sorted(all_tables - trigger_tables)}, "
+            "missing row-security contracts="
+            f"{sorted(all_tables - row_security_tables)}, "
+            "missing policy contracts="
+            f"{sorted(all_tables - policy_tables)}"
         )
 
     for table_name, column_contract in TABLE_COLUMN_CONTRACTS.items():
@@ -998,6 +1190,15 @@ async def validate_schema_against_db(
             table_name,
             TRIGGER_CONTRACTS[table_name],
         )
+        await assert_table_row_security_contract(
+            pool,
+            table_name,
+            TABLE_ROW_SECURITY_CONTRACTS[table_name],
+            TABLE_POLICY_CONTRACTS[table_name],
+        )
+
+    for view_name, view_contract in VIEW_CONTRACTS.items():
+        await assert_view_contract(pool, view_name, view_contract)
 
     await assert_function_contract(
         pool,

@@ -1,11 +1,4 @@
-"""Reconciliation of ambiguous and definite institution-filter outcomes.
-
-An offered-but-unclassifiable UUID (``HarvestResult.uncertain_records``) must
-never look absent to reconciliation on either sync path, while a definite
-institution mismatch is still an authoritative removal. Both paths write
-through ``app.services.sync``; the plain incremental and rebuild mechanics
-live in ``test_sync_incremental_db.py`` and ``test_sync_rebuild_db.py``.
-"""
+"""Reconciliation of ambiguous and definite institution-filter outcomes."""
 
 from datetime import UTC, datetime
 from unittest.mock import patch
@@ -13,21 +6,29 @@ from unittest.mock import patch
 import pytest
 from lxml import etree
 
-from app.services import oai_client, sync
-from app.services.oai_client import OAI_NS, HarvestResult
-from app.services.sync import run_full_rebuild
-from config import settings
+from app.services import ingestion
+from app.services.harvest import HarvestResult
+from app.services.ingestion import run_full_rebuild
+from app.sources.oai_client import OAI_NS
 from tests.integration.sync_doubles import (
     FETCH,
+    SourceCase,
     ingestion_failure_uuids,
     make_record,
     sync_status_row,
 )
-from tests.oai_fixtures import SAMPLE_CMDI_XML, SOURCE_CURSOR, FakeOAIResponse, patch_session_get
+from tests.oai_fixtures import (
+    SAMPLE_CMDI_XML,
+    SOURCE_CURSOR,
+    FakeOAIResponse,
+    fetch_updates_in_process,
+    patch_session_get,
+)
+from tests.source_fixtures import TEST_INSTITUTION_FILTER
 
 
 def _uncertain_record_xml(uuid, institutions):
-    """Adapt real CMDI XML; distinct DOIs avoid unrelated uniqueness failures."""
+    """Adapt real CMDI XML while keeping each record's DOI distinct."""
     record = etree.fromstring(SAMPLE_CMDI_XML.encode())
     identifier = record.find(f"{{{OAI_NS}}}header/{{{OAI_NS}}}identifier")
     assert identifier is not None
@@ -49,6 +50,7 @@ def _uncertain_record_xml(uuid, institutions):
 
 
 def _uncertain_record_page(records, token=""):
+    """Wrap supplied records and a resumption token in an OAI XML response."""
     return FakeOAIResponse(
         (
             f'<OAI-PMH xmlns="{OAI_NS}"><responseDate>2026-09-10T12:00:00Z</responseDate><ListRecords>'
@@ -59,10 +61,8 @@ def _uncertain_record_page(records, token=""):
     )
 
 
-class TestUncertainInstitutionMetadata:
-    """A row whose institution metadata is missing or unusable must be
-    preserved, and both diagnostic channels must pin the run that could not
-    resolve it — never claim a complete, watermark-advancing reconciliation."""
+class TestUncertainInstitutionMetadata(SourceCase):
+    """Check uncertain Institution Metadata."""
 
     @pytest.mark.parametrize(
         ("runner", "expected_titles"),
@@ -77,7 +77,7 @@ class TestUncertainInstitutionMetadata:
                 id="rebuild",
             ),
             pytest.param(
-                sync._sync_source_a,
+                ingestion._sync_source,
                 {
                     "oai:uncertain-inst:known": "Test Dataset Title",
                     "oai:uncertain-inst:uncertain": "Existing title",
@@ -101,6 +101,7 @@ class TestUncertainInstitutionMetadata:
         expected_titles,
         institutions,
     ):
+        """Verify uncertain institution preserves row and pins watermark."""
         for uuid in (
             "oai:uncertain-inst:known",
             "oai:uncertain-inst:uncertain",
@@ -108,7 +109,7 @@ class TestUncertainInstitutionMetadata:
         ):
             dataset_factory(
                 uuid=uuid,
-                source="swissubase",
+                source=self.source.name,
                 title="Existing title",
             )
 
@@ -122,13 +123,13 @@ class TestUncertainInstitutionMetadata:
                 last_sync_error_at = %s,
                 last_rebuild_error = 'prior rebuild error',
                 last_rebuild_error_at = %s
-            WHERE id = 1
+            WHERE source = %s
             """,
-            (prior, prior, prior, prior),
+            (prior, prior, prior, prior, self.source.name),
         )
         sync_conn.commit()
 
-        matching = [settings.oai_institution_filter]
+        matching = [TEST_INSTITUTION_FILTER]
         tombstone = (
             '<record><header status="deleted">'
             "<identifier>oai:uncertain-inst:deleted</identifier>"
@@ -139,14 +140,8 @@ class TestUncertainInstitutionMetadata:
             side_effect=[
                 _uncertain_record_page(
                     [
-                        _uncertain_record_xml(
-                            "oai:uncertain-inst:known",
-                            matching,
-                        ),
-                        _uncertain_record_xml(
-                            "oai:uncertain-inst:new",
-                            matching,
-                        ),
+                        _uncertain_record_xml("oai:uncertain-inst:known", matching),
+                        _uncertain_record_xml("oai:uncertain-inst:new", matching),
                         tombstone,
                     ],
                     token="T1",
@@ -164,32 +159,30 @@ class TestUncertainInstitutionMetadata:
 
         with (
             patcher as session_factory,
-            patch(FETCH, new=oai_client.fetch_updates),
+            patch(FETCH, autospec=True, side_effect=fetch_updates_in_process),
         ):
-            await runner(db_pool)
+            await runner(db_pool, configured_source=self.source)
 
         assert mock_get.call_count == 2
         session_factory.return_value.close.assert_called_once()
 
-        after = sync_status_row(sync_conn)
+        after = sync_status_row(sync_conn, source=self.source.name)
         rows = sync_conn.execute(
             """
             SELECT uuid, title
             FROM oral_history_datasets
-            WHERE source = 'swissubase'
+            WHERE source = %s
             ORDER BY uuid
-            """
+            """,
+            (self.source.name,),
         ).fetchall()
-        failure_uuids = ingestion_failure_uuids(sync_conn)
+        failure_uuids = ingestion_failure_uuids(sync_conn, source=self.source.name)
 
         assert dict(rows) == expected_titles
         assert "oai:uncertain-inst:deleted" not in dict(rows)
         assert "oai:uncertain-inst:uncertain" in failure_uuids
 
         if runner is run_full_rebuild:
-            # The uncertain UUID is protected from stale deletion. Because the
-            # rebuild was incomplete, neither catalogue cursor advances and
-            # both recovery channels retain the unresolved identity.
             assert dict(rows)["oai:uncertain-inst:uncertain"] == "Existing title"
             assert after["last_full_rebuild_date"] == prior
             assert after["last_harvest_date"] == prior
@@ -198,16 +191,11 @@ class TestUncertainInstitutionMetadata:
             assert "oai:uncertain-inst:uncertain" in after["last_sync_error"]
             assert after["last_sync_error_at"] > prior
         else:
-            # Incremental sync also retains the last known representation and
-            # pins its cursor until this identifier can be replayed
-            # successfully.
             assert dict(rows)["oai:uncertain-inst:uncertain"] == "Existing title"
             assert after["last_harvest_date"] == prior
             assert after["last_full_rebuild_date"] == prior
             assert "oai:uncertain-inst:uncertain" in after["last_sync_error"]
             assert after["last_sync_error_at"] > prior
-
-            # Error channels remain independent.
             assert after["last_rebuild_error"] == "prior rebuild error"
             assert after["last_rebuild_error_at"] == prior
 
@@ -217,33 +205,27 @@ class TestUncertainInstitutionMetadata:
         sync_conn,
         dataset_factory,
     ):
-        """An offered-but-unclassifiable UUID must never look absent to
-        reconciliation, driven directly through the rebuild entry point
-        (rather than through a patched OAI page) as a positive control on
-        the reconciliation function itself."""
+        """An offered-but-unclassifiable identity remains protected from deletion."""
         uncertain_uuid = "oai:uncertain-inst:direct-uncertain"
         uncertain_id = dataset_factory(
             uuid=uncertain_uuid,
-            source="swissubase",
+            source=self.source.name,
             title="Last known good title",
         )
         dataset_factory(
             uuid="oai:uncertain-inst:direct-stale",
-            source="swissubase",
+            source=self.source.name,
             title="Actually absent upstream",
         )
-        # The contraction guard (sync.py:289-326) refuses to infer-delete
-        # more than 25% of existing Source A rows in one rebuild. Only
-        # "oai:uncertain-inst:direct-stale" is unoffered here, so two more
-        # pre-existing rows that stay offered (and therefore protected) keep
-        # inferred absence at 1/4 = 25%, at the limit rather than over it,
-        # letting the reconciliation under test run instead of tripping the
-        # guard first.
         dataset_factory(
-            uuid="oai:uncertain-inst:direct-kept-1", source="swissubase", title="Still offered 1"
+            uuid="oai:uncertain-inst:direct-kept-1",
+            source=self.source.name,
+            title="Still offered 1",
         )
         dataset_factory(
-            uuid="oai:uncertain-inst:direct-kept-2", source="swissubase", title="Still offered 2"
+            uuid="oai:uncertain-inst:direct-kept-2",
+            source=self.source.name,
+            title="Still offered 2",
         )
 
         prior = datetime(2020, 1, 1, tzinfo=UTC)
@@ -255,8 +237,8 @@ class TestUncertainInstitutionMetadata:
                    last_sync_error_at = NULL,
                    last_rebuild_error = NULL,
                    last_rebuild_error_at = NULL
-               WHERE id = 1""",
-            (prior, prior),
+               WHERE source = %s""",
+            (prior, prior, self.source.name),
         )
         sync_conn.commit()
 
@@ -275,12 +257,13 @@ class TestUncertainInstitutionMetadata:
         )
 
         with patch(FETCH, autospec=True, return_value=harvest):
-            await sync._full_rebuild_source_a(db_pool)
+            await ingestion._full_rebuild_source(db_pool, configured_source=self.source)
 
         rows = sync_conn.execute(
             """SELECT id, uuid, title
                FROM oral_history_datasets
-               WHERE source = 'swissubase'"""
+               WHERE source = %s""",
+            (self.source.name,),
         ).fetchall()
         by_uuid = {uuid: (row_id, title) for row_id, uuid, title in rows}
 
@@ -290,12 +273,11 @@ class TestUncertainInstitutionMetadata:
         assert by_uuid["oai:uncertain-inst:direct-kept-2"][1] == "Still offered 2"
         assert "oai:uncertain-inst:direct-stale" not in by_uuid
 
-        status = sync_status_row(sync_conn)
-        # Unresolved identities live in ingestion_failures, not the dead
-        # sync_status.incremental_failures column (sync.py:360-503).
+        status = sync_status_row(sync_conn, source=self.source.name)
         failures = dict(
             sync_conn.execute(
-                "SELECT uuid, message FROM ingestion_failures WHERE source = 'swissubase'"
+                "SELECT uuid, message FROM ingestion_failures WHERE source = %s",
+                (self.source.name,),
             ).fetchall()
         )
 
@@ -306,41 +288,42 @@ class TestUncertainInstitutionMetadata:
         assert uncertain_uuid in status["last_rebuild_error"]
 
 
-class TestDefiniteInstitutionMismatch:
-    """Positive control for TestUncertainInstitutionMetadata: a definite
-    (not ambiguous) filter mismatch must still be reconciled away."""
+class TestDefiniteInstitutionMismatch(SourceCase):
+    """Check definite Institution Mismatch."""
 
     async def test_known_nonmatching_record_is_still_reconciled(
         self, db_pool, sync_conn, dataset_factory
     ):
-        """A definite institution change must still remove a previously
-        included row."""
-        dataset_factory(uuid="oai:uncertain-inst:excluded", source="swissubase")
+        """A broad filter exclusion withholds known data and triggers source review."""
+        dataset_factory(uuid="oai:uncertain-inst:excluded", source=self.source.name)
         patcher, mock_get = patch_session_get(
             return_value=_uncertain_record_page(
                 [
-                    _uncertain_record_xml(
-                        "oai:uncertain-inst:accepted", [settings.oai_institution_filter]
-                    ),
+                    _uncertain_record_xml("oai:uncertain-inst:accepted", [TEST_INSTITUTION_FILTER]),
                     _uncertain_record_xml("oai:uncertain-inst:excluded", ["Elsewhere Institute"]),
                 ]
             )
         )
         with (
             patcher,
-            patch(FETCH, new=oai_client.fetch_updates),
+            patch(FETCH, autospec=True, side_effect=fetch_updates_in_process),
         ):
-            await run_full_rebuild(db_pool)
+            outcome = await run_full_rebuild(db_pool, configured_source=self.source)
 
         mock_get.assert_called_once()
         rows = dict(
             sync_conn.execute(
-                "SELECT uuid, source FROM oral_history_datasets WHERE source = 'swissubase'"
+                "SELECT uuid, source FROM oral_history_datasets WHERE source = %s",
+                (self.source.name,),
             ).fetchall()
         )
-        assert "oai:uncertain-inst:excluded" not in rows
-        assert "oai:uncertain-inst:accepted" in rows
-        status = sync_status_row(sync_conn)
-        assert status["last_full_rebuild_date"] is not None
-        assert status["last_harvest_date"] == status["last_full_rebuild_date"]
-        assert status["last_rebuild_error"] is None
+        assert "oai:uncertain-inst:excluded" in rows
+        assert "oai:uncertain-inst:accepted" not in rows
+        assert outcome.status == "failed"
+        assert sync_conn.execute(
+            "SELECT reason FROM ingestion_quarantine WHERE source = %s AND uuid = %s",
+            (self.source.name, "oai:uncertain-inst:excluded"),
+        ).fetchone() == ("filter_mismatch",)
+        status = sync_status_row(sync_conn, source=self.source.name)
+        assert status["last_full_rebuild_date"] is None
+        assert "filter exclusion" in status["last_rebuild_error"]

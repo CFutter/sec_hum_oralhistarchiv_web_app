@@ -1,34 +1,23 @@
-"""Email-change outbox delivery and enqueue-failure behavior — real PostgreSQL.
+"""Email-change outbox delivery and enqueue-failure behavior — real PostgreSQL."""
 
-Covers how a staged email-change reaches SMTP through
-app.services.email_delivery.deliver_email_outbox_batch (an already-occupied
-destination must never be delivered, even though it was queued before the
-race was known) and what happens to pending state and prior outbox rows when
-a mid-staging enqueue call raises
-(app.services.email_change / app.services.email_outbox).
-
-Staging is exercised through the real POST route so each scenario starts
-from a durable outbox row exactly as production would produce it.
-"""
-
+import time
 from unittest.mock import patch
 
 import pyotp
+import time_machine
 from fastapi import status
 
-from app.services.crypto import encrypt_value
 from app.services.email import DeliveryResult
 from app.services.email_delivery import deliver_email_outbox_batch
 from app.services.email_outbox import enqueue_outbound_email_cur
+from app.services.totp_crypto import encrypt_value
 from tests.integration.conftest import DEFAULT_PASSWORD, do_login
 
-NEW_EMAIL = "new@uzh.ch"
+NEW_EMAIL = "new@example.org"
 _EMAIL_CHANGE_MESSAGE_COUNT = 2
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_totp_user(user_factory, **overrides):
@@ -39,8 +28,9 @@ def _make_totp_user(user_factory, **overrides):
 
 
 def _login(client, u, secret):
-    """Real login (password + current TOTP code) → full session in the jar."""
-    resp = do_login(client, u.email, DEFAULT_PASSWORD, pyotp.TOTP(secret).now())
+    """Keep the prior step valid throughout login, leaving a fresh code for staging."""
+    with time_machine.travel(time.time(), tick=False):
+        resp = do_login(client, u.email, DEFAULT_PASSWORD, pyotp.TOTP(secret).at(time.time() - 30))
     assert resp.status_code == status.HTTP_303_SEE_OTHER, "login must succeed to a full session"
     return resp
 
@@ -80,12 +70,12 @@ def _outbox_messages(sync_conn, user_id):
     return [dict(zip(columns, row, strict=True)) for row in rows]
 
 
-# ---------------------------------------------------------------------------
 # Scenarios
-# ---------------------------------------------------------------------------
 
 
 class TestBatchDeliveryDiscardsOccupiedDestinations:
+    """Check batch Delivery Discards Occupied Destinations."""
+
     async def test_occupied_destination_verification_is_discarded_before_smtp(
         self,
         e2e_client,
@@ -97,7 +87,7 @@ class TestBatchDeliveryDiscardsOccupiedDestinations:
         while the sibling notice to the actor's own (unchanged) address is
         still delivered normally — the block is destination-specific, not a
         wholesale delivery failure."""
-        occupied = user_factory(email="occupied@uzh.ch")
+        occupied = user_factory(email="occupied@example.org")
         actor, secret = _make_totp_user(user_factory)
         _login(e2e_client, actor, secret)
         csrf = _csrf_for_session(e2e_client)
@@ -107,6 +97,7 @@ class TestBatchDeliveryDiscardsOccupiedDestinations:
             data={
                 "new_email": occupied.email,
                 "current_password": DEFAULT_PASSWORD,
+                "totp_code": pyotp.TOTP(secret).now(),
                 "csrf_token": csrf,
             },
             follow_redirects=False,
@@ -149,6 +140,8 @@ class TestBatchDeliveryDiscardsOccupiedDestinations:
 
 
 class TestEnqueueFailureRollsBackStaging:
+    """Check enqueue Failure Rolls Back Staging."""
+
     async def test_change_email_staging_rolls_back_if_second_enqueue_fails(
         self,
         e2e_client,
@@ -162,6 +155,7 @@ class TestEnqueueFailureRollsBackStaging:
         enqueue_count = 0
 
         async def enqueue_then_fail(cur, *, user_id, email, action):
+            """Raise on the second enqueue and delegate earlier messages to the real writer."""
             nonlocal enqueue_count
             enqueue_count += 1
             if enqueue_count == _EMAIL_CHANGE_MESSAGE_COUNT:
@@ -183,6 +177,7 @@ class TestEnqueueFailureRollsBackStaging:
                 data={
                     "new_email": NEW_EMAIL,
                     "current_password": DEFAULT_PASSWORD,
+                    "totp_code": pyotp.TOTP(secret).now(),
                     "csrf_token": csrf,
                 },
                 follow_redirects=False,

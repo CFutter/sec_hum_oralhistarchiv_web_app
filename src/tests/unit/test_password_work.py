@@ -1,9 +1,5 @@
-"""Unit tests for `app.services.password_work` — the bounded Argon2 thread
-budget, separate from the general thread pool.
-
-Pure unit tier: no DB, no TestClient. Each event loop gets its own
-`CapacityLimiter` (an `anyio.lowlevel.RunVar`), so these tests exercise the
-real limiter with real threads rather than mocking concurrency away.
+"""Unit tests for `app.services.password_work` — the bounded Argon2 thread budget, separate from the
+general thread pool.
 """
 
 import asyncio
@@ -20,23 +16,18 @@ _CALLERS = 40
 
 
 class TestPasswordWorkCapacityBudget:
-    """`run_password_work` bounds concurrent Argon2 work to
-    `settings.password_work_concurrency`, independently of the general
-    thread pool, and never releases a cancelled slot before its thread
-    actually finishes."""
+    """Cover password work capacity budget."""
 
     async def test_concurrent_password_work_never_exceeds_its_own_capacity(self, monkeypatch):
-        """A burst of password-hashing calls, each of which would run
-        happily on the general thread pool's much larger capacity, is
-        instead bounded by password_work's OWN limiter (here set to 1): at
-        no point does more than one hash run at a time, and every submitted
-        unit of work still completes."""
+        """Check concurrent password work never exceeds its own capacity."""
         monkeypatch.setattr(settings, "password_work_concurrency", 1)
+        monkeypatch.setattr(settings, "password_work_admission_timeout_seconds", 5.0)
         active = peak = completed = 0
         guard = threading.Lock()
         release = threading.Event()
 
         def expensive_work():
+            """Track active and completed workers under a lock while waiting up to five seconds."""
             nonlocal active, peak, completed
             with guard:
                 active += 1
@@ -47,6 +38,7 @@ class TestPasswordWorkCapacityBudget:
                 completed += 1
 
         async def limiter_for_current_loop() -> anyio.CapacityLimiter:
+            """Wait up to two seconds for the current-loop password-work limiter."""
             with anyio.fail_after(2):
                 while True:
                     try:
@@ -76,17 +68,15 @@ class TestPasswordWorkCapacityBudget:
     async def test_cancelling_a_request_keeps_its_capacity_until_the_thread_finishes(
         self, monkeypatch
     ):
-        """Cancelling the awaiting coroutine must NOT release the limiter
-        slot early: a second caller queued behind a cancelled-but-still-
-        running first call must stay blocked until the first thread actually
-        finishes, or a single-worker capacity budget could be oversubscribed
-        by a caller that gives up waiting."""
+        """Check cancelling a request keeps its capacity until the thread finishes."""
         monkeypatch.setattr(settings, "password_work_concurrency", 1)
+        monkeypatch.setattr(settings, "password_work_admission_timeout_seconds", 5.0)
         started = threading.Event()
         release = threading.Event()
         second_started = threading.Event()
 
         def first_work():
+            """Signal worker entry and wait up to five seconds for test release."""
             started.set()
             release.wait(timeout=5)
 

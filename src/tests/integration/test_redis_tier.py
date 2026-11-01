@@ -1,22 +1,10 @@
-"""Redis coordination integration tests.
-
-Everything here requires a real Redis:
-
-- reachable Redis -> tests run;
-- unreachable without REQUIRE_REDIS=1 -> module skips;
-- unreachable with REQUIRE_REDIS=1 -> hard failure.
-
-The tests cover:
-
-- cross-worker invalidation of CatalogueStatsCache;
-- subscriber recovery after a dropped Redis connection;
-- clean subscriber-thread shutdown;
-- shared rate-limit counters across Limiter instances.
-"""
+"""Redis coordination integration tests."""
 
 import contextlib
 import os
+import subprocess
 import time
+from collections.abc import Iterator
 from typing import cast
 
 import pytest
@@ -26,10 +14,11 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 import app.services.redis_client as rc
+from app.middleware.bounded_rate_limit_storage import bounded_redis_uri
+from app.middleware.rate_limiting import bounded_storage_options
 from app.services.cache import (
     _INVALIDATION_CHANNEL,
     CatalogueStatsCache,
-    GlobalStats,
 )
 from config import settings
 
@@ -55,7 +44,7 @@ _REDIS_AVAILABLE = _redis_reachable()
 
 @pytest.fixture(scope="session", autouse=True)
 def _require_redis_tier():
-    """Skip without Redis unless CI explicitly requires the Redis tier."""
+    """Require the shared Redis used by the root limiter-reset fixture."""
     if not _REDIS_AVAILABLE:
         if os.environ.get("REQUIRE_REDIS") == "1":
             raise RuntimeError(f"REQUIRE_REDIS=1 but Redis unreachable at {REDIS_URL}")
@@ -63,33 +52,32 @@ def _require_redis_tier():
 
 
 @pytest.fixture
-def redis_enabled(monkeypatch):
-    """Point the application Redis client at the integration-test Redis."""
-    monkeypatch.setattr(settings, "redis_enabled", True)
-    monkeypatch.setattr(settings, "redis_url", SecretStr(REDIS_URL))
-
-    saved_client = rc._client
-    saved_failure = rc._last_failure_time
-
-    rc._client = None
-    rc._last_failure_time = None
-
-    try:
-        yield
-    finally:
-        if rc._client is not None:
-            with contextlib.suppress(Exception):
-                rc._client.close()
-
-        rc._client = saved_client
-        rc._last_failure_time = saved_failure
+def redis_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    private_redis: tuple[int, subprocess.Popen[bytes]],
+) -> Iterator[str]:
+    """Use one test's private Redis and restore the application's client afterward."""
+    port, _proc = private_redis
+    redis_url = f"redis://127.0.0.1:{port}/0"
+    with monkeypatch.context() as patches:
+        patches.setattr(settings, "redis_enabled", True)
+        patches.setattr(settings, "redis_url", SecretStr(redis_url))
+        patches.setattr(rc, "_client", None)
+        patches.setattr(rc, "_last_failure_time", None)
+        try:
+            yield redis_url
+        finally:
+            client = rc._client
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    client.close()
 
 
 @pytest.fixture
-def clean_channel(redis_enabled):  # noqa: ARG001
-    """Provide a direct Redis handle for assertions and fault injection."""
+def clean_channel(redis_enabled: str) -> Iterator[redis_lib.Redis]:
+    """Inspect and inject faults only into this test's private Redis."""
     client = redis_lib.Redis.from_url(
-        REDIS_URL,
+        redis_enabled,
         decode_responses=True,
     )
     try:
@@ -119,34 +107,30 @@ def _subscriber_count(client: redis_lib.Redis) -> int:
     return int(result[0][1])
 
 
-def _prime_global_cache(cache: CatalogueStatsCache) -> None:
-    """Install a fresh global-statistics value without querying PostgreSQL."""
+def _prime_freshness_cache(cache: CatalogueStatsCache) -> None:
+    """Install cached unknown freshness without querying PostgreSQL."""
     with cache._lock:
-        cache._global = (
-            GlobalStats(
-                total_datasets=1,
-                last_full_rebuild=None,
-            ),
-            time.monotonic(),
-        )
+        cache._freshness = (None, time.monotonic())
 
 
-def _global_cache_is_empty(cache: CatalogueStatsCache) -> bool:
+def _freshness_cache_is_empty(cache: CatalogueStatsCache) -> bool:
     """Read the private cache slot under the same lock used by production."""
     with cache._lock:
-        return cache._global is None
+        return cache._freshness is None
 
 
-# ---------------------------------------------------------------------------
 # Cross-worker statistics-cache invalidation
-# ---------------------------------------------------------------------------
 
 
 def test_publish_on_one_cache_invalidates_another(clean_channel):
-    """An invalidation published by worker A clears worker B's global slot."""
+    """An invalidation published by worker A clears worker B's freshness slot."""
     pool = _DummyPool()
-    worker_a = CatalogueStatsCache(pool)
-    worker_b = CatalogueStatsCache(pool)
+    worker_a = CatalogueStatsCache(
+        pool, source_names=("redis_archive",), policy_fingerprint="a" * 64
+    )
+    worker_b = CatalogueStatsCache(
+        pool, source_names=("redis_archive",), policy_fingerprint="a" * 64
+    )
 
     try:
         # Waiting for Redis' subscriber count avoids relying on an arbitrary
@@ -155,13 +139,13 @@ def test_publish_on_one_cache_invalidates_another(clean_channel):
             lambda: _subscriber_count(clean_channel) >= 2,
         )
 
-        _prime_global_cache(worker_b)
-        assert not _global_cache_is_empty(worker_b)
+        _prime_freshness_cache(worker_b)
+        assert not _freshness_cache_is_empty(worker_b)
 
         worker_a.invalidate_cache()
 
         assert _wait_until(
-            lambda: _global_cache_is_empty(worker_b),
+            lambda: _freshness_cache_is_empty(worker_b),
         )
     finally:
         worker_a.stop()
@@ -170,26 +154,30 @@ def test_publish_on_one_cache_invalidates_another(clean_channel):
 
 def test_subscriber_survives_dropped_connection(clean_channel):
     """The subscriber reconnects and processes later invalidations."""
-    cache = CatalogueStatsCache(_DummyPool())
+    cache = CatalogueStatsCache(
+        _DummyPool(), source_names=("redis_archive",), policy_fingerprint="a" * 64
+    )
 
     try:
         assert _wait_until(
             lambda: _subscriber_count(clean_channel) >= 1,
         )
 
-        # Drop server-side pub/sub connections. skipme=True preserves the
-        # direct test connection issuing this command.
-        clean_channel.client_kill_filter(
+        # This private server has exactly this cache's subscriber. The
+        # direct inspection connection is not a pub/sub client.
+        killed = clean_channel.client_kill_filter(
             _type="pubsub",
             skipme=True,
         )
+        assert killed == 1, "fault injection must disconnect this cache's subscriber"
 
-        _prime_global_cache(cache)
-        assert not _global_cache_is_empty(cache)
+        _prime_freshness_cache(cache)
+        assert not _freshness_cache_is_empty(cache)
 
         def _publish_until_received() -> bool:
+            """Publish an invalidation and report whether the cache became empty."""
             clean_channel.publish(_INVALIDATION_CHANNEL, "1")
-            return _global_cache_is_empty(cache)
+            return _freshness_cache_is_empty(cache)
 
         # The first publication may precede the reconnect, so publish
         # repeatedly until the subscriber has re-established its subscription.
@@ -205,34 +193,36 @@ def test_subscriber_survives_dropped_connection(clean_channel):
 @pytest.mark.usefixtures("redis_enabled")
 def test_stop_joins_subscriber_thread():
     """stop() terminates and joins the subscriber thread."""
-    cache = CatalogueStatsCache(_DummyPool())
-
-    assert _wait_until(
-        lambda: cache._subscriber_thread is not None and cache._subscriber_thread.is_alive()
+    cache = CatalogueStatsCache(
+        _DummyPool(), source_names=("redis_archive",), policy_fingerprint="a" * 64
     )
 
-    cache.stop()
+    try:
+        assert _wait_until(
+            lambda: cache._subscriber_thread is not None and cache._subscriber_thread.is_alive()
+        )
+    finally:
+        cache.stop()
 
     assert cache._subscriber_thread is not None
     assert not cache._subscriber_thread.is_alive(), "subscriber thread did not join"
 
 
-# ---------------------------------------------------------------------------
 # Shared rate-limit counters
-# ---------------------------------------------------------------------------
 
 
-@pytest.mark.usefixtures("redis_enabled")
-def test_two_limiters_share_counters_via_redis():
+def test_two_limiters_share_counters_via_redis(redis_enabled):
     """Independent Limiter instances share one Redis-backed counter."""
     limiter_a = Limiter(
         key_func=get_remote_address,
-        storage_uri=REDIS_URL,
+        storage_uri=bounded_redis_uri(redis_enabled),
+        storage_options=bounded_storage_options(),
         enabled=True,
     )
     limiter_b = Limiter(
         key_func=get_remote_address,
-        storage_uri=REDIS_URL,
+        storage_uri=bounded_redis_uri(redis_enabled),
+        storage_options=bounded_storage_options(),
         enabled=True,
     )
 
@@ -255,4 +245,5 @@ class _DummyPool:
     """Pool stand-in for tests that never initiate a cache fill."""
 
     def __repr__(self) -> str:  # pragma: no cover
+        """Identify this Redis-test pool double."""
         return "<DummyPool for Redis coordination tests>"

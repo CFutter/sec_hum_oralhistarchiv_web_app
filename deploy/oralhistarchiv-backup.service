@@ -12,6 +12,7 @@ After=postgresql.service
 Type=oneshot
 User=oralhistarchiv_backup
 Group=oralhistarchiv_backup
+SupplementaryGroups=oralhistarchiv-deploy-lock
 EnvironmentFile=/etc/oralhistarchiv-backup.conf
 ExecStart=/usr/local/libexec/oralhistarchiv-backup
 
@@ -42,6 +43,9 @@ ProtectProc=invisible
 ProtectSystem=strict
 ProcSubset=pid
 ReadWritePaths=/var/lib/oralhistarchiv-backup
+# Nonsecret timestamp only; optional backup tmpfiles provisions this mode-0755 path.
+# Ignore an absent path when marker publication is disabled; enabled scripts validate it.
+ReadWritePaths=-/var/lib/oralhistarchiv-backup-status
 InaccessiblePaths=/opt/oralhistarchiv
 CapabilityBoundingSet=
 LockPersonality=true

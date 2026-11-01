@@ -1,16 +1,4 @@
-"""TOTP rotation-confirmation and recovery-code attempt budgets against PostgreSQL.
-
-Two durable, per-challenge budgets from ``app.services.totp``,
-``app.services.totp_recover`` and ``app.services.totp_recovery_codes`` cannot
-be proved with mock cursors: one confirmation quota per staged TOTP rotation
-challenge (``pending_totp_rotations``), and one password-attempt quota per
-recovery-code row (``totp_recovery_codes``), matched and charged atomically
-under concurrent redemption attempts. A closing class pins the database check
-and not-null constraints that remain a backstop if a future caller bypasses
-these services. The integration conftest applies the application's Alembic
-migration and skips this module when the configured test database is
-unavailable.
-"""
+"""TOTP rotation-confirmation and recovery-code attempt budgets against PostgreSQL."""
 
 import asyncio
 from datetime import UTC, datetime, timedelta
@@ -20,13 +8,13 @@ import psycopg
 import pytest
 from psycopg.errors import CheckViolation, NotNullViolation
 
-from app.services import totp_recover
-from app.services.crypto import encrypt_value
+from app.services import password_verification, totp_recover
 from app.services.db import get_db_cursor
 from app.services.session_ids import hash_session_id
 from app.services.sessions import create_session_cur
 from app.services.tokens import hash_token
 from app.services.totp import TotpRotationOutcome, confirm_totp_rotation
+from app.services.totp_crypto import encrypt_value
 from app.services.totp_recover import (
     TotpRecoveryRedemptionRejected,
     redeem_totp_recovery,
@@ -49,12 +37,14 @@ _UNKNOWN_RECOVERY_CODE = "EEEEE-FFFFF-00000-99999"
 
 
 def _canonical_recovery_code(code: str) -> str:
+    """Normalize a recovery code and assert it is valid."""
     canonical = normalize_recovery_code(code)
     assert canonical is not None
     return canonical
 
 
 def _session_state(sync_conn, raw_session_id: str) -> tuple[int, bool] | None:
+    """Read the session attempt count and database-time expiry state, or None."""
     return sync_conn.execute(
         """
         SELECT step_up_attempt_count,
@@ -67,6 +57,7 @@ def _session_state(sync_conn, raw_session_id: str) -> tuple[int, bool] | None:
 
 
 def _user_login_lock_state(sync_conn, user_id: int):
+    """Read failed-login count and lock deadline."""
     return sync_conn.execute(
         "SELECT failed_login_count, locked_until FROM users WHERE id = %s",
         (user_id,),
@@ -118,6 +109,7 @@ def _authorize_public_recovery(sync_conn, user_id: int) -> None:
 
 
 def _recovery_code_states(sync_conn, user_id: int):
+    """Read first-generation code positions, attempt counts and usage markers."""
     return sync_conn.execute(
         """
         SELECT position, password_attempt_count, used_at
@@ -130,6 +122,7 @@ def _recovery_code_states(sync_conn, user_id: int):
 
 
 async def _backend_pid(conn: psycopg.AsyncConnection) -> int:
+    """Read the PostgreSQL backend PID and commit the observer transaction."""
     cursor = await conn.execute("SELECT pg_backend_pid()")
     row = await cursor.fetchone()
     await conn.commit()
@@ -143,6 +136,7 @@ async def _reserve_recovery_password_attempt(
     code: str,
     barrier: asyncio.Barrier,
 ):
+    """Reserve one recovery-code password attempt on an independent connection after a barrier."""
     async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn:
         backend_pid = await _backend_pid(conn)
         async with get_db_cursor(conn) as cur:
@@ -475,9 +469,10 @@ class TestRecoveryCodeBudget:
         user = user_factory()
         _install_active_recovery_codes(sync_conn, user.id)
         _authorize_public_recovery(sync_conn, user.id)
-        real_password_work = totp_recover.run_password_work
+        real_password_work = password_verification.run_password_work
 
         async def verify_then_change_auth_state(function, *args):
+            """Complete real password work, then increment and commit the user's revision."""
             result = await real_password_work(function, *args)
             sync_conn.execute(
                 "UPDATE users SET auth_revision = auth_revision + 1 WHERE id = %s",
@@ -490,11 +485,11 @@ class TestRecoveryCodeBudget:
         # passing keyword arguments in the future would raise here instead of
         # silently stop being exercised by this fault injection.
         autospecced_password_work = create_autospec(
-            totp_recover.run_password_work,
+            password_verification.run_password_work,
             spec_set=True,
             side_effect=verify_then_change_auth_state,
         )
-        monkeypatch.setattr(totp_recover, "run_password_work", autospecced_password_work)
+        monkeypatch.setattr(password_verification, "run_password_work", autospecced_password_work)
 
         with pytest.raises(TotpRecoveryRedemptionRejected) as stale:
             await redeem_totp_recovery(

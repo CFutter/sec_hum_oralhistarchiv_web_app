@@ -1,20 +1,4 @@
-"""TOTP enrollment and the two-step rotation protocol — real PostgreSQL, real pyotp codes.
-
-The client tier (client/test_totp_routes.py) pins the route WIRING with mocked
-services; this module drives the same protocol end-to-end through the real
-routes (login, /setup-totp, /account/reset-totp[/confirm]) AND directly
-through app.services.totp's begin_totp_rotation / confirm_totp_rotation, so it
-also pins the transaction boundaries the route tests mock away: the
-begin-minted challenge in pending_totp_rotations, the row lock that serializes
-competing confirmations, the atomic factor-replacement + session-revocation
-transaction, and its rollback when session deletion fails mid-transaction.
-
-TOTP timing note: verify_and_consume_totp is monotonic per user (any step <=
-last consumed fails), and login itself consumes the current step. Rotation
-therefore proves the CURRENT authenticator with the NEXT step's code
-(time+30s — inside the ±1 matched_step window, strictly greater than the
-consumed step).
-"""
+"""TOTP enrollment and the two-step rotation protocol — real PostgreSQL, real pyotp codes."""
 
 import asyncio
 import re
@@ -30,36 +14,27 @@ import pytest
 import time_machine
 
 from app.services import totp as totp_module
-from app.services.crypto import decrypt_value, encrypt_value
 from app.services.db import get_db_cursor
 from app.services.session_ids import hash_session_id
 from app.services.session_revocation import delete_user_sessions_cur
 from app.services.totp import (
+    PendingTotpOutcome,
+    PendingTotpPurpose,
     TotpEnrollmentOutcome,
     TotpRotationOutcome,
     TotpRotationStartOutcome,
     begin_totp_rotation,
     confirm_totp_rotation,
+    get_or_create_pending_totp_secret,
     matched_step,
     verify_and_consume_totp,
     verify_and_enroll_totp,
 )
-from app.services.totp_recovery_codes import (
-    generate_recovery_codes,
-    stage_recovery_code_set_cur,
-)
-from tests.account_setup import store_pending_totp_secret
+from app.services.totp_crypto import decrypt_value, encrypt_value
 from tests.integration.conftest import TEST_DATABASE_URL, do_login
 
 _RACE_POLL_INTERVAL = 0.02
 _RACE_TIMEOUT = 5.0
-
-# A syntactically valid but never-staged recovery code. Every parametrized
-# session_state in test_enrollment_requires_the_exact_live_authorizing_session
-# is rejected at the session-authorization gate (totp.py's
-# _lock_authorizing_session_cur), which runs before the recovery-code
-# confirmation is ever read, so no real staged code is needed here.
-_UNUSED_RECOVERY_CODE = "AAAAA-BBBBB"
 
 _RECOVERY_CODE_RE = re.compile(r"<code>([0-9A-F-]{20,})</code>")
 _NEW_SECRET_RE = re.compile(r'class="totp-key">([A-Z2-7]+)<')
@@ -80,6 +55,7 @@ def _extract_new_secret(text: str) -> str:
 
 
 def _totp_account_row(sync_conn, user_id):
+    """Read active/pending factors, replay step and display name into a dictionary."""
     row = sync_conn.execute(
         "SELECT totp_secret, pending_totp_secret, last_totp_step, display_name"
         " FROM users WHERE id = %s",
@@ -94,11 +70,13 @@ def _totp_account_row(sync_conn, user_id):
 
 
 def _session_purpose(sync_conn):
+    """Read the first stored session purpose, or None if no session exists."""
     row = sync_conn.execute("SELECT purpose FROM sessions").fetchone()
     return row[0] if row else None
 
 
 def _csrf_after_get(client, path):
+    """Require a successful GET and return its response with the CSRF cookie."""
     resp = client.get(path)
     assert resp.status_code == 200, resp.text
     return client.cookies.get("csrf_token"), resp
@@ -134,6 +112,7 @@ def _fetch_pending_rotation_columns(sync_conn, user_id, columns):
 
 
 def _pending_rotation_exists(sync_conn, user_id) -> bool:
+    """Check whether a pending rotation row exists for the user."""
     return (
         sync_conn.execute(
             "SELECT 1 FROM pending_totp_rotations WHERE user_id = %s",
@@ -144,6 +123,7 @@ def _pending_rotation_exists(sync_conn, user_id) -> bool:
 
 
 def _totp_secret_and_revision(sync_conn, user_id: int):
+    """Read the active encrypted TOTP secret and authentication revision."""
     return sync_conn.execute(
         "SELECT totp_secret, auth_revision FROM users WHERE id = %s",
         (user_id,),
@@ -151,6 +131,7 @@ def _totp_secret_and_revision(sync_conn, user_id: int):
 
 
 def _active_session_count(sync_conn, user_id: int) -> int:
+    """Count stored sessions for the user, including expired rows."""
     return sync_conn.execute(
         "SELECT count(*) FROM sessions WHERE user_id = %s",
         (user_id,),
@@ -189,24 +170,11 @@ async def _wait_until_all_blocked_by(observer, active, tasks, leader_pid):
         await asyncio.sleep(_RACE_POLL_INTERVAL)
 
 
-async def _stage_one_recovery_code(db_pool, user_id: int) -> str:
-    """Stage a real pending recovery-code set and return one displayable code.
-
-    Mirrors what get_or_create_pending_totp_secret does during enrollment
-    (totp.py:260-264, 320-326): verify_and_enroll_totp's call to
-    activate_pending_recovery_code_set_cur (totp.py:508-512) requires an
-    exact match against a currently staged, unused code.
-    """
-    codes = generate_recovery_codes()
-    async with get_db_cursor(db_pool) as cur:
-        await stage_recovery_code_set_cur(cur, user_id=user_id, codes=codes)
-    return codes[0]
-
-
 class TestEnrollmentSessionAuthorization:
-    """verify_and_enroll_totp only accepts a live totp_setup session that
-    authorizes THIS user; every other session state is rejected before the
-    recovery-code confirmation is even read."""
+    """Initial enrollment requires a live full or totp_setup session for this user.
+
+    Missing, expired, foreign, and recovery-purpose sessions cannot authorize it.
+    """
 
     @pytest.mark.parametrize(
         "session_state",
@@ -225,22 +193,31 @@ class TestEnrollmentSessionAuthorization:
         leaves the user's pending secret, active secret and auth_revision
         untouched — the gate rejects before any write is attempted."""
         user = user_factory()
-        secret = pyotp.random_base32()
-        await store_pending_totp_secret(db_pool, user.id, secret)
+        setup_session = session_factory(user.id, purpose="totp_setup")
+        pending = await get_or_create_pending_totp_secret(
+            db_pool,
+            user.id,
+            purpose=PendingTotpPurpose.ENROLLMENT,
+            session_id=setup_session,
+        )
+        assert pending.outcome is PendingTotpOutcome.READY
+        assert pending.secret is not None
+        secret = pending.secret
+        recovery_code = pending.recovery_codes[0]
+
         session_id = "missing"
         if session_state == "expired":
             session_id = session_factory(user.id, purpose="totp_setup", expires_in_seconds=-1)
         elif session_state == "other_user":
             session_id = session_factory(user_factory().id, purpose="totp_setup")
         elif session_state == "wrong_purpose":
-            # The schema permits only full/totp_setup; an unknown session is the
-            # relevant forbidden authorization state without bypassing constraints.
-            session_id = session_factory(user.id, purpose="full") + "tampered"
+            session_id = session_factory(user.id, purpose="totp_recovery")
+
         result = await verify_and_enroll_totp(
             db_pool,
             user.id,
             pyotp.TOTP(secret).now(),
-            _UNUSED_RECOVERY_CODE,
+            recovery_code,
             session_id=session_id,
         )
         assert result is TotpEnrollmentOutcome.SESSION_EXPIRED
@@ -251,29 +228,37 @@ class TestEnrollmentSessionAuthorization:
 
 
 class TestEnrollmentActivationAtomicity:
-    """The session upgrade and the authenticator activation commit as one
+    """Session revocation and authenticator activation commit as one
     transaction: a mid-transaction database error rolls back both."""
 
-    async def test_session_upgrade_database_error_rolls_back_totp_activation(
+    async def test_session_revocation_database_error_rolls_back_totp_activation(
         self, db_pool, sync_conn, user_factory, session_factory
     ):
-        """A failure while upgrading the authorizing session's purpose rolls
-        back the whole activation: the pending secret is neither promoted nor
-        cleared, auth_revision does not advance, and the session that was being
-        upgraded keeps its original totp_setup purpose."""
+        """A failure while revoking setup sessions rolls back the whole activation:
+        the pending secret is neither promoted nor cleared, auth_revision does
+        not advance, and the original setup session remains unchanged."""
         user = user_factory()
-        secret = pyotp.random_base32()
-        await store_pending_totp_secret(db_pool, user.id, secret)
-        recovery_code = await _stage_one_recovery_code(db_pool, user.id)
         session_id = session_factory(user.id, purpose="totp_setup")
+        pending = await get_or_create_pending_totp_secret(
+            db_pool,
+            user.id,
+            purpose=PendingTotpPurpose.ENROLLMENT,
+            session_id=session_id,
+        )
+        assert pending.outcome is PendingTotpOutcome.READY
+        assert pending.secret is not None
+        secret = pending.secret
+        recovery_code = pending.recovery_codes[0]
 
         @asynccontextmanager
-        async def failing_upgrade(pool):
+        async def failing_revocation(pool):
+            """Yield a cursor wrapper that raises when deleting sessions."""
             async with get_db_cursor(pool) as cur:
 
-                async def execute(query, params):
-                    if str(query).startswith("UPDATE sessions"):
-                        raise RuntimeError("upgrade failed")
+                async def execute(query, params=None):
+                    """Reject session deletion with RuntimeError and forward all other SQL."""
+                    if str(query).strip().startswith("DELETE FROM sessions"):
+                        raise RuntimeError("session revocation failed")
                     return await cur.execute(query, params)
 
                 yield SimpleNamespace(execute=execute, fetchone=cur.fetchone)
@@ -282,11 +267,11 @@ class TestEnrollmentActivationAtomicity:
         # parameter it gains (e.g. an added row_factory default) would raise
         # here rather than silently stop being exercised.
         autospecced_get_db_cursor = create_autospec(
-            get_db_cursor, spec_set=True, side_effect=failing_upgrade
+            get_db_cursor, spec_set=True, side_effect=failing_revocation
         )
         with (
             patch("app.services.totp.get_db_cursor", new=autospecced_get_db_cursor),
-            pytest.raises(RuntimeError, match="upgrade failed"),
+            pytest.raises(RuntimeError, match="session revocation failed"),
         ):
             await verify_and_enroll_totp(
                 db_pool,
@@ -307,9 +292,10 @@ class TestEnrollmentActivationAtomicity:
 class TestEnrollmentEndToEnd:
     """Password login mints a totp_setup session; a verified code lifts the gate."""
 
-    def test_enrollment_end_to_end_persists_pending_and_upgrades_session(
+    def test_enrollment_end_to_end_requires_fresh_login_after_factor_activation(
         self, e2e_client, user_factory, sync_conn
     ):
+        """Verify enrollment end to end requires fresh login after factor activation."""
         with time_machine.travel(datetime.now(UTC), tick=False):
             user = user_factory()  # local, verified, NO totp secret
 
@@ -345,7 +331,7 @@ class TestEnrollmentEndToEnd:
                 follow_redirects=False,
             )
             assert resp.status_code == 303
-            assert resp.headers["location"] == "/account"
+            assert resp.headers["location"] == "/login?notice=totp_setup_completed"
 
             after = _totp_account_row(sync_conn, user.id)
             assert after["totp_secret"] is not None
@@ -353,10 +339,18 @@ class TestEnrollmentEndToEnd:
             assert after["pending_totp_secret"] is None  # staging cleared
             now_step = int(time.time()) // 30
             assert after["last_totp_step"] == now_step  # replay guard seeded, exact step
-            assert _session_purpose(sync_conn) == "full"  # gate lifted
+            assert _session_purpose(sync_conn) is None
 
-            # And the lifted gate is real: a state-changing POST now executes.
-            csrf2 = e2e_client.cookies.get("csrf_token")
+            # Full authority requires a fresh password-and-authenticator login.
+            fresh_login = do_login(
+                e2e_client,
+                user.email,
+                user.password,
+                pyotp.TOTP(pending).at(int(time.time()) + 30),
+            )
+            assert fresh_login.status_code == 303
+            assert _session_purpose(sync_conn) == "full"
+            csrf2, _ = _csrf_after_get(e2e_client, "/account")
             rename = e2e_client.post(
                 "/account/change-name",
                 data={"display_name": "Enrolled User", "csrf_token": csrf2},
@@ -442,7 +436,7 @@ class TestRotationEndToEnd:
                 follow_redirects=False,
             )
             assert resp.status_code == 303
-            assert resp.headers["location"] == "/login?totp_changed=1"
+            assert resp.headers["location"] == "/login?notice=totp_changed"
             assert _session_purpose(sync_conn) is None  # every session revoked
 
             after = _totp_account_row(sync_conn, user.id)
@@ -512,6 +506,13 @@ class TestSessionBoundRotationChallenge:
         outcome = await confirm_totp_rotation(db_pool, handle.id, new_code, session_id=raw_session)
 
         assert outcome is TotpRotationOutcome.ROTATED
+        assert (
+            sync_conn.execute(
+                "SELECT count(*) FROM email_outbox WHERE user_id=%s AND message_type='totp_rotated_notice'",
+                (handle.id,),
+            ).fetchone()[0]
+            == 1
+        )
 
         row = _fetch_user_columns(sync_conn, handle.id, ["totp_secret", "last_totp_step"])
         assert row["totp_secret"] == pending_ciphertext
@@ -600,19 +601,7 @@ class TestSessionBoundRotationChallenge:
     async def test_competing_confirmations_cannot_both_succeed(
         self, db_pool, user_factory, session_factory, monkeypatch
     ):
-        """The row lock serializes two confirmations of the same challenge.
-
-        An independent transaction first locks the user row so both contenders
-        reach the database before either can mutate it. Once released, exactly
-        one promotes the pending secret; confirm_totp_rotation re-locks and
-        re-reads the exact session row before it re-reads the challenge, and the
-        winner's factor-replacement transaction already revoked every session for
-        this user — so the loser reports SESSION_EXPIRED, never a second ROTATED.
-
-        Both contenders being blocked on the leader's row lock is observed
-        through ``pg_blocking_pids`` from an independent connection, not
-        inferred from a fixed sleep.
-        """
+        """Verify competing confirmations cannot both succeed."""
         old_secret = pyotp.random_base32()
         handle = user_factory(totp_secret=encrypt_value(old_secret))
         raw_session = session_factory(handle.id, purpose="full")
@@ -631,6 +620,9 @@ class TestSessionBoundRotationChallenge:
 
         @asynccontextmanager
         async def tracked_cursor(pool, *args, **kwargs):
+            """Yield a real cursor while tracking the current task's backend PID; remove it on
+            exit.
+            """
             async with get_db_cursor(pool, *args, **kwargs) as cur:
                 task = asyncio.current_task()
                 active[task] = cur.connection.info.backend_pid
@@ -687,6 +679,7 @@ class TestRotationRevokesSessions:
         session_factory,
         sync_conn,
     ):
+        """Verify successful rotation revokes every existing session."""
         old_secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(old_secret), auth_revision=4)
         session_factory(user.id, purpose="full")
@@ -724,6 +717,7 @@ class TestRotationRevokesSessions:
         sync_conn,
         monkeypatch,
     ):
+        """Verify session delete failure rolls back factor replacement."""
         old_secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(old_secret), auth_revision=9)
         raw_session = session_factory(user.id, purpose="full")

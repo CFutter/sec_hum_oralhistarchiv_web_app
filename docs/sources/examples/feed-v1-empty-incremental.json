@@ -1,0 +1,14 @@
+{
+    "feed_version": 1,
+    "snapshot_id": "00000000-0000-4000-8000-000000000002",
+    "generated_at": "2030-01-03T03:04:05Z",
+    "request": {
+      "nonce": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "since": "2030-01-02T03:04:05Z",
+      "cursor": null
+    },
+    "records": [],
+    "withdrawn": [],
+    "next_cursor": null,
+    "complete": true
+  }

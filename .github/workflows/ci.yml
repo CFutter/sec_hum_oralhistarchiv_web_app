@@ -33,6 +33,12 @@ jobs:
         run: uv run ruff check .
       - name: Ruff format check
         run: uv run ruff format --check .
+      - name: Standalone runtime verifier contracts
+        run: uv run python scripts/check_runtime_verifier.py
+      - name: Shared domain SQL contracts
+        run: uv run python scripts/check_domain_contracts.py
+      - name: Standalone staging inventory contracts
+        run: uv run python scripts/check_staging_inventory.py
 
   opaque-references:
     name: no opaque references
@@ -43,6 +49,16 @@ jobs:
           persist-credentials: false
       - name: Reject opaque references and warn on planning vocabulary
         run: bash scripts/check-no-opaque-refs.sh
+
+  site-references:
+    name: no site references
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reject unreviewed deployment and institution references
+        run: bash scripts/check-no-site-refs.sh
 
   typecheck:
     name: mypy
@@ -59,14 +75,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --extra dev
       - name: Mypy (application) — blocking
-        run: uv run mypy src/app src/config run.py run_scheduler.py scripts gunicorn.conf.py
-      - name: Mypy (tests) — advisory
+        run: uv run mypy src/app src/config run.py run_scheduler.py run_parser.py scripts gunicorn.conf.py
+      - name: Mypy (tests) — blocking
         run: uv run mypy src/tests
-        continue-on-error: true
 
   security:
     name: security
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,13 +93,22 @@ jobs:
           version: "0.12.11"
           python-version: "3.11"
       - name: Install dependencies
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --no-install-project
       - name: Bandit
-        run: uv run bandit -r src/app src/config run.py run_scheduler.py gunicorn.conf.py scripts
-      - name: Export locked requirements
-        run: uv export --locked --no-emit-project --no-hashes -o requirements-runtime.txt
-      - name: pip-audit
-        run: uv run pip-audit --disable-pip --no-deps -r requirements-runtime.txt
+        run: uv run --no-sync bandit -r src/app src/config run.py run_scheduler.py run_parser.py gunicorn.conf.py scripts
+      - name: Audit runtime, development, documentation and actual build dependencies
+        run: .venv/bin/python scripts/audit_dependencies.py --output-dir dependency-advisories
+      - name: Retain dated dependency evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dependency-advisories-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dependency-advisories/*.json
+            dependency-advisories/*.txt
+            dependency-advisories/*.log
+          if-no-files-found: error
+          retention-days: 30
 
   wheel-smoke:
     name: installed wheel smoke
@@ -101,25 +126,23 @@ jobs:
         run: uv run --no-project --python 3.11 python scripts/run_wheel_smoke.py
 
   tests:
-    # Each ordering gets fresh services; xdist workers use separate DB names
-    # and Redis databases. Rerun random-order failures with --randomly-seed=N
-    # from the pytest header. Redis allocation supports at most 15 workers
-    # with the default TEST_RATE_LIMIT_REDIS_DB=0; -n auto may exceed that.
+    # Run fixed serial and randomized parallel suites with fresh services.
+    # Workers use separate PostgreSQL databases and Redis limiter databases.
+    # Base 0 leaves Redis databases 1-15 for workers; cap automatic selection.
+    # To investigate failures, reuse the logged seed and numeric worker count.
     name: pytest (${{ matrix.order }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
           - order: fixed order
             pytest_flags: -p no:randomly
-          - order: random order
-            pytest_flags: -p randomly
           - order: parallel workers
-            pytest_flags: -n auto
+            pytest_flags: -p randomly -n auto --maxprocesses 15
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:18-alpine
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -145,21 +168,27 @@ jobs:
       REQUIRE_DB: "1"
       REDIS_URL: redis://localhost:6379/0
       REQUIRE_REDIS: "1"
+      TEST_RATE_LIMIT_REDIS_DB: "0"
       REQUIRE_NGINX: "1"
+      REQUIRE_SYSTEMD: "1"
       # Integration skips fail an otherwise-passing pytest run; the separate
       # summary gate rejects every skip under CI=true.
       CI: "true"
       # Separate overall and security-module branch-coverage thresholds.
-      COVERAGE_FLOOR: "89"
+      COVERAGE_FLOOR: "92.5"
       SECURITY_COVERAGE_FLOOR: "90"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install nginx and redis-server binaries
+      - name: Install host test tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends nginx redis-server
+          sudo apt-get install --yes --no-install-recommends postgresql-common ca-certificates
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install --yes --no-install-recommends nginx redis-server systemd age postgresql-client-18
+          # Match the PostgreSQL 18 service for the same-cluster restore drill.
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
           # Keep port 6379 for the service container; tests start private Redis on free ports.
           sudo systemctl disable --now redis-server || true
       - name: Install uv
@@ -181,17 +210,49 @@ jobs:
             --cov=src/app --cov=src/config --cov-branch \
             --cov-fail-under="$COVERAGE_FLOOR" \
             2>&1 | tee pytest-output.log
+      - name: Parser service enforces its operating-system boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          parser_proof_root=/opt/oralhistarchiv-parser-proof
+          parser_uv="$(command -v uv)"
+          uv export --locked --no-emit-project --no-hashes -o "$RUNNER_TEMP/parser-runtime.txt"
+          uv build --wheel --out-dir "$RUNNER_TEMP/parser-wheel"
+          sudo install -d -m 0755 "$parser_proof_root"
+          # ProtectHome must remain enabled: install the proof interpreter and
+          # the current wheel outside the runner's home and editable checkout.
+          sudo env UV_PYTHON_INSTALL_DIR="$parser_proof_root/python" \
+            "$parser_uv" venv --managed-python --python 3.11 "$parser_proof_root/venv"
+          sudo "$parser_uv" pip sync --python "$parser_proof_root/venv/bin/python" \
+            "$RUNNER_TEMP/parser-runtime.txt"
+          sudo "$parser_uv" pip install --python "$parser_proof_root/venv/bin/python" \
+            --no-deps "$RUNNER_TEMP"/parser-wheel/*.whl
+          if ! id oralhistarchiv-scheduler >/dev/null 2>&1; then
+            sudo useradd --system --no-create-home --shell /usr/sbin/nologin oralhistarchiv-scheduler
+          fi
+          sudo env RUN_PARSER_SANDBOX_TESTS=1 \
+            PARSER_PROOF_PYTHON="$parser_proof_root/venv/bin/python" \
+            REDIS_URL="$REDIS_URL" REQUIRE_REDIS=1 CI=true \
+            "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest --no-cov -q \
+            src/tests/host_proofs/parser_sandbox.py
+      - name: Deployment lock excludes unrelated local identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env RUN_DEPLOYMENT_LOCK_TESTS=1 \
+            REDIS_URL="$REDIS_URL" REQUIRE_REDIS=1 CI=true \
+            "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest --no-cov -q \
+            src/tests/host_proofs/deployment_lock.py
       - name: Every skip is an expected one (none under CI)
         run: bash scripts/check-skips-are-expected.sh pytest-output.log
       - name: Security modules meet their own coverage floor
         run: >-
           uv run coverage report --fail-under="$SECURITY_COVERAGE_FLOOR"
-          --include='src/app/middleware/*,src/app/route_security.py,src/app/request_utils.py,src/app/url_safety.py,src/app/cookie_contract.py,src/app/credentials.py,src/app/services/access_tiers.py,src/app/services/admin_promotion.py,src/app/services/audit.py,src/app/services/authentication.py,src/app/services/credential_attempts.py,src/app/services/crypto.py,src/app/services/email_change.py,src/app/services/email_verification.py,src/app/services/federated_*,src/app/services/password_*,src/app/services/registration.py,src/app/services/session*,src/app/services/tokens.py,src/app/services/totp*,src/app/services/users.py,src/app/routes/auth/*,src/config/settings.py,src/config/secret_strength.py,src/config/logging.py'
-
+          --include='src/app/catalogue_runtime.py,src/app/catalogue_sql.py,src/app/cookie_contract.py,src/app/environment.py,src/app/log_text.py,src/app/credentials.py,src/app/doi.py,src/app/federation_contract.py,src/app/federated_tier_rules.py,src/app/field_visibility.py,src/app/main.py,src/app/middleware/*,src/app/request_utils.py,src/app/route_security.py,src/app/routes/auth/*,src/app/routes/health.py,src/app/routes/pages.py,src/app/runtime_preflight.py,src/app/search_mask_contract.py,src/app/search_projection_sql.py,src/app/services/_smtp_child.py,src/app/services/access_tiers.py,src/app/services/account_deletion.py,src/app/services/admin_promotion.py,src/app/services/audit.py,src/app/services/audit_outbox.py,src/app/services/disclosure_audit.py,src/app/services/mail_issuance.py,src/app/services/security_notifications.py,src/app/services/authentication.py,src/app/services/credential_attempts.py,src/app/services/crypto.py,src/app/services/catalogue_lock.py,src/app/services/catalogue_policy.py,src/app/services/database_privileges.py,src/app/services/dataset_admin.py,src/app/services/dataset_admin_queries.py,src/app/services/datasets.py,src/app/services/db.py,src/app/services/db_constraints.py,src/app/services/db_drift.py,src/app/services/db_schema_contract.py,src/app/services/email.py,src/app/services/email_change.py,src/app/services/email_delivery.py,src/app/services/email_outbox.py,src/app/services/email_verification.py,src/app/services/federated_*,src/app/services/harvest.py,src/app/services/outbox_maintenance.py,src/app/services/parsed_record.py,src/app/services/password_*,src/app/services/policy_digest.py,src/app/services/registration_setup.py,src/app/services/schema.py,src/app/services/schema_invariants.py,src/app/services/search_projection.py,src/app/services/search_work.py,src/app/services/seed_admin.py,src/app/services/session*,src/app/services/smtp_process.py,src/app/services/stored_harvest.py,src/app/services/ingestion.py,src/app/services/ingestion_audit.py,src/app/services/tokens.py,src/app/services/totp*,src/app/services/users.py,src/app/sources/*.py,src/app/template_setup.py,src/app/thread_work.py,src/app/url_safety.py,src/config/logging.py,src/config/redis_policy.py,src/config/settings.py'
   release:
     name: reviewed production release
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
-    needs: [lint, opaque-references, typecheck, security, wheel-smoke, tests]
+    needs: [lint, opaque-references, site-references, typecheck, security, wheel-smoke, tests]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -228,13 +289,29 @@ jobs:
             oralhistarchiv.service
             oralhistarchiv-scheduler.service
             oralhistarchiv-migrate.service
+            oralhistarchiv-parser.socket
+            oralhistarchiv-parser@.service
+            run_parser.py
+            scripts/rebuild_search_policy.py
+            scripts/bootstrap_admin.py
+            scripts/acknowledge_source_binding.py
+            scripts/export_security_audit.py
+            deploy/migrate_release.py
+            deploy/oralhistarchiv-tmpfiles.conf
             deploy/bootstrap-database-roles.sql
             deploy/database-runtime-grants.sql
             deploy/verify-runtime-database-access.sql
+            deploy/invalidate-action-email-capabilities.sql
             deploy/nginx.conf.example
             deploy/nginx-ordinary-proxy-headers.conf.example
             deploy/nginx-shibboleth-phase2.conf.example
             deploy/nginx-shibboleth-secret.conf.example
+            deploy/redis-security.conf.example
+            deploy/oralhistarchiv-rate-limit-redis.service
+            LICENSE
+            THIRD_PARTY_NOTICES.md
+            src/app/static/fonts/OFL.txt
+            src/app/services/data/SECLISTS-LICENSE.txt
           )
           for relative_path in "${required_paths[@]}"; do
             tar -tzf "$release_archive" \

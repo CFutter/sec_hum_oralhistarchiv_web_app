@@ -8,6 +8,8 @@ from fastapi import Request
 
 from config import settings
 
+from .request_log_contract import RATE_LIMIT_LOG_PATH_STATE
+
 logger = logging.getLogger(__name__)
 
 _TRUSTED_UPSTREAM_IPS = frozenset(settings.trusted_proxy_ips)
@@ -74,12 +76,20 @@ def scrub_sensitive_path(path: str) -> str:
 
 
 def safe_request_path(request: Request) -> str:
-    """Return a matched route template, otherwise scrub the three known capability paths."""
+    """Prefer the routed template, then admission's internal label, then path scrubbing.
+
+    Early admission refusals never reach the router, but admission has already
+    resolved a bounded route label. Do not obtain that label from request input.
+    """
     route = request.scope.get("route")
     route_template = getattr(route, "path", None)
 
     if isinstance(route_template, str):
         return route_template
+
+    admission_label = getattr(request.state, RATE_LIMIT_LOG_PATH_STATE, None)
+    if isinstance(admission_label, str):
+        return admission_label
 
     return scrub_sensitive_path(request.url.path)
 

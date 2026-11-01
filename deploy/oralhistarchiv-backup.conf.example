@@ -1,4 +1,6 @@
 # Install as /etc/oralhistarchiv-backup.conf, root:root 0600; systemd reads it.
+# Unset/empty values use the script defaults shown below, except the required
+# BACKUP_AGE_RECIPIENT and optional BACKUP_STATUS_DIR (empty disables the marker).
 # Public age recipient; replace the placeholder. Keep its private identity off-host.
 BACKUP_AGE_RECIPIENT=age1replace_with_public_recipient
 # Decimal days, 1–3650 without leading zeroes. find -mtime +N prunes at N+1 whole
@@ -7,6 +9,13 @@ BACKUP_RETENTION_DAYS=30
 # Existing absolute nonsymlink directory, mode 0700, owned by the backup UID.
 # A custom path also requires corresponding systemd writable-path configuration.
 BACKUP_DIR=/var/lib/oralhistarchiv-backup
+
+# Optional nonsecret local-publication timestamp, read by authorized health detail.
+# Unset/empty disables it. Provision through oralhistarchiv-backup-tmpfiles.conf
+# only after creating the backup OS identity; the base deployment lock stays separate.
+# This directory is backup-owned 0755; last-success is 0644. Keep archives private.
+# A custom path also needs a matching backup-unit ReadWritePaths entry.
+BACKUP_STATUS_DIR=/var/lib/oralhistarchiv-backup-status
 
 # Unix-socket directory (TCP hosts are rejected); peer authentication is configured separately.
 PGHOST=/var/run/postgresql

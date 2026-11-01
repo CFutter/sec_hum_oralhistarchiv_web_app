@@ -1,12 +1,4 @@
-"""app.services.db: pool-backed cursor row shape and transaction boundary (real pool).
-
-get_db_cursor's row_factory defaults to dict_row and normalizes an explicit
-row_factory=None to tuple_row, independent of any connection-level default
-set by create_pool's configure callback. Separately, the cursor's async
-context manager commits on clean exit and rolls back on exception, which is
-what lets a per-record sync loop leave no partial row behind for a failed
-record.
-"""
+"""app.services.db: pool-backed cursor row shape and transaction boundary (real pool)."""
 
 import pytest
 from psycopg.rows import dict_row
@@ -21,6 +13,7 @@ class TestCursorRowFactory:
     """get_db_cursor's row shape is controlled per-call, not by the pool."""
 
     async def test_default_yields_dict_rows(self, db_pool):
+        """Verify default yields dict rows."""
         async with get_db_cursor(db_pool) as cur:
             await cur.execute("SELECT 1 AS one")
             row = await cur.fetchone()
@@ -28,6 +21,7 @@ class TestCursorRowFactory:
         assert row["one"] == 1
 
     async def test_row_factory_none_yields_tuples(self, db_pool):
+        """Verify row factory none yields tuples."""
         async with get_db_cursor(db_pool, row_factory=None) as cur:
             await cur.execute("SELECT 1, 'two'")
             row = await cur.fetchone()
@@ -41,6 +35,7 @@ class TestCursorRowFactory:
         connection."""
 
         async def configure(conn):
+            """Configure dictionary rows on the supplied connection."""
             conn.row_factory = dict_row
 
         pool = AsyncConnectionPool(
@@ -74,8 +69,8 @@ class TestCursorTransactionBoundary:
         record."""
         async with get_db_cursor(db_pool) as cur:
             await cur.execute(
-                "INSERT INTO oral_history_datasets (uuid, title) VALUES (%s, %s)",
-                ("oai:test:commit-check", "Committed"),
+                "INSERT INTO oral_history_datasets (uuid, source, title) VALUES (%s, %s, %s)",
+                ("oai:test:commit-check", "test_archive", "Committed"),
             )
         row = sync_conn.execute(
             "SELECT title FROM oral_history_datasets WHERE uuid = %s",
@@ -90,8 +85,8 @@ class TestCursorTransactionBoundary:
         with pytest.raises(RuntimeError):
             async with get_db_cursor(db_pool) as cur:
                 await cur.execute(
-                    "INSERT INTO oral_history_datasets (uuid, title) VALUES (%s, %s)",
-                    ("oai:test:rollback-check", "Doomed"),
+                    "INSERT INTO oral_history_datasets (uuid, source, title) VALUES (%s, %s, %s)",
+                    ("oai:test:rollback-check", "test_archive", "Doomed"),
                 )
                 raise RuntimeError("boom")
         row = sync_conn.execute(

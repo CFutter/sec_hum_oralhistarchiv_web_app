@@ -1,32 +1,21 @@
-"""Unit tests for the harvest wire codec (`encode_harvest_result` /
-`_decode_worker_harvest_result`) and the durable stored-harvest envelope
-(`app.services.stored_harvest`).
+"""Worker harvest codecs, byte lifetime and durable stored-harvest envelopes."""
 
-No database and no network are used: every test builds a `HarvestResult` or
-a raw envelope payload directly.
-"""
-
+import gc
 import json
 from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
 
-from app.services import oai_client, stored_harvest
-from app.services.oai_client import HarvestResult, OAIProtocolError, encode_harvest_result
+from app.services import stored_harvest
+from app.services.harvest import HarvestResult, harvest_result_to_document
 from app.services.parsed_record import PARSED_RECORD_CONTRACT_VERSION
+from app.sources import oai_client
+from app.sources.oai_client import OAIProtocolError, encode_harvest_result
 from tests.oai_fixtures import SOURCE_CURSOR, parsed_record
 
-FINGERPRINT = stored_harvest.build_source_fingerprint(
-    source="source_a",
-    oai_url="https://oai.example/oai",
-    institution_filter="Kassel",
-)
-OTHER_FINGERPRINT = stored_harvest.build_source_fingerprint(
-    source="source_a",
-    oai_url="https://oai.example/oai",
-    institution_filter="A different institution filter",
-)
+FINGERPRINT = "a" * 64
+OTHER_FINGERPRINT = "b" * 64
 
 
 class TestHarvestResultCanonicalEncoding:
@@ -34,6 +23,7 @@ class TestHarvestResultCanonicalEncoding:
     Unicode, timestamps, and every outcome collection without loss."""
 
     def test_datetimes_and_non_ascii_text_round_trip_exactly(self):
+        """Datetimes and non ascii text round trip exactly."""
         modified_at = datetime(2026, 9, 10, 12, 30, 45, tzinfo=UTC)
         record = parsed_record(
             "oai:x:é-café",
@@ -46,7 +36,6 @@ class TestHarvestResultCanonicalEncoding:
         )
 
         payload = encode_harvest_result(harvest)
-        # ensure_ascii=False: non-ASCII text is stored as UTF-8, not \u escapes.
         assert "café".encode() in payload
         assert b"\\u" not in payload
 
@@ -75,6 +64,7 @@ class TestHarvestResultCanonicalEncoding:
         assert encode_harvest_result(first_order) == encode_harvest_result(second_order)
 
     def test_empty_collections_round_trip_to_an_equal_empty_result(self):
+        """Empty collections round trip to an equal empty result."""
         empty = HarvestResult(source_cursor=SOURCE_CURSOR)
         payload = encode_harvest_result(empty)
         decoded = oai_client._decode_worker_harvest_result(payload)
@@ -85,10 +75,7 @@ class TestHarvestResultCanonicalEncoding:
         assert decoded.uncertain_records == {}
 
     def test_every_outcome_collection_is_equivalent_regardless_of_build_order(self):
-        """Two harvests carrying the same matching records, deletions,
-        nonmatches and uncertain entries — built by inserting them in a
-        different order — must decode to equal results even where the wire
-        bytes are free to differ (e.g. a dict's own key order)."""
+        """Every outcome collection is equivalent regardless of build order."""
         record = parsed_record("oai:x:m")
         built_forward = HarvestResult(
             source_cursor=SOURCE_CURSOR,
@@ -121,6 +108,7 @@ class TestHarvestResultEncodedSizeLimit:
     exactly its boundary."""
 
     def test_encode_harvest_result_accepts_exactly_the_result_limit(self, monkeypatch):
+        """Encode harvest result accepts exactly the result limit."""
         harvest = HarvestResult(source_cursor=SOURCE_CURSOR, nonmatching_uuids={"oai:x:1"})
         payload = oai_client._encode_worker_harvest_result(harvest)
         monkeypatch.setattr(oai_client, "_OAI_MAX_RESULT_BYTES", len(payload))
@@ -128,6 +116,7 @@ class TestHarvestResultEncodedSizeLimit:
         assert encode_harvest_result(harvest) == payload
 
     def test_encode_harvest_result_rejects_one_byte_over_the_result_limit(self, monkeypatch):
+        """Encode harvest result rejects one byte over the result limit."""
         harvest = HarvestResult(source_cursor=SOURCE_CURSOR, nonmatching_uuids={"oai:x:1"})
         payload = oai_client._encode_worker_harvest_result(harvest)
         monkeypatch.setattr(oai_client, "_OAI_MAX_RESULT_BYTES", len(payload) - 1)
@@ -138,55 +127,56 @@ class TestHarvestResultEncodedSizeLimit:
         assert exc_info.value.error_code == "resource_limit"
 
 
-class TestWorkerPayloadAttachment:
-    """A `HarvestResult` decoded from the worker wire form carries its exact
-    validated bytes exactly once."""
+class TestWorkerPayloadLifetime:
+    """The decoded result must not extend the lifetime of the input byte buffer."""
 
-    def test_decoded_result_returns_its_exact_bytes_once_then_none(self):
+    def test_decoded_result_releases_worker_bytes_while_remaining_usable(self):
+        """Decoded result releases worker bytes while remaining usable."""
+        released = []
+
+        class TrackedPayload(bytes):
+            """Track release of the decoded worker-payload byte buffer."""
+
+            def __del__(self):
+                """Record that the payload object was released."""
+                released.append(True)
+
         harvest = HarvestResult(source_cursor=SOURCE_CURSOR, nonmatching_uuids={"oai:x:1"})
-        payload = oai_client._encode_worker_harvest_result(harvest)
+        payload = TrackedPayload(oai_client._encode_worker_harvest_result(harvest))
         decoded = oai_client._decode_worker_harvest_result(payload)
+        del payload
+        gc.collect()
 
-        assert decoded.take_serialized_worker_payload() == payload
-        assert decoded.take_serialized_worker_payload() is None
-
-    def test_discarding_the_attached_payload_does_not_change_equality_or_validation(self):
-        """Positive control: releasing the attached bytes without taking
-        them must not affect the result's own equality or validity."""
-        harvest = HarvestResult(source_cursor=SOURCE_CURSOR, nonmatching_uuids={"oai:x:1"})
-        payload = oai_client._encode_worker_harvest_result(harvest)
-        decoded = oai_client._decode_worker_harvest_result(payload)
-
-        decoded.discard_serialized_worker_payload()
-
+        assert released == [True], "Decoded harvest retained its serialized worker payload"
         assert decoded == harvest
-        assert decoded.validate() == harvest.source_cursor
-        assert decoded.take_serialized_worker_payload() is None
+        assert decoded.validate() == SOURCE_CURSOR
 
 
-class TestEncodeStoredHarvestPartsReusesWorkerPayload:
-    """`encode_stored_harvest_parts` must reuse an already-validated worker
-    payload rather than re-encoding the harvest from scratch."""
+class TestEncodeStoredHarvestPartsUsesCurrentState:
+    """Durable staging encodes the current mutable result on every call."""
 
-    def test_attached_worker_payload_is_reused_without_reencoding(self):
+    def test_decoded_worker_result_is_freshly_encoded(self):
+        """Decoded worker result is freshly encoded."""
         harvest = HarvestResult(source_cursor=SOURCE_CURSOR, nonmatching_uuids={"oai:x:1"})
         wire = oai_client._encode_worker_harvest_result(harvest)
-        attached = oai_client._decode_worker_harvest_result(wire)
+        decoded = oai_client._decode_worker_harvest_result(wire)
         real_encode = stored_harvest.encode_harvest_result
 
         with patch.object(
             stored_harvest, "encode_harvest_result", autospec=True, side_effect=real_encode
         ) as encode_spy:
             parts = stored_harvest.encode_stored_harvest_parts(
-                attached, source_fingerprint=FINGERPRINT
+                decoded, source_fingerprint=FINGERPRINT
             )
 
-        encode_spy.assert_not_called()
+        encode_spy.assert_called_once_with(
+            decoded,
+            max_bytes=stored_harvest.HARVEST_RESULT_MAX_BYTES,
+        )
         assert parts.harvest == wire
 
-    def test_harvest_without_an_attached_payload_is_encoded_exactly_once(self):
-        """Positive control: without an attached worker payload, the
-        harvest must still be encoded — exactly once."""
+    def test_directly_constructed_harvest_is_encoded_exactly_once(self):
+        """Adapter-created results use the same source-neutral encoder."""
         harvest = HarvestResult(source_cursor=SOURCE_CURSOR, nonmatching_uuids={"oai:x:1"})
         real_encode = stored_harvest.encode_harvest_result
 
@@ -197,24 +187,30 @@ class TestEncodeStoredHarvestPartsReusesWorkerPayload:
                 harvest, source_fingerprint=FINGERPRINT
             )
 
-        encode_spy.assert_called_once_with(harvest)
+        encode_spy.assert_called_once_with(
+            harvest,
+            max_bytes=stored_harvest.HARVEST_RESULT_MAX_BYTES,
+        )
         assert parts.harvest == real_encode(harvest)
 
-    def test_an_attached_payload_can_be_reused_by_stored_harvest_only_once(self):
-        """A stored payload is consumed only once: a second call for the
-        same harvest can no longer reuse the already-taken bytes and falls
-        through to a fresh encode instead."""
+    def test_each_staging_call_encodes_the_current_state(self):
+        """A later mutation is reflected by a later staging attempt."""
         harvest = HarvestResult(source_cursor=SOURCE_CURSOR, nonmatching_uuids={"oai:x:1"})
         wire = oai_client._encode_worker_harvest_result(harvest)
-        attached = oai_client._decode_worker_harvest_result(wire)
+        decoded = oai_client._decode_worker_harvest_result(wire)
 
-        first = stored_harvest.encode_stored_harvest_parts(attached, source_fingerprint=FINGERPRINT)
+        first = stored_harvest.encode_stored_harvest_parts(decoded, source_fingerprint=FINGERPRINT)
         assert first.harvest == wire
+        decoded.nonmatching_uuids.add("oai:x:2")
 
-        second = stored_harvest.encode_stored_harvest_parts(
-            attached, source_fingerprint=FINGERPRINT
+        second = stored_harvest.encode_stored_harvest_parts(decoded, source_fingerprint=FINGERPRINT)
+        assert second.harvest != first.harvest
+        assert (
+            stored_harvest.decode_stored_harvest(
+                second.joined(), expected_source_fingerprint=FINGERPRINT
+            )
+            == decoded
         )
-        assert second.harvest == oai_client.encode_harvest_result(attached)
 
 
 class TestStoredHarvestRoundTrip:
@@ -222,6 +218,7 @@ class TestStoredHarvestRoundTrip:
     decodes back to the exact harvest it was built from."""
 
     def test_joined_parts_round_trip_through_decode(self):
+        """Joined parts round trip through decode."""
         harvest = HarvestResult(
             source_cursor=datetime(2026, 9, 10, 12, 30, tzinfo=UTC),
             matching_records=[parsed_record("oai:x:m", title="Résumé café ☃")],
@@ -245,12 +242,13 @@ class TestStoredHarvestRoundTrip:
 
 
 def _valid_envelope(**overrides: object) -> bytes:
+    """Encode a valid stored harvest with explicit envelope overrides."""
     harvest = HarvestResult(source_cursor=SOURCE_CURSOR, nonmatching_uuids={"oai:x:1"})
     document: dict[str, object] = {
         "format_version": stored_harvest.STORED_HARVEST_FORMAT_VERSION,
         "parser_contract_version": PARSED_RECORD_CONTRACT_VERSION,
         "source_fingerprint": FINGERPRINT,
-        "harvest": oai_client.harvest_result_to_document(harvest),
+        "harvest": harvest_result_to_document(harvest),
     }
     document.update(overrides)
     return json.dumps(document).encode("utf-8")
@@ -261,13 +259,14 @@ class TestStoredHarvestRecoveryActions:
     documented recovery action."""
 
     def test_well_formed_envelope_decodes_without_recovery(self):
-        """Positive control: a well-formed envelope needs no recovery at all."""
+        """A well-formed envelope needs no recovery at all."""
         result = stored_harvest.decode_stored_harvest(
             _valid_envelope(), expected_source_fingerprint=FINGERPRINT
         )
         assert result.nonmatching_uuids == {"oai:x:1"}
 
     def test_malformed_bytes_prescribe_a_full_reharvest(self):
+        """Malformed bytes prescribe a full reharvest."""
         with pytest.raises(stored_harvest.InvalidStoredHarvest) as exc_info:
             stored_harvest.decode_stored_harvest(
                 b"not json at all", expected_source_fingerprint=FINGERPRINT
@@ -277,6 +276,7 @@ class TestStoredHarvestRecoveryActions:
     def test_unsupported_format_version_with_matching_fingerprint_requests_incremental_refetch(
         self,
     ):
+        """Unsupported format version with matching fingerprint requests incremental refetch."""
         payload = _valid_envelope(format_version=999)
         with pytest.raises(stored_harvest.IncompatibleStoredHarvest) as exc_info:
             stored_harvest.decode_stored_harvest(payload, expected_source_fingerprint=FINGERPRINT)
@@ -285,18 +285,21 @@ class TestStoredHarvestRecoveryActions:
     def test_unsupported_format_version_with_mismatched_fingerprint_requests_full_reharvest(
         self,
     ):
+        """Unsupported format version with mismatched fingerprint requests full reharvest."""
         payload = _valid_envelope(format_version=999, source_fingerprint=OTHER_FINGERPRINT)
         with pytest.raises(stored_harvest.IncompatibleStoredHarvest) as exc_info:
             stored_harvest.decode_stored_harvest(payload, expected_source_fingerprint=FINGERPRINT)
         assert exc_info.value.recovery_action == "full_reharvest"
 
     def test_parser_contract_drift_requests_incremental_refetch(self):
+        """Parser contract drift requests incremental refetch."""
         payload = _valid_envelope(parser_contract_version=PARSED_RECORD_CONTRACT_VERSION + 1)
         with pytest.raises(stored_harvest.IncompatibleStoredHarvest) as exc_info:
             stored_harvest.decode_stored_harvest(payload, expected_source_fingerprint=FINGERPRINT)
         assert exc_info.value.recovery_action == "incremental_refetch"
 
     def test_source_fingerprint_mismatch_requests_full_reharvest(self):
+        """Source fingerprint mismatch requests full reharvest."""
         payload = _valid_envelope(source_fingerprint=OTHER_FINGERPRINT)
         with pytest.raises(stored_harvest.IncompatibleStoredHarvest) as exc_info:
             stored_harvest.decode_stored_harvest(payload, expected_source_fingerprint=FINGERPRINT)

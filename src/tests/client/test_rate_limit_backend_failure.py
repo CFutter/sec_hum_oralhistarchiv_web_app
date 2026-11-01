@@ -1,18 +1,4 @@
-"""Backend-failure handling for the bounded rate-limit admission middleware.
-
-Every storage-backend failure the limiter's single serialized check can
-raise, plus the bounded worker's own admission-timeout and outstanding-
-capacity limits, must fail closed: a 503 carrying the response-security
-contract (bounded Retry-After, Cache-Control: no-store, the request id, the
-CSP and other secure headers), with the endpoint and the outbox worker never
-running, and an operator-facing log record that names the failure category
-and the exception class without echoing any backend connection detail.
-
-Positive control: with the same request unpatched, the backend is healthy,
-the endpoint runs, and the outbox is untouched only because the submitted
-email is unknown (proven separately in test_rate_limiting.py's per-route
-limit coverage).
-"""
+"""Backend-failure handling for the bounded rate-limit admission middleware."""
 
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -34,10 +20,11 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 import app.middleware.rate_limiting as rl
 from app.routes.auth import password_reset
+from app.services import password_reset as recovery_service
 from app.services.email_outbox import (
     enqueue_outbound_email_cur as _real_enqueue_outbound_email_cur,
 )
-from app.services.users import get_user_by_email as _real_get_user_by_email
+from app.services.password_reset import request_password_reset as _real_request_password_reset
 from app.thread_work import ThreadWorkAdmissionTimeout
 from app.thread_work import run_thread_work as _real_run_thread_work
 
@@ -73,11 +60,11 @@ def _route_service_spies():
     with (
         patch.object(
             password_reset,
-            "get_user_by_email",
-            new=create_autospec(_real_get_user_by_email),
+            "request_password_reset",
+            new=create_autospec(_real_request_password_reset),
         ) as get_user_spy,
         patch.object(
-            password_reset,
+            recovery_service,
             "enqueue_outbound_email_cur",
             new=create_autospec(_real_enqueue_outbound_email_cur),
         ) as enqueue_spy,
@@ -86,6 +73,7 @@ def _route_service_spies():
 
 
 def _submit_forgot_password(client):
+    """Submit a CSRF-protected password-reset request for the sample address."""
     return client.post(
         FORGOT_PASSWORD_URL,
         data={"email": "user@example.com", "csrf_token": client.csrf_token},
@@ -93,6 +81,7 @@ def _submit_forgot_password(client):
 
 
 def _assert_early_rejection_security_contract(response) -> None:
+    """Require bounded retry guidance, no caching, request correlation, and framing protection."""
     retry_after = response.headers.get("Retry-After")
     assert retry_after is not None and retry_after.isdigit()
     assert 1 <= int(retry_after) <= 60
@@ -102,6 +91,7 @@ def _assert_early_rejection_security_contract(response) -> None:
 
 
 def _assert_body_names_nothing_identifying(response, *forbidden: str) -> None:
+    """Require a generic backend-failure page without connection or secret details."""
     body = response.text.lower()
     assert "rate-limit service temporarily unavailable" in body
     for value in (*forbidden, "redis://", "6379", "password", "secret"):
@@ -120,6 +110,7 @@ class TestStorageBackendFailuresFailClosed:
     def test_backend_failure_returns_503_without_running_the_endpoint(
         self, guest_client, caplog, _case_id, exc, category
     ):
+        """Check backend failure returns 503 without running the endpoint."""
         with (
             caplog.at_level("WARNING", logger="app.middleware.rate_limiting"),
             _route_service_spies() as (get_user_spy, enqueue_spy),
@@ -147,8 +138,7 @@ class TestStorageBackendFailuresFailClosed:
         assert str(exc) not in record.getMessage()
 
     def test_healthy_backend_completes_the_same_request(self, guest_client):
-        """Positive control: with nothing patched to fail, the identical
-        request reaches the route and the route's own lookup runs."""
+        """Check healthy backend completes the same request (HTTP 200)."""
         with _route_service_spies() as (get_user_spy, enqueue_spy):
             get_user_spy.return_value = None
             response = _submit_forgot_password(guest_client)
@@ -167,6 +157,7 @@ class TestStorageBackendFailuresFailClosed:
         ids=["connection", "unexpected"],
     )
     def test_backend_failure_performs_no_session_lookup(self, authenticated_client, _case_id, exc):
+        """Check backend failure performs no session lookup (HTTP 503)."""
         authenticated_client.session_spy.reset_mock()
         with _check_request_limit_raises(exc):
             response = authenticated_client.get("/about")
@@ -176,11 +167,10 @@ class TestStorageBackendFailuresFailClosed:
 
 
 class TestAdmissionAndCapacityFailuresFailClosed:
-    """The bounded worker's own admission-timeout and outstanding-capacity
-    limits are a distinct failure mode from a storage exception, and fail
-    closed the same way: 503, before the endpoint or the outbox runs."""
+    """Cover admission and capacity failures fail closed."""
 
     def test_worker_admission_timeout_returns_503_without_running_the_endpoint(self, guest_client):
+        """Check worker admission timeout returns 503 without running the endpoint."""
         with (
             _route_service_spies() as (get_user_spy, enqueue_spy),
             patch(
@@ -205,6 +195,7 @@ class TestAdmissionAndCapacityFailuresFailClosed:
         # anyio.CapacityLimiter; its asyncio-backend implementation (not the
         # public facade class) defines acquire_nowait, so that is the
         # concrete class under test.
+        """Check outstanding capacity exhaustion returns 503 without running the endpoint."""
         with (
             _route_service_spies() as (get_user_spy, enqueue_spy),
             patch.object(
@@ -222,8 +213,7 @@ class TestAdmissionAndCapacityFailuresFailClosed:
         _assert_early_rejection_security_contract(response)
 
     def test_healthy_worker_completes_the_same_request(self, guest_client):
-        """Positive control shared by both failure modes above: with the
-        bounded worker healthy, the identical request reaches the route."""
+        """Check healthy worker completes the same request (HTTP 200)."""
         with _route_service_spies() as (get_user_spy, enqueue_spy):
             get_user_spy.return_value = None
             response = _submit_forgot_password(guest_client)

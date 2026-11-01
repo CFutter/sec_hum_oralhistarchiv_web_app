@@ -47,7 +47,25 @@ _LEASE = timedelta(minutes=10)
 _MINIMUM = timedelta(minutes=2)
 
 
+def _action_user(user_factory, kind):
+    """Verification mail belongs to a passwordless pending registration."""
+    if kind == "email_verification":
+        return user_factory(
+            password_hash=None,
+            is_active=False,
+            email_verified=False,
+            is_admin=False,
+            display_name=None,
+            affiliation=None,
+            country=None,
+            email_verification_token_hash=hash_token(uuid4().hex),
+            email_verification_created_at=datetime.now(UTC),
+        )
+    return user_factory(email_verified=False)
+
+
 async def _store(cur, kind, user, action):
+    """Store the selected action-token hash in the user's corresponding credential fields."""
     if kind == "password_reset":
         await store_reset_token_hash_cur(
             cur,
@@ -79,6 +97,7 @@ async def _store(cur, kind, user, action):
 
 
 async def _queue(pool, kind, user, *, action=None):
+    """Store an action token and enqueue its email atomically; return message ID and metadata."""
     if action is None:
         action = ActionEmailMetadata(
             hash_token(uuid4().hex),
@@ -103,6 +122,7 @@ async def _queue(pool, kind, user, *, action=None):
 
 
 async def _notice(pool, user_id=None, *, kind="account_locked_notice"):
+    """Enqueue a non-action account notice and return its ID."""
     async with get_db_cursor(pool) as cur:
         return await enqueue_email_cur(
             cur,
@@ -116,6 +136,7 @@ async def _notice(pool, user_id=None, *, kind="account_locked_notice"):
 
 
 async def _claim(pool):
+    """Claim due messages and assert exactly one was returned."""
     messages = await claim_due_emails(
         pool,
         limit=10,
@@ -126,17 +147,20 @@ async def _claim(pool):
 
 
 async def _fetch(pool, query, params=()):
+    """Execute a query through the test pool and return its first row."""
     async with get_db_cursor(pool) as cur:
         await cur.execute(query, params)
         return await cur.fetchone()
 
 
 async def _execute(pool, query, params=()):
+    """Execute the supplied SQL and parameters through the test pool."""
     async with get_db_cursor(pool) as cur:
         await cur.execute(query, params)
 
 
 async def _state(pool, message_id):
+    """Read the complete outbox row for the supplied message ID, or None."""
     return await _fetch(
         pool,
         "SELECT * FROM email_outbox WHERE id = %s",
@@ -150,7 +174,8 @@ async def test_replacement_cancels_pending_but_keeps_notices(
     user_factory,
     kind,
 ):
-    user = user_factory(email_verified=False)
+    """Verify replacement cancels pending but keeps notices."""
+    user = _action_user(user_factory, kind)
     old_id, action = await _queue(db_pool, kind, user)
     notice_id = await _notice(db_pool, user.id)
 
@@ -173,7 +198,8 @@ async def test_failed_replacement_restores_old_token_and_message(
     user_factory,
     kind,
 ):
-    user = user_factory(email_verified=False)
+    """Verify failed replacement restores old token and message."""
+    user = _action_user(user_factory, kind)
     old_id, old_action = await _queue(db_pool, kind, user)
     replacement = ActionEmailMetadata(
         hash_token(uuid4().hex),
@@ -206,7 +232,8 @@ async def test_failed_replacement_restores_old_token_and_message(
 
 @pytest.mark.parametrize("kind", _KINDS)
 async def test_superseded_claim_is_discarded_before_smtp(db_pool, user_factory, kind):
-    user = user_factory(email_verified=False)
+    """Verify superseded claim is discarded before SMTP."""
+    user = _action_user(user_factory, kind)
     old_id, _ = await _queue(db_pool, kind, user)
     old = await _claim(db_pool)
     new_id, _ = await _queue(db_pool, kind, user)
@@ -221,7 +248,8 @@ async def test_superseded_claim_is_discarded_before_smtp(db_pool, user_factory, 
 @pytest.mark.parametrize("kind", _KINDS)
 @pytest.mark.parametrize("change", ["consumed", "database_expired"])
 async def test_user_state_is_reread_after_claim(db_pool, user_factory, kind, change):
-    user = user_factory(email_verified=False)
+    """Verify user state is reread after claim."""
+    user = _action_user(user_factory, kind)
     message_id, _ = await _queue(db_pool, kind, user)
     message = await _claim(db_pool)
     column = _KINDS[kind][0 if change == "consumed" else 1]
@@ -235,7 +263,8 @@ async def test_user_state_is_reread_after_claim(db_pool, user_factory, kind, cha
 
 @pytest.mark.parametrize("kind", _KINDS)
 async def test_expired_signed_deadline_is_terminal_without_smtp(db_pool, user_factory, kind):
-    user = user_factory(email_verified=False)
+    """Verify expired signed deadline is terminal without SMTP."""
+    user = _action_user(user_factory, kind)
     action = ActionEmailMetadata(hash_token(uuid4().hex), datetime.now(UTC) - timedelta(seconds=1))
     message_id, _ = await _queue(db_pool, kind, user, action=action)
     message = await _claim(db_pool)
@@ -260,7 +289,8 @@ async def test_expired_signed_deadline_is_terminal_without_smtp(db_pool, user_fa
     ],
 )
 async def test_changed_account_predicate_blocks_smtp(db_pool, user_factory, kind, mutation):
-    user = user_factory(email_verified=False)
+    """Verify changed account predicate blocks SMTP."""
+    user = _action_user(user_factory, kind)
     await _queue(db_pool, kind, user)
     message = await _claim(db_pool)
     if mutation == "taken":
@@ -274,7 +304,9 @@ async def test_changed_account_predicate_blocks_smtp(db_pool, user_factory, kind
                 "federated_status = 'pending', is_active = false, access_tier = 'public'"
             ),
             "recipient": "email = 'changed@example.test'",
-            "verified": "email_verified = true",
+            "verified": (
+                "password_hash = 'completed-password-hash', is_active = true, email_verified = true"
+            ),
             "pending_recipient": "pending_email = 'different@example.test'",
         }
         await _execute(
@@ -287,11 +319,13 @@ async def test_changed_account_predicate_blocks_smtp(db_pool, user_factory, kind
 
 @pytest.mark.parametrize("kind", _KINDS)
 async def test_valid_action_sends_without_holding_database_locks(db_pool, user_factory, kind):
-    user = user_factory(email_verified=False)
+    """Verify valid action sends without holding database locks."""
+    user = _action_user(user_factory, kind)
     message_id, action = await _queue(db_pool, kind, user)
     message = await _claim(db_pool)
 
     async def smtp(_message, _email, *, deadline):
+        """Require unlocked user/message rows on another connection, then report SMTP acceptance."""
         assert deadline > 0
         with psycopg.connect(settings.database_url.get_secret_value()) as conn:
             conn.execute("SELECT id FROM users WHERE id = %s FOR UPDATE NOWAIT", (user.id,))
@@ -311,6 +345,7 @@ async def test_valid_action_sends_without_holding_database_locks(db_pool, user_f
 
 
 async def test_locked_account_can_receive_password_recovery(db_pool, user_factory):
+    """Verify locked account can receive password recovery."""
     user = user_factory(locked_until=datetime.now(UTC) + timedelta(hours=1), failed_login_count=20)
     await _queue(db_pool, "password_reset", user)
     message = await _claim(db_pool)
@@ -326,6 +361,7 @@ async def test_locked_account_can_receive_password_recovery(db_pool, user_factor
 
 @pytest.mark.parametrize("loss", ["timeout", "reclaimed", "deleted_user"])
 async def test_lost_lease_never_reaches_smtp(db_pool, user_factory, loss):
+    """Verify lost lease never reaches SMTP."""
     user = user_factory()
     message_id, _ = await _queue(db_pool, "password_reset", user)
     message = await _claim(db_pool)
@@ -360,6 +396,7 @@ async def test_retry_preserves_metadata_and_notice_has_no_action_deadline(
     db_pool,
     user_factory,
 ):
+    """Verify retry preserves metadata and notice has no action deadline."""
     user = user_factory()
     message_id, action = await _queue(db_pool, "password_reset", user)
     message = await _claim(db_pool)
@@ -441,6 +478,7 @@ async def test_retry_that_leaves_too_little_lifetime_becomes_dead(
     db_pool,
     user_factory,
 ):
+    """Verify retry that leaves too little lifetime becomes dead."""
     user = user_factory()
     action = ActionEmailMetadata(
         hash_token(uuid4().hex),
@@ -484,11 +522,13 @@ async def test_retry_that_leaves_too_little_lifetime_becomes_dead(
 
 
 async def test_failed_smtp_rechecks_token_before_scheduling_retry(db_pool, user_factory):
+    """Verify failed SMTP rechecks token before scheduling retry."""
     user = user_factory()
     message_id, _ = await _queue(db_pool, "password_reset", user)
     message = await _claim(db_pool)
 
     async def smtp(_message, _email, *, deadline):
+        """Clear the reset token on another connection, then report a temporary SMTP failure."""
         assert deadline > 0
         with psycopg.connect(settings.database_url.get_secret_value()) as conn:
             conn.execute(
@@ -508,6 +548,7 @@ async def test_replacement_does_not_rewrite_sent_messages(
     db_pool,
     user_factory,
 ):
+    """Verify replacement does not rewrite sent messages."""
     user = user_factory()
     old_id, _ = await _queue(db_pool, "password_reset", user)
     message = await _claim(db_pool)
@@ -538,6 +579,7 @@ async def test_database_rejects_invalid_action_metadata(
     user_bound,
     has_metadata,
 ):
+    """Verify database rejects invalid action metadata."""
     user = user_factory()
 
     with pytest.raises(CheckViolation):
@@ -564,11 +606,22 @@ async def test_cancellation_is_scoped_to_user_and_message_type(
     db_pool,
     user_factory,
 ):
+    """Verify cancellation is scoped to user and message type."""
     user = user_factory(email_verified=False)
     other = user_factory(email_verified=False)
 
     old_id, _ = await _queue(db_pool, "password_reset", user)
-    verification_id, _ = await _queue(db_pool, "email_verification", user)
+    # This unrelated action row tests cancellation scope, not verification eligibility.
+    async with get_db_cursor(db_pool) as cur:
+        verification_id = await enqueue_email_cur(
+            cur,
+            user_id=user.id,
+            message_type="email_verification",
+            recipient=user.email,
+            subject="Action",
+            body="Unrelated verification action",
+            action=ActionEmailMetadata(hash_token(uuid4().hex), datetime.now(UTC) + _LEASE),
+        )
     other_id, _ = await _queue(db_pool, "password_reset", other)
 
     await _queue(db_pool, "password_reset", user)
@@ -588,6 +641,7 @@ async def test_cancellation_is_scoped_to_user_and_message_type(
     ],
 )
 async def test_notices_send_without_action_state(db_pool, kind):
+    """Verify notices send without action state."""
     message_id = await _notice(db_pool, kind=kind)
     message = await _claim(db_pool)
     with patch.object(

@@ -1,18 +1,11 @@
-"""Federated authentication and the administrator approval workflow.
-
-Covers ``app.services.federated_authentication`` (principal validation and the
-``finalize_shibboleth_login`` login sink) and the fail-closed administrator
-approval contracts in ``app.services.users`` that gate activation, access
-tier, and administrator grants for federated identities.  The login route's
-own header handling lives in ``test_shibboleth_callback.py`` and is not
-covered here.
-"""
+"""Federated principal/login validation and administrator approval boundaries."""
 
 from dataclasses import replace
 from unittest.mock import create_autospec, patch
 
 import pytest
 
+from app.federation_contract import ENTITLEMENT_MAX_LENGTH
 from app.services import federated_authentication as auth
 from app.services import users
 from app.services.federated_session_policy import REQUIRED_SHIBBOLETH_AUTHN_CONTEXT
@@ -30,6 +23,7 @@ SUBJECT = "stable-subject-7"
 
 
 def principal(**overrides) -> auth.FederatedPrincipal:
+    """Return a trusted synthetic principal with explicit attribute overrides."""
     values = {
         "issuer": ISSUER,
         "subject_id": "stable-subject-1",
@@ -41,7 +35,7 @@ def principal(**overrides) -> auth.FederatedPrincipal:
     return auth.FederatedPrincipal(**values)
 
 
-def _healthy_actor_row() -> dict:
+def _healthy_actor_row() -> dict[str, object]:
     """The row `guard_current_admin_session_cur` reads for the acting administrator.
 
     A local admin with an active, unused recovery-code generation passes the
@@ -61,6 +55,7 @@ class TestFederatedPrincipalBuilder:
     """build_federated_principal validates raw headers and normalizes profile fields."""
 
     def test_builder_preserves_security_values_and_normalizes_profile(self):
+        """Builder preserves security values and normalizes profile."""
         result = auth.build_federated_principal(
             issuer=ISSUER,
             subject_id="Opaque-Subject",
@@ -69,6 +64,7 @@ class TestFederatedPrincipalBuilder:
             display_name=" Person Name ",
             affiliation=" Research Group ",
             country=" CH ",
+            entitlement=r" urn:example:researcher;urn:example:escaped\;value ",
         )
 
         assert result == auth.FederatedPrincipal(
@@ -79,6 +75,7 @@ class TestFederatedPrincipalBuilder:
             display_name="Person Name",
             affiliation="Research Group",
             country="CH",
+            entitlement=r"urn:example:researcher;urn:example:escaped\;value",
         )
 
     @pytest.mark.parametrize(
@@ -91,6 +88,7 @@ class TestFederatedPrincipalBuilder:
         ids=["embedded_newlines", "bidi_control_character", "over_length"],
     )
     def test_builder_rejects_unsafe_raw_profile_values(self, profile):
+        """Builder rejects unsafe raw profile values."""
         with pytest.raises(auth.InvalidFederatedPrincipal):
             auth.build_federated_principal(
                 issuer=ISSUER,
@@ -106,21 +104,26 @@ class TestFinalizeShibbolethLoginSink:
 
     @pytest.fixture(autouse=True)
     def trusted_issuer(self, monkeypatch):
+        """Enable federation and trust the synthetic issuer for the test."""
         monkeypatch.setattr(settings, "shibboleth_enabled", True)
         monkeypatch.setattr(settings, "shibboleth_trusted_issuers", [ISSUER])
 
     @pytest.fixture(autouse=True)
     def current_federation_policy(self):
         """Opt into the already-reconciled startup invariant by default."""
-        with patch.object(
-            auth,
-            "federation_policy_is_current_cur",
-            autospec=True,
-            return_value=True,
-        ) as current:
+        with (
+            patch.object(
+                auth,
+                "federation_policy_is_current_cur",
+                autospec=True,
+                return_value=True,
+            ) as current,
+            patch.object(auth, "record_federated_review_cur", autospec=True),
+        ):
             yield current
 
     async def test_disabled_flag_is_rejected_without_database(self, monkeypatch):
+        """Disabled flag is rejected without database."""
         monkeypatch.setattr(settings, "shibboleth_enabled", False)
         with patch.object(auth, "get_db_cursor", autospec=True) as acquire:
             result = await auth.finalize_shibboleth_login(
@@ -131,6 +134,7 @@ class TestFinalizeShibbolethLoginSink:
         acquire.assert_not_called()
 
     async def test_nonprincipal_object_is_rejected_without_database(self):
+        """Nonprincipal object is rejected without database."""
         with patch.object(auth, "get_db_cursor", autospec=True) as acquire:
             result = await auth.finalize_shibboleth_login(
                 make_mock_pool(),
@@ -144,6 +148,7 @@ class TestFinalizeShibbolethLoginSink:
     async def test_stale_policy_aborts_before_provisioning_or_session_write(
         self, current_federation_policy
     ):
+        """Stale policy aborts before provisioning or session write."""
         cur = make_async_cursor()
         current_federation_policy.return_value = False
         with (
@@ -164,6 +169,7 @@ class TestFinalizeShibbolethLoginSink:
         cur.execute.assert_not_awaited()
 
     async def test_inactive_profile_never_reaches_login_writes(self):
+        """Inactive profile never reaches login writes."""
         user = make_sample_user(
             auth_method="shibboleth",
             is_active=False,
@@ -183,6 +189,7 @@ class TestFinalizeShibbolethLoginSink:
         cur.execute.assert_not_awaited()
 
     async def test_success_uses_shared_cursor_and_authoritative_row(self):
+        """Success uses shared cursor and authoritative row."""
         user = make_sample_user(auth_method="shibboleth", federated_status="approved")
         row = make_sample_user_row(
             auth_method="shibboleth",
@@ -215,6 +222,7 @@ class TestFinalizeShibbolethLoginSink:
         assert "raw-token" not in repr(result)
 
     async def test_session_failure_propagates_out_of_transaction(self):
+        """Session failure propagates out of transaction."""
         user = make_sample_user(auth_method="shibboleth", federated_status="approved")
         cur = make_async_cursor(
             fetchone=make_sample_user_row(
@@ -234,12 +242,13 @@ class TestFinalizeShibbolethLoginSink:
                 make_mock_pool(), principal=principal(email=user.email), ip_address="127.0.0.1"
             )
 
-    @pytest.mark.parametrize("status", [None, "pending", "disabled", "legacy_quarantined"])
+    @pytest.mark.parametrize("status", [None, "pending", "disabled", "unsupported"])
     async def test_only_approved_federated_status_can_reach_session_issue(self, status):
         # Deliberately model a corrupt/inconsistent read. The shared factory
         # keeps normal rows schema-coherent and would otherwise force these
         # states inactive, letting the is_active guard mask a missing status
         # check.
+        """Only approved federated status can reach session issue."""
         user = replace(
             make_sample_user(auth_method="shibboleth", federated_status="approved"),
             is_active=True,
@@ -281,6 +290,7 @@ class TestFinalizeShibbolethLoginSink:
         ],
     )
     async def test_untrusted_principal_is_rejected_before_database_access(self, untrusted):
+        """Untrusted principal is rejected before database access."""
         with patch.object(auth, "get_db_cursor", autospec=True) as acquire:
             result = await auth.finalize_shibboleth_login(
                 make_mock_pool(), principal=untrusted, ip_address="127.0.0.1"
@@ -302,6 +312,9 @@ class TestFinalizeShibbolethLoginSink:
             principal(email=" Person@Example.org "),
             principal(email="Person@Example.org"),
             principal(display_name=" Person "),
+            principal(entitlement=" urn:example:member "),
+            principal(entitlement="x" * (ENTITLEMENT_MAX_LENGTH + 1)),
+            principal(entitlement="urn:example:\u202emember"),
         ],
         ids=[
             "issuer_leading_whitespace",
@@ -315,9 +328,13 @@ class TestFinalizeShibbolethLoginSink:
             "email_needs_normalization",
             "email_needs_lowercasing",
             "display_name_needs_normalization",
+            "entitlement_needs_normalization",
+            "entitlement_oversized",
+            "entitlement_nonprintable",
         ],
     )
     async def test_noncanonical_or_invalid_principal_is_rejected_before_database(self, invalid):
+        """Noncanonical or invalid principal is rejected before database."""
         with patch.object(auth, "get_db_cursor", autospec=True) as acquire:
             result = await auth.finalize_shibboleth_login(
                 make_mock_pool(), principal=invalid, ip_address="127.0.0.1"
@@ -350,6 +367,7 @@ class TestUserProvisioningIdentityExactness:
         ],
     )
     async def test_provisioning_rejects_nonexact_identity_without_query(self, issuer, subject_id):
+        """Provisioning rejects nonexact identity without query."""
         cur = make_async_cursor()
 
         result = await users.create_shibboleth_user_cur(
@@ -363,6 +381,7 @@ class TestUserProvisioningIdentityExactness:
         cur.execute.assert_not_awaited()
 
     async def test_provisioning_queries_for_exact_identity(self):
+        """Provisioning queries for exact identity."""
         cur = make_async_cursor(
             fetchone=make_sample_user_row(auth_method="shibboleth", federated_status="pending")
         )
@@ -383,6 +402,7 @@ class TestFederatedAdminApproval:
 
     @pytest.fixture(autouse=True)
     def enabled_trusted_federation(self, monkeypatch):
+        """Enable trusted federation and return the signature-checked current-policy double."""
         monkeypatch.setattr(users.settings, "shibboleth_enabled", True)
         monkeypatch.setattr(users.settings, "shibboleth_trusted_issuers", [ISSUER])
         current_policy = create_autospec(users.federation_policy_is_current_cur, return_value=True)
@@ -394,11 +414,13 @@ class TestFederatedAdminApproval:
         return current_policy
 
     async def test_atomically_binds_pending_identity_tier_and_actor(self):
+        """Atomically binds pending identity tier and actor."""
         approved_row = make_sample_user_row(
             id=7,
             auth_method="shibboleth",
             access_tier="vetted",
             federated_status="approved",
+            reviewed_proposal=None,
         )
         cur = make_async_cursor(
             fetchone=[
@@ -414,17 +436,18 @@ class TestFederatedAdminApproval:
                 7,
                 expected_issuer=ISSUER,
                 expected_subject_id=SUBJECT,
+                expected_review_revision=1,
                 access_tier="vetted",
                 actor_id=99,
                 actor_session_id="resolved-admin-session",
             )
 
-        assert approved.id == 7
-        assert approved.federated_status == "approved"
-        assert approved.is_active is True
-        assert approved.access_tier == "vetted"
-        assert approved.is_admin is False
-        assert approved.email_verified is False
+        assert approved.user.id == 7
+        assert approved.user.federated_status == "approved"
+        assert approved.user.is_active is True
+        assert approved.user.access_tier == "vetted"
+        assert approved.user.is_admin is False
+        assert approved.user.email_verified is False
 
         update = cur.execute.await_args_list[3]
         statement = str(update.args[0])
@@ -441,6 +464,7 @@ class TestFederatedAdminApproval:
             "user_id": 7,
             "expected_issuer": ISSUER,
             "expected_subject_id": SUBJECT,
+            "expected_review_revision": 1,
             "access_tier": "vetted",
             "actor_id": 99,
         }
@@ -460,6 +484,7 @@ class TestFederatedAdminApproval:
     async def test_refuses_disabled_or_untrusted_federation_before_db(
         self, monkeypatch, enabled, trusted_issuers
     ):
+        """Refuses disabled or untrusted federation before database."""
         monkeypatch.setattr(users.settings, "shibboleth_enabled", enabled)
         monkeypatch.setattr(users.settings, "shibboleth_trusted_issuers", trusted_issuers)
 
@@ -472,6 +497,7 @@ class TestFederatedAdminApproval:
                 7,
                 expected_issuer=ISSUER,
                 expected_subject_id=SUBJECT,
+                expected_review_revision=1,
                 access_tier="registered",
                 actor_id=99,
                 actor_session_id="resolved-admin-session",
@@ -482,6 +508,7 @@ class TestFederatedAdminApproval:
     async def test_refuses_stale_persisted_policy_before_admin_or_user_write(
         self, enabled_trusted_federation
     ):
+        """Refuses stale persisted policy before admin or user write."""
         enabled_trusted_federation.return_value = False
         cur = make_async_cursor()
 
@@ -494,6 +521,7 @@ class TestFederatedAdminApproval:
                 7,
                 expected_issuer=ISSUER,
                 expected_subject_id=SUBJECT,
+                expected_review_revision=1,
                 access_tier="registered",
                 actor_id=99,
                 actor_session_id="resolved-admin-session",
@@ -512,6 +540,7 @@ class TestFederatedAdminApproval:
         ids=["issuer_leading_whitespace", "subject_trailing_whitespace", "issuer_comma_ambiguous"],
     )
     async def test_never_normalizes_or_accepts_ambiguous_identity(self, issuer, subject):
+        """Never normalizes or accepts ambiguous identity."""
         with (
             patch.object(users, "get_db_cursor", autospec=True) as db,
             pytest.raises(users.AdminActionRejected, match="approval request is invalid"),
@@ -521,6 +550,7 @@ class TestFederatedAdminApproval:
                 7,
                 expected_issuer=issuer,
                 expected_subject_id=subject,
+                expected_review_revision=1,
                 access_tier="public",
                 actor_id=99,
                 actor_session_id="resolved-admin-session",
@@ -529,6 +559,7 @@ class TestFederatedAdminApproval:
         db.assert_not_called()
 
     async def test_stale_or_mismatched_identity_cannot_be_approved(self):
+        """Stale or mismatched identity cannot be approved."""
         cur = make_async_cursor(
             fetchone=[
                 _healthy_actor_row(),
@@ -546,6 +577,7 @@ class TestFederatedAdminApproval:
                 7,
                 expected_issuer=ISSUER,
                 expected_subject_id=SUBJECT,
+                expected_review_revision=1,
                 access_tier="registered",
                 actor_id=99,
                 actor_session_id="resolved-admin-session",
@@ -557,6 +589,7 @@ class TestNonApprovalPathsCannotBypassFederatedReview:
 
     @pytest.fixture(autouse=True)
     def enabled_trusted_federation(self, monkeypatch):
+        """Enable trusted federation and return the signature-checked current-policy double."""
         monkeypatch.setattr(users.settings, "shibboleth_enabled", True)
         monkeypatch.setattr(users.settings, "shibboleth_trusted_issuers", [ISSUER])
         current_policy = create_autospec(users.federation_policy_is_current_cur, return_value=True)
@@ -567,7 +600,7 @@ class TestNonApprovalPathsCannotBypassFederatedReview:
         )
         return current_policy
 
-    @pytest.mark.parametrize("status", ["pending", "legacy_quarantined", None])
+    @pytest.mark.parametrize("status", ["pending", "unsupported", None])
     @pytest.mark.parametrize("operation", ["activate", "tier"])
     async def test_generic_membership_paths_reject_unapproved_federated_state(
         self, status, operation
@@ -588,6 +621,7 @@ class TestNonApprovalPathsCannotBypassFederatedReview:
         )
 
         async def invoke():
+            """Activate or raise the test account tier using the fixed administrator session."""
             common = {
                 "actor_id": 99,
                 "actor_session_id": "resolved-admin-session",
@@ -602,15 +636,11 @@ class TestNonApprovalPathsCannotBypassFederatedReview:
         ):
             await invoke()
 
-        # Advisory lock + actor row + exact session + target row only. No UPDATE.
         assert len(cur.execute.await_args_list) == 4
 
     @pytest.mark.parametrize("operation", ["activate", "tier"])
     async def test_generic_membership_paths_permit_an_approved_federated_state(self, operation):
-        """The federated-review guard is targeted at unapproved states: once a
-        federated identity carries ``approved`` (or ``disabled``), the same
-        generic membership paths that reject pending/legacy-quarantined
-        identities above go on to perform their write."""
+        """Generic membership paths permit an approved federated state."""
         target_row = {
             "is_active": False,
             "is_admin": False,
@@ -628,6 +658,7 @@ class TestNonApprovalPathsCannotBypassFederatedReview:
         )
 
         async def invoke():
+            """Activate or raise the test account tier using the fixed administrator session."""
             common = {
                 "actor_id": 99,
                 "actor_session_id": "resolved-admin-session",
@@ -650,9 +681,7 @@ class TestNonApprovalPathsCannotBypassFederatedReview:
     async def test_admin_grant_is_rejected_by_the_promotion_workflow_before_any_federation_check(
         self,
     ):
-        """A direct administrator grant is always rejected by the promotion
-        workflow before the generic membership path opens a cursor, so the
-        target's federated status can never be consulted."""
+        """Admin grant is rejected by the promotion workflow before any federation check."""
         with (
             patch.object(users, "get_db_cursor", autospec=True) as db,
             pytest.raises(
@@ -669,3 +698,76 @@ class TestNonApprovalPathsCannotBypassFederatedReview:
             )
 
         db.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("urn:example:member", "urn:example:member"),
+        ("x" * ENTITLEMENT_MAX_LENGTH, "x" * ENTITLEMENT_MAX_LENGTH),
+    ],
+    ids=["absent", "empty", "blank", "opaque-value", "maximum-length"],
+)
+def test_builder_preserves_bounded_optional_entitlement(raw, expected):
+    """Builder preserves bounded optional entitlement."""
+    result = auth.build_federated_principal(
+        issuer=ISSUER,
+        subject_id="Opaque-Subject",
+        email="person@example.org",
+        authn_context=REQUIRED_SHIBBOLETH_AUTHN_CONTEXT,
+        entitlement=raw,
+    )
+
+    assert result.entitlement == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        1,
+        True,
+        [],
+        "urn:example:member\n",
+        "urn:example:\u202emember",
+        "x" * (ENTITLEMENT_MAX_LENGTH + 1),
+        " " + "x" * ENTITLEMENT_MAX_LENGTH,
+    ],
+    ids=["integer", "boolean", "list", "newline", "bidi", "oversized", "raw-bound"],
+)
+def test_builder_rejects_unsafe_entitlement_before_normalization(raw):
+    """Builder rejects unsafe entitlement before normalization."""
+    with pytest.raises(auth.InvalidFederatedPrincipal, match="entitlement:"):
+        auth.build_federated_principal(
+            issuer=ISSUER,
+            subject_id="Opaque-Subject",
+            email="person@example.org",
+            authn_context=REQUIRED_SHIBBOLETH_AUTHN_CONTEXT,
+            entitlement=raw,
+        )
+
+
+@pytest.mark.parametrize(
+    "review_revision", [None, True, False, "1", 0, -1, 9_223_372_036_854_775_808]
+)
+async def test_invalid_review_revision_cannot_reach_the_database(monkeypatch, review_revision):
+    """Invalid review revision cannot reach the database."""
+    monkeypatch.setattr(settings, "shibboleth_enabled", True)
+    monkeypatch.setattr(settings, "shibboleth_trusted_issuers", [ISSUER])
+    with (
+        patch.object(users, "get_db_cursor", autospec=True) as acquire,
+        pytest.raises(users.AdminActionRejected, match="approval request is invalid"),
+    ):
+        await users.approve_federated_user(
+            make_mock_pool(),
+            7,
+            expected_issuer=ISSUER,
+            expected_subject_id=SUBJECT,
+            expected_review_revision=review_revision,
+            access_tier="vetted",
+            actor_id=99,
+            actor_session_id="resolved-admin-session",
+        )
+    acquire.assert_not_called()

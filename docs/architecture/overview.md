@@ -1,6 +1,9 @@
 # Architecture Overview
 
-FastAPI serves the catalogue from PostgreSQL. A separate scheduler harvests SWISSUbase metadata, delivers queued email, and runs maintenance.
+FastAPI serves a local PostgreSQL catalogue. A separate scheduler ingests
+explicitly configured sources, delivers queued email and runs maintenance.
+Both processes require `SOURCES_CONFIG_FILE` and retain their selected source
+snapshot until restart.
 
 ## The big picture
 
@@ -10,7 +13,7 @@ flowchart TD
     Nginx --> Web[Web workers]
     Web <--> DB[(PostgreSQL)]
     Scheduler[Scheduler] <--> DB
-    Scheduler --> OAI[SWISSUbase OAI-PMH]
+    Scheduler --> Sources[Configured source adapters]
     Scheduler --> SMTP[SMTP or development mailbox]
     Web <--> Redis[(Redis)]
     Scheduler --> Redis
@@ -27,6 +30,7 @@ The shipped deployment uses TLS at nginx and a Unix socket to Gunicorn. Jinja2 r
 | `src/app/routes/`, `src/app/route_security.py` | Handlers and enforced route policies |
 | `src/app/middleware/` | Admission, sessions, CSRF, auditing, and headers |
 | `src/app/services/` | Authentication, storage, harvesting, email, and jobs |
+| `src/app/sources/` | Source contracts, validated descriptions, construction registry and harvest adapters |
 | `src/app/templates/`, `src/app/static/` | HTML and static assets |
 | `src/config/` | Settings and logging |
 | `src/alembic/` | Database migrations |
@@ -37,15 +41,44 @@ The shipped deployment uses TLS at nginx and a Unix socket to Gunicorn. Jinja2 r
 `app.main.lifespan` performs these steps before serving requests:
 
 1. Configure logging and, in development, warn about unused `.env` keys.
-2. Validate security settings, the route-policy inventory, and the rate-limit backend.
-3. Load the password blocklist and warm the dummy Argon2 hash.
+2. Require the web process role, validate security settings, and load nonsecret
+   metadata and pure policy from the explicitly selected source file. No fetch
+   adapters or feed credentials are constructed; selected feed credential
+   variables in the web environment abort startup.
+3. Validate route policy and the rate-limit backend; load the password blocklist
+   and warm the dummy Argon2 hash.
 4. In development, upgrade Alembic to head. Hardened deployments migrate separately.
-5. Open the database pool; validate schema and runtime-role contracts.
-6. Reconcile the federation-policy fingerprint, revoking federated sessions when it is missing or changed.
-7. Create the lazy catalogue cache and its optional Redis subscriber.
-8. Seed development mock data when enabled, then seed the administrator when configured.
+5. Open the ordinary pool and validate schema/runtime roles. Open the separate
+   one-connection search pool after publishing the catalogue policy below.
+6. Reconcile the federation-policy fingerprint and revoke incompatible sessions.
+   Verify the durable search-policy binding, then publish the detached source
+   metadata and compiled catalogue policy. A changed binding needs an explicit
+   operator transition; restarting a worker cannot overwrite it.
+7. Create the lazy catalogue cache for the selected source names and its optional
+   Redis subscriber.
 
-Shutdown stops the cache subscriber and closes the pool, including after startup failure. `run_scheduler.py` independently validates settings and schema, optionally seeds staging mock data, then starts the jobs. It does not run web migrations or administrator seeding. See [Deployment](../configuration/deployment.md) and [Sync](sync.md).
+Shutdown stops the cache subscriber and closes both database pools, including
+after startup failure. Web startup does not provision source-status rows or
+harvest records. Create the initial administrator with the
+[bootstrap command](../runbooks/bootstrap-admin.md).
+
+Every catalogue read checks the durable policy fingerprint inside its database
+transaction. Public statistics also check before returning a warm cache entry;
+their guard, freshness lookup and live count share one connection. A worker
+whose policy has been replaced returns the controlled unavailable response
+until it loads the current configuration. Operator policy changes cannot race
+with a guarded read to expose a mixture of old and new disclosure rules.
+
+`run_scheduler.py` independently validates settings and selects sources, opens
+PostgreSQL, checks schema/role contracts and provisions the selected source-status
+rows before registering jobs. Each source receives incremental and rebuild jobs
+with its own schedule; maintenance jobs remain shared. Initial unbound-source
+recovery can immediately initiate a rebuild through the scheduler wrapper.
+Catalogue population, including development fixture data, uses normal ingestion.
+
+The scheduler does not run web migrations or administrator seeding. See
+[Sources](../sources/index.md), [Deployment](../configuration/deployment.md) and
+[Source Ingestion Pipeline](sync.md).
 
 ## How a request flows
 
@@ -75,5 +108,6 @@ PostgreSQL stores catalogue rows, user credentials and authority, sessions, reco
 | ...the dataset and user dataclasses, and what's in PostgreSQL | [Data Model](data-model.md) |
 | ...how login, registration, TOTP, email verification, and sessions fit together | [Authentication & Sessions](auth.md) |
 | ...how visibility tiers are enforced | [Access Control & Visibility](access-control.md) |
-| ...how OAI-PMH harvesting works | [OAI-PMH Sync Pipeline](sync.md) |
+| ...how configured-source ingestion works | [Source Ingestion Pipeline](sync.md) |
+| ...how to configure or implement sources | [Sources](../sources/index.md) |
 | ...the layered security controls | [Security Layers](security.md) |

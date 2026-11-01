@@ -1,8 +1,12 @@
 {% extends "base.html" %}
 {% set active_page = "search" %}
-{% block title %}Search — Oral History Archive{% endblock %}
+{% block title %}Search — {{ site_name }}{% endblock %}
 
 {% block content %}
+{# Render a labeled field-tier restriction using item and configured_sources. #}
+{% macro restricted(item, field, label) -%}
+<p class="metadata-restricted" data-field="{{ field }}">{{ label }} requires <strong>{{ field_required_tier(item, field, configured_sources=configured_sources) }}</strong> access or higher.</p>
+{%- endmacro %}
 <section class="container search-page">
 
   <div class="search-header">
@@ -18,12 +22,11 @@
 
   <div class="search-layout">
 
-    <!-- Filters -->
     <aside class="filters">
       <div class="filter-heading">
         Filters
         {% if active_keyword or active_language or active_access_level %}
-        <a href="{{ url_for_query(request, keyword=None, language=None, access_level=None, page=None) }}" class="filter-clear">Clear all</a>
+        <a href="{{ url_for_query(request, keyword=None, language=None, access_level=None, page=None, cursor=None, pagination=None) }}" class="filter-clear">Clear all</a>
         {% endif %}
       </div>
 
@@ -50,16 +53,18 @@
       </form>
     </aside>
 
-    <!-- Results -->
     <div class="results">
       <div class="results-meta">
+        {% if result_count is not none %}
         <span>{{ result_count }} dataset{{ 's' if result_count != 1 }} found</span>
+        {% else %}
+        <span>Search results</span>
+        {% endif %}
         {% if query %}<span class="results-query">for "{{ query }}"</span>{% endif %}
       </div>
 
-      {% if result_window_limited %}
-      <p>Only the first {{ total_pages }} pages are available for this search.
-        Add search terms or filters to reach the remaining matches.</p>
+      {% if pagination_notice %}
+      <p class="pagination-notice" role="status">{{ pagination_notice }}</p>
       {% endif %}
       {% if results %}
       <div class="results-list">
@@ -71,23 +76,40 @@
               <span class="card-access {{ item.access_level }}">{{ item.access_level }}</span>
             </div>
 
-            {% if can_view_full(item, user_tier) %}
-            <p class="result-authors">{{ item.authors | map(attribute='name') | join(', ') }}</p>
-            <p class="result-summary">{{ (item.description or '')[:200] }}{% if item.description and item.description|length > 200 %}…{% endif %}</p>
+            {% if can_view_field(item, user_tier, 'authors', configured_sources=configured_sources) %}
+            <p class="result-authors" data-field="authors">{{ item.authors | map(attribute='name') | join(', ') }}</p>
+            {% else %}
+            {{ restricted(item, 'authors', 'Authors') }}
+            {% endif %}
+            {% if can_view_field(item, user_tier, 'description', configured_sources=configured_sources) %}
+            <p class="result-summary" data-field="description">{{ (item.description or '')[:200] }}{% if item.description and item.description|length > 200 %}…{% endif %}</p>
+            {% else %}
+            {{ restricted(item, 'description', 'Description') }}
+            {% endif %}
             <div class="result-bottom">
-              <div class="card-topics">
+              {% if can_view_field(item, user_tier, 'keywords', configured_sources=configured_sources) %}
+              <div class="card-topics" data-field="keywords">
                 {% for keyword in item.keywords[:5] %}
                 <span class="tag">{{ keyword }}</span>
                 {% endfor %}
               </div>
+              {% else %}
+              {{ restricted(item, 'keywords', 'Keywords') }}
+              {% endif %}
               <div class="card-meta">
+                {% if can_view_field(item, user_tier, 'languages', configured_sources=configured_sources) %}
+                <span data-field="languages">
                 {% for lang in item.languages %}<span>{{ lang }}</span>{% endfor %}
+                </span>
+                {% else %}
+                {{ restricted(item, 'languages', 'Languages') }}
+                {% endif %}
               </div>
             </div>
-            {% else %}
+            {% if not can_view_full(item, user_tier, configured_sources=configured_sources) %}
               <p class="result-restricted">
                 Extended metadata available to authorized researchers.<br>
-                Log in or request access to view.
+                Full metadata requires <strong>{{ full_required_tier(item, configured_sources=configured_sources) }}</strong> access or higher. Log in or request access to view.
               </p>
             {% endif %}
 
@@ -96,29 +118,34 @@
         {% endfor %}
       </div>
 
-      {% if total_pages > 1 %}
-      <nav class="pagination" aria-label="Search results pagination">
-        {% if current_page > 1 %}
-        <a href="{{ url_for_query(request, page=current_page - 1) }}" class="pagination-link pagination-prev">← Previous</a>
-        {% else %}
-        <span class="pagination-link pagination-prev disabled">← Previous</span>
-        {% endif %}
-
-        <span class="pagination-info">Page {{ current_page }} of {{ total_pages }}</span>
-
-        {% if current_page < total_pages %}
-        <a href="{{ url_for_query(request, page=current_page + 1) }}" class="pagination-link pagination-next">Next →</a>
-        {% else %}
-        <span class="pagination-link pagination-next disabled">Next →</span>
-        {% endif %}
-      </nav>
-      {% endif %}
-
       {% else %}
       <div class="results-empty">
         <p><strong>No datasets found.</strong></p>
         <p>Try broadening your search or removing some filters.</p>
       </div>
+      {% endif %}
+
+      {% if previous_page_url or next_page_url or cursor_pagination %}
+      <nav class="pagination" aria-label="Search results pagination">
+        {% if previous_page_url %}
+        <a href="{{ previous_page_url }}" class="pagination-link pagination-prev">← Previous</a>
+        {% else %}
+        <span class="pagination-link pagination-prev disabled">← Previous</span>
+        {% endif %}
+
+        {% if total_pages is none or cursor_pagination or (current_page == total_pages and next_page_url) %}
+        <span class="pagination-info">Page {{ current_page }}</span>
+        {% if cursor_pagination %}<a href="{{ search_start_url }}" class="pagination-link">Start again</a>{% endif %}
+        {% else %}
+        <span class="pagination-info">Page {{ current_page }} of {{ total_pages }}</span>
+        {% endif %}
+
+        {% if next_page_url %}
+        <a href="{{ next_page_url }}" class="pagination-link pagination-next">Next →</a>
+        {% else %}
+        <span class="pagination-link pagination-next disabled">Next →</span>
+        {% endif %}
+      </nav>
       {% endif %}
     </div>
 

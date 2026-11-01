@@ -12,6 +12,7 @@ set -Eeuo pipefail
 umask 077
 
 
+# Print usage to stderr and exit 64.
 usage() {
     printf 'Usage: %s <archive.dump.age> <age-identity-file>\n' "${0##*/}" >&2
     exit 64

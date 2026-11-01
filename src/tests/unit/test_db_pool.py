@@ -1,27 +1,14 @@
-"""Unit-level coverage for db.get_db_cursor's failure branch.
-
-The happy path (real cursor from a live pool) is exercised throughout the
-integration tier; this file pins the pool-exhaustion arm (db.py: the
-`except PoolTimeout` log-and-reraise) with no database, by driving a mock
-pool whose `connection()` raises PoolTimeout.
-
-get_db_cursor must LOG the exhaustion (with the configured pool
-size, for the operator) and then RE-RAISE — callers depend on the timeout
-propagating, not being swallowed into a None cursor.
-
-The only real pool constructed here is created with open=False and never
-opened, so no database is touched.
-"""
+"""Pool exhaustion logging and propagation without opening PostgreSQL."""
 
 import logging
 from contextlib import asynccontextmanager
-from unittest.mock import create_autospec
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 from pydantic import ValidationError
 
-from app.services.db import _POOL_ACQUIRE_TIMEOUT, create_pool, get_db_cursor
+from app.services.db import _POOL_ACQUIRE_TIMEOUT, create_pool, create_search_pool, get_db_cursor
 from config import settings
 from tests.unit.settings_builders import base_kwargs, make_settings
 
@@ -34,6 +21,7 @@ def _pool_that_times_out() -> AsyncConnectionPool:
 
     @asynccontextmanager
     async def _conn():
+        """Raise PoolTimeout when entering the fake connection context."""
         raise PoolTimeout("couldn't get a connection from the pool")
         yield  # pragma: no cover - unreachable, makes this an async CM
 
@@ -66,8 +54,6 @@ async def test_get_db_cursor_logs_pool_size_on_timeout(caplog):
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings, "pool exhaustion must emit a WARNING"
-    # The configured pool size appears in the message so the operator knows
-    # the current ceiling.
     assert str(settings.database_pool_size) in warnings[-1].getMessage()
 
 
@@ -77,16 +63,7 @@ async def test_get_db_cursor_logs_pool_size_on_timeout(caplog):
     ids=["size-1-min-clamped-to-1", "size-2-min-equals-size", "size-5-min-capped-at-2"],
 )
 def test_create_pool_clamps_min_size_to_configured_ceiling(monkeypatch, size):
-    """Validator-accepts-what-a-consumer-rejects — the settings
-    boundary allows DATABASE_POOL_SIZE=1 (ge=1), but psycopg_pool raises
-    when min_size > max_size, so create_pool must clamp min_size to
-    min(2, configured size); for size 1 the pool is exactly 1/1. Asserting
-    the pool attributes pins the clamp directly: a create_pool without the
-    min(2, ...) clamp fails on these lines, not only via psycopg_pool's ValueError.
-
-    create_pool returns the pool UNOPENED (open=False) and this test never
-    opens it, so nothing connects.
-    """
+    """Create pool clamps min size to configured ceiling."""
     monkeypatch.setattr(settings, "database_pool_size", size)
     pool = create_pool()
     assert pool.min_size == min(2, size)
@@ -94,11 +71,10 @@ def test_create_pool_clamps_min_size_to_configured_ceiling(monkeypatch, size):
 
 
 class TestPoolAdmissionIsExplicitlyBounded:
-    """The pool never falls back to psycopg_pool's own defaults for waiter
-    admission: `max_waiting` comes from settings and the acquire timeout is
-    the module's own bounded constant, not psycopg_pool's 30s default."""
+    """Set waiter capacity and acquisition timeout explicitly when constructing the pool."""
 
     def test_create_pool_uses_the_configured_max_waiting_and_a_bounded_timeout(self, monkeypatch):
+        """Create pool uses the configured max waiting and a bounded timeout."""
         monkeypatch.setattr(settings, "database_pool_max_waiting", 17)
         pool = create_pool()
         assert pool.max_waiting == 17
@@ -107,12 +83,11 @@ class TestPoolAdmissionIsExplicitlyBounded:
 
 
 class TestDatabasePoolMaxWaitingBounds:
-    """`database_pool_max_waiting` accepts its documented 1..1000 range and
-    rejects anything outside it — an unbounded or zero waiter queue would
-    let one slow request either queue forever or be rejected immediately."""
+    """Accept waiter capacities 1..1000 and reject values outside that range."""
 
     @pytest.mark.parametrize("value", [1, 1000], ids=["lower-bound-1", "upper-bound-1000"])
     def test_boundary_values_are_accepted(self, value):
+        """Boundary values are accepted."""
         configured = make_settings(**base_kwargs(database_pool_max_waiting=value))
         assert configured.database_pool_max_waiting == value
 
@@ -120,5 +95,28 @@ class TestDatabasePoolMaxWaitingBounds:
         "value", [0, -1, 1001], ids=["zero", "negative", "above-upper-bound-1001"]
     )
     def test_out_of_range_values_are_rejected(self, value):
+        """Out of range values are rejected."""
         with pytest.raises(ValidationError, match="database_pool_max_waiting"):
             make_settings(**base_kwargs(database_pool_max_waiting=value))
+
+
+async def test_search_pool_has_independent_admission_and_read_only_deadlines(monkeypatch):
+    """Search pool has independent admission and read only deadlines."""
+    monkeypatch.setattr(settings, "database_pool_size", 9)
+    monkeypatch.setattr(settings, "database_pool_max_waiting", 20)
+    monkeypatch.setattr(settings, "search_pool_timeout_seconds", 0.1)
+    monkeypatch.setattr(settings, "search_statement_timeout_ms", 500)
+    pool = create_search_pool()
+    assert pool.min_size == pool.max_size == 1
+    assert pool.max_waiting == 1
+    assert pool.timeout == 0.1
+    connection = AsyncMock()
+    assert pool._configure is not None
+    await pool._configure(connection)
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    rendered = [item.as_string() if hasattr(item, "as_string") else item for item in statements]
+    assert "SET application_name = 'oralhistarchiv-search'" in rendered
+    assert "SET statement_timeout = '500ms'" in rendered
+    assert "SET max_parallel_workers_per_gather = 0" in rendered
+    assert "SET default_transaction_read_only = on" in rendered
+    assert connection.set_autocommit.await_args_list[-1].args == (False,)

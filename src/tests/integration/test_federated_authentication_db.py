@@ -1,10 +1,4 @@
-"""Real PostgreSQL tests for the federated-identity surface.
-
-Covers atomic, policy-approved federated login (``finalize_shibboleth_login``),
-the deadline-bounded races between login finalization and federated-session
-policy reconciliation, serialization of concurrent writers on one identity
-row, and reconciliation of the federated-session policy state itself.
-"""
+"""Real PostgreSQL tests for the federated-identity surface."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -12,6 +6,7 @@ from datetime import UTC, datetime
 
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 from pydantic import SecretStr
 
 from app.services import federated_authentication as auth
@@ -30,6 +25,7 @@ SECRET_B = "Bvn3v2uTyRLeUmRGXuGTt4IbjaAwhivCcwpDBKlqiuLbWrMqPP2AzUQs6wtawK3C"
 
 
 def _principal(email: str) -> auth.FederatedPrincipal:
+    """Construct the test's federated identity assertion."""
     return auth.FederatedPrincipal(
         issuer=ISSUER,
         subject_id=SUBJECT,
@@ -40,6 +36,7 @@ def _principal(email: str) -> auth.FederatedPrincipal:
 
 
 async def _login(pool, email):
+    """Finalize a federated login with the test principal and loopback address."""
     return await auth.finalize_shibboleth_login(
         pool,
         principal=_principal(email),
@@ -56,6 +53,7 @@ async def _apply_trusted_issuer_policy(monkeypatch, db_pool):
 
 
 def _enable_test_federation(monkeypatch, *, secret=SECRET_A):
+    """Patch federation settings to trust this test issuer and shared secret."""
     monkeypatch.setattr(settings, "shibboleth_enabled", True)
     monkeypatch.setattr(settings, "shibboleth_trusted_issuers", [ISSUER])
     monkeypatch.setattr(settings, "shibboleth_internal_secret", SecretStr(secret))
@@ -92,12 +90,14 @@ class TestFederatedLoginOutcomes:
 
     @pytest.fixture(autouse=True)
     async def _trust_test_issuer(self, monkeypatch, clean_db, db_pool):
+        """Reconcile the test issuer policy after the destructive fixture reset."""
         del clean_db  # explicit ordering: reconcile only after the autouse truncate
         await _apply_trusted_issuer_policy(monkeypatch, db_pool)
 
     async def test_inactive_identity_has_no_profile_refresh_session_or_new_last_login(
         self, db_pool, user_factory, sync_conn
     ):
+        """Verify inactive identity has no profile refresh session or new last login."""
         previous = datetime(2025, 1, 1, tzinfo=UTC)
         user = user_factory(
             email="inactive@example.org",
@@ -125,6 +125,7 @@ class TestFederatedLoginOutcomes:
     async def test_new_identity_is_quarantined_without_session_or_last_login(
         self, db_pool, sync_conn
     ):
+        """Verify new identity is quarantined without session or last login."""
         result = await _login(db_pool, "new-person@example.org")
 
         assert isinstance(result, auth.FederatedLoginFailure)
@@ -145,6 +146,7 @@ class TestFederatedLoginOutcomes:
     async def test_active_reviewed_identity_commits_full_session_and_last_login(
         self, db_pool, user_factory, sync_conn
     ):
+        """Verify active reviewed identity commits full session and last login."""
         user = user_factory(
             email="active@example.org",
             auth_method="shibboleth",
@@ -168,6 +170,7 @@ class TestFederatedLoginOutcomes:
     async def test_session_failure_rolls_back_profile_last_login_and_session(
         self, db_pool, user_factory, sync_conn, monkeypatch
     ):
+        """Verify session failure rolls back profile last login and session."""
         user = user_factory(
             email="old@example.org",
             display_name="Old profile",
@@ -180,6 +183,7 @@ class TestFederatedLoginOutcomes:
         real = auth.create_session_cur
 
         async def fail_after_insert(cur, **kwargs):
+            """Perform the real insert, then trigger a PostgreSQL division error."""
             await real(cur, **kwargs)
             await cur.execute("SELECT 1 / 0")
 
@@ -193,6 +197,7 @@ class TestFederatedLoginOutcomes:
         assert sync_conn.execute("SELECT count(*) FROM sessions").fetchone() == (0,)
 
     async def test_email_collision_preserves_local_identity(self, db_pool, user_factory, sync_conn):
+        """Verify email collision preserves local identity."""
         local = user_factory()
 
         result = await _login(db_pool, local.email)
@@ -211,6 +216,7 @@ class TestFederatedSessionPolicyRaces:
 
     @pytest.fixture(autouse=True)
     async def _trust_test_issuer(self, monkeypatch, clean_db, db_pool):
+        """Reconcile the test issuer policy after the destructive fixture reset."""
         del clean_db  # explicit ordering: reconcile only after the autouse truncate
         await _apply_trusted_issuer_policy(monkeypatch, db_pool)
 
@@ -236,6 +242,9 @@ class TestFederatedSessionPolicyRaces:
 
         @asynccontextmanager
         async def pause_finalizer_before_commit(pool):
+            """Yield the real cursor, record its backend PID and hold the transaction before
+            commit.
+            """
             async with real_cursor(pool) as cur:
                 yield cur
                 owner["pid"] = cur.connection.info.backend_pid
@@ -309,6 +318,9 @@ class TestFederatedSessionPolicyRaces:
 
         @asynccontextmanager
         async def pause_reconciler_before_commit(pool):
+            """Yield the real cursor, record its backend PID and hold the transaction before
+            commit.
+            """
             async with real_cursor(pool) as cur:
                 yield cur
                 owner["pid"] = cur.connection.info.backend_pid
@@ -362,6 +374,7 @@ class TestIdentityRowSerialization:
 
     @pytest.fixture(autouse=True)
     async def _trust_test_issuer(self, monkeypatch, clean_db, db_pool):
+        """Reconcile the test issuer policy after the destructive fixture reset."""
         del clean_db  # explicit ordering: reconcile only after the autouse truncate
         await _apply_trusted_issuer_policy(monkeypatch, db_pool)
 
@@ -382,6 +395,10 @@ class TestIdentityRowSerialization:
             shibboleth_issuer=ISSUER,
             shibboleth_subject_id=SUBJECT,
             federated_status="pending",
+            federated_review_revision=1,
+            federated_review=Jsonb(
+                {"issuer": ISSUER, "affiliation": None, "entitlement": None, "proposal": None}
+            ),
             is_active=False,
             access_tier="public",
         )
@@ -397,6 +414,9 @@ class TestIdentityRowSerialization:
 
         @asynccontextmanager
         async def pause_before_commit(pool):
+            """Yield the real cursor, record its backend PID and hold the transaction before
+            commit.
+            """
             async with real_cursor(pool) as cur:
                 yield cur
                 owner["pid"] = cur.connection.info.backend_pid
@@ -406,11 +426,13 @@ class TestIdentityRowSerialization:
         monkeypatch.setattr(module, "get_db_cursor", pause_before_commit)
 
         async def approve():
+            """Approve the test identity against its expected issuer, subject and review revision."""
             return await users.approve_federated_user(
                 db_pool,
                 pending.id,
                 expected_issuer=ISSUER,
                 expected_subject_id=SUBJECT,
+                expected_review_revision=1,
                 access_tier="vetted",
                 actor_id=admin_actor.id,
                 actor_session_id=admin_actor.session_id,
@@ -450,7 +472,7 @@ class TestIdentityRowSerialization:
 
         login_result = values[0] if login_first else values[1]
         approved = values[1] if login_first else values[0]
-        assert approved.federated_status == "approved"
+        assert approved.user.federated_status == "approved"
         assert sync_conn.execute(
             """SELECT federated_status, is_active, access_tier, auth_revision
                  FROM users WHERE id = %s""",
@@ -486,6 +508,7 @@ class TestIdentityRowSerialization:
         monkeypatch,
         login_first,
     ):
+        """Verify deactivation and login serialize on same identity row."""
         user = user_factory(
             email="person@example.org",
             auth_method="shibboleth",
@@ -502,6 +525,9 @@ class TestIdentityRowSerialization:
 
         @asynccontextmanager
         async def pause_before_commit(pool):
+            """Yield the real cursor, record its backend PID and hold the transaction before
+            commit.
+            """
             async with real_cursor(pool) as cur:
                 yield cur
                 owner["pid"] = cur.connection.info.backend_pid
@@ -511,6 +537,7 @@ class TestIdentityRowSerialization:
         monkeypatch.setattr(module, "get_db_cursor", pause_before_commit)
 
         async def deactivate():
+            """Deactivate the test identity using the administrator actor's session."""
             return await users.set_user_active(
                 db_pool,
                 user.id,
@@ -567,6 +594,7 @@ class TestFederatedSessionPolicyReconciliation:
         sync_conn,
         monkeypatch,
     ):
+        """Verify first reconciliation revokes only federated sessions."""
         _enable_test_federation(monkeypatch)
         local = user_factory(email="local@example.org")
         federated = user_factory(
@@ -599,6 +627,7 @@ class TestFederatedSessionPolicyReconciliation:
         session_factory,
         monkeypatch,
     ):
+        """Verify callback secret rotation revokes federated but not local sessions."""
         _enable_test_federation(monkeypatch)
         assert await policy.reconcile_federated_session_policy(db_pool) == 0
 
@@ -625,6 +654,7 @@ class TestFederatedSessionPolicyReconciliation:
         sync_conn,
         monkeypatch,
     ):
+        """Verify live sink deletes session after flag or exact issuer is withdrawn."""
         _enable_test_federation(monkeypatch)
         user = user_factory(
             auth_method="shibboleth",
@@ -647,3 +677,78 @@ class TestFederatedSessionPolicyReconciliation:
         assert sync_conn.execute(
             "SELECT count(*) FROM sessions WHERE user_id = %s", (user.id,)
         ).fetchone() == (0,)
+
+
+async def test_changed_assertion_committing_first_rejects_waiting_stale_review_approval(
+    db_pool, admin_actor, sync_conn, monkeypatch
+):
+    """An approval waiting on a changed assertion rechecks its reviewed revision."""
+    await _apply_trusted_issuer_policy(monkeypatch, db_pool)
+    pending = await _login(db_pool, "changed-review-race@example.org")
+    assert pending.user is not None
+    real_cursor = auth.get_db_cursor
+    held = asyncio.Event()
+    release = asyncio.Event()
+    owner = {}
+
+    @asynccontextmanager
+    async def pause_before_commit(pool):
+        """Yield the real cursor, record its backend PID and hold the transaction before commit."""
+        async with real_cursor(pool) as cur:
+            yield cur
+            owner["pid"] = cur.connection.info.backend_pid
+            held.set()
+            await release.wait()
+
+    monkeypatch.setattr(auth, "get_db_cursor", pause_before_commit)
+    changed = auth.FederatedPrincipal(
+        issuer=ISSUER,
+        subject_id=SUBJECT,
+        email="changed-review-race@example.org",
+        authn_context=REQUIRED_SHIBBOLETH_AUTHN_CONTEXT,
+        display_name="Fresh profile",
+        affiliation="new accepted group",
+    )
+    login_task = asyncio.create_task(
+        auth.finalize_shibboleth_login(db_pool, principal=changed, ip_address="127.0.0.1")
+    )
+    approval_task = None
+    try:
+        await asyncio.wait_for(held.wait(), timeout=10)
+        approval_task = asyncio.create_task(
+            users.approve_federated_user(
+                db_pool,
+                pending.user.id,
+                expected_issuer=ISSUER,
+                expected_subject_id=SUBJECT,
+                expected_review_revision=1,
+                access_tier="vetted",
+                actor_id=admin_actor.id,
+                actor_session_id=admin_actor.session_id,
+            )
+        )
+        await _wait_for_blocker(owner["pid"])
+        release.set()
+        result = await asyncio.wait_for(login_task, timeout=10)
+        assert isinstance(result, auth.FederatedLoginFailure)
+        with pytest.raises(users.AdminActionRejected, match="review changed"):
+            await asyncio.wait_for(approval_task, timeout=10)
+    finally:
+        release.set()
+        for task in (login_task, approval_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (login_task, approval_task) if task is not None),
+            return_exceptions=True,
+        )
+
+    assert sync_conn.execute(
+        """SELECT federated_status, is_active, access_tier,
+                  federated_review_revision, federated_approved_proposal
+             FROM users WHERE id = %s""",
+        (pending.user.id,),
+    ).fetchone() == ("pending", False, "public", 2, None)
+    assert sync_conn.execute(
+        "SELECT count(*) FROM sessions WHERE user_id = %s", (pending.user.id,)
+    ).fetchone() == (0,)

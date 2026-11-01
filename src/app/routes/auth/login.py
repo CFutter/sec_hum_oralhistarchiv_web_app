@@ -11,13 +11,14 @@ from psycopg_pool import AsyncConnectionPool
 from app.request_utils import get_client_ip
 from config import settings
 
-from ...credentials import LOCAL_EMAIL_MAX_CHARS, LOCAL_PASSWORD_MAX_CHARS
+from ...credentials import LOCAL_EMAIL_MAX_CHARS, LOCAL_PASSWORD_MAX_CHARS, TOTP_CODE_RAW_MAX_CHARS
 from ...federation_contract import (
     AFFILIATION_MAX_LENGTH,
     AUTHN_CONTEXT_MAX_LENGTH,
     COUNTRY_MAX_LENGTH,
     DISPLAY_NAME_MAX_LENGTH,
     EMAIL_MAX_LENGTH,
+    ENTITLEMENT_MAX_LENGTH,
     ISSUER_MAX_LENGTH,
     SUBJECT_MAX_LENGTH,
 )
@@ -35,6 +36,7 @@ from ...services import (
     SHIBBOLETH_AUTHN_CONTEXT_HEADER,
     SHIBBOLETH_COUNTRY_HEADER,
     SHIBBOLETH_DISPLAY_NAME_HEADER,
+    SHIBBOLETH_ENTITLEMENT_HEADER,
     SHIBBOLETH_INTERNAL_AUTH_HEADER,
     SHIBBOLETH_ISSUER_HEADER,
     SHIBBOLETH_MAIL_HEADER,
@@ -81,6 +83,7 @@ _FEDERATED_REQUIRED_HEADER_LIMITS = {
 _FEDERATED_OPTIONAL_HEADER_LIMITS = {
     SHIBBOLETH_DISPLAY_NAME_HEADER: DISPLAY_NAME_MAX_LENGTH,
     SHIBBOLETH_AFFILIATION_HEADER: AFFILIATION_MAX_LENGTH,
+    SHIBBOLETH_ENTITLEMENT_HEADER: ENTITLEMENT_MAX_LENGTH,
     SHIBBOLETH_COUNTRY_HEADER: COUNTRY_MAX_LENGTH,
 }
 
@@ -162,9 +165,7 @@ def _read_federated_principal(request: Request) -> FederatedPrincipal:
     email = required[SHIBBOLETH_MAIL_HEADER]
     authn_context = required[SHIBBOLETH_AUTHN_CONTEXT_HEADER]
     if issuer is None or subject_id is None or email is None or authn_context is None:
-        # ``required=True`` currently makes this unreachable. Keep a runtime
-        # guard (rather than an assert removed by ``python -O``) so a future
-        # header-reader refactor still fails closed.
+        # Keep this guard active under python -O if the required-header contract changes.
         raise _FederatedHeaderRejected("required-assertion-header:missing")
 
     return build_federated_principal(
@@ -175,6 +176,7 @@ def _read_federated_principal(request: Request) -> FederatedPrincipal:
         display_name=optional[SHIBBOLETH_DISPLAY_NAME_HEADER],
         affiliation=optional[SHIBBOLETH_AFFILIATION_HEADER],
         country=optional[SHIBBOLETH_COUNTRY_HEADER],
+        entitlement=optional[SHIBBOLETH_ENTITLEMENT_HEADER],
     )
 
 
@@ -222,6 +224,7 @@ def _login_error(request: Request, email: str, error: str) -> Response:
         {
             "error": error,
             "email": email,
+            "notice": None,
         },
         status_code=401,
     )
@@ -238,8 +241,9 @@ async def _record_failure_and_queue_notice(
 ) -> tuple[int | None, bool]:
     """Commit a revision-guarded failure/notice; return (count, entered_lockout).
 
-    Integrity reasons select repair guidance; other reasons select lockout mail.
-    The boolean reports the transition, not whether enqueueing claimed a notice.
+    A None count means the account/revision is no longer eligible. The boolean
+    reports entering lockout, not notice enqueue success. Integrity reasons
+    select repair guidance; other reasons select lockout mail.
     """
     async with get_db_cursor(pool) as cur:
         count, entered_lockout = await record_login_failure_cur(
@@ -273,27 +277,41 @@ _LOGIN_ERROR_MESSAGES: dict[str, str] = {
         "Your institution did not provide a valid email address. "
         "Please contact your institution's support team."
     ),
-    "totp_setup_completed": ("Authenticator setup is complete. Please sign in again."),
+    "session_expired": "Your session has expired. Please sign in again.",
+}
+
+_LOGIN_NOTICE_MESSAGES: dict[str, str] = {
+    "password_changed": (
+        "Your password was changed. Wait for a fresh authenticator code, then sign in again."
+    ),
+    "account_deleted": "Your account was permanently deleted.",
+    "totp_setup_completed": (
+        "Authenticator setup is complete. Wait for a fresh code, then sign in again."
+    ),
     "totp_recovery_completed": (
         "Your replacement authenticator is configured. Please sign in again."
     ),
-    "admin_promotion_completed": ("Administrator setup is complete. Please sign in again."),
-    "session_expired": "Your session has expired. Please sign in again.",
+    "admin_promotion_completed": "Administrator setup is complete. Please sign in again.",
+    "email_changed": "Your email was changed. Please log in with your new address.",
+    "totp_changed": ("Your authenticator was changed. Wait for its next code, then sign in again."),
+    "registration_complete": (
+        "Your account is ready. Sign in to set up your authenticator and recovery codes."
+    ),
 }
 
 
 @public_router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request) -> Response:
-    """Render an uncached login form with allowlisted error text, or 303-redirect users home."""
+    """Render fixed login feedback without caching; authenticated users go home."""
     if request.state.user:
         return RedirectResponse(url="/", status_code=303)
 
+    error = _LOGIN_ERROR_MESSAGES.get(request.query_params.get("error", ""))
+    notice = None if error else _LOGIN_NOTICE_MESSAGES.get(request.query_params.get("notice", ""))
     response = templates.TemplateResponse(
         request,
         "login.html",
-        {
-            "error": _LOGIN_ERROR_MESSAGES.get(request.query_params.get("error", "")),
-        },
+        {"error": error, "notice": notice},
     )
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -305,7 +323,7 @@ async def login_submit(
     request: Request,
     email: str = Form(..., max_length=LOCAL_EMAIL_MAX_CHARS),
     password: str = Form(..., max_length=LOCAL_PASSWORD_MAX_CHARS),
-    totp_code: str = Form(default="", max_length=16),
+    totp_code: str = Form(default="", max_length=TOTP_CODE_RAW_MAX_CHARS),
 ) -> Response:
     """Verify local credentials and issue a fresh signed-session cookie after commit.
 
@@ -493,14 +511,15 @@ async def login_submit(
 
 @capability_router.get("/auth/shibboleth/callback")
 async def shibboleth_callback(request: Request) -> Response:
-    """Validate trusted SP headers and complete institutional login.
+    """Validate trusted SP assertions and create a full institutional session.
 
-    Require enabled federation, a Unix-socket peer, callback secret, canonical
-    attributes, trusted issuer, and fixed MFA context. Reject pre-service checks
-    with 303 login redirects; service rejection renders generic 401. Success
-    commits/audits a full session, best-effort revokes the old token, sets signed
-    cookies, and redirects to safe next. Deploy nginx header replacement and
-    socket permissions; forwarded headers must not define request.client.
+    Require enabled federation, absent request.client (deployed Unix socket),
+    callback secret, canonical attributes, trusted issuer and fixed MFA context.
+    Pre-service refusals redirect 303 to login; service refusal renders generic
+    401. Success commits/audits, best-effort deletes the old session, sets the
+    signed cookie and redirects 303 to safe next. Duplicate security cookies
+    raise HTTPException(400). Deploy trusted nginx header replacement/socket
+    permissions; forwarded headers must not define request.client.
     """
     old_session = get_session_id_from_cookie(request)
     if not settings.shibboleth_enabled:

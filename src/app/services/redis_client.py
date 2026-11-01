@@ -9,8 +9,10 @@ import threading
 import time
 
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
-from config import settings
+from config import redis_connection_policy_issues, redis_url_policy_issues, settings
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,29 @@ _client: redis.Redis | None = None
 _client_lock = threading.Lock()
 _last_failure_time: float | None = None
 _FAILURE_COOLDOWN_SECONDS = 30.0
+
+
+def _create_client() -> redis.Redis:
+    """Construct and inspect the client before making any network request."""
+    url = settings.redis_url.get_secret_value()
+    if redis_url_policy_issues(url, hardened=settings.is_hardened):
+        raise ValueError("Redis URL violates the connection policy")
+    client = redis.Redis.from_url(
+        url,
+        decode_responses=True,
+        socket_timeout=2.0,
+        socket_connect_timeout=2.0,
+        retry=Retry(NoBackoff(), 0),
+        retry_on_timeout=False,
+    )
+    pool = client.connection_pool
+    if redis_connection_policy_issues(
+        {**pool.connection_kwargs, "connection_class": pool.connection_class},
+        maximum_timeout=2.0,
+    ):
+        client.close()
+        raise ValueError("Effective Redis connection violates the connection policy")
+    return client
 
 
 def get_redis() -> redis.Redis | None:
@@ -57,18 +82,15 @@ def get_redis() -> redis.Redis | None:
             return None
 
         try:
-            client = redis.Redis.from_url(
-                settings.redis_url.get_secret_value(),
-                decode_responses=True,
-                socket_timeout=2.0,
-                socket_connect_timeout=2.0,
-            )
+            client = _create_client()
             client.ping()
             _client = client
             _last_failure_time = None
             logger.info("Redis client initialized")
             return _client
-        except (redis.RedisError, ValueError) as e:
-            logger.error("Redis connection failed: %s", e)  # noqa: TRY400
+        except (redis.RedisError, ValueError):
+            logger.error(  # noqa: TRY400 - dependency exception text may contain credentials
+                "Redis connection failed; cache invalidation is temporarily unavailable"
+            )
             _last_failure_time = time.monotonic()
             return None

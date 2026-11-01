@@ -1,19 +1,4 @@
-"""Token signing/validation and salt domain separation across action-email flows.
-
-Pins the itsdangerous token layer shared by three flows:
-
-- app.services.tokens.hash_token          — SHA-256 storage hashing
-- app.services.email_verification         — salt "email-verification", 24h max age
-- app.services.password_reset             — salt "password-reset", 30min max age
-- app.services.email_change               — salt "email-change", 1h max age
-
-and the delivery-lifetime policy each action email is enqueued under
-(app.services.email_outbox, app.services.email).
-
-All tests are pure unit tests: no DB, no client, no Argon2. Expiry is tested
-by patching itsdangerous.timed.TimestampSigner.get_timestamp during GENERATION
-only (the token is signed "in the past"), then validating normally.
-"""
+"""Token signing/validation and salt domain separation across action-email flows."""
 
 import hashlib
 import logging
@@ -39,7 +24,7 @@ from app.services import (
 from app.services.tokens import ActionEmailMetadata, hash_token
 from config import settings
 
-EMAIL = "alice@uzh.ch"
+EMAIL = "alice@example.org"
 USER_ID = 42
 AUTH_REVISION = 6
 
@@ -47,13 +32,8 @@ _NOW = datetime(2030, 1, 1, tzinfo=UTC)
 
 
 def _tamper(token: str) -> str:
-    """Flip a character in the PAYLOAD segment deterministically.
-
-    Deliberately not the token's final character: base64's last char carries
-    unused trailing bits, so two different final chars can decode to the same
-    signature bytes and the tampered token would still verify (a real flake
-    observed in full-suite runs). Changing a payload character always
-    invalidates the HMAC computed over the payload.
+    """Alter a payload character; changing the final base64 character can preserve its decoded
+    signature.
     """
     payload, sep, rest = token.partition(".")
     ch = payload[0]
@@ -61,22 +41,13 @@ def _tamper(token: str) -> str:
     return replacement + payload[1:] + sep + rest
 
 
-# ---------------------------------------------------------------------------
-# Minting and hashing
-# ---------------------------------------------------------------------------
-
-
 class TestHashToken:
-    def test_hash_token_is_sha256_hexdigest(self):
-        """hash_token must be exactly sha256(token).hexdigest().
+    """Cover hash token."""
 
-        Pins the storage-hash algorithm: the DB stores this digest for
-        single-use enforcement, so silently changing the algorithm would
-        invalidate every outstanding verification/reset/email-change link.
-        """
+    def test_hash_token_is_sha256_hexdigest(self):
+        """Hash_token must be exactly sha256(token).hexdigest()."""
         token = "some-raw-token-value"
         assert hash_token(token) == hashlib.sha256(token.encode()).hexdigest()
-        # 64 lowercase hex chars — the shape the DB columns expect.
         digest = hash_token("x")
         assert len(digest) == 64
         assert digest == digest.lower()
@@ -86,39 +57,42 @@ class TestEmailChangeTokenPayload:
     """Roundtrip and validation contracts specific to the email-change token."""
 
     def test_email_change_token_self_service_binds_auth_revision(self):
+        """Check email change token self service binds auth revision."""
         token = email_change.generate_email_change_token(
             USER_ID,
-            "new@uzh.ch",
+            "new@example.org",
             auth_revision=AUTH_REVISION,
         )
         data = email_change.validate_email_change_token(token)
         assert data == {
             "user_id": USER_ID,
-            "new_email": "new@uzh.ch",
+            "new_email": "new@example.org",
             "auth_revision": AUTH_REVISION,
         }
         assert "acting_admin_id" not in data
 
     def test_email_change_token_carries_admin_and_auth_revision(self):
+        """Check email change token carries admin and auth revision."""
         token = email_change.generate_email_change_token(
             USER_ID,
-            "new@uzh.ch",
+            "new@example.org",
             auth_revision=AUTH_REVISION,
             acting_admin_id=99,
         )
         assert email_change.validate_email_change_token(token) == {
             "user_id": USER_ID,
-            "new_email": "new@uzh.ch",
+            "new_email": "new@example.org",
             "auth_revision": AUTH_REVISION,
             "acting_admin_id": 99,
         }
 
     def test_email_change_token_without_revision_fails_closed(self):
-        signer = email_change.URLSafeTimedSerializer(settings.secret_key.get_secret_value())
+        """Check email change token without revision fails closed."""
+        signer = URLSafeTimedSerializer(settings.secret_key.get_secret_value())
         legacy = signer.dumps(
             {
                 "user_id": USER_ID,
-                "new_email": "new@uzh.ch",
+                "new_email": "new@example.org",
                 "nonce": "legacy-token-without-revision",
             },
             salt=email_change._SALT,
@@ -131,11 +105,12 @@ class TestEmailChangeTokenPayload:
         ids=["boolean-true", "negative-integer", "numeric-string", "null"],
     )
     def test_email_change_token_rejects_invalid_revision_payload(self, bad_revision):
-        signer = email_change.URLSafeTimedSerializer(settings.secret_key.get_secret_value())
+        """Check email change token rejects invalid revision payload."""
+        signer = URLSafeTimedSerializer(settings.secret_key.get_secret_value())
         token = signer.dumps(
             {
                 "user_id": USER_ID,
-                "new_email": "new@uzh.ch",
+                "new_email": "new@example.org",
                 "auth_revision": bad_revision,
                 "nonce": "malformed-revision",
             },
@@ -144,28 +119,32 @@ class TestEmailChangeTokenPayload:
         assert email_change.validate_email_change_token(token) is None
 
     def test_email_change_token_validates_as_neither_verification_nor_reset(self):
+        """Check email change token validates as neither verification nor reset."""
         token = email_change.generate_email_change_token(
             USER_ID,
-            "new@uzh.ch",
+            "new@example.org",
             auth_revision=AUTH_REVISION,
         )
         assert email_verification.validate_verification_token(token) is None
         assert password_reset.validate_reset_token(token) is None
 
     def test_email_change_token_expires_after_max_age(self):
+        """Check email change token expires after max age."""
         assert email_change.EMAIL_CHANGE_TOKEN_MAX_AGE_SECONDS == 3600
         # Mint the token two hours in the past (twice the max age), then
         # return to the real clock for validation.
         with time_machine.travel(datetime.now(UTC) - timedelta(seconds=7200)):
             token = email_change.generate_email_change_token(
                 USER_ID,
-                "new@uzh.ch",
+                "new@example.org",
                 auth_revision=AUTH_REVISION,
             )
         assert email_change.validate_email_change_token(token) is None
 
 
 class TestTamperedTokensAreRejected:
+    """Cover tampered tokens are rejected."""
+
     @pytest.mark.parametrize(
         ("generate", "validate", "logger_name"),
         [
@@ -187,7 +166,7 @@ class TestTamperedTokensAreRejected:
             pytest.param(
                 lambda: email_change.generate_email_change_token(
                     USER_ID,
-                    "new@uzh.ch",
+                    "new@example.org",
                     auth_revision=AUTH_REVISION,
                 ),
                 email_change.validate_email_change_token,
@@ -203,6 +182,7 @@ class TestTamperedTokensAreRejected:
         logger_name,
         caplog,
     ):
+        """Check tampered token returns none and logs warning."""
         token = generate()
         tampered = _tamper(token)
         assert tampered != token
@@ -216,16 +196,12 @@ class TestTamperedTokensAreRejected:
         assert warnings, "expected a WARNING log for the tampered token"
 
 
-# ---------------------------------------------------------------------------
-# Nonce uniqueness
-# ---------------------------------------------------------------------------
-
-
 class TestNonceUniqueness:
     """Every issuance is distinct even when the signer clock has not ticked."""
 
     @pytest.fixture
     def frozen_signer(self, monkeypatch):
+        """Freeze UTC time and the signer timestamp to the same second for nonce tests."""
         frozen_at = datetime(2031, 6, 1, tzinfo=UTC)
         instant = int(frozen_at.timestamp())
         with time_machine.travel(frozen_at, tick=False):
@@ -272,6 +248,7 @@ class TestNonceUniqueness:
         kwargs,
         frozen_signer,
     ):
+        """Check same second tokens are distinct and keep payload and expiry."""
         first = getattr(module, generate)(7, "person@example.org", **kwargs)
         second = getattr(module, generate)(7, "person@example.org", **kwargs)
         assert first != second
@@ -301,6 +278,7 @@ class TestNonceUniqueness:
 
     @pytest.mark.usefixtures("frozen_signer")
     def test_admin_identity_is_preserved_alongside_revision_and_nonce(self):
+        """Check admin identity is preserved alongside revision and nonce."""
         kwargs = {"auth_revision": 4, "acting_admin_id": 99}
         first = email_change.generate_email_change_token(7, "new@example.org", **kwargs)
         second = email_change.generate_email_change_token(7, "new@example.org", **kwargs)
@@ -312,12 +290,9 @@ class TestNonceUniqueness:
         }
 
 
-# ---------------------------------------------------------------------------
-# Action-email lifetimes and delivery policy
-# ---------------------------------------------------------------------------
-
-
 class TestActionEmailMetadataDeadlines:
+    """Cover action email metadata deadlines."""
+
     @pytest.mark.parametrize(
         ("generate", "metadata", "lifetime"),
         [
@@ -350,6 +325,7 @@ class TestActionEmailMetadataDeadlines:
         metadata,
         lifetime,
     ):
+        """Check metadata keeps original signed deadline."""
         signed_at = int(_NOW.timestamp())
         monkeypatch.setattr(
             TimestampSigner,
@@ -383,6 +359,8 @@ class TestActionEmailMetadataDeadlines:
 
 
 class TestActionEmailRendering:
+    """Cover action email rendering."""
+
     @pytest.mark.parametrize(
         "builder",
         [
@@ -392,6 +370,7 @@ class TestActionEmailRendering:
         ],
     )
     def test_action_builders_render_absolute_utc_expiry(self, builder):
+        """Check action builders render absolute UTC expiry (ValueError)."""
         expiry = datetime(
             2030,
             1,
@@ -406,6 +385,7 @@ class TestActionEmailRendering:
             "person@example.test",
             link,
             expires_at=expiry,
+            security_code="expiry-rendering-code.canary",
         )
 
         assert "expires at 2030-01-01 12:00:00 UTC" in message.body
@@ -417,10 +397,13 @@ class TestActionEmailRendering:
                 "person@example.test",
                 link,
                 expires_at=expiry.replace(tzinfo=None),
+                security_code="expiry-rendering-code.canary",
             )
 
 
 class TestDeliveryLifetimeGuards:
+    """Cover delivery lifetime guards."""
+
     @pytest.mark.parametrize(
         ("seconds", "required", "expected"),
         [
@@ -440,6 +423,7 @@ class TestDeliveryLifetimeGuards:
         expected,
         limiting_deadline,
     ):
+        """Check earlier deadline controls send and retry."""
         row = {
             "message_type": "password_reset",
             "action_token_hash": "hash",
@@ -470,13 +454,7 @@ class TestDeliveryLifetimeGuards:
 
 
 class TestEnqueuePolicyValidation:
-    """Every rejection here has its acceptance path covered elsewhere.
-
-    ``TestActionEmailMetadataDeadlines`` and ``TestDeliveryLifetimeGuards``
-    exercise the accepted shapes (a real ``ActionEmailMetadata`` paired with
-    the matching message type); this class proves the mismatched and missing
-    shapes are rejected before any SQL runs.
-    """
+    """Reject missing or mismatched action-email metadata before issuing SQL."""
 
     @pytest.mark.parametrize(
         ("kind", "user_id", "action"),
@@ -531,6 +509,7 @@ class TestEnqueuePolicyValidation:
         user_id,
         action,
     ):
+        """Check invalid enqueue policy never reaches SQL (ValueError)."""
         cur = AsyncMock()
 
         with pytest.raises(ValueError):
@@ -547,6 +526,7 @@ class TestEnqueuePolicyValidation:
         cur.execute.assert_not_awaited()
 
     async def test_omitted_policy_is_an_error(self):
+        """Check omitted policy is an error (TypeError)."""
         cur = AsyncMock()
 
         with pytest.raises(TypeError, match="action"):

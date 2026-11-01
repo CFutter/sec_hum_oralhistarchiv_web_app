@@ -4,8 +4,22 @@
 # (anything except unset/empty, 0, false, or no, case-insensitive).
 # This list covers only the entries below; other local service/binary skips fail.
 
-# Preserve an existing developer database instead of recreating it for the probe.
+# Preserve an existing deployment database or roles instead of altering them.
 src/tests/integration/test_deployed_preflight_db.py::test_runtime_preflight_with_actual_deployed_role_login_defaults - Existing oralhistarchiv database must not be altered by a deployment probe
+src/tests/integration/test_deployed_preflight_db.py::test_runtime_preflight_with_actual_deployed_role_login_defaults - Existing deployment roles must not be altered by a deployment probe
 
-# Permit the syntax probe to skip without local nginx; REQUIRE_NGINX=1 fails instead.
+# Permit these probes to skip without local nginx; REQUIRE_NGINX=1 fails instead.
 src/tests/unit/test_nginx_contract.py::test_ordinary_proxy_include_parses_with_nginx - nginx is not installed in this development environment
+src/tests/unit/test_nginx_contract.py::test_static_hsts_survives_success_revalidation_and_missing_assets - nginx is not installed in this development environment
+src/tests/unit/test_nginx_contract.py::test_throttled_capability_token_stays_out_of_access_log - nginx is not installed in this development environment
+src/tests/unit/test_nginx_contract.py::test_throttled_capability_token_stays_out_of_error_log - nginx is not installed in this development environment
+
+src/tests/unit/test_nginx_federation_admission.py::test_rate_rejections_precede_both_sp_backends_and_preserve_small_nat_bursts - nginx is not installed in this development environment
+src/tests/unit/test_nginx_federation_admission.py::test_aggregate_budget_is_shared_across_locations_and_rotating_addresses - nginx is not installed in this development environment
+src/tests/unit/test_nginx_federation_admission.py::test_concurrency_rejections_precede_sp_work_and_capacity_recovers - nginx is not installed in this development environment
+src/tests/unit/test_nginx_federation_admission.py::test_oversized_responder_body_never_reaches_fastcgi - nginx is not installed in this development environment
+
+src/tests/unit/test_nginx_federation_admission.py::test_stalled_fastcgi_fails_closed_and_capacity_recovers - nginx is not installed in this development environment
+
+# Permit a missing local verifier; REQUIRE_SYSTEMD=1 fails instead.
+src/tests/unit/test_deployment_units.py::TestProductionModeStartGuard::test_the_units_pass_systemd_syntax_verification - systemd-analyze is not installed in this development environment

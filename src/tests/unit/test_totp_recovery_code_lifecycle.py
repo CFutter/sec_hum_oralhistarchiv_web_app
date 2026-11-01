@@ -1,12 +1,5 @@
-"""Unit tests for app.services.totp_recovery_codes: the staging, activation,
-nonlocking lookup, and reservation-gated consumption of durable one-time
-TOTP recovery codes.
-
-Each cursor-taking helper here is exercised directly against a scripted mock
-cursor (no DB) — this is the module TOTP callers rely on to keep an unknown
-or already-used code from spending real Argon2 work or a real database
-write. Every test proving a code/state is rejected has a positive control
-in the same class proving the matching valid code/state still succeeds.
+"""Unit tests for app.services.totp_recovery_codes: the staging, activation, nonlocking lookup, and
+reservation-gated consumption of durable one-time TOTP recovery codes.
 """
 
 from unittest.mock import AsyncMock
@@ -34,38 +27,38 @@ POSITION = 7
 CODE_HASH = hash_token("AAAAAAAAAAAAAAAAAAAA")
 
 
-def _candidate(**overrides) -> MatchedRecoveryCodeCandidate:
-    fields = {
-        "user_id": USER_ID,
-        "generation": GENERATION,
-        "position": POSITION,
-        "code_hash": CODE_HASH,
-    }
-    fields.update(overrides)
-    return MatchedRecoveryCodeCandidate(**fields)
+def _candidate() -> MatchedRecoveryCodeCandidate:
+    """Build the matched recovery-code candidate with the fixed identity and digest."""
+    return MatchedRecoveryCodeCandidate(
+        user_id=USER_ID,
+        generation=GENERATION,
+        position=POSITION,
+        code_hash=CODE_HASH,
+    )
 
 
-def _reservation(**overrides) -> ReservedRecoveryCodePasswordAttempt:
-    fields = {
-        "user_id": USER_ID,
-        "generation": GENERATION,
-        "position": POSITION,
-        "code_hash": CODE_HASH,
-    }
-    fields.update(overrides)
-    return ReservedRecoveryCodePasswordAttempt(**fields)
+def _reservation() -> ReservedRecoveryCodePasswordAttempt:
+    """Build the reserved recovery-code attempt with the fixed identity and digest."""
+    return ReservedRecoveryCodePasswordAttempt(
+        user_id=USER_ID,
+        generation=GENERATION,
+        position=POSITION,
+        code_hash=CODE_HASH,
+    )
 
 
 class TestStageRecoveryCodeSet:
     """stage_recovery_code_set_cur: the write path that displays a new pending set."""
 
     async def test_wrong_cardinality_is_rejected_before_touching_the_database(self):
+        """Check wrong cardinality is rejected before touching the database (ValueError)."""
         cur = make_async_cursor()
         with pytest.raises(ValueError, match="wrong cardinality"):
             await stage_recovery_code_set_cur(cur, user_id=USER_ID, codes=("ONLY-ONE-CODE",))
         cur.execute.assert_not_awaited()
 
     async def test_duplicate_raw_codes_are_rejected_as_the_wrong_cardinality(self):
+        """Check duplicate raw codes are rejected as the wrong cardinality (ValueError)."""
         codes = (*generate_recovery_codes()[:9], generate_recovery_codes()[0])
         # Force an exact raw-string duplicate (independent of hashing).
         codes = (codes[0], codes[0], *codes[2:])
@@ -74,10 +67,7 @@ class TestStageRecoveryCodeSet:
             await stage_recovery_code_set_cur(cur, user_id=USER_ID, codes=codes)
 
     async def test_a_malformed_generated_code_raises_before_any_write(self):
-        """Defends _code_hash's own invariant: every code this function hashes must
-        already be a normalizable canonical value; a caller-supplied garbage code
-        is a programming error, not a silent rejection.
-        """
+        """Check a malformed generated code raises before any write (ValueError)."""
         codes = (*generate_recovery_codes()[:9], "not-a-valid-recovery-code")
         cur = make_async_cursor()
         with pytest.raises(ValueError, match="Generated recovery code is invalid"):
@@ -96,12 +86,13 @@ class TestStageRecoveryCodeSet:
             await stage_recovery_code_set_cur(cur, user_id=USER_ID, codes=codes)
 
     async def test_unknown_user_id_is_rejected(self):
+        """Check unknown user ID is rejected (ValueError)."""
         cur = make_async_cursor(fetchone=None)
         with pytest.raises(ValueError, match=f"User {USER_ID} not found"):
             await stage_recovery_code_set_cur(cur, user_id=USER_ID, codes=generate_recovery_codes())
 
     async def test_valid_code_set_is_staged_as_the_next_generation(self):
-        """Positive control for every rejection above."""
+        """Check valid code set is staged as the next generation."""
         cur = make_async_cursor(fetchone={"totp_recovery_code_generation": 6})
         cur.executemany = AsyncMock()
         codes = generate_recovery_codes()
@@ -125,6 +116,7 @@ class TestActivatePendingRecoveryCodeSet:
     promotes a pending set to active."""
 
     async def test_malformed_confirmation_code_is_rejected_without_touching_the_database(self):
+        """Check malformed confirmation code is rejected without touching the database."""
         cur = make_async_cursor()
         confirmed = await activate_pending_recovery_code_set_cur(
             cur, user_id=USER_ID, candidate_code="not-a-recovery-code"
@@ -138,6 +130,7 @@ class TestActivatePendingRecoveryCodeSet:
         ids=["no_such_user", "no_pending_generation_staged"],
     )
     async def test_missing_pending_generation_is_rejected(self, row):
+        """Check missing pending generation is rejected."""
         cur = make_async_cursor(fetchone=row)
         confirmed = await activate_pending_recovery_code_set_cur(
             cur, user_id=USER_ID, candidate_code="AAAAA-BBBBB-CCCCC-DDDDD"
@@ -146,6 +139,7 @@ class TestActivatePendingRecoveryCodeSet:
         assert cur.execute.await_count == 1
 
     async def test_pending_generation_not_newer_than_active_is_a_runtime_error(self):
+        """Check pending generation not newer than active is a runtime error."""
         cur = make_async_cursor(
             fetchone={
                 "totp_recovery_code_generation": 5,
@@ -158,6 +152,7 @@ class TestActivatePendingRecoveryCodeSet:
             )
 
     async def test_wrong_or_already_used_confirmation_code_is_rejected(self):
+        """Check wrong or already used confirmation code is rejected."""
         cur = make_async_cursor(
             fetchone=[
                 {"totp_recovery_code_generation": 5, "pending_totp_recovery_code_generation": 6},
@@ -172,7 +167,7 @@ class TestActivatePendingRecoveryCodeSet:
         assert not any(statement.startswith("UPDATE") for statement in statements)
 
     async def test_matching_unused_confirmation_code_activates_the_pending_set(self):
-        """Positive control for every rejection above."""
+        """Check matching unused confirmation code activates the pending set."""
         cur = make_async_cursor(
             fetchone=[
                 {"totp_recovery_code_generation": 5, "pending_totp_recovery_code_generation": 6},
@@ -193,6 +188,7 @@ class TestFindActiveRecoveryCodeCandidate:
     """find_active_recovery_code_candidate_cur: the nonlocking public lookup."""
 
     async def test_malformed_code_returns_none_without_touching_the_database(self):
+        """Check malformed code returns none without touching the database."""
         cur = make_async_cursor()
         candidate = await find_active_recovery_code_candidate_cur(
             cur, user_id=USER_ID, active_generation=GENERATION, candidate_code="garbage"
@@ -201,6 +197,7 @@ class TestFindActiveRecoveryCodeCandidate:
         cur.execute.assert_not_awaited()
 
     async def test_non_positive_active_generation_returns_none_without_touching_the_database(self):
+        """Check non positive active generation returns none without touching the database."""
         cur = make_async_cursor()
         candidate = await find_active_recovery_code_candidate_cur(
             cur, user_id=USER_ID, active_generation=0, candidate_code="AAAAA-BBBBB-CCCCC-DDDDD"
@@ -209,6 +206,7 @@ class TestFindActiveRecoveryCodeCandidate:
         cur.execute.assert_not_awaited()
 
     async def test_unmatched_code_returns_none(self):
+        """Check unmatched code returns none."""
         cur = make_async_cursor(fetchone=None)
         candidate = await find_active_recovery_code_candidate_cur(
             cur,
@@ -219,7 +217,7 @@ class TestFindActiveRecoveryCodeCandidate:
         assert candidate is None
 
     async def test_matched_code_returns_the_exact_row_candidate(self):
-        """Positive control above: an unknown code at the same generation returns None."""
+        """Check matched code returns the exact row candidate."""
         cur = make_async_cursor(fetchone={"position": POSITION})
         candidate = await find_active_recovery_code_candidate_cur(
             cur,
@@ -240,24 +238,27 @@ class TestReserveRecoveryCodePasswordAttempt:
     one password-attempt slot for an already-matched candidate."""
 
     async def test_stale_generation_returns_none_without_reserving(self):
+        """Check stale generation returns none without reserving."""
         cur = make_async_cursor(fetchone={"totp_recovery_code_generation": GENERATION + 1})
         reserved = await reserve_recovery_code_password_attempt_cur(cur, candidate=_candidate())
         assert reserved is None
         assert cur.execute.await_count == 1
 
     async def test_missing_user_returns_none_without_reserving(self):
+        """Check missing user returns none without reserving."""
         cur = make_async_cursor(fetchone=None)
         reserved = await reserve_recovery_code_password_attempt_cur(cur, candidate=_candidate())
         assert reserved is None
         assert cur.execute.await_count == 1
 
     async def test_exhausted_or_already_used_row_returns_none(self):
+        """Check exhausted or already used row returns none."""
         cur = make_async_cursor(fetchone=[{"totp_recovery_code_generation": GENERATION}, None])
         reserved = await reserve_recovery_code_password_attempt_cur(cur, candidate=_candidate())
         assert reserved is None
 
     async def test_matching_current_generation_reserves_the_exact_row(self):
-        """Positive control above: a stale generation snapshot reserves nothing."""
+        """Check matching current generation reserves the exact row."""
         cur = make_async_cursor(
             fetchone=[{"totp_recovery_code_generation": GENERATION}, {"position": POSITION}]
         )
@@ -271,13 +272,14 @@ class TestConsumeReservedRecoveryCode:
     """consume_reserved_recovery_code_cur: the final, single-use write."""
 
     async def test_stale_generation_leaves_the_code_unconsumed(self):
+        """Check stale generation leaves the code unconsumed."""
         cur = make_async_cursor(fetchone={"totp_recovery_code_generation": GENERATION + 1})
         consumed = await consume_reserved_recovery_code_cur(cur, reservation=_reservation())
         assert consumed is False
         assert cur.execute.await_count == 1
 
     async def test_matching_reservation_marks_the_row_used(self):
-        """Positive control above: a stale generation snapshot never consumes the row."""
+        """Check matching reservation marks the row used."""
         cur = make_async_cursor(
             fetchone=[{"totp_recovery_code_generation": GENERATION}, {"position": POSITION}]
         )
@@ -291,6 +293,7 @@ class TestHasUnusedActiveRecoveryCode:
     """has_unused_active_recovery_code_cur: the account-level "any codes left?" check."""
 
     async def test_non_positive_generation_returns_false_without_touching_the_database(self):
+        """Check non positive generation returns false without touching the database."""
         cur = make_async_cursor()
         assert (
             await has_unused_active_recovery_code_cur(cur, user_id=USER_ID, active_generation=0)
@@ -299,6 +302,7 @@ class TestHasUnusedActiveRecoveryCode:
         cur.execute.assert_not_awaited()
 
     async def test_exhausted_generation_returns_false(self):
+        """Check exhausted generation returns false."""
         cur = make_async_cursor(fetchone=None)
         assert (
             await has_unused_active_recovery_code_cur(
@@ -308,7 +312,7 @@ class TestHasUnusedActiveRecoveryCode:
         )
 
     async def test_generation_with_an_unused_code_returns_true(self):
-        """Positive control above: a generation with no unused rows returns False."""
+        """Check generation with an unused code returns true."""
         cur = make_async_cursor(fetchone={"?column?": 1})
         assert (
             await has_unused_active_recovery_code_cur(
@@ -322,6 +326,7 @@ class TestDiscardPendingRecoveryCodeSet:
     """discard_pending_recovery_code_set_cur: clears a displayed-but-unconfirmed set."""
 
     async def test_discard_deletes_the_pending_generation_and_clears_the_pointer(self):
+        """Check discard deletes the pending generation and clears the pointer."""
         cur = make_async_cursor()
         await discard_pending_recovery_code_set_cur(cur, user_id=USER_ID)
         assert cur.execute.await_count == 2

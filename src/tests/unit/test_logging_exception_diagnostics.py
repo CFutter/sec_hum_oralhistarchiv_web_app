@@ -1,26 +1,4 @@
-"""Unit tests for the bounded exception-diagnostic machinery in
-src/config/logging.py: `_safe_exception_tree` (node budget, depth cap,
-cycle detection, cause/context chains, exception-group members, errno and
-sqlstate extraction), `_render_exception_text` (how a diagnostic node
-renders to the text formatter), and the formatter-level failure paths that
-must fail closed instead of leaking a formatting exception or a raw value.
-
-Pins, against src/config/logging.py:
-- the node budget (`_MAX_EXCEPTION_TREE_NODES`) and depth cap
-  (`_MAX_EXCEPTION_TREE_DEPTH`) are enforced across the WHOLE tree (root,
-  causes, contexts, and exception-group members share one counter), so a
-  wide or deep exception cannot make the diagnostic unbounded;
-- a cause/context/member that does not fit the remaining budget is recorded
-  as "omitted" (with a count/reason), never silently dropped or left to
-  raise;
-- `_safe_sqlstate` and the OSError `errno` extraction fail closed to "not
-  present" rather than propagating an unexpected attribute-access error;
-- `RedactingFormatter`/`JSONFormatter` catch a formatting-time fault and
-  return a fixed placeholder instead of ever emitting an unhandled traceback
-  or the un-redacted record that triggered the fault.
-
-No database is touched anywhere in this file.
-"""
+"""Bounded exception trees, diagnostic rendering and safe formatter fallbacks."""
 
 import itertools
 import json
@@ -34,15 +12,18 @@ import config.logging as config_logging
 from config.logging import JSONFormatter, RedactingFormatter
 
 
-def _tree(exc: BaseException, root_traceback=None) -> dict:
+def _tree(exc: BaseException, root_traceback=None) -> config_logging._ExceptionDiagnostic:
+    """Build a safe exception tree with the optional root traceback override."""
     return config_logging._safe_exception_tree(exc, root_traceback=root_traceback)
 
 
 def _raise_runtime_error(message: str) -> None:
+    """Raise RuntimeError carrying the supplied diagnostic canary."""
     raise RuntimeError(message)
 
 
 def _record(msg: str = "event", **extra) -> logging.LogRecord:
+    """Build an ERROR record and attach the supplied extra attributes."""
     record = logging.LogRecord(
         name="app.test",
         level=logging.ERROR,
@@ -72,8 +53,9 @@ class TestSafeTracebackFramesFailsClosed:
         assert node["frames"] == ["<traceback unavailable>"]
 
     def test_a_real_traceback_renders_actual_frame_text(self):
-        """Positive control: an ordinary traceback is NOT replaced by the
-        placeholder — real frame lines make it into the node."""
+        """An ordinary traceback is NOT replaced by the placeholder — real frame lines make it into
+        the node.
+        """
         try:
             _raise_runtime_error("boom")
         except RuntimeError as exc:
@@ -91,14 +73,17 @@ class TestSafeSqlstateFailsClosed:
         accessor reports "no sqlstate" rather than crashing the log call."""
 
         class _BoomOnSqlstateAccess(RuntimeError):
+            """Simulate a driver exception whose sqlstate attribute raises."""
+
             @property
             def sqlstate(self):
+                """Raise ValueError when diagnostics read sqlstate."""
                 raise ValueError("driver internals are not readable here")
 
         assert config_logging._safe_sqlstate(_BoomOnSqlstateAccess("db failed")) is None
 
     def test_a_well_formed_sqlstate_is_returned(self):
-        """Positive control: a valid 5-character alnum SQLSTATE passes through."""
+        """A valid 5-character alnum SQLSTATE passes through."""
         exc = RuntimeError("db failed")
         exc.sqlstate = "42501"
 
@@ -115,6 +100,7 @@ class TestErrnoDiagnosticOnlyForOSError:
     OSError.errno — never inferred for other exception types."""
 
     def test_an_oserror_with_an_integer_errno_is_recorded(self):
+        """An oserror with an integer errno is recorded."""
         exc = OSError(13, "Permission denied")
 
         node = _tree(exc, root_traceback=None)
@@ -122,7 +108,7 @@ class TestErrnoDiagnosticOnlyForOSError:
         assert node["errno"] == 13
 
     def test_a_non_oserror_exception_carries_no_errno_diagnostic(self):
-        """Positive control: the permitted case (no OSError, no errno key)."""
+        """The permitted case (no OSError, no errno key)."""
         node = _tree(RuntimeError("boom"), root_traceback=None)
 
         assert "errno" not in node
@@ -133,6 +119,7 @@ class TestExceptionTreeSqlstate:
     isolation) carries a well-formed SQLSTATE when the exception has one."""
 
     def test_a_valid_sqlstate_attribute_is_recorded_on_the_node(self):
+        """A valid SQLSTATE attribute is recorded on the node."""
         exc = RuntimeError("db failed")
         exc.sqlstate = "42501"
 
@@ -141,7 +128,7 @@ class TestExceptionTreeSqlstate:
         assert node["sqlstate"] == "42501"
 
     def test_an_exception_without_a_sqlstate_carries_no_sqlstate_key(self):
-        """Positive control: the ordinary case adds no key at all."""
+        """The ordinary case adds no key at all."""
         node = _tree(RuntimeError("db failed"), root_traceback=None)
 
         assert "sqlstate" not in node
@@ -152,6 +139,7 @@ class TestExceptionTreeCauseChain:
     nested diagnostic node under the "cause" key."""
 
     def test_an_explicit_cause_is_recorded_as_a_nested_node(self):
+        """An explicit cause is recorded as a nested node."""
         inner = ValueError("root cause")
         outer = RuntimeError("outer failure")
         outer.__cause__ = inner
@@ -162,7 +150,7 @@ class TestExceptionTreeCauseChain:
         assert "cause_omitted" not in node
 
     def test_an_exception_without_a_cause_carries_no_cause_key(self):
-        """Positive control: the ordinary, uncaused exception has neither key."""
+        """The ordinary, uncaused exception has neither key."""
         node = _tree(RuntimeError("outer failure"), root_traceback=None)
 
         assert "cause" not in node
@@ -215,11 +203,10 @@ class TestExceptionTreeCauseChain:
 
 
 class TestExceptionTreeContextChain:
-    """`__context__` (an implicit "during handling of") is preserved unless
-    explicitly suppressed, mirroring `raise ... from ...`/`raise ... from
-    None` semantics."""
+    """Keep unsuppressed implicit exception context in diagnostics."""
 
     def test_an_unsuppressed_context_is_recorded_as_a_nested_node(self):
+        """An unsuppressed context is recorded as a nested node."""
         inner = ValueError("earlier failure")
         outer = RuntimeError("later failure")
         outer.__context__ = inner
@@ -244,6 +231,7 @@ class TestExceptionTreeContextChain:
         assert "context_omitted" not in node
 
     def test_a_context_that_exceeds_the_node_budget_is_marked_omitted(self, monkeypatch):
+        """A context that exceeds the node budget is marked omitted."""
         monkeypatch.setattr(config_logging, "_MAX_EXCEPTION_TREE_NODES", 1)
         inner = ValueError("earlier failure")
         outer = RuntimeError("later failure")
@@ -277,6 +265,7 @@ class TestExceptionTreeGroupMembers:
     subject to the same shared node budget as causes and contexts."""
 
     def test_members_within_budget_are_all_rendered(self):
+        """Members within budget are all rendered."""
         group = ExceptionGroup(
             "problems", [RuntimeError("a"), RuntimeError("b"), RuntimeError("c")]
         )
@@ -287,6 +276,7 @@ class TestExceptionTreeGroupMembers:
         assert "members_omitted" not in node
 
     def test_members_exceeding_the_node_budget_are_counted_as_omitted(self):
+        """Members exceeding the node budget are counted as omitted."""
         group = ExceptionGroup("problems", [RuntimeError(f"m{i}") for i in range(20)])
 
         node = _tree(group, root_traceback=None)
@@ -296,10 +286,7 @@ class TestExceptionTreeGroupMembers:
         assert node["members_omitted"] == 20 - rendered
 
     def test_a_group_carries_no_members_key_when_none_fit_the_budget(self, monkeypatch):
-        """When the root itself exhausts the budget, not even the first
-        member is rendered: `members` must stay ABSENT (never an empty
-        list under a truthy key) while `members_omitted` still reports the
-        full count."""
+        """Omit members when the root exhausts the node budget, retaining the omitted count."""
         monkeypatch.setattr(config_logging, "_MAX_EXCEPTION_TREE_NODES", 1)
         group = ExceptionGroup("problems", [RuntimeError("a"), RuntimeError("b")])
 
@@ -310,11 +297,10 @@ class TestExceptionTreeGroupMembers:
 
 
 class TestExceptionTreeNodeBudgetGuard:
-    """The root call itself is bound by the node budget: if the budget does
-    not even allow one node, the builder fails loudly instead of returning a
-    diagnostic that silently has no root."""
+    """Reject budgets that cannot represent even the root exception."""
 
     def test_a_zero_node_budget_raises_instead_of_returning_an_empty_tree(self, monkeypatch):
+        """A zero node budget raises instead of returning an empty tree."""
         monkeypatch.setattr(config_logging, "_MAX_EXCEPTION_TREE_NODES", 0)
 
         with pytest.raises(RuntimeError, match="exception-tree node budget"):
@@ -322,16 +308,16 @@ class TestExceptionTreeNodeBudgetGuard:
 
 
 class TestRenderExceptionTextDiagnosticFields:
-    """`_render_exception_text` turns each diagnostic field into one line of
-    the text-formatter output, using the SAME dict shape `_safe_exception_tree`
-    produces."""
+    """Render each safe diagnostic field as a text line."""
 
     def test_errno_is_rendered_as_a_diagnostic_suffix(self):
+        """Errno is rendered as a diagnostic suffix."""
         text = config_logging._render_exception_text({"type": "OSError", "frames": [], "errno": 13})
 
         assert "errno=13" in text
 
     def test_sqlstate_is_rendered_as_a_diagnostic_suffix(self):
+        """SQLSTATE is rendered as a diagnostic suffix."""
         text = config_logging._render_exception_text(
             {"type": "DatabaseError", "frames": [], "sqlstate": "42501"}
         )
@@ -339,6 +325,7 @@ class TestRenderExceptionTextDiagnosticFields:
         assert "sqlstate=42501" in text
 
     def test_a_truncated_node_is_rendered_with_its_reason(self):
+        """A truncated node is rendered with its reason."""
         text = config_logging._render_exception_text(
             {"type": "<exception details truncated>", "frames": [], "truncated": "cycle detected"}
         )
@@ -347,6 +334,7 @@ class TestRenderExceptionTextDiagnosticFields:
         assert "truncated=cycle detected" in text
 
     def test_a_cause_is_rendered_under_a_caused_by_heading_and_indented(self):
+        """A cause is rendered under a caused by heading and indented."""
         text = config_logging._render_exception_text(
             {
                 "type": "RuntimeError",
@@ -362,6 +350,7 @@ class TestRenderExceptionTextDiagnosticFields:
         assert lines[cause_heading + 1].startswith("  ")
 
     def test_an_omitted_cause_is_rendered_with_its_reason(self):
+        """An omitted cause is rendered with its reason."""
         text = config_logging._render_exception_text(
             {"type": "RuntimeError", "frames": [], "cause_omitted": "maximum node count reached"}
         )
@@ -369,6 +358,7 @@ class TestRenderExceptionTextDiagnosticFields:
         assert "caused by: <omitted: maximum node count reached>" in text
 
     def test_a_context_is_rendered_under_a_during_handling_heading(self):
+        """A context is rendered under a during handling heading."""
         text = config_logging._render_exception_text(
             {
                 "type": "RuntimeError",
@@ -385,6 +375,7 @@ class TestRenderExceptionTextDiagnosticFields:
         assert lines[context_heading + 1].endswith("ValueError")
 
     def test_an_omitted_context_is_rendered_with_its_reason(self):
+        """An omitted context is rendered with its reason."""
         text = config_logging._render_exception_text(
             {"type": "RuntimeError", "frames": [], "context_omitted": "maximum node count reached"}
         )
@@ -392,6 +383,7 @@ class TestRenderExceptionTextDiagnosticFields:
         assert "during handling of: <omitted: maximum node count reached>" in text
 
     def test_group_members_are_rendered_as_numbered_indented_sections(self):
+        """Group members are rendered as numbered indented sections."""
         text = config_logging._render_exception_text(
             {
                 "type": "ExceptionGroup",
@@ -407,6 +399,7 @@ class TestRenderExceptionTextDiagnosticFields:
         assert "exception-group member 2:" in text
 
     def test_omitted_members_are_rendered_with_their_count(self):
+        """Omitted members are rendered with their count."""
         text = config_logging._render_exception_text(
             {"type": "ExceptionGroup", "frames": [], "members_omitted": 5}
         )
@@ -420,6 +413,7 @@ class TestExceptionDiagnosticForAnAbsentException:
     placeholder."""
 
     def test_a_none_exc_info_tuple_renders_as_unavailable(self):
+        """A None exc info tuple renders as unavailable."""
         record = logging.LogRecord(
             name="app.test",
             level=logging.ERROR,
@@ -436,8 +430,7 @@ class TestExceptionDiagnosticForAnAbsentException:
         assert "<exception unavailable>" in output
 
     def test_a_real_exc_info_tuple_never_renders_the_unavailable_placeholder(self):
-        """Positive control: a genuine exception is never mistaken for the
-        "no exception" case."""
+        """A genuine exception is never mistaken for the "no exception" case."""
         try:
             _raise_runtime_error("boom")
         except RuntimeError:
@@ -459,11 +452,10 @@ class TestExceptionDiagnosticForAnAbsentException:
 
 
 class TestFormatterFailureFallbacks:
-    """Every formatter entry point fails closed to a fixed placeholder
-    instead of propagating a formatting-time exception or an un-redacted
-    fragment of the record that triggered it."""
+    """Replace formatter failures with a fixed safe placeholder."""
 
     def test_formatexception_failure_falls_back_to_the_constant_placeholder(self, monkeypatch):
+        """Formatexception failure falls back to the constant placeholder."""
         canary = "RAW-EXCEPTION-VALUE-CANARY"
         try:
             _raise_runtime_error(canary)
@@ -480,6 +472,7 @@ class TestFormatterFailureFallbacks:
         formatter = RedactingFormatter("%(levelname)s %(message)s")
 
         def fail_diagnostic(_exc_info):
+            """Raise TypeError during diagnostic construction."""
             raise TypeError("diagnostic builder exploded")
 
         monkeypatch.setattr(formatter, "_exception_diagnostic", fail_diagnostic)
@@ -490,7 +483,7 @@ class TestFormatterFailureFallbacks:
         assert canary not in output
 
     def test_a_healthy_exception_never_shows_the_formatting_failed_placeholder(self):
-        """Positive control: ordinary exception formatting does not fall back."""
+        """Ordinary exception formatting does not fall back."""
         try:
             _raise_runtime_error("boom")
         except RuntimeError:
@@ -510,9 +503,7 @@ class TestFormatterFailureFallbacks:
         assert RedactingFormatter._EXCEPTION_FORMATTING_FAILED not in output
 
     def test_formatstack_redacts_stack_info_text(self):
-        """`formatStack` output goes through the same redactor as the message
-        and the exception text — a secret embedded in captured stack text
-        must not survive formatting."""
+        """Redact secrets from captured stack text."""
         record = logging.LogRecord(
             name="app.test",
             level=logging.WARNING,
@@ -531,7 +522,7 @@ class TestFormatterFailureFallbacks:
         assert "Bearer ***" in output
 
     def test_formatstack_leaves_non_secret_stack_text_intact(self):
-        """Positive control: ordinary stack text is not mangled by redaction."""
+        """Ordinary stack text is not mangled by redaction."""
         record = logging.LogRecord(
             name="app.test",
             level=logging.WARNING,
@@ -560,8 +551,7 @@ class TestFormatterFailureFallbacks:
         assert output == RedactingFormatter._LOG_FORMATTING_FAILED
 
     def test_a_well_formed_format_string_never_falls_back(self):
-        """Positive control: a format string whose fields all exist renders
-        normally."""
+        """A format string whose fields all exist renders normally."""
         record = _record("event")
         formatter = RedactingFormatter("%(levelname)s %(message)s")
 
@@ -582,8 +572,7 @@ class TestFormatterFailureFallbacks:
         assert json.loads(output) == {"message": JSONFormatter._LOG_FORMATTING_FAILED}
 
     def test_a_well_formed_record_never_falls_back_to_the_json_placeholder(self):
-        """Positive control: an ordinary record formats to real JSON, not the
-        failure placeholder."""
+        """An ordinary record formats to real JSON, not the failure placeholder."""
         record = _record("event")
         formatter = JSONFormatter()
 

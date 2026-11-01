@@ -21,19 +21,22 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 
 from alembic import command
+from app.catalogue_runtime import publish_catalogue_sources
 from config import settings, setup_logging, warn_unconsumed_env_keys
 
 from .exceptions import UserFacingForbidden
 from .middleware import (
     build_secure_headers,
+    limiter,
     setup_audit_logging,
     setup_csrf_middleware,
     setup_database_capacity_middleware,
     setup_rate_limiting,
     setup_session_middleware,
+    validate_rate_limit_backend,
+    validate_search_start_gate,
     validate_security_settings,
 )
-from .middleware.rate_limiting import validate_rate_limit_backend
 from .paths import ALEMBIC_DIR, ALEMBIC_INI, STATIC_DIR
 from .request_utils import get_client_ip, safe_request_path
 from .route_security import validate_route_security_contract
@@ -41,21 +44,23 @@ from .routes import application_routers
 from .runtime_preflight import validate_runtime_schema
 from .services import (
     CatalogueStatsCache,
+    SearchUnavailable,
+    SearchWork,
     create_pool,
+    create_search_pool,
+    load_runtime_catalogue_sources,
     reconcile_federated_session_policy,
-    seed_admin_user,
     warm_password_blocklist,
 )
-from .services.authentication import warm_dummy_password_hash
+from .services.password_verification import warm_dummy_password_hash
+from .services.password_work import PasswordWorkAdmissionTimeout
 from .template_setup import templates
-
-# =============================================================================
-# Startup
-# =============================================================================
+from .version import application_version
 
 logger = logging.getLogger(__name__)
 
 _STATIC_ASSET_PREFIX = "/static/"
+_PASSWORD_WORK_RETRY_AFTER_SECONDS = 5
 
 _SENSITIVE_ACTION_PREFIXES = (
     "/reset-password",
@@ -95,23 +100,40 @@ def _is_sensitive_action_request(request: Request) -> bool:
 
 
 def _apply_response_privacy_headers(request: Request, response: Response) -> None:
-    """Make dynamic responses non-cacheable and contain action capabilities."""
+    """Keep dynamic responses uncached and hide action URL paths and queries."""
     if not request.url.path.startswith(_STATIC_ASSET_PREFIX):
         response.headers["Cache-Control"] = "no-store"
 
     if _is_sensitive_action_request(request):
-        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Referrer-Policy"] = "strict-origin"
+
+
+def _search_busy_response(request: Request) -> Response:
+    """Render an early search refusal without resolving identity or issuing cookies."""
+    return templates.TemplateResponse(
+        request,
+        "error.html",
+        {
+            "error_title": "Search temporarily busy",
+            "error_message": "Search is temporarily busy. Please wait briefly and try again.",
+            "error_return_route": "search_page",
+            "error_return_label": "← Back to search",
+            "show_auth_navigation": False,
+        },
+        status_code=503,
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Prepare web resources, yield once, then stop the cache and close PostgreSQL.
+    """Initialize web resources, yield once, then stop the cache and close both DB pools.
 
-    Configures logging; validates settings/routes/limiter; warms password caches;
-    runs dev migrations; opens app.state.db_pool; checks schema/role contracts;
-    reconciles federated sessions; sets app.state.catalogue_stats_cache; and seeds
-    requested dev data/admin. Startup errors propagate; cleanup errors are logged.
-    Requires the configured database and hardened limiter; SMTP preflight may connect.
+    Require APP_PROCESS_ROLE=web, valid security/source/route policy and the
+    configured admission backends. Configure logging, warm password caches,
+    run migrations only in dev, verify database/schema contracts, reconcile
+    federated sessions, and publish catalogue policy. Store database/search
+    pools, SearchWork and subscribed catalogue statistics on app.state.
+    Startup errors propagate; cleanup errors are logged.
     """
     setup_logging(
         log_level=settings.log_level,
@@ -122,9 +144,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Checking unconsumed .env keys (dev mode)...")
         warn_unconsumed_env_keys()
 
+    if settings.app_process_role != "web":
+        raise RuntimeError("Web runtime requires APP_PROCESS_ROLE=web")
     validate_security_settings()
+    configured_sources = load_runtime_catalogue_sources()
+
     validate_route_security_contract(app)
-    await validate_rate_limit_backend()
+    await validate_rate_limit_backend(app.state.limiter)
+    await validate_search_start_gate()
     await run_in_threadpool(warm_password_blocklist)
     await warm_dummy_password_hash()
 
@@ -142,6 +169,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
 
     pool = create_pool()
+    search_pool = create_search_pool()
     catalogue_stats_cache: CatalogueStatsCache | None = None
 
     try:
@@ -150,21 +178,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         await validate_runtime_schema(pool, process="web")
         await reconcile_federated_session_policy(pool)
+        catalogue_policy = await publish_catalogue_sources(app, pool, configured_sources)
 
-        catalogue_stats_cache = CatalogueStatsCache(pool, subscribe=True)
+        await search_pool.open()
+        await search_pool.wait(timeout=10.0)
+        app.state.search_pool = search_pool
+        app.state.search_work = SearchWork(search_pool)
+
+        catalogue_stats_cache = CatalogueStatsCache(
+            pool,
+            source_names=tuple(source.name for source in configured_sources),
+            policy_fingerprint=catalogue_policy.fingerprint,
+            subscribe=True,
+        )
         app.state.catalogue_stats_cache = catalogue_stats_cache
-
-        if settings.seed_mock_data and settings.env_state == "dev":
-            from .services.seed_mock_data import seed_mock_data  # noqa: PLC0415
-
-            await seed_mock_data(pool)
-
-        if settings.admin_seed_email and settings.admin_seed_password:
-            await seed_admin_user(
-                pool,
-                settings.admin_seed_email,
-                settings.admin_seed_password.get_secret_value(),
-            )
 
         logger.info("Database ready!")
         yield
@@ -178,6 +205,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 logger.exception("Failed to stop catalogue statistics cache")
 
         try:
+            await search_pool.close()
+        except Exception:
+            logger.exception("Failed to close search database pool")
+
+        try:
             await pool.close()
         except Exception:
             logger.exception("Failed to close database pool")
@@ -186,8 +218,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(
-    title="Oral History Archive",
-    version="0.1.0",
+    title=settings.site_name,
+    version=application_version(),
     lifespan=lifespan,
     redirect_slashes=False,
     docs_url="/docs" if settings.fastapi_debug else None,
@@ -197,17 +229,9 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-# =============================================================================
-# Middleware Configuration
-# =============================================================================
-
-# CSRF protection — double-submit cookie pattern.
-# Middleware sets the cookie on GET responses. SecureAPIRouter installs
-# verification and Content-Type validation on every mutation method.
 setup_csrf_middleware(app)
 
 
-# Security Headers
 secure_headers = build_secure_headers(settings.is_production)
 
 
@@ -215,9 +239,12 @@ secure_headers = build_secure_headers(settings.is_production)
 async def set_secure_headers(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
-    """Add security headers, no-store on dynamic paths and no-referrer on capability paths."""
+    """Add security defaults while preserving explicit restrictive referrer policies."""
     response = await call_next(request)
+    referrer_policy = response.headers.get("Referrer-Policy")
     await secure_headers.set_headers_async(response)  # type: ignore[arg-type]
+    if referrer_policy in {"no-referrer", "strict-origin"}:
+        response.headers["Referrer-Policy"] = referrer_policy
     _apply_response_privacy_headers(request, response)
     return response
 
@@ -227,7 +254,7 @@ async def set_secure_headers(
 setup_session_middleware(app)
 
 # Rate admission wraps session resolution; audit wraps both so 429s are logged.
-setup_rate_limiting(app)
+setup_rate_limiting(app, limiter, search_busy_response=_search_busy_response)
 setup_database_capacity_middleware(app)
 setup_audit_logging(app)
 
@@ -243,17 +270,12 @@ if settings.cors_enabled:
         allow_headers=settings.cors_allow_headers,
     )
 
-# TrustedHost — outermost. Rejects unknown Host headers before any
-# other middleware spends cycles on the request. Coordinates with
-# nginx's default-reject server block (defense-in-depth).
+# Reject unknown hosts before admission spends shared resources.
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=settings.allowed_hosts,
 )
 
-# =============================================================================
-# Routes
-# =============================================================================
 
 for application_router in application_routers:
     app.include_router(application_router)
@@ -262,14 +284,10 @@ for application_router in application_routers:
 # the check before external services are touched, catching late embedding code.
 validate_route_security_contract(app)
 
-# =============================================================================
-# Exception handlers
-# =============================================================================
-
 
 @app.exception_handler(303)
 async def redirect_handler(request: Request, exc: HTTPException) -> Response:
-    """Convert 303 exceptions into redirect responses."""
+    """Return a 303 to the exception Location header, defaulting to /."""
     return RedirectResponse(url=(exc.headers or {}).get("Location", "/"), status_code=303)
 
 
@@ -389,6 +407,65 @@ def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> Response:
         response.headers["X-RateLimit-Limit"] = str(limit_item.amount)
         response.headers["X-RateLimit-Remaining"] = str(remaining)
         response.headers["X-RateLimit-Reset"] = str(int(reset_at) + 1)
+    return response
+
+
+@app.exception_handler(PasswordWorkAdmissionTimeout)
+async def password_work_admission_timeout_handler(
+    request: Request, exc: PasswordWorkAdmissionTimeout
+) -> Response:
+    """Render retryable password-capacity failures without logging submitted credentials."""
+    logger.warning(
+        "Password work admission timed out",
+        extra={
+            "event_type": "password_work_admission_timeout",
+            "request_id": getattr(request.state, "request_id", "unknown"),
+            "path": safe_request_path(request),
+            "timeout_seconds": exc.timeout_seconds,
+        },
+    )
+    response = templates.TemplateResponse(
+        request,
+        "error.html",
+        {
+            "error_title": "Service temporarily busy",
+            "error_message": "Password processing is temporarily busy. "
+            "Please wait a few seconds and submit the form again.",
+        },
+        status_code=503,
+        headers={
+            "Retry-After": str(_PASSWORD_WORK_RETRY_AFTER_SECONDS),
+            "Cache-Control": "no-store",
+        },
+    )
+    await secure_headers.set_headers_async(response)  # type: ignore[arg-type]
+    _apply_response_privacy_headers(request, response)
+    return response
+
+
+@app.exception_handler(SearchUnavailable)
+async def search_unavailable_handler(request: Request, exc: SearchUnavailable) -> Response:
+    """Return a retryable catalogue refusal without disclosing database diagnostics."""
+    logger.warning(
+        "Catalogue work temporarily unavailable",
+        extra={
+            "event_type": "search_unavailable",
+            "request_id": getattr(request.state, "request_id", "unknown"),
+            "path": safe_request_path(request),
+        },
+    )
+    response = templates.TemplateResponse(
+        request,
+        "error.html",
+        {
+            "error_title": "Catalogue temporarily unavailable",
+            "error_message": "Please wait a moment and try again.",
+        },
+        status_code=503,
+        headers={"Retry-After": "2", "Cache-Control": "no-store"},
+    )
+    await secure_headers.set_headers_async(response)  # type: ignore[arg-type]
+    _apply_response_privacy_headers(request, response)
     return response
 
 

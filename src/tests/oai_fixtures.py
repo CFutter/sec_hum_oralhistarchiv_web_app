@@ -1,39 +1,55 @@
-"""Shared OAI fixtures: the canonical sample CMDI record + OAI fetch stubs.
-
-Single home for the test doubles that every OAI-facing tier needs, so the
-sample record and the fake-HTTP plumbing cannot drift between copies:
-
-- SAMPLE_CMDI_XML  — the canonical CMDI record string, parsed (and spliced
-  into variants) by tests/unit/test_parsing_units.py and
-  tests/unit/test_oai_client.py.
-- FakeOAIResponse  — requests.Response stand-in (.content bytes +
-  .raise_for_status()).
-- patch_session_get — patches the OAI client's per-harvest Session factory
-  and hands back the fake session's .get mock.
-
-Used by tests/unit/test_oai_client.py, tests/unit/test_parsing_units.py and
-tests/integration/test_sync_db.py.
-"""
+"""Shared synthetic CMDI records, streaming HTTP responses and in-process OAI fetch doubles."""
 
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from threading import Event
 from unittest.mock import MagicMock, patch
 
 from lxml import etree
 
-from app.services.oai_client import _parse_cmdi_to_dict
+from app.ingestion_contracts import HarvestResult
+from app.ingestion_contracts.cancellation import check_harvest_cancellation
+from app.sources import oai_client
+from app.sources.oai_client import OAI_DEFAULT_MAX_PAGES, _parse_cmdi_to_dict
 
 SOURCE_CURSOR = datetime(2026, 9, 10, 12, tzinfo=UTC)
+
+
+def fetch_updates_in_process(
+    oai_url: str,
+    since: str,
+    institution_filter: str,
+    *,
+    source: str,
+    log_level: str,
+    log_format: str,
+    max_pages: int = OAI_DEFAULT_MAX_PAGES,
+    cancel_event: Event | None = None,
+) -> HarvestResult:
+    """Adapt the isolated entrypoint to the real parser for recorded-input tests.
+
+    Consume child logging metadata at this test-only boundary. Dedicated worker
+    tests exercise process setup and logging through fetch_updates_isolated.
+    """
+    del source, log_level, log_format
+    check_harvest_cancellation(cancel_event)
+    return oai_client.fetch_updates(
+        oai_url=oai_url,
+        since=since,
+        institution_filter=institution_filter,
+        max_pages=max_pages,
+    )
 
 
 def patch_records(*, return_value):
     """Mock the iterator, including its source-clock result on the budget."""
 
     def records(*_args, **kwargs):
+        """Publish the fixture source cursor on the budget and yield the supplied records."""
         kwargs["budget"].source_cursor = SOURCE_CURSOR
-        return iter(return_value)
+        yield from return_value
 
-    return patch("app.services.oai_client._oai_list_records", autospec=True, side_effect=records)
+    return patch("app.sources.oai_client._oai_list_records", autospec=True, side_effect=records)
 
 
 def parsed_record(uuid, **overrides):
@@ -45,15 +61,11 @@ def parsed_record(uuid, **overrides):
     return record
 
 
-# ---------------------------------------------------------------------------
 # Sample CMDI record.
 #
-# Copied verbatim from src/tests_legacy/conftest.py::SAMPLE_CMDI_XML (that
-# module cannot be imported: it does `from app.middleware.cookies import
-# get_signer`, a function the current code base no longer exposes). Its
-# institutions include 'Universität Kassel', which matches the test-env
-# OAI_INSTITUTION_FILTER set by src/tests/conftest.py.
-# ---------------------------------------------------------------------------
+# Canonical synthetic sample shared by the OAI parser, client and sync tests.
+# Its institutions include 'Universität Beispielstadt', matching the explicit
+# TEST_INSTITUTION_FILTER used by the OAI tests.
 
 SAMPLE_CMDI_XML = """\
 <record xmlns:oai="http://www.openarchives.org/OAI/2.0/">
@@ -82,8 +94,8 @@ SAMPLE_CMDI_XML = """\
 <cmdp:Overview>
 <cmdp:Author>Müller, Urs</cmdp:Author>
 <cmdp:Author>Keller, Anna</cmdp:Author>
-<cmdp:Institution>Universität Kassel</cmdp:Institution>
-<cmdp:Institution>University of Zurich</cmdp:Institution>
+<cmdp:Institution>Universität Beispielstadt</cmdp:Institution>
+<cmdp:Institution>Example University</cmdp:Institution>
 <cmdp:Project_title xml:lang="en">Test Project Title</cmdp:Project_title>
 <cmdp:Project_title xml:lang="de">Test Projekttitel</cmdp:Project_title>
 <cmdp:Main_discipline xml:lang="en">Linguistics</cmdp:Main_discipline>
@@ -133,6 +145,7 @@ class FakeOAIResponse:
         headers: dict[str, str] | None = None,
         chunks: list[bytes] | None = None,
     ) -> None:
+        """Store response metadata and chunks; None uses the complete content as one chunk."""
         self.content = content
         self.status_code = status_code
         self.headers = headers or {}
@@ -142,31 +155,34 @@ class FakeOAIResponse:
         self._status_error = status_error
 
     def __enter__(self) -> "FakeOAIResponse":
+        """Return this response."""
         return self
 
     def __exit__(self, *_args: object) -> None:
+        """Mark the response closed on context exit."""
         self.close()
 
     def raise_for_status(self) -> None:
+        """Raise the configured status exception, if any."""
         if self._status_error is not None:
             raise self._status_error
 
     def iter_content(self, chunk_size: int) -> Iterator[bytes]:
+        """Require a positive chunk size, mark iteration and yield configured chunks unchanged."""
         assert chunk_size > 0
         self.iterated = True
         yield from self._chunks
 
     def close(self) -> None:
+        """Mark this response closed."""
         self.closed = True
 
 
 def patch_session_get(**get_config):
-    """The client builds a Session per harvest via
-    _build_session(); patch the factory and expose the fake session's .get,
-    which is where a test configures the HTTP responses a harvest sees."""
+    """Return the session-factory patch and GET mock configured by get_config."""
     fake = MagicMock()
     fake.get = MagicMock(**get_config)
     return (
-        patch("app.services.oai_client._build_session", autospec=True, return_value=fake),
+        patch("app.sources.oai_client._build_session", autospec=True, return_value=fake),
         fake.get,
     )

@@ -1,18 +1,4 @@
-"""Edge and defensive branches of the target-driven admin_promotion
-transitions: prepare_admin_promotion, accept_admin_promotion, and
-decline_admin_promotion.
-
-Companion to test_admin_promotion_refusals.py, which covers the same edge and
-defensive branches for the validators and the administrator-driven entry
-points. Companion to test_admin_authority_credential_budgets.py, which proves
-the step-up reservation always runs first for prepare/accept; this module
-proves what happens once that reservation is granted: every remaining
-validation (locked account, stale password/TOTP snapshot, expired/mismatched
-invitation, stale or foreign preparation, incorrect code) still rejects a
-live-but-invalid state, an eligible state still proceeds end to end, and
-every "this cannot happen" guard actually raises instead of silently
-trusting its precondition.
-"""
+"""Target-driven promotion preparation, acceptance and decline refusal branches."""
 
 from contextlib import ExitStack
 from datetime import UTC, datetime
@@ -22,6 +8,7 @@ import pytest
 
 from app.services import admin_promotion
 from app.services.credential_attempts import SessionStepUpAttemptOutcome
+from app.services.password_verification import VerifiedPasswordSnapshot
 from app.services.session_ids import hash_session_id
 from app.services.totp_recovery_codes import PendingRecoveryCodeSet
 from tests.fixtures import FakeCursorCtx, make_async_cursor
@@ -30,6 +17,7 @@ USER_ID = 41
 ACTOR_ID = 91
 SESSION_ID = "raw-session-secret"
 RECOVERY_CODE = "AAAAA-BBBBB-CCCCC-DDDDD"
+_VERIFIED_SNAPSHOT = VerifiedPasswordSnapshot("stored-hash", 3)
 
 
 def _target_row(**overrides):
@@ -48,6 +36,7 @@ def _target_row(**overrides):
 
 
 def _prepare_target_row(**overrides):
+    """Return an unlocked preparation candidate with explicit field overrides."""
     row = _target_row(password_hash="stored-hash")
     row["login_unlocked"] = True
     row.update(overrides)
@@ -55,6 +44,7 @@ def _prepare_target_row(**overrides):
 
 
 def _accept_target_row(**overrides):
+    """Return an unlocked acceptance candidate with explicit field overrides."""
     row = _target_row()
     row["login_unlocked"] = True
     row.update(overrides)
@@ -62,6 +52,7 @@ def _accept_target_row(**overrides):
 
 
 def _prepare_promotion_row(**overrides):
+    """Return an unexpired invitation row with explicit field overrides."""
     row = {
         "requested_by": ACTOR_ID,
         "expected_auth_revision": 3,
@@ -73,6 +64,7 @@ def _prepare_promotion_row(**overrides):
 
 
 def _accept_promotion_row(**overrides):
+    """Return a preparation bound to SESSION_ID with explicit field overrides."""
     row = {
         "requested_by": ACTOR_ID,
         "expected_auth_revision": 3,
@@ -85,6 +77,7 @@ def _accept_promotion_row(**overrides):
 
 
 def _autospec(target):
+    """Return a strict signature-checked double of target."""
     return create_autospec(target, spec_set=True)
 
 
@@ -92,10 +85,11 @@ def _patched_prepare_dependencies(
     cur,
     *,
     reservation=SessionStepUpAttemptOutcome.RESERVED,
-    verified=("stored-hash", 3),
+    verified=_VERIFIED_SNAPSHOT,
     totp_ok=True,
     staged=None,
 ):
+    """Return preparation patches in an ExitStack that the caller must close."""
     stack = ExitStack()
     stack.enter_context(
         patch.object(
@@ -111,9 +105,9 @@ def _patched_prepare_dependencies(
     stack.enter_context(
         patch.object(
             admin_promotion,
-            "_verify_password_snapshot",
+            "verify_password_snapshot",
             create_autospec(
-                admin_promotion._verify_password_snapshot,
+                admin_promotion.verify_password_snapshot,
                 return_value=verified,
                 spec_set=True,
             ),
@@ -179,6 +173,7 @@ def _patched_accept_dependencies(
     reservation=SessionStepUpAttemptOutcome.RESERVED,
     activate_result=True,
 ):
+    """Return acceptance patches in an ExitStack that the caller must close."""
     stack = ExitStack()
     stack.enter_context(
         patch.object(
@@ -249,15 +244,11 @@ def _patched_accept_dependencies(
     return stack
 
 
-# ---------------------------------------------------------------------------
-# prepare_admin_promotion
-# ---------------------------------------------------------------------------
-
-
 class TestPrepareAdminPromotionValidatesTheLiveInvitationUnderLock:
-    """Once the credential reservation is granted, prepare_admin_promotion still refuses a locked account, a stale password/TOTP snapshot, or an expired/mismatched invitation."""
+    """Once the credential reservation is granted, prepare_admin_promotion still refuses a stale password/TOTP snapshot or an expired/mismatched invitation."""
 
     async def _call(self, **kwargs):
+        """Prepare the test invitation using kwargs to override the default proof."""
         params = {
             "user_id": USER_ID,
             "session_id": SESSION_ID,
@@ -267,16 +258,18 @@ class TestPrepareAdminPromotionValidatesTheLiveInvitationUnderLock:
         params.update(kwargs)
         return await admin_promotion.prepare_admin_promotion(sentinel.pool, **params)
 
-    async def test_locked_account_is_rejected_after_reauthentication_already_succeeded(self):
+    async def test_login_lock_does_not_bypass_the_required_live_invitation(self):
+        """Login lock does not bypass the required live invitation."""
         cur = make_async_cursor(fetchone=[_prepare_target_row(login_unlocked=False), None, None])
         with (
             _patched_prepare_dependencies(cur),
             pytest.raises(admin_promotion.AdminPromotionRejected) as caught,
         ):
             await self._call()
-        assert caught.value.reason == "account_locked"
+        assert caught.value.reason == "no_request"
 
     async def test_password_hash_changed_since_verification_is_rejected(self):
+        """Password hash changed since verification is rejected."""
         cur = make_async_cursor(
             fetchone=[_prepare_target_row(password_hash="a-different-hash"), None, None]
         )
@@ -288,6 +281,7 @@ class TestPrepareAdminPromotionValidatesTheLiveInvitationUnderLock:
         assert caught.value.reason == "state_changed"
 
     async def test_missing_invitation_is_rejected(self):
+        """Missing invitation is rejected."""
         cur = make_async_cursor(fetchone=[_prepare_target_row(), None])
         with (
             _patched_prepare_dependencies(cur),
@@ -297,6 +291,7 @@ class TestPrepareAdminPromotionValidatesTheLiveInvitationUnderLock:
         assert caught.value.reason == "no_request"
 
     async def test_expired_invitation_is_rejected(self):
+        """Expired invitation is rejected."""
         cur = make_async_cursor(
             fetchone=[_prepare_target_row(), _prepare_promotion_row(unexpired=False)]
         )
@@ -308,6 +303,7 @@ class TestPrepareAdminPromotionValidatesTheLiveInvitationUnderLock:
         assert caught.value.reason == "invitation_expired"
 
     async def test_invitation_bound_to_a_stale_auth_revision_is_rejected(self):
+        """Invitation bound to a stale auth revision is rejected."""
         cur = make_async_cursor(
             fetchone=[_prepare_target_row(), _prepare_promotion_row(expected_auth_revision=99)]
         )
@@ -319,6 +315,7 @@ class TestPrepareAdminPromotionValidatesTheLiveInvitationUnderLock:
         assert caught.value.reason == "state_changed"
 
     async def test_already_consumed_totp_step_is_rejected(self):
+        """Already consumed TOTP step is rejected."""
         cur = make_async_cursor(fetchone=[_prepare_target_row(), _prepare_promotion_row()])
         with (
             _patched_prepare_dependencies(cur, totp_ok=False),
@@ -328,6 +325,7 @@ class TestPrepareAdminPromotionValidatesTheLiveInvitationUnderLock:
         assert caught.value.reason == "invalid_totp"
 
     async def test_unhandled_reservation_outcome_raises_instead_of_silently_proceeding(self):
+        """Unhandled reservation outcome raises instead of silently proceeding."""
         cur = make_async_cursor()
         with (
             _patched_prepare_dependencies(cur, reservation="not-a-real-outcome"),
@@ -338,6 +336,7 @@ class TestPrepareAdminPromotionValidatesTheLiveInvitationUnderLock:
     async def test_target_row_disappearing_after_validation_raises_instead_of_silently_continuing(
         self,
     ):
+        """Target row disappearing after validation raises instead of silently continuing."""
         cur = make_async_cursor(fetchone=[None, None, None])
         with (
             _patched_prepare_dependencies(cur),
@@ -350,13 +349,18 @@ class TestPrepareAdminPromotionValidatesTheLiveInvitationUnderLock:
         ):
             await self._call()
 
-    async def test_eligible_target_with_a_live_invitation_stages_a_fresh_code_set(self):
-        """Positive control: a fully eligible target with a live, matching invitation stages a fresh code set and both expirations."""
+    @pytest.mark.parametrize("login_unlocked", [True, False])
+    async def test_eligible_target_with_a_live_invitation_stages_a_fresh_code_set(
+        self, login_unlocked
+    ):
+        """A fully eligible target with a live, matching invitation stages a fresh code set and both
+        expirations.
+        """
         invitation_expires_at = datetime(2026, 1, 8, tzinfo=UTC)
         preparation_expires_at = datetime(2026, 1, 1, 0, 15, tzinfo=UTC)
         cur = make_async_cursor(
             fetchone=[
-                _prepare_target_row(),
+                _prepare_target_row(login_unlocked=login_unlocked),
                 _prepare_promotion_row(),
                 {
                     "invitation_expires_at": invitation_expires_at,
@@ -375,29 +379,27 @@ class TestPrepareAdminPromotionValidatesTheLiveInvitationUnderLock:
         )
 
 
-# ---------------------------------------------------------------------------
-# accept_admin_promotion
-# ---------------------------------------------------------------------------
-
-
 class TestAcceptAdminPromotionActivatesOnlyWithALiveMatchingPreparation:
-    """Once the credential reservation is granted, accept_admin_promotion still refuses a locked account, an expired/unmatched/stale preparation, or an incorrect code."""
+    """Once the credential reservation is granted, accept_admin_promotion still refuses an expired/unmatched/stale preparation or an incorrect code."""
 
     async def _call(self, **kwargs):
+        """Accept the test invitation using kwargs to override the default proof."""
         params = {"user_id": USER_ID, "session_id": SESSION_ID, "recovery_code": RECOVERY_CODE}
         params.update(kwargs)
         return await admin_promotion.accept_admin_promotion(sentinel.pool, **params)
 
-    async def test_locked_account_is_rejected(self):
-        cur = make_async_cursor(fetchone=[_accept_target_row(login_unlocked=False)])
+    async def test_login_lock_does_not_bypass_the_required_preparation(self):
+        """Login lock does not bypass the required preparation."""
+        cur = make_async_cursor(fetchone=[_accept_target_row(login_unlocked=False), None])
         with (
             _patched_accept_dependencies(cur),
             pytest.raises(admin_promotion.AdminPromotionRejected) as caught,
         ):
             await self._call()
-        assert caught.value.reason == "account_locked"
+        assert caught.value.reason == "no_request"
 
     async def test_missing_invitation_is_rejected(self):
+        """Missing invitation is rejected."""
         cur = make_async_cursor(fetchone=[_accept_target_row(), None])
         with (
             _patched_accept_dependencies(cur),
@@ -407,6 +409,7 @@ class TestAcceptAdminPromotionActivatesOnlyWithALiveMatchingPreparation:
         assert caught.value.reason == "no_request"
 
     async def test_expired_invitation_is_rejected(self):
+        """Expired invitation is rejected."""
         cur = make_async_cursor(
             fetchone=[_accept_target_row(), _accept_promotion_row(unexpired=False)]
         )
@@ -418,6 +421,7 @@ class TestAcceptAdminPromotionActivatesOnlyWithALiveMatchingPreparation:
         assert caught.value.reason == "invitation_expired"
 
     async def test_invitation_bound_to_a_stale_auth_revision_is_rejected(self):
+        """Invitation bound to a stale auth revision is rejected."""
         cur = make_async_cursor(
             fetchone=[_accept_target_row(), _accept_promotion_row(expected_auth_revision=99)]
         )
@@ -429,6 +433,7 @@ class TestAcceptAdminPromotionActivatesOnlyWithALiveMatchingPreparation:
         assert caught.value.reason == "state_changed"
 
     async def test_preparation_from_a_different_session_is_rejected(self):
+        """Preparation from a different session is rejected."""
         cur = make_async_cursor(
             fetchone=[
                 _accept_target_row(),
@@ -443,6 +448,7 @@ class TestAcceptAdminPromotionActivatesOnlyWithALiveMatchingPreparation:
         assert caught.value.reason == "codes_not_prepared"
 
     async def test_preparation_never_completed_is_rejected(self):
+        """Preparation never completed is rejected."""
         cur = make_async_cursor(
             fetchone=[_accept_target_row(), _accept_promotion_row(prepared_at=None)]
         )
@@ -454,6 +460,7 @@ class TestAcceptAdminPromotionActivatesOnlyWithALiveMatchingPreparation:
         assert caught.value.reason == "codes_not_prepared"
 
     async def test_stale_preparation_window_is_rejected(self):
+        """Stale preparation window is rejected."""
         cur = make_async_cursor(
             fetchone=[
                 _accept_target_row(),
@@ -469,6 +476,7 @@ class TestAcceptAdminPromotionActivatesOnlyWithALiveMatchingPreparation:
         assert caught.value.reason == "codes_not_prepared"
 
     async def test_incorrect_recovery_code_is_rejected(self):
+        """Incorrect recovery code is rejected."""
         cur = make_async_cursor(
             fetchone=[
                 _accept_target_row(),
@@ -484,6 +492,7 @@ class TestAcceptAdminPromotionActivatesOnlyWithALiveMatchingPreparation:
         assert caught.value.reason == "invalid_recovery_code"
 
     async def test_unhandled_reservation_outcome_raises_instead_of_silently_proceeding(self):
+        """Unhandled reservation outcome raises instead of silently proceeding."""
         cur = make_async_cursor()
         with (
             _patched_accept_dependencies(cur, reservation="not-a-real-outcome"),
@@ -494,6 +503,7 @@ class TestAcceptAdminPromotionActivatesOnlyWithALiveMatchingPreparation:
     async def test_target_row_disappearing_after_validation_raises_instead_of_silently_continuing(
         self,
     ):
+        """Target row disappearing after validation raises instead of silently continuing."""
         cur = make_async_cursor(fetchone=[None])
         with (
             _patched_accept_dependencies(cur),
@@ -506,11 +516,14 @@ class TestAcceptAdminPromotionActivatesOnlyWithALiveMatchingPreparation:
         ):
             await self._call()
 
-    async def test_matching_preparation_and_correct_code_activates_administrator_access(self):
-        """Positive control: a live, matching preparation with the correct code activates administrator access."""
+    @pytest.mark.parametrize("login_unlocked", [True, False])
+    async def test_matching_preparation_and_correct_code_activates_administrator_access(
+        self, login_unlocked
+    ):
+        """A live, matching preparation with the correct code activates administrator access."""
         cur = make_async_cursor(
             fetchone=[
-                _accept_target_row(),
+                _accept_target_row(login_unlocked=login_unlocked),
                 _accept_promotion_row(),
                 {"preparation_current": True},
             ]
@@ -522,15 +535,11 @@ class TestAcceptAdminPromotionActivatesOnlyWithALiveMatchingPreparation:
         )
 
 
-# ---------------------------------------------------------------------------
-# decline_admin_promotion
-# ---------------------------------------------------------------------------
-
-
 class TestDeclineAdminPromotionRequiresAnEligibleLocalTarget:
     """decline_admin_promotion withdraws only an eligible local target's own live invitation, and never returns an untyped requester id."""
 
     async def test_missing_user_is_rejected(self):
+        """Missing user is rejected."""
         cur = make_async_cursor(fetchone=None)
         with (
             patch.object(
@@ -558,6 +567,7 @@ class TestDeclineAdminPromotionRequiresAnEligibleLocalTarget:
         ids=("deactivated-target", "federated-target"),
     )
     async def test_ineligible_target_is_rejected(self, override, value):
+        """Ineligible target is rejected."""
         row = {"id": USER_ID, "is_active": True, "auth_method": "local"}
         row[override] = value
         cur = make_async_cursor(fetchone=row)
@@ -582,6 +592,7 @@ class TestDeclineAdminPromotionRequiresAnEligibleLocalTarget:
         assert caught.value.reason == "ineligible_account"
 
     async def test_no_pending_invitation_is_rejected(self):
+        """No pending invitation is rejected."""
         cur = make_async_cursor(
             fetchone=[{"id": USER_ID, "is_active": True, "auth_method": "local"}, None]
         )
@@ -611,6 +622,7 @@ class TestDeclineAdminPromotionRequiresAnEligibleLocalTarget:
         assert caught.value.reason == "no_request"
 
     async def test_corrupt_requester_id_raises_instead_of_returning_a_bad_type(self):
+        """Corrupt requester ID raises instead of returning a bad type."""
         cur = make_async_cursor(
             fetchone=[
                 {"id": USER_ID, "is_active": True, "auth_method": "local"},
@@ -642,7 +654,7 @@ class TestDeclineAdminPromotionRequiresAnEligibleLocalTarget:
             )
 
     async def test_eligible_target_declines_and_returns_the_inviting_administrator_id(self):
-        """Positive control: an eligible target with a live invitation declines it and reports who invited them."""
+        """An eligible target with a live invitation declines it and reports who invited them."""
         cur = make_async_cursor(
             fetchone=[
                 {"id": USER_ID, "is_active": True, "auth_method": "local"},
@@ -675,3 +687,11 @@ class TestDeclineAdminPromotionRequiresAnEligibleLocalTarget:
             )
         assert result == ACTOR_ID
         discard.assert_awaited_once_with(cur, user_id=USER_ID)
+
+
+@pytest.fixture(autouse=True)
+def _notification_boundary(monkeypatch):
+    """Outbox SQL is covered by database transition tests, not these cursor doubles."""
+    queue = create_autospec(admin_promotion.queue_security_change_notice_cur, spec_set=True)
+    monkeypatch.setattr(admin_promotion, "queue_security_change_notice_cur", queue)
+    return queue

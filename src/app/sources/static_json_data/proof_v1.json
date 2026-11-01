@@ -1,0 +1,77 @@
+{
+    "cursor": "2020-01-04T00:00:00Z",
+    "items": [
+      {
+        "uuid": "static_json:public",
+        "title": "Public demonstration conversation",
+        "project_title": null,
+        "description": "Synthetic public-tier adapter proof metadata; no real participant or recording.",
+        "resource_description": null,
+        "languages": ["en"],
+        "project_description": null,
+        "authors": ["Example narrator"],
+        "keywords": ["adapter proof", "public"],
+        "resource_proxies": [
+          {"type": "Resource", "ref": "https://archive.example.org/proof/public"}
+        ],
+        "license_val": "Public access",
+        "license_url": null,
+        "version": "1",
+        "doi": null,
+        "resource_type": "interview",
+        "institutions": ["Example Archive"],
+        "main_disciplines": [],
+        "bibliographical_citation": null,
+        "upstream_modified_at": "2020-01-01T12:00:00Z",
+        "visibility_tier": "public"
+      },
+      {
+        "uuid": "static_json:registered",
+        "title": "Registered demonstration conversation",
+        "project_title": null,
+        "description": "Synthetic registered-tier adapter proof metadata; no real participant or recording.",
+        "resource_description": null,
+        "languages": ["en"],
+        "project_description": null,
+        "authors": ["Example narrator"],
+        "keywords": ["adapter proof", "registered"],
+        "resource_proxies": [
+          {"type": "Resource", "ref": "https://archive.example.org/proof/registered"}
+        ],
+        "license_val": "Restricted access",
+        "license_url": null,
+        "version": "1",
+        "doi": null,
+        "resource_type": "interview",
+        "institutions": ["Example Archive"],
+        "main_disciplines": [],
+        "bibliographical_citation": null,
+        "upstream_modified_at": "2020-01-02T12:00:00Z",
+        "visibility_tier": "registered"
+      },
+      {
+        "uuid": "static_json:vetted",
+        "title": "Vetted demonstration conversation",
+        "project_title": null,
+        "description": "Synthetic vetted-tier adapter proof metadata; no real participant or recording.",
+        "resource_description": null,
+        "languages": ["en"],
+        "project_description": null,
+        "authors": ["Example narrator"],
+        "keywords": ["adapter proof", "vetted"],
+        "resource_proxies": [
+          {"type": "Resource", "ref": "https://archive.example.org/proof/vetted"}
+        ],
+        "license_val": "Restricted access",
+        "license_url": null,
+        "version": "1",
+        "doi": null,
+        "resource_type": "interview",
+        "institutions": ["Example Archive"],
+        "main_disciplines": [],
+        "bibliographical_citation": null,
+        "upstream_modified_at": "2020-01-03T12:00:00Z",
+        "visibility_tier": "vetted"
+      }
+    ]
+  }

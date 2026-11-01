@@ -1,14 +1,4 @@
-"""Integration tests for the incremental Source A sync against real PostgreSQL.
-
-Covers ``app.services.sync._sync_source_a``: the record-upsert boundary
-contract, the happy path (policy tier, access classification, the
-migration-owned search trigger, watermark timing), replay/idempotency,
-upstream redaction, tombstones and other withdrawals, DOI collisions, and
-per-record resilience of the incremental loop. Full-rebuild scenarios live in
-``test_sync_rebuild_db.py`` and ``test_sync_rebuild_thresholds_db.py``;
-reconciliation of ambiguous/uncertain records lives in
-``test_sync_uncertain_reconciliation_db.py``.
-"""
+"""Incremental ingestion regressions for each selected source against PostgreSQL."""
 
 import asyncio
 from datetime import UTC, datetime, timedelta
@@ -16,29 +6,50 @@ from unittest.mock import create_autospec, patch
 
 import pytest
 from lxml import etree
-from starlette.concurrency import run_in_threadpool
 
-from app.services import oai_client, sync
+from app.services import ingestion
 from app.services.db import get_db_cursor
-from app.services.schema import PARSER_OWNED
-from app.services.sync import (
-    _SWISSUBASE_POLICY,
-    _sync_source_a,
+from app.services.harvest import HarvestResult
+from app.services.ingestion import (
+    _sync_source,
     _upsert_public_catalogue_record,
     run_full_rebuild,
 )
-from config import settings
+from app.services.schema import PARSER_OWNED
+from app.services.source_fetch import run_source_fetch
+from app.sources import ConfiguredSource, oai_client
 from tests.integration.sync_doubles import (
     FETCH,
     count_datasets,
     harvest_result,
+    ingestion_failure_uuids,
     make_record,
     sync_status_row,
 )
-from tests.oai_fixtures import SOURCE_CURSOR, FakeOAIResponse, patch_records, patch_session_get
+from tests.oai_fixtures import (
+    SOURCE_CURSOR,
+    FakeOAIResponse,
+    fetch_updates_in_process,
+    patch_records,
+    patch_session_get,
+)
+from tests.source_fixtures import TEST_INSTITUTION_FILTER, legacy_source
+
+
+class SourceCase:
+    """Attach the parametrized source to each ingestion test instance."""
+
+    source: ConfiguredSource
+
+    @pytest.fixture(autouse=True)
+    def _select_source(self, sync_source):
+        """Attach the parametrized source to this test instance."""
+        self.source = sync_source
 
 
 class TestMakeRecordHarness:
+    """Check make Record Harness."""
+
     def test_make_record_matches_parser_contract(self):
         """Harness self-check: make_record emits exactly schema.PARSER_OWNED.
 
@@ -48,7 +59,7 @@ class TestMakeRecordHarness:
         assert set(make_record("u")) == PARSER_OWNED
 
 
-class TestUpsertBoundaryContract:
+class TestUpsertBoundaryContract(SourceCase):
     """``_upsert_public_catalogue_record`` refuses a falsy uuid at the boundary."""
 
     async def test_upsert_raises_on_none_uuid_before_touching_table(self, db_pool, sync_conn):
@@ -57,7 +68,7 @@ class TestUpsertBoundaryContract:
         with pytest.raises(ValueError, match="uuid"):
             async with get_db_cursor(db_pool) as cur:
                 await _upsert_public_catalogue_record(
-                    cur, make_record(uuid=None), _SWISSUBASE_POLICY
+                    cur, make_record(uuid=None), self.source.policy
                 )
         assert count_datasets(sync_conn) == 0
 
@@ -65,39 +76,39 @@ class TestUpsertBoundaryContract:
         """An empty-string uuid is just as falsy — same ValueError, no row."""
         with pytest.raises(ValueError):
             async with get_db_cursor(db_pool) as cur:
-                await _upsert_public_catalogue_record(cur, make_record(uuid=""), _SWISSUBASE_POLICY)
+                await _upsert_public_catalogue_record(cur, make_record(uuid=""), self.source.policy)
         assert count_datasets(sync_conn) == 0
 
     async def test_sync_loop_records_missing_uuid_as_failed_record(self, db_pool, sync_conn):
-        """Through the loop: a no-uuid record is skipped-and-recorded — the
-        sync COMPLETES and last_sync_error carries the '<no-uuid>' marker
-        instead of the whole run aborting or duplicates accumulating."""
-        with patch(FETCH, autospec=True, return_value=harvest_result([make_record(uuid=None)])):
-            await _sync_source_a(db_pool)
+        """An invalid harvest identity fails validation before staging or writes.
 
-        status = sync_status_row(sync_conn)
+        The fetch error records the identity failure without creating a row.
+        """
+        with patch(FETCH, autospec=True, return_value=harvest_result([make_record(uuid=None)])):
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
+
+        status = sync_status_row(sync_conn, source=self.source.name)
         assert status["last_sync_error"] is not None
         assert "fetch" in status["last_sync_error"]
         assert "identities" in status["last_sync_error"]
         assert count_datasets(sync_conn) == 0
 
 
-class TestIncrementalHappyPath:
+class TestIncrementalHappyPath(SourceCase):
     """Policy tier, access classification, the migration-owned search
     trigger, and watermark timing on a clean incremental run."""
 
     async def test_incremental_sync_happy_path(self, db_pool, sync_conn):
-        """Two records land with source='swissubase'; visibility resolves through
-        the source POLICY ceiling (settings.swissubase_max_visibility — records
-        carry no tier of their own); access_level derives from the license text;
-        the SEARCH TRIGGER (defined only in the migration — schema source of
-        truth) fills search_text_full with the description but keeps it OUT of
-        search_text_public; the watermark lands between call start and fetch
-        return (captured BEFORE the fetch); error state clears."""
+        """Check incremental insertion, access classification, source scoping and progress."""
+        configured_source = self.source
         fetch_returned_at = {}
 
         def fake_fetch(**_kwargs):
             # Capture t1 INSIDE the fake: the watermark must be <= this instant.
+            """Return the case's synthetic harvest and apply its test-controlled synchronization."""
             fetch_returned_at["t1"] = datetime.now(UTC)
             return harvest_result(
                 [
@@ -119,7 +130,10 @@ class TestIncrementalHappyPath:
 
         t0 = datetime.now(UTC)
         with patch(FETCH, autospec=True, side_effect=fake_fetch):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=configured_source,
+            )
 
         rows = sync_conn.execute(
             """SELECT uuid, source, visibility_tier, access_level,
@@ -130,11 +144,9 @@ class TestIncrementalHappyPath:
         by_uuid = {r[0]: r for r in rows}
 
         for r in rows:
-            assert r[1] == "swissubase"
-            # Records carry visibility_tier=None -> resolve_tier returns the
-            # policy ceiling, which is settings.swissubase_max_visibility
-            # ('vetted' in the default test env).
-            assert r[2] == settings.swissubase_max_visibility
+            assert r[1] == self.source.name
+            # Records without an explicit tier resolve to the selected policy ceiling.
+            assert r[2] == configured_source.policy.max_visibility
 
         # License classification: 'Restricted access …' -> restricted; CC -> public.
         assert by_uuid["oai:swissubase:aaa-1"][3] == "restricted"
@@ -147,30 +159,36 @@ class TestIncrementalHappyPath:
         assert "Restricted Interviews" in pub
         assert "unmistakableword" not in pub
 
-        status = sync_status_row(sync_conn)
+        status = sync_status_row(sync_conn, source=self.source.name)
         assert status["last_sync_error"] is None
         # Watermark: captured before the fetch, so t0 <= watermark <= t1.
         assert t0 <= status["last_harvest_date"] <= fetch_returned_at["t1"]
 
     async def test_sync_same_uuid_twice_updates_not_duplicates(self, db_pool, sync_conn):
-        """ON CONFLICT (source, uuid) DO UPDATE: re-syncing the same uuid with
-        a changed title updates the single existing row instead of inserting
-        a second."""
+        """Re-syncing a UUID updates the selected source's existing row."""
         with patch(
             FETCH,
             autospec=True,
             return_value=harvest_result([make_record("oai:x:dup-1", title="Old Title")]),
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
+
         with patch(
             FETCH,
             autospec=True,
             return_value=harvest_result([make_record("oai:x:dup-1", title="New Title")]),
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
 
         rows = sync_conn.execute(
-            "SELECT title FROM oral_history_datasets WHERE uuid = %s", ("oai:x:dup-1",)
+            "SELECT title FROM oral_history_datasets WHERE source = %s AND uuid = %s",
+            (self.source.name, "oai:x:dup-1"),
         ).fetchall()
         assert rows == [("New Title",)]
         assert count_datasets(sync_conn) == 1
@@ -181,21 +199,32 @@ class TestIncrementalHappyPath:
         the overlap window, but leaves that stored cursor untouched — there is
         nothing new to advance the watermark to."""
         previous = datetime(2026, 1, 3, 18, tzinfo=UTC)
-        sync_conn.execute("UPDATE sync_status SET source_cursor=%s", (previous,))
+        sync_conn.execute(
+            "UPDATE sync_status SET source_cursor = %s WHERE source = %s",
+            (previous, self.source.name),
+        )
         sync_conn.commit()
         with patch(FETCH, autospec=True, return_value=harvest_result()) as fetch:
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
+        assert fetch.call_args is not None
         assert fetch.call_args.kwargs["since"] == (previous - timedelta(days=2)).strftime(
             "%Y-%m-%d"
         )
-        assert sync_conn.execute("SELECT source_cursor FROM sync_status").fetchone()[0] == previous
+        assert (
+            sync_conn.execute(
+                "SELECT source_cursor FROM sync_status WHERE source = %s",
+                (self.source.name,),
+            ).fetchone()[0]
+            == previous
+        )
 
-
-class TestUpstreamRedactionPropagation:
     @pytest.mark.parametrize(
         "runner",
         [
-            pytest.param(_sync_source_a, id="incremental"),
+            pytest.param(_sync_source, id="incremental"),
             pytest.param(run_full_rebuild, id="full-rebuild"),
         ],
     )
@@ -205,14 +234,7 @@ class TestUpstreamRedactionPropagation:
         sync_conn,
         runner,
     ):
-        """A correction replaces normalized, raw and derived copies, whether
-        the correction lands via the incremental loop or a full rebuild.
-
-        The Source A database is a source-authoritative cache. A correction
-        that merely clears the rendered column but leaves the previous value
-        in JSONB or trigger-maintained search text would retain withdrawn
-        metadata.
-        """
+        """Verify source a upstream redaction clears every stored copy."""
         uuid = "oai:x:upstream-redaction"
         marker = "source-a-sensitive-withdrawal-marker"
         original_modified_at = datetime(2026, 1, 2, tzinfo=UTC)
@@ -233,13 +255,16 @@ class TestUpstreamRedactionPropagation:
             version=marker,
             doi=f"10.1234/{marker}",
             resource_type=marker,
-            institutions=[settings.oai_institution_filter, marker],
+            institutions=[TEST_INSTITUTION_FILTER, marker],
             main_disciplines=[marker],
             bibliographical_citation=marker,
             upstream_modified_at=original_modified_at,
         )
         with patch(FETCH, autospec=True, return_value=harvest_result([original])):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
 
         positive = sync_conn.execute(
             """SELECT uuid, title, project_title, description, resource_description,
@@ -250,13 +275,13 @@ class TestUpstreamRedactionPropagation:
                       upstream_modified_at, data::text, search_text_public,
                       search_text_full
                FROM oral_history_datasets
-               WHERE source = 'swissubase' AND uuid = %s""",
-            (uuid,),
+               WHERE source = %s AND uuid = %s""",
+            (self.source.name, uuid),
         ).fetchone()
         assert positive is not None
         assert positive[12] == "restricted"
-        assert positive[19] == "swissubase"
-        assert positive[20] == _SWISSUBASE_POLICY.max_visibility
+        assert positive[19] == self.source.name
+        assert positive[20] == self.source.policy.max_visibility
         assert positive[21] == original_modified_at
         marker_bearing_indexes = (
             1,
@@ -298,13 +323,13 @@ class TestUpstreamRedactionPropagation:
             version=None,
             doi=None,
             resource_type=None,
-            institutions=[settings.oai_institution_filter],
+            institutions=[TEST_INSTITUTION_FILTER],
             main_disciplines=[],
             bibliographical_citation=None,
             upstream_modified_at=corrected_modified_at,
         )
         with patch(FETCH, autospec=True, return_value=harvest_result([corrected])):
-            await runner(db_pool)
+            await runner(db_pool, configured_source=self.source)
 
         row = sync_conn.execute(
             """SELECT uuid, title, project_title, description, resource_description,
@@ -315,8 +340,8 @@ class TestUpstreamRedactionPropagation:
                       upstream_modified_at, data::text, search_text_public,
                       search_text_full
                FROM oral_history_datasets
-               WHERE source = 'swissubase' AND uuid = %s""",
-            (uuid,),
+               WHERE source = %s AND uuid = %s""",
+            (self.source.name, uuid),
         ).fetchone()
         assert row is not None
         assert row[:22] == (
@@ -332,15 +357,15 @@ class TestUpstreamRedactionPropagation:
             [],
             None,
             None,
-            "public",
-            [settings.oai_institution_filter],
+            "restricted",
+            [TEST_INSTITUTION_FILTER],
             None,
             None,
             None,
             [],
             None,
-            "swissubase",
-            _SWISSUBASE_POLICY.max_visibility,
+            self.source.name,
+            self.source.policy.max_visibility,
             corrected_modified_at,
         )
         assert marker not in row[22]  # complete parsed record JSONB
@@ -348,7 +373,7 @@ class TestUpstreamRedactionPropagation:
         assert marker not in row[24]  # full trigger-derived search text
 
 
-class TestWithdrawals:
+class TestWithdrawals(SourceCase):
     """Tombstones and definitive filter mismatches on the incremental path."""
 
     async def test_tombstone_record_deletes_row(self, db_pool, sync_conn):
@@ -356,42 +381,45 @@ class TestWithdrawals:
         with patch(
             FETCH, autospec=True, return_value=harvest_result([make_record("oai:x:tomb-1")])
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
         assert count_datasets(sync_conn, uuid="oai:x:tomb-1") == 1
 
         with patch(
             FETCH, autospec=True, return_value=harvest_result(deleted_uuids={"oai:x:tomb-1"})
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
         assert count_datasets(sync_conn, uuid="oai:x:tomb-1") == 0
-        assert sync_status_row(sync_conn)["last_sync_error"] is None
+        assert sync_status_row(sync_conn, source=self.source.name)["last_sync_error"] is None
 
     async def test_tombstone_for_never_seen_uuid_is_a_clean_noop(self, db_pool, sync_conn):
         """OAI replays tombstones, so a delete for a uuid this instance
         never held must be a clean no-op — 0 rows deleted, no error recorded,
         the watermark still advances. Raising on a 0-row DELETE would turn
         routine replayed tombstones into a perpetual last_sync_error."""
-        before = sync_status_row(sync_conn)["last_harvest_date"]
+        before = sync_status_row(sync_conn, source=self.source.name)["last_harvest_date"]
         with patch(
             FETCH,
             autospec=True,
             return_value=harvest_result(deleted_uuids={"oai:x:never-existed"}),
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
 
-        assert sync_status_row(sync_conn)["last_sync_error"] is None
-        assert sync_status_row(sync_conn)["last_harvest_date"] > before
+        assert sync_status_row(sync_conn, source=self.source.name)["last_sync_error"] is None
+        assert sync_status_row(sync_conn, source=self.source.name)["last_harvest_date"] > before
 
     async def test_tombstone_spares_foreign_source_row_sharing_its_uuid(
         self, db_pool, sync_conn, dataset_factory
     ):
-        """Cross-source data loss on the INCREMENTAL tombstone path —
-        without the 'AND source =' predicate on the tombstone DELETE, a
-        replayed Source A tombstone would silently destroy ANY row that
-        happens to share its uuid, wiping another source's catalogue entry.
-        (The REBUILD path's source-scoping is pinned separately in
-        test_sync_rebuild_db.py. Positive control for the survival
-        assertion: the same-source twin below.)"""
+        """Verify tombstone spares foreign source row sharing its UUID."""
         dataset_factory(uuid="oai:x:cross-tomb", source="mock")
 
         with patch(
@@ -399,36 +427,39 @@ class TestWithdrawals:
             autospec=True,
             return_value=harvest_result(deleted_uuids={"oai:x:cross-tomb"}),
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
 
         assert count_datasets(sync_conn, uuid="oai:x:cross-tomb") == 1  # survives
-        assert sync_status_row(sync_conn)["last_sync_error"] is None
+        assert count_datasets(sync_conn, uuid="oai:x:cross-tomb", source="mock") == 1
+        assert sync_status_row(sync_conn, source=self.source.name)["last_sync_error"] is None
 
     async def test_tombstone_still_deletes_same_source_row_with_that_uuid(
         self, db_pool, sync_conn, dataset_factory
     ):
-        """Identical tombstone, identical row differing ONLY in
-        source='swissubase': the DELETE must fire. Pins the second half of
-        the 'AND source =' predicate, so an over-scoped 'fix' that stops the
-        incremental tombstone from deleting anything at all fails here
-        instead of quietly accumulating upstream-deleted records."""
-        dataset_factory(uuid="oai:x:cross-tomb", source="swissubase")
+        """Verify tombstone still deletes same source row with that UUID."""
+        dataset_factory(uuid="oai:x:cross-tomb", source=self.source.name)
 
         with patch(
             FETCH,
             autospec=True,
             return_value=harvest_result(deleted_uuids={"oai:x:cross-tomb"}),
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
 
         assert count_datasets(sync_conn, uuid="oai:x:cross-tomb") == 0  # deleted
-        assert sync_status_row(sync_conn)["last_sync_error"] is None
+        assert sync_status_row(sync_conn, source=self.source.name)["last_sync_error"] is None
 
-    async def test_incremental_nonmatching_record_removes_only_source_row(
+    async def test_incremental_nonmatching_record_withholds_only_source_row(
         self, db_pool, sync_conn, dataset_factory
     ):
-        """A definite filter mismatch is an authoritative Source A removal."""
-        dataset_factory(uuid="oai:x:nonmatching", source="swissubase")
+        """A local filter exclusion retains the selected row under serving quarantine."""
+        dataset_factory(uuid="oai:x:nonmatching", source=self.source.name)
         dataset_factory(uuid="oai:x:nonmatching", source="mock")
 
         with patch(
@@ -436,11 +467,17 @@ class TestWithdrawals:
             autospec=True,
             return_value=harvest_result(nonmatching_uuids={"oai:x:nonmatching"}),
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
 
-        assert count_datasets(sync_conn, uuid="oai:x:nonmatching", source="swissubase") == 0
+        assert count_datasets(sync_conn, uuid="oai:x:nonmatching", source=self.source.name) == 1
         assert count_datasets(sync_conn, uuid="oai:x:nonmatching", source="mock") == 1
-        assert sync_status_row(sync_conn)["last_sync_error"] is None
+        assert sync_status_row(sync_conn, source=self.source.name)["last_sync_error"] is not None
+        assert sync_conn.execute(
+            "SELECT source, reason FROM ingestion_quarantine WHERE uuid = 'oai:x:nonmatching'"
+        ).fetchall() == [(self.source.name, "filter_mismatch")]
 
     async def test_spaced_tombstone_deletes_live_record(self, db_pool, monkeypatch):
         """Whitespace-normalized tombstones delete the persisted live
@@ -448,51 +485,61 @@ class TestWithdrawals:
         stripped before matching."""
         async with get_db_cursor(db_pool) as cur:
             await cur.execute(
-                "INSERT INTO oral_history_datasets (uuid, source, title) VALUES (%s, 'swissubase', 'Old')",
-                ("oai:test:spaced",),
+                "INSERT INTO oral_history_datasets (uuid, source, title) VALUES (%s, %s, 'Old')",
+                ("oai:test:spaced", self.source.name),
             )
         xml = etree.fromstring(
             b'<record xmlns="http://www.openarchives.org/OAI/2.0/">'
             b'<header status="deleted"><identifier>  oai:test:spaced \n</identifier></header></record>'
         )
-        monkeypatch.setattr("app.services.sync.fetch_updates_isolated", oai_client.fetch_updates)
+        monkeypatch.setattr(
+            FETCH,
+            create_autospec(
+                oai_client.fetch_updates_isolated, side_effect=fetch_updates_in_process
+            ),
+        )
         with patch_records(return_value=[xml]):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
         async with get_db_cursor(db_pool) as cur:
             await cur.execute(
-                "SELECT 1 FROM oral_history_datasets WHERE uuid = %s", ("oai:test:spaced",)
+                "SELECT 1 FROM oral_history_datasets WHERE source = %s AND uuid = %s",
+                (self.source.name, "oai:test:spaced"),
             )
             assert await cur.fetchone() is None
 
-    async def test_many_unrelated_withdrawals_advance_cursor_without_claiming_changes(
+    async def test_many_unknown_filter_exclusions_advance_cursor_without_creating_state(
         self, db_pool, sync_conn
     ):
-        """20,000 upstream withdrawals for uuids this instance never held (a
-        large definitive-mismatch batch) apply as a clean no-op: nothing is
-        claimed as a change, the run still reports success, and the
-        incremental cursor still advances to the harvest's source_cursor."""
+        """Unknown filter exclusions are clean progress, without retained per-identity state."""
         with patch(
             FETCH,
             autospec=True,
             return_value=harvest_result(nonmatching_uuids={f"other:{i}" for i in range(20000)}),
         ):
-            outcome = await _sync_source_a(db_pool)
+            outcome = await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
         assert outcome.affected_count == 0
         assert outcome.status == "success"
-        assert sync_conn.execute("SELECT source_cursor FROM sync_status").fetchone() == (
-            SOURCE_CURSOR,
-        )
+        assert sync_conn.execute(
+            "SELECT source_cursor FROM sync_status WHERE source = %s",
+            (self.source.name,),
+        ).fetchone() == (SOURCE_CURSOR,)
+        for table in ("ingestion_quarantine", "ingestion_failures", "source_security_state"):
+            assert sync_conn.execute(
+                f"SELECT count(*) FROM {table} WHERE source = %s", (self.source.name,)
+            ).fetchone() == (0,)
 
 
-class TestDoiCollision:
+class TestDoiCollision(SourceCase):
     """The self-diagnosing UniqueViolation branch on the incremental path."""
 
     async def test_doi_collision_skips_record_with_diagnostic_message(self, db_pool, sync_conn):
-        """Upstream minted a new uuid but reused an existing doi: the doi
-        UNIQUE constraint blocks the new version; the sync records the
-        self-diagnosing 'DOI collision' message naming the new uuid, keeps
-        the original row, and still lands the other record of the same
-        batch (per-record isolation)."""
+        """Verify doi collision skips record with diagnostic message."""
         with patch(
             FETCH,
             autospec=True,
@@ -500,7 +547,10 @@ class TestDoiCollision:
                 [make_record("oai:x:orig-1", title="Original Version", doi="10.1/dup")]
             ),
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
         assert count_datasets(sync_conn, uuid="oai:x:orig-1") == 1
 
         with patch(
@@ -514,23 +564,27 @@ class TestDoiCollision:
                 ]
             ),
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
 
         # Colliding record skipped; original intact; batch-mate landed.
         assert count_datasets(sync_conn, uuid="oai:x:newver-2") == 0
         assert sync_conn.execute(
-            "SELECT title FROM oral_history_datasets WHERE uuid = %s", ("oai:x:orig-1",)
+            "SELECT title FROM oral_history_datasets WHERE source = %s AND uuid = %s",
+            (self.source.name, "oai:x:orig-1"),
         ).fetchone() == ("Original Version",)
         assert count_datasets(sync_conn, uuid="oai:x:innocent-3") == 1
 
-        err = sync_status_row(sync_conn)["last_sync_error"]
+        err = sync_status_row(sync_conn, source=self.source.name)["last_sync_error"]
         assert err is not None
         assert "DOI collision" in err
         assert "reused an existing" in err
         assert "oai:x:newver-2" in err
 
 
-class TestSameHarvestDoiReplacement:
+class TestSameHarvestDoiReplacement(SourceCase):
     """A withdrawn predecessor and its DOI successor inside one harvest."""
 
     @pytest.mark.parametrize(
@@ -541,37 +595,59 @@ class TestSameHarvestDoiReplacement:
     async def test_same_harvest_replaces_a_doi_predecessor(
         self, db_pool, sync_conn, dataset_factory, monkeypatch, withdrawal
     ):
-        """Withdrawals in a harvest batch apply before the batch's inserts,
-        so a successor record reusing its predecessor's DOI lands instead of
-        colliding with the still-present old row — whether the predecessor
-        leaves via an OAI tombstone (deleted_uuids) or a definitive filter
-        mismatch (nonmatching_uuids) in that same batch."""
-        dataset_factory(source="swissubase", uuid="old-uuid", doi="10.1234/shared")
-        harvest = oai_client.HarvestResult(
+        """Only an authoritative tombstone frees the predecessor's DOI ownership."""
+        dataset_factory(source=self.source.name, uuid="old-uuid", doi="10.1234/shared")
+        harvest = HarvestResult(
             source_cursor=SOURCE_CURSOR,
             matching_records=[make_record("new-uuid", doi="10.1234/shared")],
             **{withdrawal: {"old-uuid"}},
         )
         monkeypatch.setattr(
-            sync, "run_in_threadpool", create_autospec(run_in_threadpool, return_value=harvest)
+            ingestion, "run_source_fetch", create_autospec(run_source_fetch, return_value=harvest)
         )
-        result = await sync.run_sync(db_pool)
+        result = await ingestion.run_sync(
+            db_pool,
+            configured_source=self.source,
+        )
+        if withdrawal == "nonmatching_uuids":
+            assert result.status == "partial" and result.affected_count == 0
+            assert sync_conn.execute(
+                "SELECT uuid FROM oral_history_datasets WHERE source = %s", (self.source.name,)
+            ).fetchall() == [("old-uuid",)]
+            assert sync_conn.execute(
+                "SELECT uuid, reason FROM ingestion_quarantine WHERE source = %s",
+                (self.source.name,),
+            ).fetchall() == [("old-uuid", "filter_mismatch")]
+            assert ingestion_failure_uuids(sync_conn, source=self.source.name) == {
+                "old-uuid",
+                "new-uuid",
+            }
+            return
         assert result.status == "success"
         assert result.affected_count == 2
         assert sync_conn.execute(
-            "SELECT uuid FROM oral_history_datasets WHERE source = 'swissubase'"
+            "SELECT uuid FROM oral_history_datasets WHERE source = %s",
+            (self.source.name,),
         ).fetchall() == [("new-uuid",)]
-        assert sync_conn.execute("SELECT incremental_failures FROM sync_status").fetchone() == ({},)
+        assert (
+            sync_conn.execute(
+                "SELECT uuid FROM ingestion_failures WHERE source = %s",
+                (self.source.name,),
+            ).fetchall()
+            == []
+        )
+        assert ingestion_failure_uuids(sync_conn, source=self.source.name) == set()
 
 
-class TestPerRecordResilience:
+class TestPerRecordResilience(SourceCase):
     """Per-record fault isolation and watermark discipline in the
     incremental loop."""
 
     async def test_incremental_sync_survives_one_broken_record(self, db_pool, sync_conn):
-        """A record missing a PARSER_OWNED key (parser-contract drift ->
-        KeyError) is skipped-and-recorded; both healthy neighbours still
-        land."""
+        """A PostgreSQL-rejected record is isolated and recorded as failed.
+
+        Both healthy neighbours still land.
+        """
         broken = make_record("oai:x:broken-2")
         broken["authors"] = ["\x00"]  # PostgreSQL rejects NUL after structural validation.
 
@@ -586,13 +662,16 @@ class TestPerRecordResilience:
                 ]
             ),
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
 
         assert count_datasets(sync_conn, uuid="oai:x:good-1") == 1
         assert count_datasets(sync_conn, uuid="oai:x:good-3") == 1
         assert count_datasets(sync_conn, uuid="oai:x:broken-2") == 0
 
-        err = sync_status_row(sync_conn)["last_sync_error"]
+        err = sync_status_row(sync_conn, source=self.source.name)["last_sync_error"]
         assert err is not None
         assert "oai:x:broken-2" in err
 
@@ -601,14 +680,17 @@ class TestPerRecordResilience:
         holds the watermark back, even though the successful record lands."""
         broken = make_record("oai:x:broken")
         broken["authors"] = ["\x00"]  # PostgreSQL rejects NUL after structural validation.
-        before = sync_status_row(sync_conn)["last_harvest_date"]
+        before = sync_status_row(sync_conn, source=self.source.name)["last_harvest_date"]
         with patch(
             FETCH,
             autospec=True,
             return_value=harvest_result([make_record("oai:x:ok"), broken]),
         ):
-            await _sync_source_a(db_pool)
-        status = sync_status_row(sync_conn)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
+        status = sync_status_row(sync_conn, source=self.source.name)
         assert count_datasets(sync_conn, uuid="oai:x:ok") == 1
         assert "oai:x:broken" in status["last_sync_error"]
         assert status["last_harvest_date"] == before
@@ -630,10 +712,11 @@ class TestPerRecordResilience:
                        last_sync_error_at = CURRENT_TIMESTAMP,
                        last_rebuild_error = 'existing rebuild error',
                        last_rebuild_error_at = CURRENT_TIMESTAMP
-                   WHERE id = 1"""
+                   WHERE source = %s""",
+                (self.source.name,),
             )
 
-        before = sync_status_row(sync_conn)
+        before = sync_status_row(sync_conn, source=self.source.name)
 
         malformed_body = b"<html><body>maintenance</body></html>"
         patcher, mock_get = patch_session_get(
@@ -642,11 +725,14 @@ class TestPerRecordResilience:
 
         with (
             patcher,
-            patch(FETCH, new=oai_client.fetch_updates),
+            patch(FETCH, autospec=True, side_effect=fetch_updates_in_process),
         ):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
 
-        after = sync_status_row(sync_conn)
+        after = sync_status_row(sync_conn, source=self.source.name)
 
         assert mock_get.call_count == 1
         assert after["last_harvest_date"] == before["last_harvest_date"]
@@ -664,25 +750,31 @@ class TestPerRecordResilience:
         'Incremental sync (fetch):' prefix and holds the watermark back; a
         later EMPTY successful sync — days of quiet upstream — clears the
         channel instead of leaving /health/detail 'degraded' forever."""
-        before = sync_status_row(sync_conn)["last_harvest_date"]
+        before = sync_status_row(sync_conn, source=self.source.name)["last_harvest_date"]
 
         with patch(FETCH, autospec=True, side_effect=RuntimeError("flaky network")):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
 
-        status = sync_status_row(sync_conn)
+        status = sync_status_row(sync_conn, source=self.source.name)
         assert status["last_sync_error"] is not None
         assert status["last_sync_error"].startswith("Incremental sync (fetch):")
         assert status["last_harvest_date"] == before  # fetch failure holds the watermark
 
         with patch(FETCH, autospec=True, return_value=harvest_result()):
-            await _sync_source_a(db_pool)
+            await _sync_source(
+                db_pool,
+                configured_source=self.source,
+            )
 
-        status = sync_status_row(sync_conn)
+        status = sync_status_row(sync_conn, source=self.source.name)
         assert status["last_sync_error"] is None
         assert status["last_harvest_date"] > before
 
 
-class TestTransactionalWriteFaults:
+class TestTransactionalWriteFaults(SourceCase):
     """The write phase commits one batch/record at a time, so a mid-run
     failure discards only the work in flight, and a persisted write fault
     lands on the health channel of the path (incremental or full-rebuild)
@@ -691,28 +783,30 @@ class TestTransactionalWriteFaults:
     async def test_repeated_write_deadlines_resume_the_tail_without_refetching(
         self, db_pool, sync_conn, monkeypatch
     ):
-        """Each committed incremental batch is its own top-level transaction,
-        so a deadline mid-batch can only discard the item in flight, never an
-        already-committed one before it. Forcing one item per batch pins that
-        resumability: two deadlines in a row each advance the position by
-        exactly one, and the eventual clean run picks up the remaining tail
-        without re-fetching the harvest."""
+        """Verify repeated write deadlines resume the tail without refetching."""
         harvest = harvest_result([make_record(f"resume-{i}") for i in range(3)])
-        fetch = create_autospec(run_in_threadpool, return_value=harvest)
-        monkeypatch.setattr(sync, "run_in_threadpool", fetch)
-        monkeypatch.setattr(settings, "sync_write_timeout_seconds", 0.15)
-        monkeypatch.setattr(sync, "_INCREMENTAL_COMMIT_BATCH_SIZE", 1)
-        original = sync._upsert_public_catalogue_record
+        fetch = create_autospec(run_source_fetch, return_value=harvest)
+        monkeypatch.setattr(ingestion, "run_source_fetch", fetch)
+        configured_source = legacy_source(
+            name=self.source.name, schedule={"write_timeout_seconds": 1}
+        )
+        monkeypatch.setattr(ingestion, "_INCREMENTAL_COMMIT_BATCH_SIZE", 1)
+        original = ingestion._upsert_public_catalogue_record
         writes_this_run = 0
 
         async def one_then_block(*args):
+            """Perform one real write, then block indefinitely on the second call."""
             nonlocal writes_this_run
             writes_this_run += 1
             if writes_this_run == 2:
                 await asyncio.Event().wait()
             return await original(*args)
 
-        monkeypatch.setattr(sync, "_upsert_public_catalogue_record", one_then_block)
+        monkeypatch.setattr(
+            ingestion,
+            "_upsert_public_catalogue_record",
+            create_autospec(original, side_effect=one_then_block),
+        )
         # One actual connection throughout, like the advisory-lock-owning
         # scheduler: call the connection-level entry point directly rather
         # than run_sync (which acquires its own lock connection from a pool).
@@ -722,33 +816,42 @@ class TestTransactionalWriteFaults:
             for expected_count in (1, 2):
                 writes_this_run = 0
                 with pytest.raises(TimeoutError):
-                    await sync._run_sync_on_locked_connection(connection)
+                    await ingestion._run_sync_on_locked_connection(
+                        connection,
+                        configured_source=configured_source,
+                    )
                 assert (
                     sync_conn.execute("SELECT count(*) FROM oral_history_datasets").fetchone()[0]
                     == expected_count
                 )
                 state = sync_conn.execute(
-                    "SELECT incremental_position, source_cursor, last_sync_error FROM sync_status"
+                    "SELECT incremental_position, source_cursor, last_sync_error "
+                    "FROM sync_status WHERE source = %s",
+                    (self.source.name,),
                 ).fetchone()
                 assert state[0] == expected_count
                 assert state[1] is None
                 assert "TimeoutError" in state[2]
                 sync_conn.commit()
             writes_this_run = 0
-            result = await sync._run_sync_on_locked_connection(connection)
+            result = await ingestion._run_sync_on_locked_connection(
+                connection,
+                configured_source=configured_source,
+            )
         assert result.status == "success" and result.affected_count == 3
         fetch.assert_awaited_once()
         assert sync_conn.execute(
             "SELECT incremental_harvest, incremental_position, source_cursor, last_sync_error "
-            "FROM sync_status"
+            "FROM sync_status WHERE source = %s",
+            (self.source.name,),
         ).fetchone() == (None, 0, harvest.source_cursor, None)
         assert sync_conn.execute("SELECT count(*) FROM oral_history_datasets").fetchone()[0] == 3
 
     @pytest.mark.parametrize(
         "run",
         [
-            pytest.param(sync.run_sync, id="incremental"),
-            pytest.param(sync.run_full_rebuild, id="full-rebuild"),
+            pytest.param(ingestion.run_sync, id="incremental"),
+            pytest.param(ingestion.run_full_rebuild, id="full-rebuild"),
         ],
     )
     async def test_write_fault_persists_its_health_channel_after_rollback(
@@ -759,21 +862,29 @@ class TestTransactionalWriteFaults:
         channel belonging to the path that failed, leaving the other
         channel untouched."""
         monkeypatch.setattr(
-            sync,
-            "run_in_threadpool",
-            create_autospec(run_in_threadpool, return_value=harvest_result([make_record("fault")])),
+            ingestion,
+            "run_source_fetch",
+            create_autospec(run_source_fetch, return_value=harvest_result([make_record("fault")])),
         )
 
+        original = ingestion._upsert_public_catalogue_record
+
         async def broken_write(*_args):
+            """Raise the injected catalogue-write failure."""
             raise RuntimeError("injected write failure")
 
-        monkeypatch.setattr(sync, "_upsert_public_catalogue_record", broken_write)
+        monkeypatch.setattr(
+            ingestion,
+            "_upsert_public_catalogue_record",
+            create_autospec(original, side_effect=broken_write),
+        )
         with pytest.raises(RuntimeError, match="injected write failure"):
-            await run(db_pool)
+            await run(db_pool, configured_source=self.source)
         incremental, full = sync_conn.execute(
-            "SELECT last_sync_error, last_rebuild_error FROM sync_status"
+            "SELECT last_sync_error, last_rebuild_error FROM sync_status WHERE source = %s",
+            (self.source.name,),
         ).fetchone()
-        rebuild = run is sync.run_full_rebuild
+        rebuild = run is ingestion.run_full_rebuild
         assert "injected write failure" in (full if rebuild else incremental)
         assert (incremental if rebuild else full) is None
         assert sync_conn.execute("SELECT count(*) FROM oral_history_datasets").fetchone()[0] == 0

@@ -1,13 +1,9 @@
-"""Helpers for reading the shipped systemd units and running their checks.
+"""Approximate shipped unit directives for tests; this is not a systemd parser.
 
-Shared by the deployment-unit contract tests and the settings tests, which
-both need to know what a unit's processes would actually see at start time.
-The rules modelled here are systemd's own: ``Environment=`` is applied first
-and every ``EnvironmentFile=`` afterwards in the order written, so a later
-file wins; a command line's ``${NAME}`` or ``$NAME`` word is replaced by the
-variable's value and split into words, with an unset or empty variable
-contributing nothing; and ``ExecStartPre=`` commands run before the main
-process, which never starts if one of them exits non-zero.
+Strip hash tails, split commands on whitespace and expand only whole-token
+variables; brace and bare references both split their values. Quoting, command
+prefixes, reset semantics, specifiers and systemd execution context are not
+modeled. Guards run as subprocesses with the test process environment.
 """
 
 import re
@@ -24,22 +20,21 @@ _VARIABLE_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A
 
 
 def unit_directives(path: Path, name: str) -> list[str]:
-    """Every value a unit assigns to one directive, in file order."""
+    """Read with default text encoding, strip hash tails and return matching directive values in
+    order.
+    """
     text = "\n".join(line.split("#", 1)[0] for line in path.read_text().splitlines())
     return re.findall(rf"(?m)^\s*{re.escape(name)}=(.*?)\s*$", text)
 
 
 def environment_file_paths(unit: Path) -> list[str]:
-    """The environment files a unit loads, in order, without systemd's
-    leading '-' (which only marks a file as optional)."""
+    """Return EnvironmentFile values in order, removing one optional-file hyphen."""
     return [value.removeprefix("-") for value in unit_directives(unit, "EnvironmentFile")]
 
 
 def effective_environment(unit: Path, file_contents: dict[str, dict[str, str]]) -> dict[str, str]:
-    """The environment a unit's processes would actually see.
-
-    ``file_contents`` maps a path named by the unit to the assignments that
-    file makes; a file left out contributes nothing.
+    """Merge parsed Environment assignments then supplied file mappings; missing files contribute
+    nothing.
     """
     environment: dict[str, str] = {}
     for assignment in unit_directives(unit, "Environment"):
@@ -51,7 +46,9 @@ def effective_environment(unit: Path, file_contents: dict[str, dict[str, str]]) 
 
 
 def command_words(raw_directive: str, environment: dict[str, str]) -> list[str]:
-    """Expand a unit command line the way systemd does before running it."""
+    """Split whitespace and expand whole-token $NAME/${NAME}; split either value and omit empty
+    ones.
+    """
     words: list[str] = []
     for token in raw_directive.split():
         reference = _VARIABLE_REFERENCE.fullmatch(token)
@@ -64,7 +61,13 @@ def command_words(raw_directive: str, environment: dict[str, str]) -> list[str]:
 
 
 def start_guards_accept(unit: Path, file_contents: dict[str, dict[str, str]]) -> bool:
-    """Run the unit's start checks and report whether its process would start."""
+    """Run parsed ExecStartPre commands with inherited test environment; return False at first
+    nonzero exit.
+
+    Require absolute existing executables or raise AssertionError; OS/subprocess
+    errors propagate. Configured unit environment only expands command arguments;
+    it is not passed as the child environment. No timeout is imposed.
+    """
     environment = effective_environment(unit, file_contents)
     for guard in unit_directives(unit, "ExecStartPre"):
         words = command_words(guard, environment)

@@ -1,8 +1,45 @@
 # Operational scripts
 
-Production scripts import the application from the installed release wheel.
+Application maintenance scripts import the application from the installed release wheel.
 Pytest's `pythonpath = ["src"]` does not configure ordinary Python scripts.
 Editable installs and `PYTHONPATH=src` are development-only workflows.
+
+## Retained staging inventory
+
+`inventory_staging.py` is a standalone read-only operator tool using stdlib and
+the locked `psycopg` dependency; it does not import application settings/services.
+Follow the [retained staging runbook](../docs/runbooks/retained-staging-inventory.md)
+for reviewed libpq authentication, database identity, shared deployment lock and
+private exclusive output. It does not migrate, declare schema compatibility or
+verify a recovery point. Record the reviewed file digest separately from the
+installed release. Never start candidate application services to obtain an inventory.
+The CLI requires `--expected-database NAME --output /absolute/private/report.json`.
+
+For authors/CI, `python scripts/check_staging_inventory.py` compares the literal
+managed-table inventory (plus Alembic's version table) with all current table
+contracts and the selected safe progress fields/types with the sync contract.
+Diagnostic error fields are explicitly excluded; new sync fields require a
+classification. This offline checker imports current application contracts,
+while `inventory_staging.py` remains standalone. Older databases may lack listed
+tables/columns: the runtime inventory still records those observations using its
+existing missing/unsupported status paths; the authoring check does not remove
+that backwards-inspection support or certify those databases for service.
+
+Add repeatable `--exclude-root /absolute/checkout` options for reviewed source
+checkouts or directories that must not contain evidence. Exclusions must exist
+and have no parent-traversal components. Checkout execution also excludes this
+project automatically; a standalone copy infers no checkout from its installation
+prefix, including when it is directly under `/tmp`. Destination/exclusion checks
+run before any database connection, and publication retains the validated parent
+directory descriptor. See the runbook for the complete locked invocation.
+
+## Catalogue search policy
+
+`rebuild_search_policy.py` is included in the installed release alongside the
+application wheel. Follow the [search-policy runbook](../docs/runbooks/search-policy.md)
+to rebuild the audience projections during maintenance with an explicit expected
+fingerprint and owner database credentials. The command compares and replaces the
+binding atomically; ordinary web startup does not perform this rebuild.
 
 ## TOTP key maintenance
 
@@ -49,13 +86,42 @@ python3.11 scripts/build_release.py \
 
 The builder validates the lock, builds an sdist and wheel, installs hash-locked binary runtime dependencies in isolation, smoke-tests packaged assets, and writes a release archive. A ZIP without Git provenance cannot build a release. `run_wheel_smoke.py` performs the same build using `GITHUB_SHA` and discards temporary output; `smoke_installed_wheel.py` and `wheel_smoke_env.py` are internal helpers used by the builder.
 
+The three offline installed-wheel probes (packaged assets, migration heads and
+offline migration SQL) share an environment built by `wheel_smoke_env.py`.
+It preserves only these host variables, matching their names case-insensitively:
+`PATH`, `HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR`, `TEMP`, `TMP`,
+`SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, and `USERPROFILE`.
+Fixed development smoke settings are then added. Active, retired and unknown
+application variables are excluded; new optional application settings therefore
+use their declared defaults. New required settings must be added to the smoke
+fixtures. Importing application settings is not needed to filter the environment.
+
+Build and dependency-install commands keep the builder's separate environment,
+including package-source, proxy and certificate configuration. Those variables
+are excluded from the offline probes. Add any additional host requirement to
+the explicit allowlist, its tests and this reference together.
+
 Repository gates:
 
 ```bash
+bash scripts/check-no-site-refs.sh
 bash scripts/check-no-opaque-refs.sh
 set -o pipefail
 pytest -rs --no-fold-skipped 2>&1 | tee /tmp/oralhistarchiv-pytest.log &&
   bash scripts/check-skips-are-expected.sh /tmp/oralhistarchiv-pytest.log
 ```
 
-The reference gate scans tests, docs, workflows, and `pyproject.toml`. The skip gate reads a completed pytest log from its argument or stdin. Outside CI it accepts exact entries in `scripts/expected-skips.txt` (override with `EXPECTED_SKIPS_FILE`); under CI it accepts no skips. It checks skip policy, not test success; the command chain above preserves pytest failures.
+The site-reference gate covers indexed and new unignored files across the entire
+repository.
+The opaque-reference gate scans tests, docs, workflows, and `pyproject.toml`. The skip gate reads a completed pytest log from its argument or stdin. Outside CI it accepts exact entries in `scripts/expected-skips.txt` (override with `EXPECTED_SKIPS_FILE`); under CI it accepts no skips. It checks skip policy, not test success; the command chain above preserves pytest failures.
+
+
+## Dependency advisory checks
+
+`audit_dependencies.py --output-dir NEW_DIRECTORY` checks locked runtime and all
+optional dependency extras, then builds a wheel in an isolated hash-constrained
+environment and scans its actual installed inventory. Run it with the locked
+development environment and network access. Advisories and incomplete scans both
+fail; UTC metadata, inventories, requirements and diagnostics remain available.
+The main security job and weekly dependency workflow retain this evidence. See
+[the dependency advisory runbook](../docs/runbooks/dependency-advisories.md).

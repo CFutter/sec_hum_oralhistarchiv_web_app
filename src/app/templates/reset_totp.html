@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% set active_page = "account" %}
-{% block title %}Change Authenticator — Oral History Archive{% endblock %}
+{% block title %}Change Authenticator — {{ site_name }}{% endblock %}
 
 {% block content %}
 <section class="container auth-page">
@@ -39,8 +39,8 @@
         id="current_totp_code"
         name="current_totp_code"
         required
-        maxlength="6"
-        pattern="[0-9]{6}"
+        maxlength="{{ totp_code_raw_max_chars }}"
+        pattern="[0-9\s]{6,{{ totp_code_raw_max_chars }}}"
         placeholder="6-digit code"
         autocomplete="one-time-code"
         inputmode="numeric"

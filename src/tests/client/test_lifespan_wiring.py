@@ -1,13 +1,6 @@
-"""Lifespan wiring — startup security calls and flag-driven mock seeding.
+"""Lifespan wiring — startup preflights and source selection.
 
-The lifespan imports seed_mock_data lazily inside the function, resolving the
-module attribute at call time — exactly the seam the client harness patches
-(app.services.seed_mock_data.seed_mock_data). The entered spy is exposed as
-client.lifespan_mocks["seed_mock_data"], so these tests observe the REAL
-lifespan's seeding decision without a database.
-
-Because the lifespan runs during client construction, any settings monkeypatch
-must land BEFORE the builder is called.
+Patch settings before client construction; the real lifespan runs then.
 """
 
 import inspect
@@ -19,12 +12,33 @@ from starlette.concurrency import run_in_threadpool as _real_run_in_threadpool
 
 from app import main
 from app.main import lifespan
+from app.sources import FixtureAdapter, FixtureConfig, SourceDisplay, configure_sources
 from config import settings
+
+
+@pytest.mark.parametrize("role", ("scheduler", "maintenance"))
+async def test_web_refuses_another_process_role_before_loading_sources(monkeypatch, role):
+    """Check web refuses another process role before loading sources (RuntimeError)."""
+    monkeypatch.setattr(settings, "app_process_role", role)
+    test_app = SimpleNamespace(state=SimpleNamespace(limiter=main.limiter))
+    with (
+        patch.object(main, "setup_logging", autospec=True),
+        patch.object(main, "warn_unconsumed_env_keys", autospec=True),
+        patch.object(main, "validate_security_settings", autospec=True) as validate,
+        patch.object(main, "load_runtime_catalogue_sources", autospec=True) as load,
+        patch.object(main, "create_pool", autospec=True) as create_pool,
+        pytest.raises(RuntimeError, match="APP_PROCESS_ROLE=web"),
+    ):
+        async with lifespan(test_app):
+            pytest.fail("web accepted another process role")
+    validate.assert_not_called()
+    load.assert_not_called()
+    create_pool.assert_not_called()
 
 
 async def test_rate_limit_probe_failure_aborts_before_opening_database():
     """An unavailable security-counter store prevents web startup."""
-    test_app = SimpleNamespace(state=SimpleNamespace())
+    test_app = SimpleNamespace(state=SimpleNamespace(limiter=main.limiter))
     with (
         patch.object(main, "setup_logging", autospec=True),
         patch.object(main, "warn_unconsumed_env_keys", autospec=True),
@@ -42,17 +56,12 @@ async def test_rate_limit_probe_failure_aborts_before_opening_database():
         async with lifespan(test_app):
             pytest.fail("web startup accepted an unavailable limiter")
 
-    probe.assert_awaited_once_with()
+    probe.assert_awaited_once_with(test_app.state.limiter)
     create_pool.assert_not_called()
 
 
 def test_federated_session_policy_is_reconciled_after_schema_validation(client_builder):
-    """Startup must fail closed before accepting any HTTP request.
-
-    The client harness exposes both awaited spies. Their call order pins that
-    the policy-state table has first passed the runtime schema contract and
-    that reconciliation uses the newly opened application pool.
-    """
+    """Require schema validation before federated-policy reconciliation and fail startup on refusal."""
     client = client_builder()
 
     schema_call = client.lifespan_mocks["validate_runtime_schema"].await_args_list[0]
@@ -75,7 +84,7 @@ async def test_federated_policy_reconciliation_failure_aborts_startup_and_closes
     pool = MagicMock(name="pool")
     pool.open = AsyncMock()
     pool.close = AsyncMock()
-    test_app = SimpleNamespace(state=SimpleNamespace())
+    test_app = SimpleNamespace(state=SimpleNamespace(limiter=main.limiter))
     reconcile_error = RuntimeError("policy reconciliation failed")
 
     with (
@@ -107,39 +116,137 @@ async def test_federated_policy_reconciliation_failure_aborts_startup_and_closes
     pool.close.assert_awaited_once_with()
 
 
-def test_seed_flag_true_drives_lifespan_seeding(client_builder, monkeypatch):
-    """Seeding follows settings.seed_mock_data — with the flag
-    on, the lifespan awaits seed_mock_data exactly once, on the pool it just
-    built. Positive control for the two negative wirings below; a lifespan
-    that dropped the flag branch (or seeded through some other pool) fails
-    here, not in staging."""
-    monkeypatch.setattr(settings, "seed_mock_data", True)
-    client = client_builder()
-    client.lifespan_mocks["seed_mock_data"].assert_awaited_once_with(client.mock_pool)
+@pytest.mark.parametrize(
+    ("environment", "debug"),
+    [("dev", False), ("dev", True), ("staging", False)],
+    ids=["development", "development-debug", "staging"],
+)
+def test_web_startup_retains_fixture_selection_without_populating_the_catalogue(
+    client_builder, monkeypatch, environment, debug
+):
+    """Check web startup retains fixture selection without populating the catalogue."""
+    monkeypatch.setattr(settings, "env_state", environment)
+    monkeypatch.setattr(settings, "fastapi_debug", debug)
+    sources = configure_sources(
+        (FixtureConfig(name="fixture_demo", display=SourceDisplay(label="Offline archive")),)
+    )
+    with patch.object(
+        FixtureAdapter,
+        "fetch",
+        autospec=True,
+        side_effect=AssertionError("Web startup must not harvest"),
+    ) as fetch:
+        client = client_builder(configured_sources=sources)
+
+    fetch.assert_not_called()
+    client.mock_pool.connection.assert_not_called()
+    assert tuple(source.config for source in client.app.state.configured_sources) == tuple(
+        source.config for source in sources
+    )
+    assert all(not hasattr(source, "adapter") for source in client.app.state.configured_sources)
 
 
-def test_seed_flag_default_false_never_seeds(client_builder):
-    """With the flag at its (conftest-pinned) default False,
-    the lifespan must not touch seed_mock_data at all. Guards the accidental-
-    seeding class — a startup path that inserts demo rows into a real
-    environment because the opt-in stopped gating it."""
-    assert settings.seed_mock_data is False  # precondition: the conftest pin
-    client = client_builder()
-    assert client.lifespan_mocks["seed_mock_data"].await_count == 0
+def test_web_startup_publishes_detached_metadata_in_selection_order(client_builder):
+    """Web consumers retain policy fields without any scheduler fetch adapter."""
+    sources = configure_sources(
+        (
+            FixtureConfig(name="archive_one", display=SourceDisplay(label="Archive one")),
+            FixtureConfig(name="archive_two", display=SourceDisplay(label="Archive two")),
+        )
+    )
+    client = client_builder(configured_sources=sources)
+    source_loader = client.lifespan_mocks["load_runtime_catalogue_sources"]
+
+    source_loader.assert_called_once_with()
+    metadata = client.app.state.configured_sources
+    assert tuple(source.config for source in metadata) == tuple(source.config for source in sources)
+    assert all(not hasattr(source, "adapter") for source in metadata)
+    assert client.app.state.catalogue_policy.sources is metadata
+    assert client.app.state.catalogue_policy.source_by_name == {
+        source.name: source for source in metadata
+    }
+    assert source_loader.return_value is sources
+    client.lifespan_mocks["publish_catalogue_sources"].assert_awaited_once_with(
+        client.app, client.mock_pool, sources
+    )
+    client.lifespan_mocks["CatalogueStatsCache"].assert_called_once_with(
+        client.mock_pool,
+        source_names=tuple(source.name for source in sources),
+        policy_fingerprint=client.app.state.catalogue_policy.fingerprint,
+        subscribe=True,
+    )
 
 
-def test_fastapi_debug_alone_does_not_seed(client_builder, monkeypatch):
-    """Seeding is decided by seed_mock_data alone, never by fastapi_debug:
-    debug-coupled seeding would mean flipping debug on quietly implies demo
-    data. With debug True but seed_mock_data False, the lifespan must still
-    not seed; debug-coupled seeding fails exactly here."""
-    monkeypatch.setattr(settings, "fastapi_debug", True)
-    client = client_builder()
-    assert client.lifespan_mocks["seed_mock_data"].await_count == 0
-
-
-def test_staging_web_never_seeds_with_its_read_only_role(client_builder, monkeypatch):
+@pytest.mark.parametrize(
+    ("selected_path", "endpoint", "message"),
+    [
+        (
+            None,
+            "https://archive.example.edu/oai",
+            r"SOURCES_CONFIG_FILE.*required",
+        ),
+        (
+            "/etc/oralhistarchiv-sources/sources.toml",
+            "http://archive.example.edu/oai",
+            r"requires.*HTTPS endpoint",
+        ),
+        (
+            "/etc/oralhistarchiv-sources/sources.toml",
+            "https://archive.example.org/oai",
+            "placeholder endpoint host",
+        ),
+    ],
+    ids=["missing-selection", "plaintext", "placeholder"],
+)
+async def test_source_selection_refusal_precedes_runtime_resources(
+    monkeypatch, selected_path, endpoint, message
+):
+    """Check source selection refusal precedes runtime resources (ValueError)."""
     monkeypatch.setattr(settings, "env_state", "staging")
-    monkeypatch.setattr(settings, "seed_mock_data", True)
-    client = client_builder()
-    client.lifespan_mocks["seed_mock_data"].assert_not_awaited()
+    monkeypatch.setattr(settings, "sources_config_file", selected_path)
+    document = (
+        "[[sources]]\n"
+        'name = "selected_archive"\n'
+        'adapter = "oai_pmh_cmdi"\n'
+        'label = "Selected archive"\n'
+        'institution_filter = "Configured archive"\n'
+        f'endpoint = "{endpoint}"\n'
+    )
+    test_app = SimpleNamespace(state=SimpleNamespace(limiter=main.limiter))
+
+    with (
+        patch(
+            "app.sources.startup_file._read_hardened_file",
+            autospec=True,
+            return_value=document,
+        ) as reader,
+        patch.object(main, "setup_logging", autospec=True),
+        patch.object(main, "warn_unconsumed_env_keys", autospec=True),
+        patch.object(main, "validate_security_settings", autospec=True),
+        patch.object(main, "validate_route_security_contract", autospec=True) as validate_routes,
+        patch.object(main, "validate_rate_limit_backend", autospec=True) as limiter_probe,
+        patch.object(
+            main,
+            "run_in_threadpool",
+            new=create_autospec(_real_run_in_threadpool),
+        ) as offload,
+        patch.object(main, "warm_password_blocklist", autospec=True) as warm_blocklist,
+        patch.object(main, "warm_dummy_password_hash", autospec=True) as warm_dummy,
+        patch.object(main, "Config", autospec=True) as migration_config,
+        patch.object(main, "create_pool", autospec=True) as create_pool,
+        patch.object(main, "CatalogueStatsCache", autospec=True) as cache,
+        pytest.raises(ValueError, match=message),
+    ):
+        async with lifespan(test_app):
+            pytest.fail("web startup accepted invalid source selection")
+
+    assert reader.call_count == int(selected_path is not None)
+    validate_routes.assert_not_called()
+    limiter_probe.assert_not_awaited()
+    offload.assert_not_awaited()
+    warm_blocklist.assert_not_called()
+    warm_dummy.assert_not_awaited()
+    migration_config.assert_not_called()
+    create_pool.assert_not_called()
+    cache.assert_not_called()
+    assert not hasattr(test_app.state, "configured_sources")

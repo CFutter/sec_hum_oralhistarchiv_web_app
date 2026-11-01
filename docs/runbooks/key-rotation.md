@@ -23,7 +23,7 @@ The rotation procedures below apply after data starts being retained. They are n
 | --- | --- | --- |
 | `TOTP_ENCRYPTION_KEYS` | Encrypts active and pending TOTP secrets using HKDF-derived Fernet keys and `MultiFernet` | An old key must remain available while stored secrets depend on it. Dropping it early can prevent TOTP login or enrollment. |
 | `OUTBOX_ENCRYPTION_KEYS` | Encrypts stored email-outbox bodies using a separate HKDF context and `MultiFernet` | An old key must remain available while retained bodies depend on it. Undecryptable claimed messages are marked `dead` by the delivery worker. |
-| `SECRET_KEY` | Signs action links; derives audit-email and limiter-client HMAC keys | Invalidates outstanding links, changes audit correlation and starts a new limiter-client namespace; TOTP/outbox encryption is unchanged |
+| `SECRET_KEY` | Signs action links; derives audit-email and limiter-client HMAC keys and encrypted search-bookmark keys | Invalidates outstanding action links and search bookmarks, changes audit correlation and starts a new limiter-client namespace; TOTP/outbox encryption is unchanged |
 | `SESSION_SECRET` | Signs session cookies and authenticates CSRF tokens | Existing session cookies become invalid; users must log in again. CSRF cookies refresh through the normal request flow. |
 | PostgreSQL peer mappings and role grants | Bind each service OS identity to one passwordless database role with an exact privilege contract | Treat any OS-user, PostgreSQL-role, socket, HBA/ident-map, or grant change as a reviewed database trust-boundary migration; runtime startup rejects a mismatched role or grant set. |
 | `SMTP_PASSWORD` | Authenticates to the mail provider, when configured | Delivery fails until provider and application credentials match; outbox attempts can progress to retries or `dead`. |
@@ -31,7 +31,7 @@ The rotation procedures below apply after data starts being retained. They are n
 | `HEALTH_DETAIL_TOKEN` | Authorizes `/health/detail` requests | Monitoring clients must receive the new token. |
 | `REDIS_URL` password | Optional general Redis | Catalogue-statistics invalidation is disrupted; dev may also use it for limiting |
 | `RATE_LIMIT_REDIS_URL` password | Dedicated hardened-web limiter Redis | Admission fails with 503 until credentials match |
-| `ADMIN_SEED_PASSWORD` / `ADMIN_SEED_EMAIL` | Bootstraps the first administrator | Remove after initial setup; these are not the existing administrator's ongoing password configuration. |
+| One-shot administrator bootstrap password | Creates the first administrator through a protected terminal command | Never configure it in service environment files. Legacy `ADMIN_SEED_PASSWORD` / `ADMIN_SEED_EMAIL` assignments are rejected. Change an existing administrator password through account management. |
 | Backup `age` private identity | Decrypts logical `*.dump.age` database archives; only its public recipient is provisioned to the backup unit | Loss prevents recovery. Exposure reveals every archive made for that recipient, including database fields not protected by application-level encryption. It is not an application setting and must remain off-host. |
 
 ### Cryptographic domains
@@ -41,6 +41,7 @@ The rotation procedures below apply after data starts being retained. They are n
 | Each `TOTP_ENCRYPTION_KEYS` entry | `oralhistarchiv-totp-encryption-v1` |
 | Each `OUTBOX_ENCRYPTION_KEYS` entry | `oralhistarchiv-email-outbox-body-v1` |
 | `SECRET_KEY` for audit hashing | `oralhistarchiv-audit-email-hash-v1` |
+| `SECRET_KEY` for search bookmarks | `oralhistarchiv-search-cursor-v2` |
 | `SESSION_SECRET` for session cookies | Signer salt `session-cookie-v1` |
 | `SESSION_SECRET` for CSRF | HMAC prefix `csrf-hmac-v1|` |
 
@@ -48,8 +49,8 @@ Changing a context string changes the derived key even when the configured secre
 
 ## 1. Rules before rotation
 
-1. **Keep both encryption key rings non-empty.** Both settings are required `list[SecretStr]` fields with `min_length=1`.
-2. **Keep every decryption key that retained data still needs.** This includes `users.pending_totp_secret` and outbox bodies retained in `sent` or `dead` rows.
+1. **Keep required key rings nonempty.** Web/maintenance requires both rings; scheduler requires only outbox keys and rejects TOTP keys. The parser receives neither ring.
+2. **Retain needed decryptors.** Cover active/pending user TOTP, `pending_totp_rotations.encrypted_secret`, retained outbox bodies in every status, and historical backups.
 3. **Restart every process that uses changed secrets.** Crypto objects are cached at module import. Editing configuration or reloading nginx does not rebuild the application's keys.
 4. **Prevent mixed key configurations.** The procedures here use a maintenance window with all web and scheduler instances stopped before changing a signing key or activating an encryption key. Include ad-hoc producers, delivery workers, and maintenance jobs.
 5. **Retain both recovery layers until verification is complete.** Account for backups and retained snapshots before destroying an application encryption key. A database archive does not contain the application key needed to decrypt its TOTP/outbox ciphertext, and the separately escrowed backup `age` identity is needed before the archive can be opened at all. Never co-locate either private layer with the archives.
@@ -73,13 +74,13 @@ python -c 'import json, secrets; print(json.dumps([secrets.token_urlsafe(64)]))'
 
 Generate each secret separately. Placeholders in this runbook and `.env.example` are not deployment values.
 
-`validate_security_settings()` checks `SECRET_KEY`, `SESSION_SECRET`, every entry in both encryption key rings, and optional `HEALTH_DETAIL_TOKEN` and `SHIBBOLETH_INTERNAL_SECRET` values when configured. Its length, diversity, entropy, and blocklist checks reject obviously weak values; they do not prove randomness. Ordinary weak or placeholder secrets block startup in staging and production and produce warnings in development. Federated authentication is stricter: whenever `SHIBBOLETH_ENABLED=true`, a weak, reused, missing, or blank `SHIBBOLETH_INTERNAL_SECRET` fails settings construction in **every** environment. Missing or empty encryption key rings also fail settings validation in every environment.
+`validate_security_settings()` checks `SECRET_KEY`, `SESSION_SECRET`, every configured encryption-key entry, and optional `HEALTH_DETAIL_TOKEN` and `SHIBBOLETH_INTERNAL_SECRET` values. Its length, diversity, entropy, and blocklist checks reject obviously weak values; they do not prove randomness. Ordinary weak or placeholder secrets block startup in staging and production and produce warnings in development. Federated authentication is stricter: whenever `SHIBBOLETH_ENABLED=true`, a weak, reused, missing, or blank `SHIBBOLETH_INTERNAL_SECRET` fails settings construction in **every** environment. The outbox ring is required in every runtime. The TOTP ring is required for web/maintenance roles and forbidden for `APP_PROCESS_ROLE=scheduler`; parser services receive neither ring.
 
 ### Configuration source
 
-- **Development:** Pydantic reads the repository-root `.env` when the OS-level `ENV_STATE` selects development, or is unset and defaults to development.
-- **Staging and production:** both runtime services load root-owned mode-`0600` `common.env`; web additionally 
-  loads `web.env` and the optional web-only `shibboleth.env`, while scheduler loads `scheduler.env`. `DATABASE_URL` is absent from `common.env`. The manual migration unit loads only `migration.env`; no runtime or maintenance process may load it.
+- **Development:** Export exact OS key `ENV_STATE=dev` before launch; only then does Pydantic read the repository-root `.env`. Missing or conflicting mode selections fail.
+- **Staging and production:** both runtime services load root-owned mode-`0600` `common.env`; web additionally
+  loads `web.env` and the optional web-only `shibboleth.env`, while scheduler loads `scheduler.env`. `DATABASE_URL` is absent from `common.env`. TOTP keys belong only in `web.env`; outbox keys remain shared. Scheduler imports no TOTP encryption implementation. The manual migration unit loads only `migration.env`; no runtime or maintenance process may load it.
 - **Maintenance commands:** TOTP scripts use the installed-wheel invocation in
   scripts/README.md with common.env and web.env; never source migration.env.
   For this runbook's interactive SQL, use the web peer role after stopping the
@@ -114,50 +115,55 @@ Confirm clean startup and the procedure-specific checks before reopening traffic
 
 ## 3. Rotating `SECRET_KEY`
 
-**Effect:** Invalidates signed links, including queued links; changes audit hashes and limiter-client identifiers, giving clients fresh counters. TOTP/outbox encryption and session signatures use other keys.
+**Effect:** Invalidates signed action codes and search bookmarks; changes audit hashes and limiter-client identifiers, giving clients fresh counters. TOTP/outbox encryption and session signatures use other keys.
 
-| Token | Maximum age in the current code |
-| --- | --- |
-| Password reset | 30 minutes (`RESET_TOKEN_MAX_AGE_SECONDS`) |
-| Email change | 1 hour (`EMAIL_CHANGE_TOKEN_MAX_AGE_SECONDS`) |
-| Email verification | 24 hours (`VERIFICATION_TOKEN_MAX_AGE_SECONDS`) |
+| Action | Signing salt | Maximum age | Browser/email transport |
+| --- | --- | --- | --- |
+| Password reset | `password-reset` | 30 minutes (`RESET_TOKEN_MAX_AGE_SECONDS`) | `/reset-password/{public_id}`; separate email code copied into explicit POST |
+| Email change | `email-change` | 1 hour (`EMAIL_CHANGE_TOKEN_MAX_AGE_SECONDS`) | `/account/confirm-email/{public_id}`; separate email code copied into explicit POST |
+| Email verification | `email-verification` | 24 hours (`VERIFICATION_TOKEN_MAX_AGE_SECONDS`) | `/verify-email/{public_id}`; separate email code copied into explicit POST |
 
-An outbox body being decryptable does not mean its signed link is valid. The key-ring change does not add automatic cancellation of emails carrying invalidated links.
+`SignedActionToken(salt, max_age)` shares signing, validation and issue-time
+metadata across these actions. The non-secret 43-character public ID is a
+one-way digest, not an alternative token or a server lookup key. Rotating
+`SECRET_KEY` still invalidates the signature in the separate code field;
+knowing the public ID cannot restore it. The email's security code remains a
+credential, while the new public link carries no secret. GET only renders a generic form, so test invalidated links by
+attempting POST redemption rather than expecting a public landing page to
+identify signature expiry. Legacy token-bearing GET paths return 404.
+
+The URL-format deployment has a separate
+[cutover/reissue procedure](action-links.md#deploying-the-link-format-change).
+It does not rotate signing keys or retroactively erase earlier URLs.
+
+Decryptable outbox bodies can contain invalid signed codes. Changing `SECRET_KEY` alone neither cancels delivery nor expires persisted capability state; complete the maintenance transaction below.
+
+`SECRET_KEY` also derives the encrypted [search-bookmark](search-pagination.md)
+key. Rotation invalidates existing bookmarks; users re-enter through page 1
+with the normal generic notice. Bookmarks carry no independent authorization,
+and this change does not alter TOTP/outbox encryption or session signatures.
 
 ### Procedure
 
 1. Enter the maintenance window and stop all producers and delivery workers, as described in [Maintenance window](#maintenance-window).
 2. Generate and provision a new `SECRET_KEY`. Keep `TOTP_ENCRYPTION_KEYS`, `OUTBOX_ENCRYPTION_KEYS`, and `SESSION_SECRET` unchanged for this operation.
-3. Cancel outstanding messages carrying links signed with the previous key before restarting delivery. In the current schema, cancellation uses `dead` with an explicit reason; there is no `cancelled` status. Run the following against the intended database while the application remains stopped:
-
-   ```sql
-   BEGIN;
-
-   UPDATE email_outbox
-      SET status = 'dead',
-          terminal_outcome = 'cancelled',
-          failed_at = CURRENT_TIMESTAMP,
-          sent_at = NULL,
-          locked_at = NULL,
-          lock_token = NULL,
-          last_error = 'Cancelled: signing-key rotation invalidated the link'
-    WHERE status IN ('pending', 'sending')
-      AND message_type IN (
-          'password_reset',
-          'email_verification',
-          'email_change_verification'
-      )
-   RETURNING id, message_type;
-
-   COMMIT;
-   ```
-
-   Preserve non-token notices, including account-lock and credential-fault notices. The query does not delete ciphertext, alter already-sent rows, or retry previously dead messages. Do not manually requeue an old token-bearing body after this rotation; generate a fresh request and message instead.
-
+3. With every writer still stopped, run the installed
+   `deploy/invalidate-action-email-capabilities.sql` using the locked web-peer
+   command in the [action-link cutover](action-links.md#deploying-the-link-format-change).
+   Require exit zero before restarting. One transaction cancels pending/sending
+   action mail, expires reset/setup timestamps while retaining their hashes,
+   and clears pending email changes. It preserves notices, sent/dead rows,
+   proof counters and the issuance ledger, and sends no mail. Expiring persisted
+   state prevents anonymous requests from copying old signed bodies retained
+   as sent/delivery-failed mail; keeping setup hashes permits fresh issuance.
 4. Start every service with the new signing key and verify clean startup.
-5. Request a fresh password-reset email and verify the complete delivery and link flow. Confirm that an old outstanding link is rejected and that an ordinary queued notice remains deliverable.
+5. Request fresh reset/setup mail, subject to the existing mail-admission limits,
+   and complete redemption. No old-capability-expiry wait is needed. Confirm old
+   codes fail and ordinary notices still deliver; public GET pages remain generic.
+   Email changes require a new authenticated staging action.
 
-Users with invalidated links must request new ones. During a compromise rotation, do not restore the previous signing key: doing so can make old signatures valid again.
+Never restore a compromised signing key. Its old signatures could become valid
+again where corresponding state has not been revoked.
 
 ## 4. Rotating `SESSION_SECRET`
 
@@ -178,7 +184,7 @@ Use this to invalidate existing signed session cookies. For account-specific rev
 
 1. Enter the maintenance window and stop all application instances and writers.
 2. Generate a new independent TOTP encryption key.
-3. Configure the ring with the new key first and every still-required old key retained:
+3. Configure the ring in web/maintenance configuration only, with the new key first and every still-required old key retained. Do not supply it to the scheduler or parser service:
 
    ```dotenv
    TOTP_ENCRYPTION_KEYS=["<new-key>", "<old-key>"]
@@ -251,7 +257,7 @@ If some data has already been encrypted with the new key, retain it as a decrypt
 
 ### Initial deployment
 
-Start with one independently generated key, as described in [First deployment and secret inventory](#0-first-deployment-and-secret-inventory). Supply it to every process that imports the application settings, including maintenance scripts. There is no SECRET_KEY fallback or legacy-data migration.
+Start with one independently generated key shared by web, scheduler and maintenance. The parser receives no application key rings. There is no `SECRET_KEY` fallback or legacy-data migration.
 
 ### Future rotation
 
@@ -330,7 +336,7 @@ Coordinate changes at the provider and the application, then restart every proce
 - **Shibboleth internal secret:** Follow the fail-closed procedure below. Never rotate it with an exposed callback. Changing a file alone revokes nothing: the web restart is mandatory so startup can reconcile the changed policy fingerprint and delete all federated sessions.
 - **Health-detail token:** Change the application token, restart affected processes, update monitoring clients, and verify authorized access.
 - **Redis password:** Change Redis and application credentials together, restart affected processes, and verify Redis-backed functions.
-- **Administrator bootstrap values:** Remove `ADMIN_SEED_PASSWORD` and `ADMIN_SEED_EMAIL` after confirming that the initial administrator exists. Change an existing administrator's password through the account-management flow.
+- **Administrator bootstrap:** Remove any legacy `ADMIN_SEED_PASSWORD` and `ADMIN_SEED_EMAIL` service assignments before the release cutover. The one-shot terminal command does not retain its password in runtime profiles. Follow [initial administrator bootstrap](bootstrap-admin.md) for a fresh installation; change an existing administrator password through the account-management flow.
 
 ### Shibboleth internal secret
 
@@ -462,5 +468,3 @@ Before deployment:
 - Confirm that an encrypted archive, the separately escrowed backup private identity, and the applicable historical application key rings can be restored together.
 - Dry-run the signing-key procedure, including handling queued token-bearing messages.
 - Record that outbox bulk re-encryption tooling remains deferred. Initial deployment uses one key; a future old-key retirement requires verified tooling or removal of every relevant ciphertext dependency under the retention policy.
-
-This runbook describes operator actions. It does not claim that its database commands or production rotation procedures have already been executed.

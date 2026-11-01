@@ -28,11 +28,12 @@ target_metadata = None
 
 
 def _db_url() -> str:
-    """Return a psycopg SQLAlchemy URL from the environment selected by ENV_STATE.
+    """Return a psycopg SQLAlchemy URL selected by the literal ENV_STATE value.
 
-    Staging/production require MIGRATION_DATABASE_URL; other values import config
-    and use DATABASE_URL. Only postgres:// and postgresql:// are accepted. Raises
-    RuntimeError for a missing/unsupported URL; settings errors propagate.
+    staging/production read MIGRATION_DATABASE_URL directly; every other value
+    imports config (which enforces canonical ENV_STATE), then prefers ambient
+    DATABASE_URL over Settings. Require postgres:// or postgresql://; missing or
+    unsupported URLs raise RuntimeError and settings errors propagate.
     """
     env_state = os.environ.get("ENV_STATE", "dev")
     if env_state in {"staging", "production"}:

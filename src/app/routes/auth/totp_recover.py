@@ -37,7 +37,7 @@ def _render_recovery_page(
     error: str | None = None,
     status_code: int = 200,
 ) -> Response:
-    """Render email/error with no-store/no-cache/no-referrer headers."""
+    """Render email/error without caching or referrer paths and queries."""
     response = templates.TemplateResponse(
         request,
         "totp_recover.html",
@@ -53,7 +53,7 @@ def _render_recovery_page(
     )
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Referrer-Policy"] = "strict-origin"
     return response
 
 
@@ -92,9 +92,7 @@ async def totp_recovery_submit(
             ip_address=get_client_ip(request),
         )
     except TotpRecoveryRedemptionRejected:
-        # This is a public endpoint.  Do not copy the service's internal
-        # rejection reason or matched user ID into the audit record: either
-        # field would turn privileged log access into an account/code oracle.
+        # Internal reasons/user IDs would make public recovery logs an account/code oracle.
         audit_user_event(
             level=logging.INFO,
             request=request,

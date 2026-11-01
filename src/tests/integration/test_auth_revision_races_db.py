@@ -1,16 +1,6 @@
-"""The ``auth_revision`` fence and its token nonces under real concurrency.
-
-Every locally-authenticated action that must invalidate stale sessions,
-tokens or in-flight work (password reset, email change, session revocation)
-bumps ``users.auth_revision`` inside the same locked transaction that removes
-the credential it consumes. These tests prove that fence holds against a
-genuine competing transaction on a second connection, that a real SQL failure
-mid-transaction rolls the whole fence back, and that reissuing a token in the
-same clock second still invalidates the token it replaces.
-"""
+"""The ``auth_revision`` fence and its token nonces under real concurrency."""
 
 import asyncio
-import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -28,26 +18,35 @@ from psycopg.rows import dict_row
 
 from app.services import (
     authentication,
+    begin_local_registration,
+    complete_local_registration,
     email_change,
     email_outbox,
-    email_verification,
+    inspect_local_registration,
     password_reset,
+    resend_local_registration,
     session_revocation,
     sessions,
     totp,
     users,
 )
-from app.services.crypto import encrypt_value
+from app.services.crypto import decrypt_outbox_body
 from app.services.db import get_db_cursor
 from app.services.tokens import hash_token
-from app.services.totp_recovery_codes import generate_recovery_codes, stage_recovery_code_set_cur
+from app.services.totp_crypto import encrypt_value
 from config import settings
-from tests.account_setup import store_pending_totp_secret
+from tests.action_links import token_from_action_email
 from tests.integration.conftest import DEFAULT_PASSWORD, TEST_DATABASE_URL
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
 _OPERATIONS = ("password_reset", "email_change", "revoke_all")
+_LOGIN_REVOCATION_CASES = [
+    pytest.param(operation, with_totp, id=f"{operation}-{'full' if with_totp else 'setup'}")
+    for operation in _OPERATIONS
+    for with_totp in (True, False)
+    if operation != "password_reset" or with_totp
+]
 _RACE_TIMEOUT = 20
 _CLEANUP_TIMEOUT = 5
 _POLL_INTERVAL = 0.01
@@ -58,14 +57,18 @@ _IP = "127.0.0.1"
 
 @dataclass
 class _Case:
+    """Credentials and pending capability for one authentication-revision race."""
+
     operation: str
     user: Any
     code: str
-    token_hash: str
+    token: str
     new_email: str
+    reset_code: str
 
     @property
     def module(self):
+        """Select the service module implementing this case's revocation operation."""
         return {
             "password_reset": password_reset,
             "email_change": email_change,
@@ -76,11 +79,13 @@ class _Case:
 @pytest.fixture(autouse=True)
 def _fixed_totp_clock(monkeypatch):
     # Replace this module reference, not time.time globally.
+    """Freeze the TOTP service's wall clock at the test instant."""
     monkeypatch.setattr(totp, "time", SimpleNamespace(time=lambda: _TOTP_TIME))
 
 
 @pytest.fixture
 async def race_observer(db_pool):
+    """Yield an independent autocommit observer with a five-second statement timeout."""
     assert db_pool.max_size >= 2, "Races need at least two pooled connections"
     async with await psycopg.AsyncConnection.connect(
         TEST_DATABASE_URL,
@@ -91,38 +96,44 @@ async def race_observer(db_pool):
         yield conn
 
 
-def _make_case(user_factory, operation, *, with_totp=True):
+async def _make_case(db_pool, user_factory, operation, *, with_totp=True):
+    """Create the credentials and pending capability for the requested race operation."""
     secret = pyotp.random_base32() if with_totp else None
-    token_hash = hash_token(secrets.token_urlsafe(32))
-    new_email = "changed-pending@uzh.ch"
-    columns = {
-        "auth_revision": 0,
-        "display_name": "Alice Example",
-        "failed_login_count": 1,
-        "totp_secret": encrypt_value(secret) if secret is not None else None,
-        "last_totp_step": None,
-    }
+    new_email = "changed-pending@example.org"
+    user = user_factory(
+        auth_revision=0,
+        display_name="Alice Example",
+        failed_login_count=1,
+        totp_secret=encrypt_value(secret) if secret is not None else None,
+        last_totp_step=None,
+    )
+    token = ""
     if operation == "password_reset":
-        columns.update(
-            password_reset_token_hash=token_hash,
-            password_reset_created_at=datetime.now(UTC),
+        token = password_reset.generate_reset_token(user.id, user.email)
+        await password_reset.store_reset_token_hash(
+            db_pool, user.id, hash_token(token), expected_email=user.email
         )
     elif operation == "email_change":
-        columns.update(
-            pending_email=new_email,
-            pending_email_token_hash=token_hash,
-            pending_email_created_at=datetime.now(UTC),
+        token = email_change.generate_email_change_token(user.id, new_email, auth_revision=0)
+        await email_change.store_pending_email(
+            db_pool, user.id, new_email, hash_token(token), expected_auth_revision=0
         )
     return _Case(
         operation=operation,
-        user=user_factory(**columns),
+        user=user,
         code=pyotp.TOTP(secret).at(_TOTP_TIME) if secret is not None else "",
-        token_hash=token_hash,
+        token=token,
         new_email=new_email,
+        # A login in the same race consumes the current step. Reset proves a
+        # distinct step within the configured clock-skew window.
+        reset_code=pyotp.TOTP(secret).at(_TOTP_TIME + 30) if secret is not None else "",
     )
 
 
 def _state(sync_conn, user_id):
+    """Read required user credentials and pending actions as a dictionary; commit the observer
+    transaction.
+    """
     with sync_conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """SELECT email, password_hash, auth_revision, totp_secret,
@@ -140,6 +151,7 @@ def _state(sync_conn, user_id):
 
 
 def _session_count(sync_conn, user_id):
+    """Count stored sessions for the user, including expired rows."""
     row = sync_conn.execute(
         "SELECT COUNT(*) FROM sessions WHERE user_id = %s", (user_id,)
     ).fetchone()
@@ -149,6 +161,7 @@ def _session_count(sync_conn, user_id):
 
 
 async def _password_proof(db_pool, case):
+    """Verify the case password and assert its identity and expected revision."""
     check = await authentication.verify_password(db_pool, case.user.email, case.user.password)
     assert check.password_ok is True
     assert check.user is not None and check.user.id == case.user.id
@@ -157,6 +170,7 @@ async def _password_proof(db_pool, case):
 
 
 async def _finalize(db_pool, case, check):
+    """Finalize login using the verified revision and case's TOTP proof."""
     assert check.auth_revision is not None
     return await authentication.finalize_local_login(
         db_pool,
@@ -168,13 +182,15 @@ async def _finalize(db_pool, case, check):
 
 
 async def _revoke(db_pool, case):
+    """Apply the case's password reset, email confirmation or session-revocation operation."""
     if case.operation == "password_reset":
         await password_reset.update_password_with_token(
             db_pool,
             case.user.id,
-            case.token_hash,
+            case.token,
             _NEW_PASSWORD,
             expected_email=case.user.email,
+            totp_code=case.reset_code,
         )
     elif case.operation == "email_change":
         assert (
@@ -182,7 +198,7 @@ async def _revoke(db_pool, case):
                 db_pool,
                 case.user.id,
                 case.new_email,
-                case.token_hash,
+                case.token,
                 expected_auth_revision=0,
             )
             is True
@@ -194,20 +210,25 @@ async def _revoke(db_pool, case):
 
 @dataclass
 class _Gate:
+    """Transaction gate carrying readiness/release events and the lock-owner backend PID."""
+
     reached: asyncio.Event = field(default_factory=asyncio.Event)
     release: asyncio.Event = field(default_factory=asyncio.Event)
     pid: int | None = None
 
     async def hold(self, cur):
+        """Record the backend PID, signal the gate and hold the transaction until released."""
         self.pid = cur.connection.info.backend_pid
         self.reached.set()
         await self.release.wait()
 
 
 def _pause_revocation(monkeypatch, case, gate):
+    """Patch session deletion to pause its transaction after the real deletion."""
     real_delete = case.module.delete_user_sessions_cur
 
     async def paused_delete(cur, user_id):
+        """Delete sessions with the real helper, then hold the transaction at the gate."""
         await real_delete(cur, user_id)
         await gate.hold(cur)
 
@@ -219,9 +240,11 @@ def _pause_revocation(monkeypatch, case, gate):
 
 
 def _pause_login(monkeypatch, gate):
+    """Patch session creation to pause its transaction after the real insert."""
     real_create = authentication.create_session_cur
 
     async def paused_create(cur, *, user_id, ip_address, purpose, max_age_seconds):
+        """Create the real session, hold its transaction at the gate and return the token."""
         token = await real_create(
             cur,
             user_id=user_id,
@@ -240,10 +263,12 @@ def _pause_login(monkeypatch, gate):
 
 
 def _track_connections(monkeypatch):
+    """Patch cursor scopes to track each active task's PostgreSQL backend PID."""
     active = {}
 
     @asynccontextmanager
     async def tracked_cursor(pool, *args, **kwargs) -> AsyncIterator[Any]:
+        """Yield a real cursor while tracking the current task's backend PID; remove it on exit."""
         async with get_db_cursor(pool, *args, **kwargs) as cur:
             task = asyncio.current_task()
             active[task] = cur.connection.info.backend_pid
@@ -258,6 +283,7 @@ def _track_connections(monkeypatch):
 
 
 async def _wait_for_gate(gate, leader):
+    """Require the leader to reach its gate before finishing; clean up the waiter task."""
     waiter = asyncio.create_task(gate.reached.wait())
     try:
         await asyncio.wait((waiter, leader), return_when=asyncio.FIRST_COMPLETED)
@@ -300,6 +326,7 @@ async def _wait_for_database_block(observer, active, follower, leader_pid):
 
 
 async def _ordered_race(observer, active, gate, leading_call, following_call):
+    """Run a gated leader and blocked follower; release and cancel outstanding tasks on exit."""
     tasks = []
     try:
         async with asyncio.timeout(_RACE_TIMEOUT):
@@ -326,8 +353,7 @@ class TestConcurrentRevocationAndLogin:
     racing a waiting login must leave the fence consistent regardless of
     which transaction the database serializes first."""
 
-    @pytest.mark.parametrize("operation", _OPERATIONS)
-    @pytest.mark.parametrize("with_totp", [True, False], ids=["full", "setup"])
+    @pytest.mark.parametrize(("operation", "with_totp"), _LOGIN_REVOCATION_CASES)
     async def test_revocation_first_rejects_old_password_proof(
         self,
         db_pool,
@@ -340,7 +366,7 @@ class TestConcurrentRevocationAndLogin:
         with_totp,
     ):
         """Revocation holds the user lock; waiting login must see the new revision."""
-        case = _make_case(user_factory, operation, with_totp=with_totp)
+        case = await _make_case(db_pool, user_factory, operation, with_totp=with_totp)
         session_factory(case.user.id)
         check = await _password_proof(db_pool, case)
         before = _state(sync_conn, case.user.id)
@@ -361,14 +387,16 @@ class TestConcurrentRevocationAndLogin:
         assert result.failed_count is None and result.just_locked is False
         after = _state(sync_conn, case.user.id)
         assert after["auth_revision"] == check.auth_revision + 1
-        assert after["last_totp_step"] == before["last_totp_step"]
+        expected_step = before["last_totp_step"]
+        if operation == "password_reset":
+            expected_step = _TOTP_TIME // 30 + 1
+        assert after["last_totp_step"] == expected_step
         assert after["last_login"] == before["last_login"]
         expected_failures = 0 if operation == "password_reset" else before["failed_login_count"]
         assert after["failed_login_count"] == expected_failures
         assert _session_count(sync_conn, case.user.id) == 0
 
-    @pytest.mark.parametrize("operation", _OPERATIONS)
-    @pytest.mark.parametrize("with_totp", [True, False], ids=["full", "setup"])
+    @pytest.mark.parametrize(("operation", "with_totp"), _LOGIN_REVOCATION_CASES)
     async def test_login_first_session_is_removed_by_waiting_revocation(
         self,
         db_pool,
@@ -381,7 +409,7 @@ class TestConcurrentRevocationAndLogin:
         with_totp,
     ):
         """Login inserts under the lock; subsequent revocation must delete that row."""
-        case = _make_case(user_factory, operation, with_totp=with_totp)
+        case = await _make_case(db_pool, user_factory, operation, with_totp=with_totp)
         session_factory(case.user.id)
         check = await _password_proof(db_pool, case)
         active = _track_connections(monkeypatch)
@@ -404,7 +432,10 @@ class TestConcurrentRevocationAndLogin:
         after = _state(sync_conn, case.user.id)
         assert after["auth_revision"] == check.auth_revision + 1
         assert after["last_login"] is not None
-        assert after["last_totp_step"] == (_TOTP_TIME // 30 if with_totp else None)
+        expected_step = _TOTP_TIME // 30 if with_totp else None
+        if operation == "password_reset":
+            expected_step = _TOTP_TIME // 30 + 1
+        assert after["last_totp_step"] == expected_step
 
 
 class TestTransactionalRollbackOnFailure:
@@ -422,12 +453,13 @@ class TestTransactionalRollbackOnFailure:
         operation,
     ):
         """A real SQL error in DELETE must undo the preceding user UPDATE."""
-        case = _make_case(user_factory, operation)
+        case = await _make_case(db_pool, user_factory, operation)
         session_factory(case.user.id)
         before = _state(sync_conn, case.user.id)
 
         async def failing_delete(cur, user_id):
             # Prove we reached deletion AFTER an uncommitted revision increment.
+            """Check the incremented revision, then cause session deletion to fail in PostgreSQL."""
             await cur.execute("SELECT auth_revision FROM users WHERE id = %s", (user_id,))
             row = await cur.fetchone()
             assert row["auth_revision"] == before["auth_revision"] + 1
@@ -457,12 +489,15 @@ class TestTransactionalRollbackOnFailure:
         monkeypatch,
     ):
         """A real FK failure during INSERT must not consume the valid TOTP code."""
-        case = _make_case(user_factory, "revoke_all")
+        case = await _make_case(db_pool, user_factory, "revoke_all")
         check = await _password_proof(db_pool, case)
         before = _state(sync_conn, case.user.id)
         real_create = authentication.create_session_cur
 
         async def invalid_insert(cur, *, user_id, ip_address, purpose, max_age_seconds):
+            """Attempt the real session insert with a nonexistent user to force a foreign-key
+            error.
+            """
             assert user_id == case.user.id
             return await real_create(
                 cur,
@@ -496,7 +531,7 @@ class TestLockoutAndRevocationEdgeCases:
         sync_conn,
     ):
         """A valid password snapshot does not override a subsequently applied lockout."""
-        case = _make_case(user_factory, "revoke_all")
+        case = await _make_case(db_pool, user_factory, "revoke_all")
         check = await _password_proof(db_pool, case)
         for _ in range(settings.login_failure_threshold):
             count, _ = await authentication.record_login_failure(
@@ -521,7 +556,7 @@ class TestLockoutAndRevocationEdgeCases:
         sync_conn,
     ):
         """DELETE affecting zero rows still commits the revision increment."""
-        case = _make_case(user_factory, "revoke_all")
+        case = await _make_case(db_pool, user_factory, "revoke_all")
         check = await _password_proof(db_pool, case)
         assert _session_count(sync_conn, case.user.id) == 0
         await _revoke(db_pool, case)
@@ -542,8 +577,27 @@ class TestLockoutAndRevocationEdgeCases:
 
 @pytest.fixture
 def _frozen_token_clock(monkeypatch):
+    """Freeze token-signer timestamps at the current whole second."""
     instant = int(datetime.now(UTC).timestamp())
     monkeypatch.setattr(TimestampSigner, "get_timestamp", lambda _self: instant)
+
+
+def _registration_mail_token(sync_conn, email):
+    """Decrypt the newest registration email and extract its capability token."""
+    row = sync_conn.execute(
+        """SELECT body_ciphertext FROM email_outbox
+           WHERE recipient = %s AND message_type = 'email_verification'
+           ORDER BY id DESC LIMIT 1""",
+        (email,),
+    ).fetchone()
+    sync_conn.commit()
+    assert row is not None
+    body = decrypt_outbox_body(row[0])
+    assert body is not None
+    prefix = settings.public_base_url + "/verify-email/"
+    return token_from_action_email(
+        body, next(line.strip() for line in body.splitlines() if prefix in line)
+    )
 
 
 class TestTokenNonceReplacement:
@@ -551,31 +605,69 @@ class TestTokenNonceReplacement:
     stored token hash immediately, even when both are signed in the same
     clock second and would otherwise carry an identical timestamp."""
 
-    async def test_same_second_verification_replacement_rejects_previous_link(
-        self, db_pool, user_factory, _frozen_token_clock
+    async def test_same_second_registration_resend_preserves_the_live_single_use_link(
+        self, db_pool, sync_conn, _frozen_token_clock
     ):
-        user = user_factory(email_verified=False)
-        first = email_verification.generate_verification_token(user.id, user.email)
-        await email_verification.store_verification_token_hash(
-            db_pool, user.id, hash_token(first), expected_email=user.email
+        """Verify same second registration resend preserves the live single use link."""
+        email = "nonce-mailbox@example.org"
+        await begin_local_registration(db_pool, email=email)
+        first = _registration_mail_token(sync_conn, email)
+        assert await inspect_local_registration(db_pool, first) is not None
+        await resend_local_registration(db_pool, email=email)
+        second = _registration_mail_token(sync_conn, email)
+        assert first == second
+        assert await inspect_local_registration(db_pool, first) is not None
+        assert await inspect_local_registration(db_pool, second) is not None
+        owner = await complete_local_registration(
+            db_pool, token=second, display_name="Mailbox Owner", password=_NEW_PASSWORD
         )
-        second = email_verification.generate_verification_token(user.id, user.email)
-        await email_verification.store_verification_token_hash(
-            db_pool, user.id, hash_token(second), expected_email=user.email
+        assert owner is not None and owner.email_verified and owner.is_active
+        assert (await authentication.verify_password(db_pool, email, _NEW_PASSWORD)).password_ok
+        assert (
+            await complete_local_registration(
+                db_pool,
+                token=second,
+                display_name="Different Owner",
+                password="Cobalt-Forests-739!Rain",
+            )
+            is None
         )
-        assert not await email_verification.confirm_email_verification(
-            db_pool, user.id, user.email, hash_token(first)
+
+    async def test_cancelled_registration_cannot_be_revived_by_same_second_resend(
+        self, db_pool, sync_conn, _frozen_token_clock
+    ):
+        """Verify cancelled registration cannot be revived by same second resend."""
+        email = "cancelled-mailbox@example.org"
+        await begin_local_registration(db_pool, email=email)
+        token = _registration_mail_token(sync_conn, email)
+        reference = await inspect_local_registration(db_pool, token)
+        assert reference is not None
+        await session_revocation.delete_user_sessions(db_pool, reference.user_id)
+        await resend_local_registration(db_pool, email=email)
+        assert await inspect_local_registration(db_pool, token) is None
+        assert (
+            await complete_local_registration(
+                db_pool, token=token, display_name="Mailbox Owner", password=_NEW_PASSWORD
+            )
+            is None
         )
-        assert await email_verification.confirm_email_verification(
-            db_pool, user.id, user.email, hash_token(second)
-        )
-        assert not await email_verification.confirm_email_verification(
-            db_pool, user.id, user.email, hash_token(second)
-        )
+        state = sync_conn.execute(
+            """SELECT password_hash, is_active, email_verified, auth_revision,
+                      email_verification_token_hash, email_verification_created_at
+               FROM users WHERE id = %s""",
+            (reference.user_id,),
+        ).fetchone()
+        assert state == (None, False, False, 1, None, None)
+        assert sync_conn.execute(
+            "SELECT status, terminal_outcome FROM email_outbox WHERE user_id = %s",
+            (reference.user_id,),
+        ).fetchall() == [("dead", "cancelled")]
+        sync_conn.commit()
 
     async def test_same_second_email_change_replacement_rejects_previous_link(
         self, db_pool, user_factory, _frozen_token_clock
     ):
+        """Verify same second email change replacement rejects previous link."""
         user = user_factory()
         revision = 0  # user_factory's explicit/default initial revision
         address = "new@example.org"
@@ -609,28 +701,30 @@ class TestTokenNonceReplacement:
             db_pool,
             user.id,
             address,
-            hash_token(first),
+            first,
             expected_auth_revision=revision,
         )
         assert await email_change.confirm_email_change(
             db_pool,
             user.id,
             address,
-            hash_token(second),
+            second,
             expected_auth_revision=revision,
         )
         assert not await email_change.confirm_email_change(
             db_pool,
             user.id,
             address,
-            hash_token(second),
+            second,
             expected_auth_revision=revision,
         )
 
     async def test_consumed_reset_token_cannot_reactivate_on_same_second_reissue(
-        self, db_pool, user_factory, _frozen_token_clock
+        self, db_pool, user_factory, _frozen_token_clock, monkeypatch
     ):
-        user = user_factory()
+        """Verify consumed reset token cannot reactivate on same second reissue."""
+        secret = pyotp.random_base32()
+        user = user_factory(totp_secret=encrypt_value(secret))
         first = password_reset.generate_reset_token(user.id, user.email)
         await password_reset.store_reset_token_hash(
             db_pool, user.id, hash_token(first), expected_email=user.email
@@ -638,9 +732,10 @@ class TestTokenNonceReplacement:
         await password_reset.update_password_with_token(
             db_pool,
             user.id,
-            hash_token(first),
+            first,
             "Cobalt-Forests-739!Rain",
             expected_email=user.email,
+            totp_code=pyotp.TOTP(secret).at(_TOTP_TIME),
         )
         second = password_reset.generate_reset_token(user.id, user.email)
         await password_reset.store_reset_token_hash(
@@ -652,36 +747,27 @@ class TestTokenNonceReplacement:
         assert await password_reset.verify_reset_token_hash(
             db_pool, user.id, hash_token(second), expected_email=user.email
         )
+        monkeypatch.setattr(totp, "time", SimpleNamespace(time=lambda: _TOTP_TIME + 30))
         with pytest.raises(ValueError, match="reset token"):
             await password_reset.update_password_with_token(
                 db_pool,
                 user.id,
-                hash_token(first),
+                first,
                 "Violet-Mountains-827!Snow",
                 expected_email=user.email,
+                totp_code=pyotp.TOTP(secret).at(_TOTP_TIME + 30),
             )
         await password_reset.update_password_with_token(
             db_pool,
             user.id,
-            hash_token(second),
+            second,
             "Violet-Mountains-827!Snow",
             expected_email=user.email,
+            totp_code=pyotp.TOTP(secret).at(_TOTP_TIME + 30),
         )
         assert not await password_reset.verify_reset_token_hash(
             db_pool, user.id, hash_token(second), expected_email=user.email
         )
-
-
-async def _stage_one_recovery_code(db_pool, user_id: int) -> str:
-    """Stage a real pending recovery-code set and return one displayable code.
-
-    ``verify_and_enroll_totp``'s call to ``activate_pending_recovery_code_set_cur``
-    requires an exact match against a currently staged, unused code.
-    """
-    codes = generate_recovery_codes()
-    async with get_db_cursor(db_pool) as cur:
-        await stage_recovery_code_set_cur(cur, user_id=user_id, codes=codes)
-    return codes[0]
 
 
 class TestRevisionChangeFencesPendingEmail:
@@ -706,8 +792,9 @@ class TestRevisionChangeFencesPendingEmail:
         transition,
         claimed,
     ):
+        """Verify revision change cancels pending email and fences claimed delivery."""
         old_secret = pyotp.random_base32()
-        new_secret = pyotp.random_base32()
+
         user = user_factory(
             totp_secret=encrypt_value(old_secret) if transition == "rotate" else None
         )
@@ -733,49 +820,56 @@ class TestRevisionChangeFencesPendingEmail:
                 actor_id=admin_actor.id,
                 actor_session_id=admin_actor.session_id,
             )
-        else:
-            await store_pending_totp_secret(db_pool, user.id, new_secret)
-            if transition == "enroll":
-                session = session_factory(user.id, purpose="totp_setup")
-                recovery_code = await _stage_one_recovery_code(db_pool, user.id)
-                # This module's autouse `_fixed_totp_clock` freezes the
-                # production step clock at `_TOTP_TIME`, so the code proved
-                # here must be generated `.at()` that same instant, not
-                # `.now()` (real wall-clock time), or the codes fall in
-                # different steps and every fresh-auth call below rejects
-                # them as invalid credentials.
-                assert (
-                    await totp.verify_and_enroll_totp(
-                        db_pool,
-                        user.id,
-                        pyotp.TOTP(new_secret).at(_TOTP_TIME),
-                        recovery_code,
-                        session_id=session,
-                    )
-                    is totp.TotpEnrollmentOutcome.ENROLLED
-                )
-            else:
-                # Rotation is a fresh-auth two-step challenge on the target
-                # user's OWN full session (not the admin actor's session,
-                # which only authorized the pending email change above).
-                rotation_session = session_factory(user.id, purpose="full")
-                start = await totp.begin_totp_rotation(
+        elif transition == "enroll":
+            session = session_factory(user.id, purpose="totp_setup")
+            pending = await totp.get_or_create_pending_totp_secret(
+                db_pool,
+                user.id,
+                purpose=totp.PendingTotpPurpose.ENROLLMENT,
+                session_id=session,
+            )
+            assert pending.outcome is totp.PendingTotpOutcome.READY
+            assert pending.secret is not None
+            new_secret = pending.secret
+            recovery_code = pending.recovery_codes[0]
+            # This module's autouse `_fixed_totp_clock` freezes the
+            # production step clock at `_TOTP_TIME`, so the code proved
+            # here must be generated `.at()` that same instant, not
+            # `.now()` (real wall-clock time), or the codes fall in
+            # different steps and every fresh-auth call below rejects
+            # them as invalid credentials.
+            assert (
+                await totp.verify_and_enroll_totp(
                     db_pool,
                     user.id,
-                    DEFAULT_PASSWORD,
-                    pyotp.TOTP(old_secret).at(_TOTP_TIME),
+                    pyotp.TOTP(new_secret).at(_TOTP_TIME),
+                    recovery_code,
+                    session_id=session,
+                )
+                is totp.TotpEnrollmentOutcome.ENROLLED
+            )
+        else:
+            # Rotation is a fresh-auth two-step challenge on the target
+            # user's OWN full session (not the admin actor's session,
+            # which only authorized the pending email change above).
+            rotation_session = session_factory(user.id, purpose="full")
+            start = await totp.begin_totp_rotation(
+                db_pool,
+                user.id,
+                DEFAULT_PASSWORD,
+                pyotp.TOTP(old_secret).at(_TOTP_TIME),
+                session_id=rotation_session,
+            )
+            assert start.outcome is totp.TotpRotationStartOutcome.READY
+            assert (
+                await totp.confirm_totp_rotation(
+                    db_pool,
+                    user.id,
+                    pyotp.TOTP(start.secret).at(_TOTP_TIME),
                     session_id=rotation_session,
                 )
-                assert start.outcome is totp.TotpRotationStartOutcome.READY
-                assert (
-                    await totp.confirm_totp_rotation(
-                        db_pool,
-                        user.id,
-                        pyotp.TOTP(start.secret).at(_TOTP_TIME),
-                        session_id=rotation_session,
-                    )
-                    is totp.TotpRotationOutcome.ROTATED
-                )
+                is totp.TotpRotationOutcome.ROTATED
+            )
         assert sync_conn.execute(
             "SELECT pending_email, pending_email_token_hash, pending_email_created_at "
             "FROM users WHERE id=%s",
@@ -794,3 +888,105 @@ class TestRevisionChangeFencesPendingEmail:
             assert sync_conn.execute(
                 "SELECT status FROM email_outbox WHERE message_type='email_change_verification'"
             ).fetchone() == ("dead",)
+
+
+async def _complete_expiring_case(db_pool, case):
+    """Attempt the case's action; return False for an invalid reset token."""
+    if case.operation == "password_reset":
+        try:
+            await password_reset.update_password_with_token(
+                db_pool,
+                case.user.id,
+                case.token,
+                _NEW_PASSWORD,
+                expected_email=case.user.email,
+                totp_code=case.reset_code,
+            )
+        except password_reset.InvalidResetToken:
+            return False
+        return True
+    return await email_change.confirm_email_change(
+        db_pool,
+        case.user.id,
+        case.new_email,
+        case.token,
+        expected_auth_revision=0,
+    )
+
+
+async def _wait_for_expiry(observer, expires_at):
+    """Poll database wall time until capability expiry; raise TimeoutError at the race deadline."""
+    deadline = asyncio.get_running_loop().time() + _RACE_TIMEOUT
+    while asyncio.get_running_loop().time() < deadline:
+        cur = await observer.execute("SELECT clock_timestamp() >= %s", (expires_at,))
+        row = await cur.fetchone()
+        if row is not None and row[0]:
+            return
+        await asyncio.sleep(_POLL_INTERVAL)
+    raise TimeoutError("Database capability did not expire before the test deadline")
+
+
+@pytest.mark.parametrize("operation", ["password_reset", "email_change"])
+@pytest.mark.parametrize("expiry", ["signature", "persisted"])
+async def test_action_expiry_is_rechecked_after_waiting_for_user_lock(
+    db_pool,
+    user_factory,
+    session_factory,
+    sync_conn,
+    monkeypatch,
+    race_observer,
+    operation,
+    expiry,
+):
+    """A valid capability becomes expired while the mutation waits behind a real row lock."""
+    clock = [int(datetime.now(UTC).timestamp())]
+    monkeypatch.setattr(TimestampSigner, "get_timestamp", lambda _self: clock[0])
+    case = await _make_case(db_pool, user_factory, operation)
+    session_factory(case.user.id)
+    expires_at = None
+    if expiry == "persisted":
+        column = (
+            "password_reset_created_at"
+            if operation == "password_reset"
+            else "pending_email_created_at"
+        )
+        age = case.module._ACTION_TOKEN.max_age
+        # The capability is valid when B starts; only wall-clock passage expires it.
+        row = sync_conn.execute(
+            psycopg.sql.SQL(
+                "UPDATE users SET {column} = clock_timestamp() - %s * INTERVAL '1 second' "
+                "+ INTERVAL '2 seconds' WHERE id = %s "
+                "RETURNING {column} + %s * INTERVAL '1 second'"
+            ).format(column=psycopg.sql.Identifier(column)),
+            (age, case.user.id, age),
+        ).fetchone()
+        assert row is not None
+        expires_at = row[0]
+        sync_conn.commit()
+    before = _state(sync_conn, case.user.id)
+    active = _track_connections(monkeypatch)
+    follower = None
+    try:
+        async with asyncio.timeout(_RACE_TIMEOUT):
+            async with db_pool.connection() as blocker:
+                await blocker.execute(
+                    "SELECT id FROM users WHERE id = %s FOR UPDATE", (case.user.id,)
+                )
+                follower = asyncio.create_task(_complete_expiring_case(db_pool, case))
+                await _wait_for_database_block(
+                    race_observer, active, follower, blocker.info.backend_pid
+                )
+                if expiry == "signature":
+                    clock[0] += case.module._ACTION_TOKEN.max_age + 1
+                else:
+                    assert expires_at is not None
+                    await _wait_for_expiry(race_observer, expires_at)
+            assert await follower is False
+    finally:
+        if follower is not None:
+            if not follower.done():
+                follower.cancel()
+            async with asyncio.timeout(_CLEANUP_TIMEOUT):
+                await asyncio.gather(follower, return_exceptions=True)
+    assert _state(sync_conn, case.user.id) == before
+    assert _session_count(sync_conn, case.user.id) == 1

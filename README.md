@@ -1,11 +1,17 @@
-![CI](https://github.com/CFutter/sec_hum_oralhistarchiv_web_app/actions/workflows/ci.yml/badge.svg)
 # Digital Oral History Archive
 
-Search and browse harvested oral-history metadata with tier-based access.
+Search and browse oral-history metadata from configured sources through a
+server-rendered catalogue with public, registered and vetted metadata tiers.
 
-> **Status:** Source A and local authentication are implemented. Registration safety and deployment verification remain release gates; see [Known Limitations](#known-limitations) and [roadmap.md](roadmap.md). Source B is not implemented; federation requires a separately configured Shibboleth edge.
+The application includes OAI-PMH/CMDI, deterministic bundled fixture, static
+JSON proof and authenticated JSON-feed adapters. Each selected source has its
+own identity, visibility policy, display labels, schedule and synchronization
+state. PostgreSQL serves catalogue requests; a separate scheduler imports
+source data.
 
----
+> Development version `0.1.0`. Real-source approval, representative recovery
+> and deployment activation require separate acceptance. See
+> [Known Limitations](#known-limitations) and [Remaining Work](#remaining-work).
 
 ## Table of Contents
 
@@ -18,478 +24,577 @@ Search and browse harvested oral-history metadata with tier-based access.
 - [Configuration](#configuration)
 - [Running the Application](#running-the-application)
 - [Testing](#testing)
-- [Code Quality & Security Tooling](#code-quality--security-tooling)
+- [Code Quality and Security Tooling](#code-quality-and-security-tooling)
 - [Security Model](#security-model)
 - [Documentation](#documentation)
 - [Known Limitations](#known-limitations)
-- [Phase 2 Roadmap](#phase-2-roadmap)
+- [Remaining Work](#remaining-work)
 - [License](#license)
-
----
 
 ## What This Is
 
-The Oral History Archive is a search and browse interface for oral history research datasets. It harvests metadata from external repositories via the OAI-PMH protocol, stores it in a local PostgreSQL cache, and serves it through a server-rendered web interface.
+The Oral History Archive is a search and browse interface for research-dataset
+metadata. Configured adapters import metadata into a local PostgreSQL catalogue;
+FastAPI and Jinja2 serve it through a web interface. The upstream repository
+remains responsible for access to recordings and other linked materials.
 
-**Administrators can make dataset visibility more restrictive.** Source policy supplies each new record's `visibility_tier`; Source A does not publish a per-record application tier, so new records use `SWISSUBASE_MAX_VISIBILITY`. An authorised operator can raise an existing record's tier directly in the database. Incremental sync and full rebuild preserve the stricter of the stored tier and the incoming source-policy tier. Metadata corrections and withdrawals remain upstream responsibilities; for an urgent removal before the source changes, follow the [emergency withdrawal runbook](docs/runbooks/emergency-dataset-withdrawal.md). See [access control](docs/architecture/access-control.md) for the administrative workflow and its limits.
+Every dataset has a `visibility_tier`: `public`, `registered` or `vetted`.
+Viewers below that tier receive only the public discovery envelope: `id`,
+`uuid`, `title`, `access_level`, `version`, `source` and `visibility_tier`.
+Source owners must approve those values, record existence and their combination
+for unrestricted publication. A higher metadata tier does not conceal that
+envelope.
 
-Two characteristics distinguish it from a generic catalogue front-end:
+Every metadata field also has a code minimum and may have a stricter immutable
+source minimum. Protected fields require the strictest record/code/source tier;
+meeting the record tier alone does not bypass a raised field minimum. The seven
+public discovery fields remain public. See the
+[field policy](docs/architecture/field-visibility.md) for all 22 classifications,
+source override syntax and restart behavior.
 
-1. **Tiered metadata visibility.** Every dataset carries a `visibility_tier` (`public`, `registered`, `vetted`). Users below the required tier see only a fixed set of non-sensitive fields — `title`, `access_level`, `visibility_tier`, `source`, `version`, and the identifiers `id`/`uuid` — while every other field is redacted server-side, before rendering. (`uuid` is the public upstream OAI identifier for Source A; its visibility below tier is a deliberate choice to re-evaluate per source policy for Source B.) This is enforced in the service layer (both in the SQL queries and in `filter_for_tier`), so the templates never receive the hidden fields.
-2. **Security-first prototype.** The application is designed as a foundation for handling sensitive research data. Argon2 password hashing, mandatory TOTP, email verification, account lockout, server-side sessions, HMAC-bound CSRF cookies, encrypted TOTP secrets at rest, strict CSP, audit logging with sensitive-field redaction, and startup validators for misconfiguration are implemented before sensitive data flows through the system.
+SQL prevents restricted metadata from contributing to unauthorized search and
+filter matches. Dataset services then redact returned objects before they
+reach templates. PostgreSQL RLS additionally limits raw web-role rows by the
+effective record tier. Narrow owner-backed views preserve public discovery and
+administrator identity/state controls. Field minima still require the matching
+application SQL/redaction/template rules; RLS does not redact individual columns.
+
+Source policy resolves each incoming metadata tier. A valid explicit upstream
+assertion can tighten or lower it automatically; an omitted tier retains the last
+accepted restriction. Eligible administrators can impose
+a durable visibility floor or hide and restore an identity through
+**Admin → Dataset administration**. Those restrictions survive synchronization,
+rebuilds and deletion followed by reintroduction of the same `(source, uuid)`.
+
+Administrator-hidden records are excluded from catalogue detail, search,
+facets, recent records and counts at every viewer tier. Administrator status
+does not bypass metadata-tier enforcement. Changing source configuration alone
+does not immediately reclassify existing records.
+
+See [access control](docs/architecture/access-control.md) and the
+[emergency withdrawal runbook](docs/runbooks/emergency-dataset-withdrawal.md).
 
 ### Audiences
 
-| Audience | What they see |
+| Audience | Access |
 |---|---|
-| **Public visitors** | Title and access level of all datasets; full metadata of public-tier datasets |
-| **Registered-tier users** | Public and registered-tier metadata; creating a local account alone leaves its tier public |
-| **Vetted users** | Full metadata of all tiers, including strictly confidential fields |
-| **Administrators** | User management, **user** access-tier assignment, account deactivation (which also revokes the user's sessions), staged email changes; authorised database operators can also raise dataset visibility tiers |
-
----
+| Public visitors | Public discovery fields for served records and other fields whose effective record/code/source requirement is public |
+| Registered-tier users | Fields requiring public or registered; creating a local account alone leaves its tier public |
+| Vetted users | Full catalogue metadata at all three tiers; external resource access remains governed upstream |
+| Administrators | Account and dataset administration; administrator status does not grant a higher metadata tier |
 
 ## Key Features
 
-### Data ingestion
-- OAI-PMH harvesting from SWISSUbase with resumption-token handling and a runaway-pagination cap
-- CMDI XML parsing via XXE-hardened lxml
-- Institution-based filtering of records, which allows reuse for different use cases
-- Incremental sync, deleted-record tombstone handling, and periodic full rebuild on independent schedules
-- Per-source visibility ceiling: harvested records are clamped to `SWISSUBASE_MAX_VISIBILITY` via a `SourcePolicy` at ingest; updates and rebuilds preserve any stricter stored classification
-- Background scheduler (APScheduler) running in its own dedicated process, not inside the web workers
-
-### Data access
-- Trigram-indexed substring search across titles, descriptions, authors, and keywords — tier-aware, so datasets above the user's tier expose only the visible field set (title, access level, tier, source, version, id/uuid)
-- Faceted filtering by keyword, language, and access level (keyword and language filters are tier-gated so they cannot probe redacted metadata)
-- In-process cache for two global statistics (dataset total and last full rebuild). Redis pub/sub invalidates it across workers after sync; without Redis the one-hour TTL is the fallback. Tier-sensitive facets and metadata counts are queried live.
-- Pagination with configurable page size
-- Per-tier metadata redaction in the service layer
-
-### Authentication & accounts
-- Local accounts with Argon2id password hashing (rehash-on-login when parameters change)
-- Mandatory email verification before an account can be used; unverified accounts reaped after a configurable period, 7 days by default
-- Mandatory TOTP enrollment for local users (limited `totp_setup` sessions until enrollment completes), with per-code replay protection
-- Account lockout after a configurable number of failed logins, with an email notice on lockout
-- Password reset via signed, single-use tokens delivered by email and stored as hashes on the user row
-- Self-service display-name change, email change (confirmed via link to the new address, notice to the old one), and authenticator rotation (requires the current code)
-- Enumeration-safe registration: duplicate sign-ups render the same page and notify the existing address by email instead
-- TOTP secrets encrypted at rest with Fernet; keys derived from `TOTP_ENCRYPTION_KEYS` via HKDF (MultiFernet — the first key encrypts, all keys decrypt, enabling rotation)
-- Common-password blocklist (SecLists 10k) plus contextual checks and a 12-character minimum
-- Shibboleth callback implemented for reverse-proxy federated login (SP deployment is Phase 2)
-- Admin dashboard for user access-tier changes, deactivation (revokes sessions), admin promotion, and staged email changes
-
-`LOCAL_REGISTRATION_ENABLED` controls new sign-ups, not existing local login. Keeping local administrator sign-in available during federation rollout is deliberate; see [authentication policy](docs/architecture/auth.md#local-sign-in-and-registration-policy) 
-
-### Security middleware
-- Server-side sessions (DB-backed, signed cookie holds only the random ID; `SameSite=Strict`)
-- Fail-closed HTTP route policy: every application route is declared through `SecureAPIRouter` with one immutable access class, and startup refuses unclassified or duplicate routes, unreviewed mounts, and WebSocket routes
-- HMAC-bound double-submit CSRF and form Content-Type validation are installed automatically on every mutation method; only the two exact token-capability POSTs reviewed in `route_security.py` omit CSRF
-- Strict Content Security Policy (no `unsafe-inline`)
-- HSTS in production with preload
-- `Cache-Control: no-store` on every dynamic response
-- Pre-session rate admission via slowapi (configurable per minute / hour /
-  day). Hardened deployments require dedicated Redis counters shared across
-  web workers and fail closed on storage errors; in-memory counters are
-  development-only
-- Audit logging on every request, with structured JSON output
-
-### Operations
-- The application auto-migrates only in dev. The supplied migration creates a new schema; no upgrade path from earlier prototype schemas is included. In staging and production,
-  migrations are an explicit reviewed release operation performed by the
-  manual `oralhistarchiv-migrate.service` while web and scheduler are stopped.
-  Runtime services use separate peer-authenticated non-owner roles and refuse
-  startup unless both the Alembic/schema contract and the exact database-role
-  contract pass.
-- Startup invariant checks: dataclass/column-list sync, redaction-field classification, 
-  and a live-database drift check
-- Bounded connection pooling via psycopg_pool, with per-process
-  `application_name`, statement timeout, and a finite waiter queue that fails
-  promptly under saturation
-- Logs to stdout, captured by systemd-journald in production (rotation/retention handled by journald)
-- Optional off-host audit shipping via a host-level rsyslog agent (RELP/TLS)
-- Public liveness endpoint and token-protected detail health endpoint
-- DevContainer with PostgreSQL for reproducible development 
-  (`.devcontainer/` — Dockerfile, devcontainer.json docker-compose.yaml, setup.sh)
-- Gunicorn + two systemd units (web and scheduler) for production
-- Tests cover unit, HTTP-client and real-service integration tiers. Get the current collected count with `pytest --collect-only -q`; parametrization makes source-function counts different.
----
+| Area | Implemented behavior and contract |
+|---|---|
+| Ingestion | Four adapters, bounded isolated source work, durable staging, reconciliation and source-specific policy; [ingestion](docs/architecture/sync.md) |
+| Catalogue | Field-aware search, filters, opaque continuation, tier redaction and durable hiding; [access control](docs/architecture/access-control.md) |
+| Accounts | Mailbox-first registration, password/TOTP, recovery and reviewed federation; [authentication](docs/architecture/auth.md) |
+| Operations | Separate web/scheduler identities, shared admission, transactional mail and encrypted backup tooling; [deployment](Deployment.md) |
 
 ## Architecture at a Glance
 
-nginx terminates HTTPS and proxies to web workers over a Unix socket. Workers
-render Jinja pages, query PostgreSQL, enqueue mail and use dedicated limiter
-Redis in hardened deployments. The separate scheduler harvests SWISSUbase,
-delivers outbox mail and runs cleanup jobs. Optional general Redis invalidates
-catalogue statistics across processes. See docs/architecture/ for the contracts.
+nginx terminates HTTPS and proxies over a Unix socket to Gunicorn/Uvicorn web
+workers. Workers validate sessions, render pages, query PostgreSQL and enqueue
+mail. Hardened web admission uses a dedicated security-counter Redis service.
 
----
+The standalone scheduler harvests selected sources, delivers queued mail and
+runs cleanup. It owns APScheduler and has its own PostgreSQL pool. Web workers
+never start ingestion jobs. Optional general Redis distributes catalogue-cache
+invalidation separately from security counters.
+
+Both processes load the same source file. Web workers retain nonsecret
+catalogue metadata and reject selected feed credential variables. Only the
+scheduler resolves feed credentials and constructs fetch adapters. Snapshots
+remain fixed until restart.
+
+The JSON-feed adapter performs complete source fetching, parsing, validation and
+serialization inside one spawned worker. Parent reconstruction uses the bounded,
+validated result and checks the same deadline; that reconstruction is not
+separately force-terminable.
+
+See [ingestion architecture](docs/architecture/sync.md) for transaction,
+recovery, cursor and worker boundaries.
 
 ## Technology Stack
 
-## Technology Stack
+FastAPI, Jinja2, psycopg/PostgreSQL, Alembic, APScheduler and Redis. The reference
+production deployment uses Gunicorn/Uvicorn behind nginx.
 
-Python 3.11+, FastAPI, Jinja2, psycopg/PostgreSQL, Alembic, APScheduler and Redis.
-Production uses Gunicorn/Uvicorn behind nginx. Dependencies and pinned versions
-are in pyproject.toml and uv.lock; the reference deployment uses PostgreSQL 16.
-
----
+CI uses Python 3.11 and PostgreSQL 18. Release tooling requires Python 3.11;
+the reference deployment uses PostgreSQL 18. Package metadata permits Python
+3.11 and later; other Python series are not covered by the current CI/release
+process. Dependencies and pinned versions are recorded in `pyproject.toml` and
+`uv.lock`.
 
 ## Project Layout
 
 | Path | Purpose |
 |---|---|
-| src/app/routes/ | HTTP handlers and access-policy declarations |
-| src/app/services/ | Authentication, datasets, sync, outbox and persistence |
-| src/app/middleware/ | Admission, sessions, CSRF, audit and security checks |
-| src/app/templates/, src/app/static/ | Server-rendered UI and assets |
-| src/config/ | Environment settings and logging |
-| src/alembic/ | Schema migration and revision template |
-| src/tests/ | Unit, client and integration tests |
-| run.py, run_scheduler.py, dev.sh | Development web, standalone scheduler and combined launcher |
-| oralhistarchiv*.service, deploy/ | Reference deployment units, policies and helpers |
-| scripts/ | Release, verification and maintenance tools |
-| docs/, mkdocs.yaml | Documentation sources and site configuration |
-
-Deployment.md is the installation/runbook reference; roadmap.md lists pending
-work and test_plan.md lists acceptance requirements.
-
----
+| `src/app/sources/` | Adapter protocol, registry, source models, feed validation, transport and startup policy |
+| `src/app/routes/` | HTTP handlers and route access declarations |
+| `src/app/services/` | Authentication, catalogue reads, dataset administration, ingestion, outbox and persistence |
+| `src/app/middleware/` | Admission, sessions, CSRF, audit and security checks |
+| `src/app/templates/`, `src/app/static/` | Server-rendered UI and assets |
+| `src/config/` | Process settings and logging |
+| `src/alembic/` | Schema migration and revision template |
+| `src/tests/` | Unit, client, adapter-conformance and integration tests |
+| `run.py`, `run_scheduler.py`, `dev.sh` | Development web, scheduler and combined launcher |
+| `oralhistarchiv*.service`, `deploy/` | Reference deployment units, policies and helpers |
+| `scripts/` | Release, verification and maintenance tools |
+| `docs/`, `mkdocs.yaml` | Documentation sources and site configuration |
 
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.11 or higher
-- PostgreSQL 15+
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- Python 3.11.
+- PostgreSQL 18 and a disposable development database.
+- [uv](https://docs.astral.sh/uv/) for the locked project environment.
 
-### Option A — DevContainer
+### Option A: DevContainer
 
-A DevContainer (Python 3.11 + PostgreSQL, via VS Code's Dev Containers extension) ships in `.devcontainer/`. Open the repo in the container at `/workspaces`; setup installs the locked environment and creates `.env` if absent, pointing `DATABASE_URL` at the Compose service `db`. Existing `.env` files are preserved: set their database host to `db` yourself. Review `.env`, then run `uv run bash dev.sh`.
+The DevContainer provides Python 3.11, PostgreSQL 18 and matching client tools.
+Open `/workspaces`; setup installs locked dev/doc dependencies and creates `.env`
+only when absent, using host `db`. Review existing `.env` files yourself.
+The PostgreSQL 18 volume is `postgres-data-pg18`, mounted at `/var/lib/postgresql`;
+it starts a fresh cluster and does not reuse the former development volume.
 
-### Option B — Manual setup (recommended)
+Review the database URL and source selection, then run the combined launcher
+from the repository root. Bootstrap an administrator interactively after startup.
 
-Run from the uploaded checkout (or clone your project's actual repository URL).
+### Option B: Manual setup
+
 These commands assume a local Linux PostgreSQL server with postgres peer access:
 
 ```bash
 uv sync --locked --extra dev --extra doc --python 3.11
-source .venv/bin/activate
 
-# Create this OS user's PostgreSQL role once; skip if it already exists.
+# Create this OS user's database role once; skip if it already exists.
 sudo -u postgres createuser --createdb "$(id -un)"
 createdb oralhistarchiv
+
+# Copy only when you do not already have a local configuration to preserve.
 cp .env.example .env
 ```
 
-Set DATABASE_URL="postgresql:///oralhistarchiv" in .env for local peer access;
-for a different host, use that server's working PostgreSQL URL. Confirm the
-source URL/institution pair and change or remove both ADMIN_SEED_* values
-before starting. The example's signing/encryption keys are public dev values.
+Set `DATABASE_URL="postgresql:///oralhistarchiv"` in `.env` for local peer
+access, or use the working development URL for your database host. Remove any
+legacy `ADMIN_SEED_EMAIL` and `ADMIN_SEED_PASSWORD` assignments: runtime services
+reject them. The example signing/encryption keys are public development values
+and must not be deployed. Start the processes below before bootstrapping an
+administrator so development migrations have initialized the database.
+
+The copied example selects only `fixture_demo` through
+`deploy/environment/sources.dev.toml`. Start both processes with that explicit
+selection:
 
 ```bash
-bash dev.sh
+ENV_STATE=dev \
+SOURCES_CONFIG_FILE="$PWD/deploy/environment/sources.dev.toml" \
+ALLOW_FIXTURE_SOURCE=false \
+uv run bash dev.sh
 ```
 
-Both launcher and web lifespan run the dev migration; the launcher completes
-it before starting the scheduler. The release builder requires a Git checkout
-and CI provenance; the uploaded ZIP alone is not a production release.
+The scheduler imports three bundled synthetic records through normal ingestion,
+with public, registered and vetted metadata tiers. This selection makes no
+upstream request. The web process does not populate the catalogue.
 
-On first start the web application:
+`dev.sh` first validates the application settings and requires the effective
+`ENV_STATE` to be `dev`, then runs the development migration and starts scheduler
+and web. Invalid settings or a non-development environment stop the launcher
+before migrations or child processes begin.
+The web lifespan also checks/runs development migrations. A fresh selected
+source has no committed fingerprint, so its immediately due incremental job
+requests an authoritative rebuild through the normal scheduler recovery path.
+Periodic rebuilds remain scheduled independently.
 
-1. Configures logging and (dev only) warns about unconsumed `.env` keys
-2. Validates security settings (refuses to start with weak secrets in staging/production) and, if SMTP is enabled with TLS, verifies the relay's certificate
-3. Runs Alembic migrations to head **in dev only**. Staging/production never
-   migrate during runtime startup.
-4. Opens the database pool and validates the expected migration/schema contract
-   and the process-specific non-owner database-role contract.
-5. Validates the dataset/user schema invariants, the redaction-field classification, and the live database columns
-6. Seeds mock restricted datasets in dev if `SEED_MOCK_DATA=true` (off by default). In staging, the scheduler seeds after its database preflight; set the flag only in `scheduler.env`. Production rejects the flag.
-7. Seeds the admin account if `ADMIN_SEED_EMAIL` and `ADMIN_SEED_PASSWORD` are set and no admin exists yet
+When an administrator is needed, leave the launcher running and use another
+interactive terminal from the repository root:
 
+```bash
+ENV_STATE=dev uv run python scripts/bootstrap_admin.py --email operator@example.org
+```
 
-The web process does **not** start the background scheduler. Run `run_scheduler.py` as a second process (or use `./dev.sh`, which launches both). The scheduler independently calls the same `validate_security_settings()` gate before it creates or opens its PostgreSQL pool, then validates the runtime schema before constructing APScheduler. It does not rely on the web unit starting successfully or on systemd `After=` ordering. The scheduler runs an incremental sync immediately on start, then on the configured interval; the first full rebuild is staggered five minutes after start.
+Enter a fresh password when prompted, complete authenticator/recovery-code
+enrollment in the browser, then verify a fresh login. See
+[bootstrap](docs/runbooks/bootstrap-admin.md) for the protected deployment command.
 
----
+### Web startup order
+
+1. Configure logging and, in development, warn about unconsumed dotenv keys.
+2. Validate security settings and load nonsecret source metadata; reject
+   selected feed credential variables in the web environment.
+3. Validate route access declarations and probe the rate-limit backend.
+4. Warm the password blocklist and dummy password hash.
+5. Run Alembic migrations in development only.
+6. Open ordinary and dedicated search PostgreSQL pools and validate runtime
+   schema, invariants and applicable role contracts.
+7. Reconcile federated-session policy and initialize the selected-source
+   statistics cache.
+
+Web startup neither provisions source-status rows nor harvests catalogue data.
+The scheduler independently validates security and selects sources before
+opening its pool. It validates schema/role contracts, provisions selected source
+rows, then constructs the jobs. It does not depend on successful web startup.
 
 ## Configuration
 
-All configuration is loaded from environment variables. In development,
-pydantic-settings also reads a local `.env`. Outside dev both runtime units
-load root-owned `/etc/oralhistarchiv/common.env`; web additionally loads
-`web.env` and the optional Phase-2 `shibboleth.env`, while scheduler loads
-`scheduler.env`. `DATABASE_URL` is forbidden in `common.env`: each runtime URL
-uses its peer-authenticated non-owner role. The manual migration unit loads only
-`migration.env` and uses the owner-only `MIGRATION_DATABASE_URL`. OS environment
-variables always take precedence. See `Deployment.md` §§3, 6, 7, and 17.
+Export exact OS key `ENV_STATE=dev`, `staging` or `production` before launch.
+Only development reads the checkout's `.env`; OS values take precedence.
+[Settings](docs/configuration/settings.md) documents every process variable,
+default, range and validation rule; `.env.example` is the annotated dev example.
 
-A complete and annotated example lives in `.env.example`. The most important settings:
+Both processes require the same explicit `SOURCES_CONFIG_FILE`. Source identity,
+policy, schedules and adapter inputs use flat TOML; see
+[Sources](docs/sources/index.md) and [feed configuration](docs/sources/json-feed-configuration.md).
+Hardened source files require the protected absolute-path procedure. Only the
+scheduler receives feed credentials; selected credential variables make web
+startup fail. Snapshots remain fixed until restart. Changed catalogue policy
+also requires an [owner transition](docs/runbooks/search-policy.md).
 
-| Group | Variable | Purpose |
-|---|---|---|
-| **Environment** | `ENV_STATE` | `dev` / `staging` / `production` |
-| | `PUBLIC_BASE_URL` | External base URL used in emailed links (required; must be non-localhost `https://` in staging/production) |
-| | `FASTAPI_DEBUG` | Enables `/docs`, `/redoc`, mock seeding, open `/health/detail` (forbidden outside dev) |
-| | `ALLOWED_HOSTS` | Host headers accepted by `TrustedHostMiddleware` (required) |
-| **Database** | `DATABASE_URL` | Runtime PostgreSQL URL. Development may use a password URL; staging/production receive a Unix-socket peer URL only from `web.env` or `scheduler.env`. Never place it in `common.env`, and never use it for migrations. |
-| | `DATABASE_POOL_SIZE` | Max connections (1–50) |
-| | `DATABASE_POOL_MAX_WAITING` | Finite per-process pool waiter queue (default 32); saturation fails promptly with a retryable 503 |
-| | `DB_STATEMENT_TIMEOUT` | Per-connection statement timeout (default `5s`) |
-| **Secrets** | `SECRET_KEY` | Signs email-verification / password-reset / email-change tokens and derives separate audit-email and pseudonymous limiter-client HMAC keys. Does **not** encrypt TOTP secrets |
-| | `SESSION_SECRET` | Session cookie signing + CSRF HMAC key (separate from `SECRET_KEY`) |
-| | `TOTP_ENCRYPTION_KEYS` | JSON list of Fernet key material for TOTP secrets at rest — first key encrypts, all keys decrypt (rotation) |
-| | `OUTBOX_ENCRYPTION_KEYS` | JSON list of Fernet key material for outbox secrets at rest — first key encrypts, all keys decrypt (rotation) |
-| | `HEALTH_DETAIL_TOKEN` | Bearer token for `/health/detail` (required outside development: staging and production) |
-| **Sessions** | `SESSION_MAX_AGE_SECONDS` | Default 28800 (8 hours) |
-| | `SESSION_COOKIE_NAME` | Default `oha_session` |
-| | `COOKIES_SECURE` | Secure flag on cookies — `false` only for local plaintext-HTTP dev |
-| **Auth** | `LOCAL_REGISTRATION_ENABLED` | Enable new local registrations; existing local users can still sign in |
-| | `TOTP_ISSUER_NAME` | Label shown in authenticator apps |
-| | `LOGIN_FAILURE_THRESHOLD` / `LOGIN_LOCKOUT_MINUTES` | Account lockout policy |
-| | `UNVERIFIED_REAP_AFTER_DAYS` | Reap unverified accounts after N days |
-| | `SHIBBOLETH_ENABLED` / `SHIBBOLETH_INTERNAL_SECRET` | Trust reverse-proxy auth headers on the callback (secret required whenever enabled) |
-| | `ADMIN_SEED_EMAIL` / `ADMIN_SEED_PASSWORD` | First-run admin bootstrap |
-| **Reverse proxy** | `TRUSTED_PROXY_IPS` | Peer IPs trusted for client-IP attribution |
-| **Redis** | `RATE_LIMIT_REDIS_URL` | Dedicated, authenticated security-counter Redis URL; required and functionally probed by hardened web startup, and permitted only in `web.env` |
-| | `REDIS_ENABLED` / `REDIS_URL` | General Redis for catalogue-statistics invalidation; dev may reuse it for limiting |
-| **OAI sync** | `SWISSUBASE_OAI_PMH_URL` | Endpoint URL |
-| | `OAI_INSTITUTION_FILTER` | Required institution name |
-| | `SWISSUBASE_MAX_VISIBILITY` | Visibility ceiling applied to harvested records at ingest |
-| | `SYNC_INTERVAL_SECONDS` / `FULL_REBUILD_INTERVAL_SECONDS` | Job intervals |
-| | `SYNC_WRITE_TIMEOUT_SECONDS` | Complete harvest write-phase deadline (default 120 seconds) |
-| | `OAI_MAX_PAGES` | Resumption-token pagination cap |
-| **SMTP** | `SMTP_ENABLED` | Required in staging/production; false in dev writes private `.eml` files |
-| | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | SMTP credentials |
-| | `SMTP_FROM_ADDRESS` / `SMTP_FROM_NAME` / `CONTACT_EMAIL` | Sender + contact identity |
-| | `SMTP_CA_BUNDLE` | PEM CA bundle for a relay signed by a private CA |
-| **Logging** | `LOG_LEVEL` / `LOG_FORMAT` | Application verbosity and `json`/`text` output; audit events always use JSON |
-| **Rate limit** | `RATE_LIMIT_ENABLED` | Master switch |
-| | `RATE_LIMIT_PER_MINUTE` / `_PER_HOUR` / `_PER_DAY` | Fixed-window per-client limits, independent of account tier |
-| | `RATE_LIMIT_TRUST_PROXY` | Trust `X-Real-IP` / `X-Forwarded-For` (must be `true` in production behind nginx) |
-| **CORS** | `CORS_ENABLED` / `CORS_ORIGINS` / `CORS_ALLOW_METHODS` / `CORS_ALLOW_HEADERS` / `CORS_ALLOW_CREDENTIALS` | Disabled by default |
-
-> ⚠️ **Generate secrets with**
-> ```bash
-> python -c "import secrets; print(secrets.token_urlsafe(64))"
-> ```
-> Never commit `.env` files. Outside dev, `ENV_STATE` must be a real OS environment variable — the production systemd units provide it (and the rest of the config) via `EnvironmentFile=`; the app refuses to start if a non-dev `ENV_STATE` is seen only from a `.env` file.
-
-### Secrets & key rotation
-
-Signing, session, TOTP, outbox, health, federation and limiter credentials have distinct purposes and rotation effects.
-
-| Secret | Protects | Rotating it… |
-|---|---|---|
-| `SECRET_KEY` | Audit-email and pseudonymous limiter-client HMAC keys; signs email-verification, password-reset, email-change tokens | Invalidates outstanding verification/reset/change links, breaks audit-hash correlation, and grants each client one fresh limiter allowance. Rotate only with a non-overlapping web maintenance restart; mixed-key workers multiply quotas. **Does not affect TOTP secrets or sessions.** |
-| `SESSION_SECRET` | Session-cookie signature + CSRF HMAC | Logs out all users and invalidates outstanding CSRF tokens; users log in again. **Does not affect TOTP secrets.** |
-| `TOTP_ENCRYPTION_KEYS` | TOTP secrets at rest (MultiFernet) | See the safe procedure below. Done wrong, **every enrolled authenticator becomes unrecoverable.** |
-
-Follow [key rotation](docs/runbooks/key-rotation.md) for each credential. TOTP rotation requires re-encryption and primary-key verification; outbox rotation requires retaining old keys until all affected retained messages and backups are handled. The TOTP scripts do not rotate outbox bodies.
-
-### Startup validators
-
-Both the web lifespan and the standalone scheduler call `validate_security_settings()` before opening their PostgreSQL pools or performing application network work. Each process therefore fails on its own;
-a failed web startup cannot leave an insecure scheduler running. The function checks `SECRET_KEY`, `SESSION_SECRET`, every `TOTP_ENCRYPTION_KEYS` and `OUTBOX_ENCRYPTION_KEYS` entry, and — when set — `HEALTH_DETAIL_TOKEN` and `SHIBBOLETH_INTERNAL_SECRET`. In staging and production it blocks startup if:
-
-- Any of those secrets is a hardcoded template default, on the blocklist, below the minimum length (43 characters ≙ 256 bits), or below the minimum Shannon entropy
-- `SWISSUBASE_OAI_PMH_URL` is not `https://`
-- Rate limiting is enabled in production without `RATE_LIMIT_TRUST_PROXY=true` (per-IP limits would collapse onto nginx's IP)
-- CORS credentials are combined with wildcard or non-HTTPS origins
-
-Pydantic model validators add more: CORS and `ALLOWED_HOSTS` misconfiguration is blocked in staging/production (wildcards, empty lists, localhost origins); `DATABASE_URL` must be a PostgreSQL URL; `PUBLIC_BASE_URL` must be a non-localhost `https://` URL in staging/production; `COOKIES_SECURE` and `FASTAPI_DEBUG=false` are enforced outside dev; SMTP is required in staging and production (with STARTTLS and paired authentication settings; host/sender placeholders are rejected in production); `HEALTH_DETAIL_TOKEN` is required outside development (staging and production); and `SHIBBOLETH_INTERNAL_SECRET` is required whenever Shibboleth is enabled, in every environment. In dev, the aggregate startup security check downgrades many findings to warnings; Settings validation still rejects invalid values, and enabled federation retains its strict checks.
-
----
+Use [Deployment](Deployment.md) for separate common/web/scheduler/migration
+profiles, generated independent secrets and restart order. Remove retired
+settings rather than assigning empty/false values. Follow
+[key rotation](docs/runbooks/key-rotation.md) before replacing or removing keys.
 
 ## Running the Application
 
 ### Development
 
+Run from the repository root with reviewed development settings:
+
 ```bash
-./dev.sh            # web server + scheduler
-# or, separately:
-python run.py
-python run_scheduler.py
+export ENV_STATE=dev
+uv run bash dev.sh
+
+# Or run in separate terminals with the same source selection:
+uv run python run.py
+uv run python run_scheduler.py
 ```
 
-`dev.sh` requires Bash 4.3+. It supervises both processes, propagates the first exit status, and waits for both children on exit or interruption. Shutdown can take up to the scheduler's 300-second drain plus cleanup.
+`dev.sh` requires Bash 4.3+ and validates the same environment/dotenv settings as
+the application before migrating or launching either child. Only an effective
+`ENV_STATE=dev` is accepted; staging and production use the reviewed workflow in
+`Deployment.md`. It propagates the first child's exit status,
+terminates the sibling and reaps both children. Scheduler shutdown allows a
+300-second drain and a five-second cancellation grace period before closing
+resources.
 
-The web app starts on `http://127.0.0.1:5000`. With `FASTAPI_DEBUG=true`:
+The example web address is `http://127.0.0.1:5000`. `FASTAPI_DEBUG=true` enables
+API documentation and unauthenticated `/health/detail` only in development.
+Development warning behavior is controlled by `ENV_STATE`, not that debug flag.
 
-- `/docs` (Swagger UI) and `/redoc` are available
-- `/health/detail` is open without a token
+With `SMTP_ENABLED=false`, the scheduler writes queued messages into the private
+`.dev-mailbox/` directory. Open its `.eml` files in a mail reader to complete
+development account flows. The web process queues mail but does not deliver it.
 
-(Weak-secret findings being warnings instead of startup blockers is tied to `ENV_STATE=dev`, not to the debug flag.)
-
-With the default `SMTP_ENABLED=false`, the scheduler writes email to
-`.dev-mailbox/` (`DEV_MAILBOX_DIR`). Open the newest `.eml` file in a mail
-reader to complete registration, password reset or an email change. Run both
-processes with `./dev.sh`; the web process only queues mail. Logs redact links
-at every level. The mailbox is private and should be cleared after testing.
+Local registration starts with email only. Follow the delivered setup link to
+choose the password/profile, then log in and complete authenticator enrollment.
+Open the public link, paste the separate security code from the same email
+into the form, then submit it. The code is the credential; the link alone grants
+no action. No JavaScript is required. See the
+[action-link procedure](docs/runbooks/action-links.md) for code entry, cutover
+and edge logging limits.
 
 ### Production
 
-The three application units are at the repository root; backup units are under `deploy/`. 
-The migration unit has no `[Install]` section and must never be
-enabled at boot. See `Deployment.md` for the reviewed maintenance, backup,
-migration, grant-reapplication, runtime-preflight, smoke-test, and reopen
-sequence. Gunicorn and scheduler remain separate long-running services.
+Use the reviewed release and systemd procedures in [Deployment](Deployment.md).
+Web and scheduler are separate long-running services with peer-authenticated
+non-owner database roles. The manual migration unit is not enabled at boot;
+migrations and grant reapplication run while runtime services are stopped.
+Runtime startup never migrates hardened databases.
 
-```bash
-/opt/oralhistarchiv/.venv/bin/python -I -m gunicorn \
-  -c /opt/oralhistarchiv/gunicorn.conf.py app.main:app
-```
+This explicitly approved pre-deployment reset keeps one fresh-install revision,
+`4f73ae3ff827`. It includes catalogue RLS, narrow views, consumed-snapshot cursors,
+the bounded password-reset proof window and password-change notification mail.
+Initialize an empty database using `upgrade head` through the manual migration
+unit and apply the matching runtime grants before starting the release. The
+backup script pins the same single head.
 
-This is the installed interpreter command used by the web unit, whose `flock`
-wrapper holds the shared deployment lock. Start production through systemd,
-with the scheduler as its own service; see Deployment.md for provisioning and
-the manual migration sequence.
+After migration, users and catalogue records are empty. Configured sources
+populate the catalogue; registration and explicit administrator bootstrap create
+accounts. The repository contains no deployment data or pre-created accounts.
+
+Recreate databases initialized from an earlier body of this baseline before
+using this release: `upgrade head` does not rerun an already recorded revision,
+and stamping cannot repair the missing structure. The operator owns that reset;
+application/updater tools do not recreate databases. Verify the complete schema
+and runtime-role inventories after initializing the new database. There is no
+forward migration for an existing database in this pre-deployment release.
+
+The baseline keeps revision-local SQL snapshots; changing current application
+SQL cannot change its replay. An explicitly reviewed reset before the first
+retained deployment must update the snapshots and SQL regression pins together.
+After that deployment, preserve old revisions and introduce a new reviewed
+migration for every schema change. See [migration history](src/alembic/README).
+
+Release builds require a clean checkout matching the requested commit. The
+deployment checklist separately binds that commit to the approved CI run.
+A source archive alone is not a reviewed production release.
+
+Public registration, federation and a real sensitive source each require their
+own activation evidence. Enabling one does not establish acceptance of the
+others.
 
 ### Health checks
 
-| Endpoint | Auth | Returns |
+| Endpoint | Access | Meaning |
 |---|---|---|
-| `GET /health` | Public; exempt from application limiting | Handler returns 200 with {"status":"alive"}; nginx admission and outer middleware can reject requests; no dependency check |
-| `GET /health/detail` | Bearer token (production) / open (debug) | Database connectivity and synchronization status. Handler JSON returns `healthy`, `degraded`, or `unhealthy`; its 503 means database unreachable. The non-exempt route may instead receive the generic pre-routing limiter 503 during a limiter outage/capacity incident. Sync errors, missing or stale harvests, and missing or stale full rebuilds return HTTP 200 with `"status": "degraded"`; monitoring must inspect content type/body as well as status. |
+| `GET /health` | Public; exempt from application rate admission | Handler liveness only: `200 {"status":"alive"}`. It does not check dependencies; outer middleware/nginx may still reject a request. |
+| `GET /health/detail` | Bearer token outside debug; unauthorized requests receive 404 | Database/pool availability, per-source history, outbox diagnostics and optional backup-publication age. Dependency unavailability can return 503; source/outbox degradation can return 200 with `"status":"degraded"`. Backup age is informational and needs its own monitor policy. |
 
----
+The diagnostic route also passes through normal admission, which can return a
+generic retryable 503 during limiter storage/capacity incidents. Monitoring must
+check response type and body as well as status.
+
+Source freshness uses each selected source's own schedule and recorded
+timestamps. It is not a live upstream probe or evidence of sensitive-source
+acceptance. Authorized `checks.backup` reports `status=ok` and integer
+`age_seconds` from the optional local marker, or `status=unknown` and a null age.
+It does not change readiness or prove off-host receipt, restore or PITR. Use the
+[monitoring checklist](docs/runbooks/monitoring.md) for every degraded cause and
+independent backup/capacity checks; the [PITR template](docs/runbooks/point-in-time-recovery.md)
+requires an approved physical-backup/WAL design and isolated replay evidence.
 
 ## Testing
 
-The suite has three tiers:
+Tests combine controlled doubles, real spawned-worker and local TLS probes,
+and PostgreSQL integration tests. The shared limiter fixture uses Redis and may
+reset counters, so all test services must be disposable.
+
+Before switching an existing Compose test cluster to PostgreSQL 18, remove its
+disposable data with `docker compose down --volumes`, then start it again.
 
 ```bash
-# Unit + client tiers; use a disposable Redis instance for the shared fixture
-pytest -m "not integration"
+uv run pytest --collect-only -q
 
-# Full suite, including the real-PostgreSQL integration tier.
-# Start disposable PostgreSQL and Redis first:
+# Unit and client tiers, with a disposable Redis service available.
+uv run pytest -m "not integration"
+
+# Start disposable services, then require the real-service integration tier.
 docker compose up -d db redis
-REQUIRE_DB=1 REQUIRE_REDIS=1 pytest
+REQUIRE_DB=1 REQUIRE_REDIS=1 uv run pytest -p no:randomly
 
-# With coverage (branch), as CI runs it
-pytest --cov=src/app --cov=src/config --cov-branch
-
-# A single tier or file
-pytest src/tests/unit/
-pytest src/tests/client/test_csrf.py
+# Local application/configuration branch-coverage report.
+uv run pytest --cov=src/app --cov=src/config --cov-branch --cov-report=html
 ```
 
-Unit/client tests replace database access, but the shared fixture configures Redis limiter counters and can reset that backend; use only disposable test services. The integration tier (`src/tests/integration/`) needs a real PostgreSQL — its `DATABASE_URL` defaults to the `docker-compose.yml` service (`docker compose up -d db`). **`REQUIRE_DB=1` turns a missing database from a silent skip into a hard failure** (pytest exits 0 on an all-skipped tier, so CI sets this to prove the integration tier actually ran). A Redis-backed behavior tier (`test_redis_tier.py`) is gated the same way with `REQUIRE_REDIS=1` (`docker compose up -d redis`).
+The integration URL defaults to the disposable Compose test database. Its
+fixtures truncate data and must never target a development/staging catalogue.
+`REQUIRE_DB=1` and `REQUIRE_REDIS=1` turn unavailable required services into
+failures instead of permitted local skips. An all-skipped test run can otherwise
+exit successfully.
 
-Coverage spans: dataset parsing and search, OAI-PMH protocol and CMDI parsing, sync operations, the full auth flow (login, register, email verification and resend, TOTP enrollment and rotation, password reset, email change, admin actions, account lockout), session lifecycle, CSRF token generation and validation, all middleware, security headers, structured logging and redaction, settings validation, scheduler job registration and lifecycle events, the Redis client and catalogue-statistics pub/sub, the email service in disabled mode, the schema column-list invariant, and visibility tier filtering.
+When the fresh baseline is edited during a planned database reset, recreate all
+existing disposable test databases, including xdist worker databases. Reusing
+the same Alembic revision with `upgrade head` does not retrofit that schema body.
 
----
+Generic ingestion and shared client tests construct explicit OAI sources with
+`src/tests/source_fixtures.py`. Shared adapter-conformance cases cover all four
+registered adapters. JSON-feed cases explicitly prepare synthetic credentials;
+dedicated tests exercise authenticated TLS, complete fetching, validation,
+resource limits and worker termination.
 
-## Code Quality & Security Tooling
+Real development lifespans select `src/tests/sources.toml`, pinned by bootstrap
+instead of inheriting an operator's selection. Individual tests override
+configurations directly. Settings and runtime-selection tests exercise their
+configuration boundaries explicitly. These test configurations are separate
+from the shipped development fixture.
 
-| Tool | Command | What it catches |
-|---|---|---|
-| `ruff` | `ruff check src/` | PEP 8, type hint hygiene, common bugs |
-| `bandit` | `bandit -r src/ --exclude src/tests/` | OWASP / CWE security smells |
-| `pip-audit` | `pip-audit` | Known CVEs in pinned dependencies |
-| `mypy` | `mypy src/app src/config run.py run_scheduler.py` | Static type errors (pydantic plugin enabled) |
-| `pytest --cov` | `pytest --cov=src --cov-report=html` | Coverage gate |
+Development Settings can read the checkout's `.env`, but tests must explicitly
+control every setting relevant to their assertions. Scheduler import tests use
+a complete synthetic staging environment so a developer's web TOTP key cannot
+enter through dotenv fallback. Keep development keys in their intended runtime
+configuration; remove ambient configuration dependencies from the tests.
 
-CI runs on pull requests, main-branch pushes and manual dispatch; use its exact commands in .github/workflows/ci.yml.
+Unknown markers/configuration are rejected. Expected failures are strict: an
+unexpected pass requires removing or updating the expectation. The
+`known_defect` marker labels a regression and does not skip it. Measure collection
+with `uv run pytest --collect-only -q`; CI currently enforces no minimum
+collected-case count.
 
----
+Redis coordination/fault tests need `redis-server` on `PATH` and start private
+servers; logical databases do not isolate pub/sub or client-management commands.
+Host-level checks also use `nginx` and `systemd-analyze`. Email-action forms
+use ordinary HTML and explicit code entry; no JavaScript or Node test step is
+required. `REQUIRE_NGINX=1` and
+`REQUIRE_SYSTEMD=1` make missing binaries fatal. Permitted local skip pairs are
+listed in `scripts/expected-skips.txt`; CI permits no skips.
+
+CI runs the suite in serial collection order with `-p no:randomly`, and with
+`-p randomly -n auto --maxprocesses 15`. Each job has separate services.
+CI pins `TEST_RATE_LIMIT_REDIS_DB=0`, leaving databases 1–15 for worker counters;
+a higher local base requires fewer workers. Reproduce randomized failures with
+the recorded seed and worker count; worker timing/scheduling can still vary.
+
+Search availability acceptance additionally exercises all query/pagination
+modes under a shared start budget, busy global database lock and operation
+expiry while ordinary login/detail traffic continues. See the
+[search load procedure](docs/runbooks/search-fulltext.md#capacity-and-load-acceptance).
+Validate bounded Redis counter capacity and restart persistence using the
+[deployment procedure](Deployment.md#limiter-capacity-and-existing-counters).
+Those load checks use disposable services and representative data.
+
+Synthetic feed tests do not replace real-source disclosure approval, deployed
+acceptance or representative backup/restore evidence.
+
+## Code Quality and Security Tooling
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src/app src/config run.py run_scheduler.py run_parser.py scripts gunicorn.conf.py
+uv run mypy src/tests
+uv run bandit -r src/app src/config run.py run_scheduler.py run_parser.py gunicorn.conf.py scripts
+bash scripts/check-no-site-refs.sh
+uv run mkdocs build --strict
+```
+
+CI additionally audits pinned runtime dependencies and builds/tests installed
+release artifacts. Follow the exact commands in
+[the CI workflow](.github/workflows/ci.yml) for dependency auditing, no-skip
+checks and coverage gates. A local coverage report alone does not enforce them.
+
+With branch coverage enabled, the current CI floors are 92.5% overall and 90%
+for the reviewed security-module scope. Re-measure both CI orders when
+enforcement code or coverage scope changes; use the lower measured result and
+keep the floor no more than 1.5 percentage points below it.
+`TestCIWorkflowGates` pins both the overall floor and the reviewed
+security-module include patterns.
+
+Both mypy scopes are blocking. The `tests.*` overrides allow unannotated test
+functions; wholly unannotated bodies are not checked by default. A green local
+selection does not establish full CI, strict-documentation or VM acceptance.
 
 ## Security Model
 
-A short tour. The MkDocs **Architecture → Security Layers** page covers each control in depth.
+See [Security Layers](docs/architecture/security.md) for detailed boundaries.
 
-| Concern | Control |
+| Concern | Implemented boundary and practical limit |
 |---|---|
-| Credential exposure in tracebacks | `SecretStr` for all secrets, masked `__repr__` on Settings |
-| Weak secrets at boot | Strength checks on signing/session/TOTP/outbox keys and configured health/federation secrets; not every external credential |
-| SQL injection | `psycopg.sql.Identifier` / `Placeholder` everywhere; no f-string SQL |
-| ILIKE wildcard abuse | User input is escaped before being interpolated into ILIKE patterns |
-| Search as a redaction oracle | Full-text, keyword, and language matching is tier-gated in SQL; redacted datasets remain deliberately matchable on the public discovery subset (title + access level) |
-| XXE in OAI responses | `lxml.etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False)` |
-| XSS | Jinja2 auto-escaping; CSP forbids inline scripts and styles; `safe_url` filter on rendered URLs |
-| CSRF / form confusion | `SecureAPIRouter` installs HMAC-bound double-submit verification and form Content-Type validation on every mutation method; only two exact reviewed token-capability POSTs omit CSRF; `SameSite=Strict` |
-| Route authorization drift | SecureAPIRouter installs declared policies; startup validates the effective route registry |
-| Session hijacking | DB-backed sessions; cookie holds only the random ID; signed with `itsdangerous` |
-| Session fixation | New random session ID issued on every login; the previous session is revoked |
-| Password storage | Argon2id with default-strong parameters, rehash on login |
-| Common passwords | SecLists 10k blocklist + contextual checks + 12-char minimum |
-| Account compromise | Mandatory email verification; temporary lockout after repeated failures (with email notice) |
-| TOTP secret theft from DB | Fernet encryption; keys derived from `TOTP_ENCRYPTION_KEYS` via HKDF (rotatable via MultiFernet) |
-| TOTP replay | Verified codes consume their time-step; a captured code cannot be reused |
-| Brute force and account discovery | slowapi limits attempts per resolved client IP; the canonical address is HMAC-pseudonymized before Redis storage. Login failures use one generic response and perform Argon2 work even when no usable stored hash exists. Complete request timing is not claimed to be constant because lockout, audit, and outbox work varies. |
-| Click-jacking | `X-Frame-Options: DENY` and CSP `frame-ancestors 'none'` |
-| TLS downgrade | HSTS with `max-age=31536000; includeSubDomains; preload` in production |
-| Cached private/capability content | All non-static application responses use `Cache-Control: no-store`; nginx caches only `/static/` assets |
-| Misconfigured CORS | Staging/production startup blocked on `*`, empty origins, or localhost |
-| Admin-area discovery | `require_admin` returns 404 (not 403) for non-admins |
-| Stack-trace leakage | Custom 404/422/500 handlers, no debug pages in production |
-| Sensitive data in logs | Application structured-field redaction; arbitrary text and nginx error logs still require review |
-| Audit retention | journald capture and optional remote shipping; tamper evidence requires independently controlled collector retention |
-| Database-backup disclosure | Separate read-only identity, no filesystem plaintext, `0700` state directory, atomic `age`-encrypted archives, and off-host private-key custody |
-
----
+| Secret representations | Declared secret fields use masked types; feed credential snapshots exclude secret fields from their representation. Arbitrary text still requires review. |
+| Weak keys | Necessary-condition strength checks plus required CSPRNG generation; passing a diversity check does not prove randomness. |
+| SQL injection | Bound data values and safely composed identifiers; trusted static SQL fragments remain part of the reviewed code. |
+| Metadata disclosure | Tier-gated SQL matching, Python result redaction and durable administrator hiding; public discovery values must be independently approved. |
+| XML attacks | Entity resolution, external DTD loading and parser network access disabled; bounded OAI transport/process handling. |
+| Feed authentication | Verified HTTPS, bearer authorization and exact-byte HMAC verification before decoding; signed request binding and freshness checks follow authentication. |
+| Feed resource exhaustion | Seven configured budgets and a terminating complete-fetch worker; bounded parent reconstruction checks the deadline but is not separately force-terminable. |
+| XSS | Jinja escaping, strict CSP and safe URL filtering. |
+| CSRF and route drift | Declared access policies, mutation checks and startup route validation; only exact `POST /account/confirm-email` omits CSRF. |
+| Sessions | Random server-side identifiers and signed cookies; login creates a fresh identifier. Revocation of a previous login session is best-effort and logs failure. |
+| Registration | Email-only passwordless pending accounts, mailbox-bound setup, CSRF-protected completion and no automatic login; deployed relay/mailbox acceptance remains required. |
+| Email-action transport | Non-secret public-ID GET forms and separately emailed codes entered in bound secret/public-ID POSTs; no JavaScript. The code remains a credential and obsolete/arbitrary edge request targets can still be logged. |
+| Passwords and TOTP | Argon2id, password-policy checks, local email verification, lockout, encrypted TOTP secrets and consumed TOTP steps. |
+| Brute force | Per-client admission and shared hardened Redis counters; addresses are HMAC-pseudonymized before storage. Entire-request timing is not constant. |
+| Framing and transport | CSP frame restrictions, `X-Frame-Options: DENY` and production HSTS. |
+| Cached private content | Dynamic application responses use `no-store`; reference nginx caching is limited to static assets. |
+| Administrative authority | Eligible full sessions and transactional authority rechecks; admin status does not raise metadata tier. |
+| Logging | Structured field redaction and bounded diagnostics; arbitrary message text and edge logs remain review surfaces. |
+| Audit retention | Journald capture and optional remote shipping; independently controlled retention/integrity remains an operational responsibility. |
+| Backups | Separate read-only identity, streamed `age` encryption, private state directory, atomic archives and off-host private-key custody. Restore/custody verification remains required. |
 
 ## Documentation
 
-| Document | What it covers |
+| Document | Scope |
 |---|---|
-| `README.md` | This file — overview, setup, configuration, security summary |
-| `Deployment.md` | Production deployment runbook for the VM (nginx, SSL, Redis, Shibboleth, firewall, backups, log shipping) |
-| `docs/runbooks/local-staging.md` | Laptop-only staging with demo SWISSUbase, Mailtrap Sandbox, isolated PostgreSQL, Redis and loopback nginx |
-| `docs/runbooks/key-rotation.md` | Operator runbook for rotating application secrets and the separately custodied backup recipient |
-| `roadmap.md` | Development phases and resolved-debt tracker |
-| `docs/` (MkDocs) | User guide, architecture deep dives, settings reference, code reference |
+| [Deployment](Deployment.md) | Reference VM installation, maintenance, identities, backups and activation gates |
+| [Deployment checklist](docs/configuration/deployment.md) | Deployment policies, upgrade procedures and registration activation |
+| [Settings](docs/configuration/settings.md) | Process settings and source configuration |
+| [Ingestion](docs/architecture/sync.md) | Source adapters, scheduling, state, recovery, worker and transaction boundaries |
+| [Access control](docs/architecture/access-control.md) | Public discovery envelope, metadata tiers and durable administrator restrictions |
+| [Field visibility](docs/architecture/field-visibility.md) | Complete field classification, source minima, Python/SQL/template enforcement, RLS and recovery boundaries |
+| [Resource access and audit](docs/architecture/resource-access.md) | Tier-checked stored redirects, source logging policy and application acceptance evidence |
+| [Authentication](docs/architecture/auth.md) | Mailbox-first registration, sessions, local/federated authentication and route policies |
+| [Federated tier proposals](docs/architecture/federated-tier-rules.md) | Ordered rules, stored trusted proposals, explicit review and later mismatches |
+| [Federation integration](docs/runbooks/federation-integration.md) | Generic SP/header contract, staged activation, negative tests and rollback; real Gate F evidence remains separate |
+| [Accounts](docs/user-guide/accounts.md) | Account setup, authentication, recovery and access-tier guidance |
+| [Emergency withdrawal](docs/runbooks/emergency-dataset-withdrawal.md) | Dataset administration and the controlled operator fallback |
+| [Laptop staging](docs/runbooks/local-staging.md) | Isolated staging topology and acceptance checks |
+| [Key rotation](docs/runbooks/key-rotation.md) | Credential-specific rotation and custody procedures |
+| [Monitoring](docs/runbooks/monitoring.md) | Per-source/outbox degraded-cause queries, publication age and independent operational checks |
+| [Point-in-time recovery](docs/runbooks/point-in-time-recovery.md) | Physical base/WAL archiving, independent encrypted retention and isolated replay template |
+| [Sensitive Source Contract](docs/architecture/source-b-ingestion-contract.md) | Mandatory sensitive-source acceptance criteria |
+| [Feed Contract v1](docs/sources/feed-contract-v1.md) | Wire specification, JSON Schema, synthetic examples and evidence mapping |
+| [JSON-feed configuration](docs/sources/json-feed-configuration.md) | Strict descriptions and explicit credential preparation |
+| [JSON-feed transport](docs/sources/json-feed-transport.md) | Authenticated bounded page reads and transport-worker boundaries |
+| [JSON-feed pages](docs/sources/json-feed-pages.md) | Strict JSON, request binding, freshness and page-chain identities |
+| [JSON-feed records](docs/sources/json-feed-records.md) | Native metadata validation, quarantine and bounded candidate harvest bytes |
+| [JSON-feed adapter](docs/sources/json-feed-adapter.md) | Complete isolated fetch, runtime credentials, fingerprints and cursor protection |
+| [JSON-feed persistence](docs/sources/json-feed-persistence.md) | Signed-feed PostgreSQL coverage, committed-change auditing and remaining acceptance |
+| [JSON-feed catalogue](docs/sources/json-feed-catalogue.md) | Signed native catalogue disclosure, search, facets, counts and correction/withdrawal acceptance |
+| [JSON-feed acceptance](docs/sources/json-feed-acceptance.md) | Requirement evidence, encrypted synthetic recovery and remaining operational acceptance |
+| [Roadmap](roadmap.md) | Development tracking and outstanding work |
+| [Sources](docs/sources/index.md) | Adapter selection, configuration, visibility and source status |
 
-To build the documentation site locally:
+Serve documentation with `uv run mkdocs serve` at `http://127.0.0.1:8000`.
+Check it from the repository root:
 
 ```bash
-uv sync --locked --extra doc
-mkdocs serve
+bash scripts/check-no-site-refs.sh
+uv run mkdocs build --strict
 ```
-
-The site will be available at `http://127.0.0.1:8000`.
-
----
 
 ## Known Limitations
 
-These are accepted limitations of the current Phase 1 prototype, with planned resolutions noted.
+- **Actual sensitive-source acceptance remains open.** B1–B9 application work,
+  including persistence, correction/withdrawal audits, catalogue checks and
+  synthetic recovery, is accepted. Source-owner approval, actual-feed acceptance
+  and representative encrypted restore remain open. Synthetic fixtures do not
+  approve a real feed's public discovery envelope or classification.
+- **WP E implementation is accepted; formal closure is pending.** E1–E4 field
+  enforcement, row security and actual-role encrypted synthetic recovery are
+  accepted. The [E5 record](docs/architecture/field-visibility.md#wp-e-implementation-acceptance-record)
+  awaits the approved main commit, required checks and earlier E2 interface
+  references; the new
+  classification-drift check passes locally.
+  Host peer, custody and representative deployed recovery remain separate open
+  [operator records](docs/runbooks/visibility-recovery-acceptance.md).
+  Shared-role application code remains trusted, and RLS does not enforce
+  per-field minima for arbitrary SQL. WP L supplies generic compliance templates;
+  completed institutional records, approvals and operational evidence remain open.
+- **Source selection is not catalogue withdrawal.** Deselecting a source does
+  not hide its stored records. Use dataset administration for supported
+  emergency hiding and follow the withdrawal runbook.
+- **Dedicated Redis is a hardened web dependency.** Required counter failures
+  prevent startup or fail dynamic admission with a retryable 503. The optional
+  general catalogue-cache Redis service does not control security quotas or
+  Gunicorn worker count. Upgrades preserve live counter state; legacy counters
+  require the documented maintenance-window expiry procedure, never a flush.
+- **Federation requires independent activation.** Callback/approval code does
+  not establish SP installation, attribute release, trusted MFA assertions or
+  successful deployed login. Those need their own acceptance evidence.
+- **Registration activation remains a deployment gate.** Mailbox-first
+  registration is implemented. Public activation still requires acceptance
+  through the deployment's production SMTP relay and a disposable mailbox.
+- **Operational rehearsals remain separate.** Implemented dataset controls and
+  backup tooling do not establish that the withdrawal runbook, representative
+  restore or key-custody procedures have been executed successfully.
 
-- **Hardened admission depends on a dedicated Redis service.** The web tier fails startup, and later dynamic admission fails closed with a retryable 503, if the dedicated `RATE_LIMIT_REDIS_URL` backend cannot execute its reviewed command contract. nginx retains independent coarse limits during that incident. Optional `REDIS_ENABLED` / `REDIS_URL` state is a physically separate, best-effort catalogue-cache pub/sub service and does not control Gunicorn worker count or security quotas.
-- **Single-source ingestion.** Only Source A (SWISSUbase OAI-PMH) is wired up. Source B integration is the headline item of Phase 2.
-- **Federated authentication is not yet deployed.** Local accounts with mandatory TOTP cover Phase 1. The Shibboleth callback route and user model are in place, but the nginx SP plumbing (shibd + FastCGI, via the nginx-http-shibboleth module) and SWITCH AAI registration are Phase 2.
-- **Per-dataset (not per-field) visibility.** `filter_for_tier` is all-or-nothing per dataset today; a per-field visibility matrix and PostgreSQL Row-Level Security are Phase 2.
-- **Manual dataset-tier administration.** Authorised operators can raise existing dataset classifications directly in the database; there is no dataset-tier admin UI. Sync preserves stricter stored tiers, including those inherited from an earlier source policy. Future Source B records must also carry a valid source-owned tier and pass the [mandatory ingestion contract](docs/architecture/source-b-ingestion-contract.md).
+## Remaining Work
 
----
+The [roadmap](roadmap.md) lists remaining implementation and operator outcomes.
+Keep real-source, federation, registration, retained-state and recovery evidence
+separate from synthetic tests and repository checks.
 
-## Phase 2 Roadmap
+### Registration activation gate
 
-The headline goals of Phase 2:
+Keep `LOCAL_REGISTRATION_ENABLED=false` until the deployment passes
+[Gate R](docs/configuration/deployment.md#registration-activation-gate-r): real
+relay/mailbox registration, single-use setup, authenticator enrollment and a
+fresh login, plus CSRF, admission and lockout checks with disposable accounts.
+Record results without credentials or security codes.
 
-- **Source B integration.** Separate client module, independent sync schedule, download-link provisioning, per-access logging.
-- **Shibboleth / SWITCH edu-ID deployment.** An nginx-integrated Shibboleth SP (shibd + FastCGI) in front of the app, federation registration, attribute mapping into the existing user model, attribute-based tier assignment.
-- **Field-level visibility matrix.** Per-field minimum tiers, backed by PostgreSQL Row-Level Security as a defense-in-depth layer.
-- **FADP / GDPR compliance.** Data processing register, purpose limitation, encryption at rest for Source B, audit trail immutability via remote log shipping, data subject access request procedures.
-- **Operational hardening.** Point-in-time recovery, automated deployment, and
-  log monitoring/alerting. Encrypted logical-backup tooling is shipped; the
-  runbook makes failure/staleness monitoring, authenticated off-host custody,
-  and recorded restore verification deployment acceptance conditions.
+## Contributing and reporting
 
-### Account and security TODOs
-
-- [ ] Resolve unverified local email reservations when a legitimate federated user claims the address, without transferring an attacker-selected password.
-- [ ] **Registration verification:** Require mailbox proof before choosing the account password; a verification link must not activate a password set by someone else.
-- [ ] **Account deletion:** Add authenticated self-service deletion and audited administrator removal, including session and token revocation and retention-aware data handling.
-- [ ] Keep reset, verification and email-change capability tokens out of URL paths that can reach application and edge error logs.
-
-**Release gate:** Do not expose local registration to untrusted users until the registration verification change is complete. Track this unresolved work in [roadmap.md](roadmap.md).
-
-The full Phase 1 → Phase 2 transition plan lives in `roadmap.md`.
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development/review expectations and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting guidance.
+[CHANGELOG.md](CHANGELOG.md) records unreleased changes, and
+[CITATION.cff](CITATION.cff) provides citation metadata.
 
 ## License
 
-Copyright (c) 2026
+The application is provided under the [MIT license](LICENSE). Bundled Source
+Sans 3 fonts are licensed under OFL-1.1; the common-password list retains its
+MIT notice. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution,
+provenance and the accompanying license texts.

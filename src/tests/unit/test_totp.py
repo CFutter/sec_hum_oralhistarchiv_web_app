@@ -1,26 +1,4 @@
-"""Unit tests for the TOTP surface: step matching and secret encryption
-(app.services.totp / app.services.crypto), and public TOTP-recovery
-redemption (app.services.totp_recover / app.services.totp_recovery_codes).
-
-Why these matter:
-- matched_step is the foundation of TOTP replay protection: verify_and_consume_totp
-  stores the *exact* step a code matched so it can never be accepted twice. If
-  matched_step returned the wrong step (or matched outside the +/-1 window), replayed
-  or stale codes would authenticate.
-- decrypt_value returning None (never raising) is what lets get_totp_secret fail
-  CLOSED via TotpDecryptionError on key mismatch/corruption instead of crashing or
-  silently treating an enrolled user as "no second factor".
-- audit_email_hash is the keyed, non-reversible email token used in the audit
-  log so that log lines for one address can be correlated without the log
-  becoming a bulk lookup table from a plaintext or unkeyed digest.
-- Recovery-code redemption must spend a bounded, per-code password-attempt
-  budget without ever letting an unknown or mismatched code skip the
-  constant-time Argon2 work that legitimate attempts pay for.
-
-matched_step tests freeze time by replacing the `time` module reference inside
-app.services.totp with a stub, so window arithmetic is fully deterministic (no
-step-rollover flakiness, no probabilistic code collisions).
-"""
+"""Contract tests for TOTP."""
 
 import hashlib
 import logging
@@ -31,12 +9,14 @@ from unittest.mock import create_autospec, patch
 import pyotp
 import pytest
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
 import app.services.totp as totp_module
-from app.services import crypto as crypto_module
-from app.services import totp_recover
-from app.services.crypto import audit_email_hash, decrypt_value, encrypt_value
+from app.services import password_verification, totp_recover
+from app.services import totp_crypto as crypto_module
+from app.services.crypto import audit_email_hash
 from app.services.totp import matched_step
+from app.services.totp_crypto import decrypt_value, encrypt_value
 from app.services.totp_recovery_codes import (
     MatchedRecoveryCodeCandidate,
     ReservedRecoveryCodePasswordAttempt,
@@ -49,16 +29,18 @@ from tests.fixtures import FakeCursorCtx, make_async_cursor, make_mock_pool
 # '000000' matches none of the three in-window codes.
 SECRET = "JBSWY3DPEHPK3PXP"
 FIXED_TS = 1_750_000_000
-FIXED_STEP = FIXED_TS // 30  # 58333333
+FIXED_STEP = FIXED_TS // 30
 
 
 class _FrozenTime:
     """Stands in for the `time` module inside app.services.totp only."""
 
     def __init__(self, ts: float):
+        """Store the fixed timestamp returned by this clock."""
         self._ts = ts
 
     def time(self) -> float:
+        """Return the stored timestamp without advancing it."""
         return self._ts
 
 
@@ -71,14 +53,7 @@ class TestCodeVerification:
     """matched_step: which codes app.services.totp accepts as a replay-safe step."""
 
     def test_matched_step_current_code_returns_the_exact_current_step(self, monkeypatch):
-        """A code generated for the current moment matches, and the returned step
-        is exactly the current 30-second epoch step (int(time.time()) // 30) —
-        not an adjacent one.
-
-        Guards the contract verify_and_consume_totp relies on: the step recorded
-        for replay protection is the real time-step, not an offset/index. Time is
-        frozen so the assertion is exact instead of tolerating a window rollover.
-        """
+        """Check matched step current code returns the exact current step."""
         _freeze_totp_time(monkeypatch, FIXED_TS)
         code = pyotp.TOTP(SECRET).at(FIXED_TS)
         step = matched_step(SECRET, code, valid_window=1)
@@ -95,13 +70,7 @@ class TestCodeVerification:
     def test_adjacent_window_code_matches_with_valid_window_one(
         self, monkeypatch, offset, expected_step
     ):
-        """A code from the adjacent (previous or next) 30s window is accepted
-        with valid_window=1 and the returned step is exactly that adjacent
-        step (clock-skew tolerance, symmetric in both directions).
-
-        An off-by-one in the offset loop, or returning the current step
-        instead of the matched one, would break replay accounting.
-        """
+        """Check adjacent window code matches with valid window one."""
         _freeze_totp_time(monkeypatch, FIXED_TS)
         code = pyotp.TOTP(SECRET).at(FIXED_TS + 30 * offset)
         assert matched_step(SECRET, code, valid_window=1) == expected_step
@@ -114,14 +83,7 @@ class TestCodeVerification:
         ],
     )
     def test_code_outside_window_returns_none(self, monkeypatch, code):
-        """A code two windows old, or an arbitrary wrong code, is rejected (None)
-        with valid_window=1.
-
-        Guards the outer boundary of clock-skew tolerance: widening it would
-        extend the lifetime of intercepted codes. Deterministic under frozen
-        time: both codes are first confirmed not to equal any in-window code
-        for this fixed secret/timestamp.
-        """
+        """A code two windows old, or an arbitrary wrong code, is rejected (None) with valid_window=1."""
         _freeze_totp_time(monkeypatch, FIXED_TS)
         in_window = {pyotp.TOTP(SECRET).at(FIXED_TS + 30 * o) for o in (-1, 0, 1)}
         assert code not in in_window  # test-vector sanity, not app behavior
@@ -155,23 +117,15 @@ class TestSecretEncryptionAtRest:
     """encrypt_value / decrypt_value: the at-rest encryption for stored TOTP secrets."""
 
     def test_encrypt_decrypt_roundtrip(self):
-        """encrypt_value -> decrypt_value returns the original plaintext.
-
-        The basic at-rest-encryption contract for stored TOTP secrets, and the
-        positive control for the rejection cases below: a valid ciphertext
-        must still decrypt correctly.
-        """
+        """Check encrypt decrypt roundtrip."""
         plaintext = "JBSWY3DPEHPK3PXP"
         ciphertext = encrypt_value(plaintext)
         assert ciphertext != plaintext
         assert decrypt_value(ciphertext) == plaintext
 
     def test_encrypt_same_plaintext_yields_distinct_ciphertexts_both_decrypt(self):
-        """Two encryptions of the same plaintext differ (Fernet random IV) yet
-        both decrypt to the original value.
-
-        Guards against a deterministic-encryption defect that would let a
-        database reader detect users sharing a TOTP secret / correlate values.
+        """Two encryptions of the same plaintext differ (Fernet random IV) yet both decrypt to the
+        original value.
         """
         plaintext = "correlate-me-not"
         c1 = encrypt_value(plaintext)
@@ -181,14 +135,10 @@ class TestSecretEncryptionAtRest:
         assert decrypt_value(c2) == plaintext
 
     def test_decrypt_garbage_returns_none_and_logs_warning(self, caplog):
-        """decrypt_value on non-Fernet garbage returns None (never raises) and
-        logs a warning on the module logger.
-
-        This None is what get_totp_secret converts into TotpDecryptionError —
-        the fail-closed path for key mismatch / corruption. A raise here would
-        become an unhandled 500 in every code-verifying route.
+        """Decrypt_value on non-Fernet garbage returns None (never raises) and logs a warning on the
+        module logger.
         """
-        with caplog.at_level(logging.WARNING, logger="app.services.crypto"):
+        with caplog.at_level(logging.WARNING, logger="app.services.totp_crypto"):
             assert decrypt_value("not-a-fernet-token") is None
         assert any(
             "Failed to decrypt" in record.getMessage() and record.levelno == logging.WARNING
@@ -201,7 +151,6 @@ class TestSecretEncryptionAtRest:
         not return corrupted plaintext or raise.
         """
         ciphertext = encrypt_value("JBSWY3DPEHPK3PXP")
-        # Flip a character in the token body, keeping length and b64 alphabet.
         idx = 10
         flipped = "B" if ciphertext[idx] != "B" else "C"
         tampered = ciphertext[:idx] + flipped + ciphertext[idx + 1 :]
@@ -209,12 +158,7 @@ class TestSecretEncryptionAtRest:
         assert decrypt_value(tampered) is None
 
     def test_decrypt_value_of_non_utf8_plaintext_returns_none(self):
-        """A ciphertext that decrypts (valid Fernet token, intact HMAC) to
-        bytes that are not valid UTF-8 still returns None rather than
-        raising UnicodeDecodeError — the same fail-closed contract as a
-        tampered or garbage ciphertext, reached through the decode step
-        instead of the HMAC check.
-        """
+        """Check decrypt value of non utf8 plaintext returns none."""
         ciphertext = crypto_module._fernet_instance.encrypt(b"\xff").decode()
         assert decrypt_value(ciphertext) is None
 
@@ -226,7 +170,7 @@ class TestAuditEmailHash:
         """Same email -> same token, so audit-log lines for one address can be
         correlated across events (the whole point of the token).
         """
-        assert audit_email_hash("alice@uzh.ch") == audit_email_hash("alice@uzh.ch")
+        assert audit_email_hash("alice@example.org") == audit_email_hash("alice@example.org")
 
     def test_audit_email_hash_normalizes_case_and_whitespace(self):
         """' A@B.com ' hashes identically to 'a@b.com' — correlation survives
@@ -237,7 +181,7 @@ class TestAuditEmailHash:
     def test_audit_email_hash_default_length_is_16_hex_chars(self):
         """Default output is a 16-character lowercase-hex string (truncated
         HMAC-SHA256 hexdigest)."""
-        token = audit_email_hash("alice@uzh.ch")
+        token = audit_email_hash("alice@example.org")
         assert len(token) == 16
         assert set(token) <= set(string.hexdigits.lower())
 
@@ -246,27 +190,23 @@ class TestAuditEmailHash:
         longer token is a strict extension of the shorter one (both remain
         correlatable prefixes of the full HMAC).
         """
-        short = audit_email_hash("alice@uzh.ch", length=16)
-        long = audit_email_hash("alice@uzh.ch", length=32)
+        short = audit_email_hash("alice@example.org", length=16)
+        long = audit_email_hash("alice@example.org", length=32)
         assert len(long) == 32
         assert long.startswith(short)
-        full = audit_email_hash("alice@uzh.ch", length=64)
+        full = audit_email_hash("alice@example.org", length=64)
         assert len(full) == 64
 
     def test_audit_email_hash_differs_across_emails(self):
         """Different addresses produce different tokens — collisions would
         misattribute audit events between users."""
-        assert audit_email_hash("alice@uzh.ch") != audit_email_hash("bob@uzh.ch")
+        assert audit_email_hash("alice@example.org") != audit_email_hash("bob@example.org")
 
     def test_audit_email_hash_is_keyed_not_plain_sha256(self):
-        """The token is NOT a truncated plain sha256(email) — it is keyed
-        (HMAC under a SECRET_KEY-derived key).
-
-        This is the anti-rainbow-table property: a log holder without the key
-        cannot precompute email -> token lookups, so the audit log cannot
-        become a bulk email-lookup oracle on its own.
+        """The token is NOT a truncated plain sha256(email) — it is keyed (HMAC under a
+        SECRET_KEY-derived key).
         """
-        email = "alice@uzh.ch"
+        email = "alice@example.org"
         token = audit_email_hash(email)
         plain_prefix = hashlib.sha256(email.encode()).hexdigest()[: len(token)]
         normalized_prefix = hashlib.sha256(email.strip().lower().encode()).hexdigest()[: len(token)]
@@ -282,9 +222,12 @@ EMAIL = "owner@example.edu"
 PASSWORD = "correct horse battery staple"
 PASSWORD_HASH = "$argon2id$v=19$m=65536,t=3,p=4$credential-snapshot"
 RECOVERY_CODE = "AAAAA-BBBBB-CCCCC-DDDDD"
+_RECOVERY_NOW = datetime(2031, 1, 1, tzinfo=UTC)
+_RECOVERY_EXPIRES_AT = datetime(2032, 1, 1, tzinfo=UTC)
 
 
 def _eligible_recovery_row() -> dict[str, object]:
+    """Build an eligible authorized recovery row with the fixed revision, deadline, and code position."""
     return {
         "id": USER_ID,
         "password_hash": PASSWORD_HASH,
@@ -297,12 +240,14 @@ def _eligible_recovery_row() -> dict[str, object]:
         "totp_recovery_code_generation": GENERATION,
         "totp_recovery_authorized_at": datetime(2026, 9, 17, tzinfo=UTC),
         "totp_recovery_auth_revision": AUTH_REVISION,
-        "recovery_unexpired": True,
+        "totp_recovery_expires_at": _RECOVERY_EXPIRES_AT,
+        "checked_at": _RECOVERY_NOW,
         "recovery_code_position": POSITION,
     }
 
 
 def _reservation() -> ReservedRecoveryCodePasswordAttempt:
+    """Build a reserved recovery-code attempt with the fixed test identity and digest."""
     return ReservedRecoveryCodePasswordAttempt(
         user_id=USER_ID,
         generation=GENERATION,
@@ -312,6 +257,7 @@ def _reservation() -> ReservedRecoveryCodePasswordAttempt:
 
 
 def _password_attempt() -> totp_recover._RecoveryPasswordAttempt:
+    """Pair the reserved recovery attempt with the stored password hash and authentication revision."""
     return totp_recover._RecoveryPasswordAttempt(
         reservation=_reservation(),
         password_hash=PASSWORD_HASH,
@@ -325,6 +271,7 @@ class TestRecoveryPasswordAttempts:
     """
 
     async def test_redeem_without_reservation_uses_only_dummy_password_work(self):
+        """Check redeem without reservation uses only dummy password work."""
         pool = make_mock_pool()
         reserve = create_autospec(
             totp_recover._reserve_recovery_password_attempt,
@@ -332,7 +279,7 @@ class TestRecoveryPasswordAttempts:
             spec_set=True,
         )
         verify_dummy = create_autospec(totp_recover.verify_dummy, spec_set=True)
-        password_work = create_autospec(totp_recover.run_password_work, spec_set=True)
+        password_work = create_autospec(password_verification.run_password_work, spec_set=True)
         consume = create_autospec(totp_recover.consume_reserved_recovery_code_cur, spec_set=True)
         acquire_cursor = create_autospec(
             totp_recover.get_db_cursor,
@@ -343,7 +290,7 @@ class TestRecoveryPasswordAttempts:
         with (
             patch.object(totp_recover, "_reserve_recovery_password_attempt", reserve),
             patch.object(totp_recover, "verify_dummy", verify_dummy),
-            patch.object(totp_recover, "run_password_work", password_work),
+            patch.object(password_verification, "run_password_work", password_work),
             patch.object(totp_recover, "consume_reserved_recovery_code_cur", consume),
             patch.object(totp_recover, "get_db_cursor", acquire_cursor),
             pytest.raises(totp_recover.TotpRecoveryRedemptionRejected) as caught,
@@ -372,7 +319,13 @@ class TestRecoveryPasswordAttempts:
         """A failed Argon2 check cannot roll back or release the reserved slot."""
         pool = make_mock_pool()
         initial_cur = make_async_cursor(fetchone=_eligible_recovery_row())
-        locked_cur = make_async_cursor(fetchone=_eligible_recovery_row())
+        locked_cur = make_async_cursor(
+            fetchone=[
+                _eligible_recovery_row(),
+                {"position": POSITION},
+                {"database_now": _RECOVERY_NOW},
+            ]
+        )
         reservation = _reservation()
         acquire_cursor = create_autospec(
             totp_recover.get_db_cursor,
@@ -385,7 +338,7 @@ class TestRecoveryPasswordAttempts:
             spec_set=True,
         )
         password_work = create_autospec(
-            totp_recover.run_password_work,
+            password_verification.run_password_work,
             side_effect=VerifyMismatchError("wrong password"),
             spec_set=True,
         )
@@ -399,7 +352,7 @@ class TestRecoveryPasswordAttempts:
                 "reserve_recovery_code_password_attempt_cur",
                 reserve_code,
             ),
-            patch.object(totp_recover, "run_password_work", password_work),
+            patch.object(password_verification, "run_password_work", password_work),
             patch.object(totp_recover, "verify_dummy", verify_dummy),
             patch.object(totp_recover, "consume_reserved_recovery_code_cur", consume),
             pytest.raises(totp_recover.TotpRecoveryRedemptionRejected) as caught,
@@ -421,7 +374,7 @@ class TestRecoveryPasswordAttempts:
         assert reserved_candidate.position == POSITION
         reserve_code.assert_awaited_once_with(locked_cur, candidate=reserved_candidate)
         password_work.assert_awaited_once_with(
-            totp_recover.password_hasher.verify,
+            password_verification.password_hasher.verify,
             PASSWORD_HASH,
             "wrong password",
         )
@@ -447,6 +400,7 @@ class TestRecoveryPasswordAttempts:
         recovery_code,
         row,
     ):
+        """Check unmatched candidate performs only nonlocking reads."""
         pool = make_mock_pool()
         cur = make_async_cursor(fetchone=row)
         acquire_cursor = create_autospec(
@@ -487,7 +441,13 @@ class TestRecoveryPasswordAttempts:
         """Admin-authorized recovery remains available during ordinary login lockout."""
         pool = make_mock_pool()
         initial_cur = make_async_cursor(fetchone=_eligible_recovery_row())
-        locked_cur = make_async_cursor(fetchone=_eligible_recovery_row())
+        locked_cur = make_async_cursor(
+            fetchone=[
+                _eligible_recovery_row(),
+                {"position": POSITION},
+                {"database_now": _RECOVERY_NOW},
+            ]
+        )
         reservation = _reservation()
         acquire_cursor = create_autospec(
             totp_recover.get_db_cursor,
@@ -524,16 +484,23 @@ class TestRecoveryPasswordAttempts:
         assert all("locked_until" not in statement for statement in statements)
 
     async def test_success_consumes_the_exact_reservation_without_plaintext_rematch(self):
+        """Check success consumes the exact reservation without plaintext rematch."""
         pool = make_mock_pool()
         attempt = _password_attempt()
-        cur = make_async_cursor(fetchone=_eligible_recovery_row())
+        cur = make_async_cursor(
+            fetchone=[
+                _eligible_recovery_row(),
+                {"position": POSITION},
+                {"database_now": _RECOVERY_NOW},
+            ]
+        )
         reserve = create_autospec(
             totp_recover._reserve_recovery_password_attempt,
             return_value=attempt,
             spec_set=True,
         )
         password_work = create_autospec(
-            totp_recover.run_password_work,
+            password_verification.run_password_work,
             return_value=True,
             spec_set=True,
         )
@@ -552,7 +519,7 @@ class TestRecoveryPasswordAttempts:
 
         with (
             patch.object(totp_recover, "_reserve_recovery_password_attempt", reserve),
-            patch.object(totp_recover, "run_password_work", password_work),
+            patch.object(password_verification, "run_password_work", password_work),
             patch.object(totp_recover, "verify_dummy", verify_dummy),
             patch.object(
                 totp_recover,
@@ -589,10 +556,11 @@ class TestRecoveryPasswordAttempts:
         ids=["invalid-hash", "verification-error"],
     )
     async def test_unverifiable_password_hash_fails_closed(self, verification_error):
+        """Check unverifiable password hash fails closed."""
         pool = make_mock_pool()
         attempt = _password_attempt()
         password_work = create_autospec(
-            totp_recover.run_password_work,
+            password_verification.run_password_work,
             side_effect=verification_error,
             spec_set=True,
         )
@@ -614,7 +582,7 @@ class TestRecoveryPasswordAttempts:
                     spec_set=True,
                 ),
             ),
-            patch.object(totp_recover, "run_password_work", password_work),
+            patch.object(password_verification, "run_password_work", password_work),
             patch.object(totp_recover, "verify_dummy", verify_dummy),
             patch.object(totp_recover, "consume_reserved_recovery_code_cur", consume),
             patch.object(totp_recover, "get_db_cursor", acquire_cursor),
@@ -641,6 +609,7 @@ class TestRecoverySecretRepr:
     """
 
     def test_secret_bearing_dataclasses_hide_hashes_from_repr(self):
+        """Check secret bearing dataclasses hide hashes from repr."""
         candidate = MatchedRecoveryCodeCandidate(
             user_id=USER_ID,
             generation=GENERATION,
@@ -658,10 +627,7 @@ class TestRecoverySecretRepr:
         assert "password-hash-must-not-be-logged" not in repr(attempt)
 
     def test_non_secret_identifiers_remain_visible_in_repr(self):
-        """Positive control for the hiding test above: the identifying fields
-        that are NOT secrets (user_id, generation, position, auth_revision)
-        still show up in repr() so logs stay useful for debugging.
-        """
+        """Check non secret identifiers remain visible in repr."""
         candidate = MatchedRecoveryCodeCandidate(
             user_id=USER_ID,
             generation=GENERATION,
@@ -678,3 +644,27 @@ class TestRecoverySecretRepr:
         assert f"generation={GENERATION}" in repr(candidate)
         assert f"position={POSITION}" in repr(candidate)
         assert f"auth_revision={AUTH_REVISION}" in repr(attempt)
+
+
+def test_public_totp_rotation_preserves_timestamp_and_uses_primary_key(monkeypatch):
+    """Check public TOTP rotation preserves timestamp and uses primary key."""
+    old_key, new_key = Fernet(Fernet.generate_key()), Fernet(Fernet.generate_key())
+    monkeypatch.setattr(crypto_module, "_fernet_instance", MultiFernet([new_key, old_key]))
+    ciphertext = old_key.encrypt_at_time(b"totp-secret", 1234567890).decode()
+    rotated = crypto_module.rotate_totp_value(ciphertext)
+    assert new_key.decrypt(rotated.encode()) == b"totp-secret"
+    assert new_key.extract_timestamp(rotated.encode()) == 1234567890
+
+
+def test_public_totp_rotation_keeps_invalid_ciphertext_failure_visible():
+    """Check public TOTP rotation keeps invalid ciphertext failure visible (InvalidToken)."""
+    with pytest.raises(InvalidToken):
+        crypto_module.rotate_totp_value("not-a-token")
+
+
+@pytest.fixture(autouse=True)
+def _notification_boundary(monkeypatch):
+    """Keep these focused cursor scenarios independent of outbox SQL plumbing."""
+    queue = create_autospec(totp_recover.queue_security_change_notice_cur, spec_set=True)
+    monkeypatch.setattr(totp_recover, "queue_security_change_notice_cur", queue)
+    return queue

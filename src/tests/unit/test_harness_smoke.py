@@ -1,16 +1,10 @@
-"""The client harness authenticates for real.
-
-Guards the harness itself: an authenticated request through the harness must
-reach its route (200, not 500). A harness whose get_session_user patch returns
-anything but a real SessionLookup makes EVERY authenticated request fail at
-the unpack, so auth tests would pass for the wrong reason. These tests fail on
-such a harness and on any SessionLookup shape drift.
-"""
+"""Client-harness interface contracts and suite collection, patching, wait and skip guards."""
 
 import inspect
 import typing
 import urllib.parse
 from datetime import datetime
+from unittest.mock import create_autospec
 
 import pytest
 
@@ -29,12 +23,11 @@ def test_authenticated_request_succeeds(authenticated_client):
     """An authenticated GET must produce a real 200 page, not a blanket 500."""
     response = authenticated_client.get("/account")
     assert response.status_code == 200
-    # The page actually rendered with the session user, proving the middleware
-    # unpacked the lookup and populated request.state.user.
-    assert "alice@uzh.ch" in response.text
+    assert "alice@example.org" in response.text
 
 
 def test_guest_request_succeeds(guest_client):
+    """Guest request succeeds."""
     response = guest_client.get("/login")
     assert response.status_code == 200
 
@@ -48,12 +41,7 @@ def test_guest_is_redirected_from_protected_page(guest_client):
 
 
 def test_require_login_preserves_query_string_in_next(guest_client):
-    """require_login's docstring promises 'path + query' is
-    preserved, but session.py:177 (`next_url += "?" + request.url.query`) is
-    the ONLY unexecuted line in the module. The existing witness asserts
-    `.startswith("/login?next=")`, which is true whether or not the query
-    survived. A refactor to a bare `next_url = request.url.path` silently
-    drops the user's filters after login."""
+    """Preserve both path and query in the login return destination."""
     resp = guest_client.get("/account?tab=security&highlight=totp", follow_redirects=False)
 
     assert resp.status_code == 303
@@ -69,9 +57,7 @@ def test_require_login_next_has_no_stray_query_marker(guest_client):
 
 
 def test_get_session_user_returns_sessionlookup_namedtuple():
-    """Structural guard: the lookup is a NamedTuple with exactly the fields the
-    middleware unpacks. If a field is added/renamed, this and every harness
-    construction site fail loudly (the test-side equivalent of the mypy gate)."""
+    """Keep SessionLookup fields and NamedTuple identity aligned with the middleware contract."""
     assert issubclass(SessionLookup, tuple)
     assert SessionLookup._fields == ("user", "purpose", "flash_present")
     hints = inspect.signature(get_session_user).return_annotation
@@ -79,27 +65,14 @@ def test_get_session_user_returns_sessionlookup_namedtuple():
 
 
 def test_client_builder_reverse_teardown_restores_reals():
-    """Pins the harness's reverse-order teardown contract, self-contained
-    (no reliance on file order, randomization, or xdist splitting).
-    unittest.mock restores the value seen at patch START: with forward-order
-    teardown, closing client1 first re-installs client1's AsyncMock as what
-    client2's patch will 'restore', so after both teardowns a mock would be
-    permanently installed over the real function for the rest of the
-    process. Drives build_client/teardown_client directly — exactly what the
-    client_builder fixture's finalizer does — and then requires the
-    middleware module to hold the ORIGINAL functions again (identity, not
-    equality), not a leaked AsyncMock."""
+    """Restore original session collaborators after reverse-order client teardown."""
     real_get_session_user = session_module.get_session_user
     real_consume_flash = session_module.consume_flash
-    # Precondition (positive control): nothing before this test leaked a
-    # mock — identity with the never-patched originals in
-    # app.services.sessions.
     assert real_get_session_user is get_session_user
     assert real_consume_flash is consume_flash
 
     first = build_client(session_user=None)
     second = build_client(session_user=make_sample_user())
-    # REVERSE build order — the pinned guarantee.
     teardown_client(second)
     teardown_client(first)
 
@@ -112,24 +85,14 @@ def test_client_builder_reverse_teardown_restores_reals():
 
 
 def test_mock_pool_fails_loudly_when_queried():
-    """make_mock_pool's contract: any code path that reaches the pool (via
-    pool.connection(), the only route to a cursor) raises instead of silently
-    handing back MagicMock results — unit-tier tests must patch the service
-    layer. Guards the 'route slipped past the patches and still passed'
-    class."""
+    """Mock pool fails loudly when queried."""
     pool = make_mock_pool()
     with pytest.raises(AssertionError, match="mock DB pool"):
         pool.connection()
 
 
 def test_harness_seam_return_shapes_are_pinned():
-    """The harness hard-codes the return shapes of the
-    two functions it patches away (consume_flash -> (message, category) tuple,
-    verify_password -> PasswordCheck(user, password_ok, locked_until, failure_reason,
-    auth_revision)). If either annotation changes, this fails and
-    fixtures.py / the login-route client tests must be updated in the same
-    commit — otherwise every client test keeps passing against a stale
-    shape while the real middleware/templates break."""
+    """Keep mocked flash/password results aligned with production return annotations."""
     hints = typing.get_type_hints(consume_flash)
     assert hints["return"] == (tuple[str, str] | None), (
         f"consume_flash return shape changed to {hints['return']!r}; "
@@ -141,8 +104,6 @@ def test_harness_seam_return_shapes_are_pinned():
         f"verify_password return shape changed to {vp_hints['return']!r}; "
         "update the login-route client tests to match"
     )
-    # Pin the NamedTuple's own field shape too — renaming/retyping a field
-    # (or reordering, via _fields) must fail here, not in a template at 3am.
     assert PasswordCheck._fields == (
         "user",
         "password_ok",
@@ -166,11 +127,6 @@ def test_harness_seam_return_shapes_are_pinned():
     )
 
 
-# ---------------------------------------------------------------------------
-# Suite integrity: guards against the suite silently shrinking or patching
-# collaborators that no longer exist.
-# ---------------------------------------------------------------------------
-
 import ast  # noqa: E402
 import importlib  # noqa: E402
 import os  # noqa: E402
@@ -180,19 +136,12 @@ from pathlib import Path  # noqa: E402
 
 _TESTS_ROOT = Path(__file__).resolve().parents[1]
 _REPO_ROOT = _TESTS_ROOT.parents[1]
-# The number of nodes the suite collects; raise it when tests are added.
-_COLLECTED_NODE_FLOOR = 3266
+# Minimum collected-node count; raise it when tests are added.
+_COLLECTED_NODE_FLOOR = 8881
 
 
 def _patch_targets(path: Path) -> list[tuple[int, str]]:
-    """Every dotted production target a test file patches, with its line.
-
-    Recognises ``patch("pkg.mod.name")``, ``patch.object(alias, "name")`` and
-    ``monkeypatch.setattr("pkg.mod.name", ...)`` / ``monkeypatch.setattr(alias, "name", ...)``
-    where ``alias`` was imported at module level; only targets under ``app.`` or
-    ``config.`` are reported (settings values and other data are resolved too:
-    a missing attribute is a stale target whatever its kind).
-    """
+    """Return production patch targets and lines resolved through module-level import aliases."""
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source)
     aliases: dict[str, str] = {}
@@ -205,6 +154,7 @@ def _patch_targets(path: Path) -> list[tuple[int, str]]:
                 aliases[name.asname or name.name] = f"{node.module}.{name.name}"
 
     def dotted(node: ast.AST) -> str | None:
+        """Resolve an AST name/attribute chain, returning None for other expressions."""
         if isinstance(node, ast.Name):
             return node.id
         if isinstance(node, ast.Attribute):
@@ -213,11 +163,13 @@ def _patch_targets(path: Path) -> list[tuple[int, str]]:
         return None
 
     def literal(node: ast.AST) -> str | None:
+        """Return a literal string value or None for other AST expressions."""
         return (
             node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
         )
 
     def object_target(base_node: ast.AST, attr_node: ast.AST) -> str | None:
+        """Resolve an attribute patch through a known module alias or return None."""
         base, attr = dotted(base_node), literal(attr_node)
         if not base or not attr:
             return None
@@ -251,9 +203,7 @@ def _patch_targets(path: Path) -> list[tuple[int, str]]:
 
 
 def _resolves(target: str) -> bool:
-    """Longest importable module prefix first, then attribute walk; shorter
-    prefixes are tried when the walk fails (``config.settings`` is both a
-    module and the ``Settings`` instance exported by the package)."""
+    """Return whether any importable module prefix resolves all remaining target attributes."""
     parts = target.split(".")
     for cut in range(len(parts), 0, -1):
         try:
@@ -274,10 +224,7 @@ class TestSuiteIntegrity:
     one and that every patched production collaborator still exists."""
 
     def test_collected_node_count_never_drops_below_the_floor(self):
-        """A module that stops being collected (a syntax error swallowed by
-        ``continue-on-collection-errors``, an accidental rename away from
-        ``test_``, a deleted file) shrinks the suite silently; the floor turns
-        that into a failure."""
+        """Collected node count never drops below the floor."""
         result = subprocess.run(
             [
                 sys.executable,
@@ -296,19 +243,40 @@ class TestSuiteIntegrity:
             check=False,
         )
         collected = [line for line in result.stdout.splitlines() if "::" in line]
-        assert "error" not in result.stdout.lower().split("collected in")[0][-200:], result.stdout[
-            -2000:
-        ]
+        assert result.returncode == 0, (
+            f"Collection failed (exit {result.returncode}):\n"
+            + (result.stdout + result.stderr)[-6000:]
+        )
         assert len(collected) >= _COLLECTED_NODE_FLOOR, (
             f"{len(collected)} nodes collected, floor is {_COLLECTED_NODE_FLOOR}"
         )
 
+    @pytest.mark.parametrize(
+        ("exit_status", "count_delta", "failure"),
+        [(2, 0, "Collection failed"), (0, -1, "nodes collected"), (0, 0, None)],
+        ids=["failed-collection-with-enough-nodes", "successful-but-shrunken", "successful"],
+    )
+    def test_collection_guard_requires_success_and_sufficient_nodes(
+        self, monkeypatch, exit_status, count_delta, failure
+    ):
+        """Partial collection can print enough nodes while reporting its failure on stderr."""
+        count = _COLLECTED_NODE_FLOOR + count_delta
+        output = "\n".join(f"src/tests/test_sample.py::test_error_case_{n}" for n in range(count))
+        result = subprocess.CompletedProcess(
+            args=[],
+            returncode=exit_status,
+            stdout=output + f"\n{count} tests collected in 1s\n",
+            stderr="collector failed" if exit_status else "",
+        )
+        monkeypatch.setattr(subprocess, "run", create_autospec(subprocess.run, return_value=result))
+        if failure:
+            with pytest.raises(AssertionError, match=failure):
+                self.test_collected_node_count_never_drops_below_the_floor()
+        else:
+            self.test_collected_node_count_never_drops_below_the_floor()
+
     def test_every_patched_production_collaborator_resolves(self):
-        """A patch of ``app.x.y`` that no longer exists raises at patch time
-        (``AttributeError``) — but only when that test runs; a stale
-        ``monkeypatch.setattr`` on a missing attribute with ``raising=False``,
-        or a target inside a helper nobody calls any more, stays silent. This
-        resolves every target statically."""
+        """Every patched production collaborator resolves."""
         stale: list[str] = []
         for path in sorted(_TESTS_ROOT.rglob("*.py")):
             for lineno, target in _patch_targets(path):
@@ -317,8 +285,7 @@ class TestSuiteIntegrity:
         assert stale == [], "patch targets that do not resolve:\n" + "\n".join(stale)
 
     def test_a_missing_collaborator_is_reported(self):
-        """Positive control: the resolver rejects a target that does not exist
-        and accepts one that does."""
+        """The resolver rejects a target that does not exist and accepts one that does."""
         assert _resolves("app.services.db.get_db_cursor")
         assert _resolves("config.settings.rate_limit_enabled")
         assert not _resolves("app.services.db.get_db_cursor_that_never_existed")
@@ -328,10 +295,12 @@ class TestSuiteIntegrity:
         found, with module-level aliases resolved."""
         sample = tmp_path / "test_sample.py"
         sample.write_text(
+            "'''Provide patch forms for the AST target extractor.'''\n"
             "from unittest.mock import patch\n"
             "import app.services.db as db_module\n"
             "from app.services import sessions\n"
             "def test_x(monkeypatch):\n"
+            "    '''Expose string, object and monkeypatch targets to the AST extractor.'''\n"
             "    with patch('app.services.db.get_db_cursor'):\n"
             "        pass\n"
             "    with patch.object(db_module, 'create_pool'):\n"
@@ -348,16 +317,13 @@ class TestSuiteIntegrity:
         ]
 
 
-# ---------------------------------------------------------------------------
-# Suite integrity, continued: signature-enforcing doubles and the sleep register.
-# ---------------------------------------------------------------------------
-
 _MOCK_CONSTRUCTORS = frozenset(
     {"Mock", "MagicMock", "AsyncMock", "NonCallableMock", "NonCallableMagicMock"}
 )
 
 
 def _dotted_name(node: ast.AST) -> str | None:
+    """Resolve an AST name/attribute chain, returning None for other expressions."""
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
@@ -367,10 +333,7 @@ def _dotted_name(node: ast.AST) -> str | None:
 
 
 def _is_permissive_replacement(node: ast.AST | None) -> bool:
-    """A replacement that accepts any call shape: none at all (``patch`` then
-    auto-creates a ``MagicMock``), a Mock-family constructor, or a lambda that
-    swallows ``*args``/``**kwargs``. A named fake with an explicit signature,
-    a ``create_autospec(...)`` call and a narrow lambda are signature-enforcing."""
+    """Recognize absent, Mock-family and variadic-lambda replacements that accept arbitrary calls."""
     if node is None:
         return True
     if isinstance(node, ast.Call):
@@ -382,9 +345,7 @@ def _is_permissive_replacement(node: ast.AST | None) -> bool:
 
 
 def _permissive_patches(path: Path) -> list[str]:
-    """Every patch of a callable under ``app.``/``config.`` whose replacement
-    is permissive; ``<module>.time.time`` with a return value is a clock
-    injection through the module's stdlib reference and is exempt."""
+    """Return permissive production-callable patch locations, excluding injected stdlib clocks."""
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source)
     targets = dict(_patch_targets(path))
@@ -404,8 +365,8 @@ def _permissive_patches(path: Path) -> list[str]:
             continue
         obj = _resolve_object(target)
         if obj is None or not callable(obj):
-            continue  # a settings value or another data attribute
-        replacement = None
+            continue
+        replacement: ast.expr | None = None
         for keyword in node.keywords:
             if (
                 keyword.arg == "autospec"
@@ -422,7 +383,7 @@ def _permissive_patches(path: Path) -> list[str]:
             positional = node.args[1:] if (string_target or plain_patch) else node.args[2:]
             replacement = positional[0] if positional else None
         if isinstance(replacement, ast.Constant) and replacement.value is True:
-            continue  # autospec=True
+            continue
         if isinstance(replacement, ast.Call) and (_dotted_name(replacement.func) or "").endswith(
             "create_autospec"
         ):
@@ -434,6 +395,7 @@ def _permissive_patches(path: Path) -> list[str]:
 
 
 def _resolve_object(target: str):
+    """Import the longest usable module prefix and resolve attributes, returning None on failure."""
     parts = target.split(".")
     for cut in range(len(parts), 0, -1):
         try:
@@ -450,16 +412,10 @@ def _resolve_object(target: str):
 
 
 class TestDoublesEnforceProductionSignatures:
-    """A mock standing in for a production callable is signature-checked.
-
-    A bare ``MagicMock()`` in place of a real function accepts any call shape,
-    so a call site that drops or renames an argument keeps passing and the
-    test proves nothing about the real signature. Every patch of a callable
-    under ``app.`` or ``config.`` therefore uses ``autospec=True``, a
-    ``create_autospec(...)`` replacement, or a fake with an explicit
-    signature."""
+    """A mock standing in for a production callable is signature-checked."""
 
     def test_no_patch_of_a_production_callable_is_a_permissive_mock(self):
+        """No patch of a production callable is a permissive mock."""
         offenders: list[str] = []
         for path in sorted(_TESTS_ROOT.rglob("*.py")):
             offenders.extend(_permissive_patches(path))
@@ -468,12 +424,14 @@ class TestDoublesEnforceProductionSignatures:
         )
 
     def test_a_bare_magicmock_replacement_is_reported(self, tmp_path):
-        """Positive control: the detector flags a bare replacement and accepts an autospecced one."""
+        """The detector flags a bare replacement and accepts an autospecced one."""
         sample = tmp_path / "test_sample.py"
         sample.write_text(
+            "'''Provide permissive and signature-checked patches for the AST detector.'''\n"
             "from unittest.mock import MagicMock, create_autospec, patch\n"
             "import app.services.db as db_module\n"
             "def test_x(monkeypatch):\n"
+            "    '''Expose permissive and signature-checked production-callable patches.'''\n"
             "    with patch('app.services.db.get_db_cursor'):\n"
             "        pass\n"
             "    with patch('app.services.db.create_pool', new=MagicMock()):\n"
@@ -485,12 +443,8 @@ class TestDoublesEnforceProductionSignatures:
             encoding="utf-8",
         )
         flagged = [line.split(" ", 1)[0].rsplit(":", 1)[1] for line in _permissive_patches(sample)]
-        assert flagged == ["4", "6", "11"]
+        assert flagged == ["6", "8", "13"]
 
-
-# ---------------------------------------------------------------------------
-# Suite integrity, continued: the register of every wait in the suite.
-# ---------------------------------------------------------------------------
 
 # Every non-yield sleep in src/tests, by (module, enclosing function). A sleep
 # is legitimate only as a short interval inside a deadline-bounded poll of a
@@ -500,10 +454,39 @@ class TestDoublesEnforceProductionSignatures:
 # a defect: add the wait to this register only with such a justification.
 _REGISTERED_WAITS: frozenset[tuple[str, str]] = frozenset(
     {
+        ("integration/server_processes.py", "_wait_for_redis_ping"),
+        # Observe a real active PostgreSQL sleep before cancelling its owning request.
+        (
+            "integration/test_search_work_db.py",
+            "test_cancelled_search_query_stops_before_capacity_is_reused",
+        ),
+        # Poll actual Redis expiry and process readiness under explicit deadlines.
+        (
+            "unit/test_bounded_rate_limit_storage.py",
+            "test_expiry_reclaims_slots_and_clear_removes_registry_member",
+        ),
+        ("unit/test_bounded_rate_limit_storage.py", "_persistent_redis"),
+        # Bounded pg_blocking_pids poll proves account expiry checks wait on a real row lock.
+        ("integration/test_account_database_clock_db.py", "_wait_for_blocked_task"),
         ("integration/test_account_deactivation_db.py", "_wait_for_database_block"),
+        # Bounded polling observes both deletion transactions blocked by PostgreSQL.
+        (
+            "integration/test_account_deletion_db.py",
+            "test_two_admin_self_deletions_observe_the_shared_lock_and_leave_one_active_admin",
+        ),
         ("integration/test_admin_authorization_races_db.py", "_wait_for_database_block"),
         ("integration/test_auth_revision_races_db.py", "_wait_for_database_block"),
+        # Cross the real signed/persisted expiry while a PostgreSQL row lock is held.
+        ("integration/test_auth_revision_races_db.py", "_wait_for_expiry"),
+        # Hold the first INSERT until the competing transaction reaches its conflict wait.
+        (
+            "integration/test_change_aware_ingestion_db.py",
+            "test_direct_concurrent_first_writes_keep_atomic_conflict_and_stricter_tier",
+        ),
+        ("integration/test_dataset_admin_actions_db.py", "_wait_for_catalogue_block"),
         ("integration/test_federated_authentication_db.py", "_wait_for_blocker"),
+        # Bounded polling observes the PostgreSQL blocker of verification/claim races.
+        ("integration/test_federated_reservation_claim_db.py", "observed_wait"),
         ("integration/test_pool_saturation_db.py", "_wait_until"),
         (
             "integration/test_pool_saturation_db.py",
@@ -511,8 +494,12 @@ _REGISTERED_WAITS: frozenset[tuple[str, str]] = frozenset(
         ),
         ("integration/test_rate_limit_redis_db.py", "_http_get_through_worker_recycling"),
         ("integration/test_rate_limit_redis_db.py", "_wait_for_http_ready"),
-        ("integration/test_rate_limit_redis_db.py", "_wait_for_redis_ping"),
         ("integration/test_rate_limit_redis_db.py", "_wait_for_worker_replacement"),
+        # Bounded poll of Gunicorn boot-log PIDs after max_requests recycling.
+        (
+            "integration/test_rate_limit_redis_db.py",
+            "test_worker_recycling_via_max_requests_does_not_restore_the_quota",
+        ),
         ("integration/test_redis_tier.py", "_wait_until"),
         ("integration/test_scheduler_db.py", "_poll"),
         ("integration/test_sync_recovery_db.py", "_loop"),
@@ -522,15 +509,18 @@ _REGISTERED_WAITS: frozenset[tuple[str, str]] = frozenset(
         ("unit/test_nginx_contract.py", "_wait_until_listening"),
         ("unit/test_oai_worker_isolation.py", "_forever_worker"),
         ("unit/test_oai_worker_isolation.py", "_ignore_terminate_worker"),
+        # Observe a live child after cancellation; the worker must be reaped before return.
+        (
+            "unit/test_source_fetch_cancellation.py",
+            "test_cancelled_fetch_is_reaped_before_ingestion_lock_and_tracker_release",
+        ),
         ("unit/test_repository_tooling.py", "_wait_for"),
     }
 )
 
 
 def _sleep_sites(path: Path) -> list[tuple[int, str]]:
-    """Every ``sleep(...)`` call with a non-zero argument, with its enclosing
-    function name (sleeps inside string literals are a spawned child's
-    program text and are not calls in this module)."""
+    """Return nonzero AST sleep locations with their enclosing function names."""
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source)
     parents: dict[ast.AST, ast.AST] = {}
@@ -563,6 +553,7 @@ class TestEveryWaitIsRegistered:
     """A sleep that is not in the register is a timing-based proof and fails here."""
 
     def test_no_sleep_outside_the_register(self):
+        """No sleep outside the register."""
         unregistered: list[str] = []
         for path in sorted(_TESTS_ROOT.rglob("*.py")):
             key_module = str(path.relative_to(_TESTS_ROOT))
@@ -581,42 +572,48 @@ class TestEveryWaitIsRegistered:
         assert stale == [], f"register entries with no sleep behind them: {stale}"
 
     def test_an_unregistered_sleep_is_reported(self, tmp_path):
-        """Positive control: a bare sleep in a test body is found with its function name,
-        while a zero-second yield and a sleep inside a string literal are not."""
+        """A bare sleep in a test body is found with its function name, while a zero-second yield
+        and a sleep inside a string literal are not.
+        """
         sample = tmp_path / "test_sample.py"
         sample.write_text(
+            "'''Provide sleep calls and child-program text for the AST wait detector.'''\n"
             "import asyncio, time\n"
             "CHILD = 'import time; time.sleep(30)'\n"
             "async def test_x():\n"
+            "    '''Expose a nonzero wait while excluding an event-loop yield.'''\n"
             "    await asyncio.sleep(0)\n"
             "    time.sleep(0.3)\n",
             encoding="utf-8",
         )
-        assert _sleep_sites(sample) == [(5, "test_x")]
+        assert _sleep_sites(sample) == [(7, "test_x")]
 
-
-# ---------------------------------------------------------------------------
-# Skipping is opt-in: under CI a skipped integration test fails the run.
-# ---------------------------------------------------------------------------
 
 _SRC_ROOT = _TESTS_ROOT.parent
 
 _SKIPPING_INTEGRATION_ITEM = (
     "def test_integration_item():\n"
+    "    '''Skip because the synthetic integration service is unavailable.'''\n"
     '    pytest.skip("the service this test needs is not reachable")\n'
 )
 _RUNNING_INTEGRATION_ITEMS = (
     "def test_integration_item():\n"
+    "    '''Complete an integration sample without side effects.'''\n"
     "    pass\n"
     "\n"
     "\n"
     '@pytest.mark.xfail(strict=True, reason="a guarded defect reports as an expected failure")\n'
     "def test_guarded_defect():\n"
+    "    '''Raise AssertionError to exercise strict expected-failure handling.'''\n"
     "    raise AssertionError\n"
 )
-_PASSING_UNIT_ITEM = "def test_unit_item():\n    pass\n"
+_PASSING_UNIT_ITEM = (
+    "def test_unit_item():\n    '''Complete a unit sample without side effects.'''\n    pass\n"
+)
 _SKIPPING_UNIT_ITEM = (
-    'def test_unit_item():\n    pytest.skip("a unit-tier skip is outside the gate")\n'
+    "def test_unit_item():\n"
+    "    '''Skip a unit sample outside the integration-skip gate.'''\n"
+    '    pytest.skip("a unit-tier skip is outside the gate")\n'
 )
 
 
@@ -631,13 +628,21 @@ def _sample_tree(root: Path, *, integration_body: str, unit_body: str = _PASSING
     # overridden with a no-op: the sample run must never touch the Redis
     # database of a sibling process (an xdist worker of the run that spawned it).
     (root / "conftest.py").write_text(
-        "import pytest\n\n\n@pytest.fixture(autouse=True)\ndef _reset_rate_limiter():\n    yield\n",
+        "'''Override sample-suite fixtures without touching sibling Redis databases.'''\n"
+        "import pytest\n"
+        "\n"
+        "\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def _reset_rate_limiter():\n"
+        "    '''Yield without resetting shared Redis state.'''\n"
+        "    yield\n",
         encoding="utf-8",
     )
     for tier, body in (("integration", integration_body), ("unit", unit_body)):
         (root / tier).mkdir()
         (root / tier / f"test_{tier}_sample.py").write_text(
-            "import pytest\n\n\n" + body, encoding="utf-8"
+            "'''Synthetic suite for integration-skip CI policy.'''\nimport pytest\n\n\n" + body,
+            encoding="utf-8",
         )
     return root
 
@@ -645,10 +650,9 @@ def _sample_tree(root: Path, *, integration_body: str, unit_body: str = _PASSING
 def _run_sample_suite(
     tree: Path, *, ci: bool, extra: tuple[str, ...] = ()
 ) -> subprocess.CompletedProcess[str]:
-    """Run pytest over a sample tree with the suite's own root conftest loaded
-    as a plugin (``-p tests.conftest``), so the hooks exercised are the real
-    ones. The environment is the parent's minus any xdist worker identity and
-    with ``CI`` set or removed as the scenario needs."""
+    """Run a sample suite with the real conftest plugin, isolated worker identity and selected CI
+    mode.
+    """
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_XDIST") and k != "CI"}
     env["PYTHONPATH"] = str(_SRC_ROOT)
     # A fixed base keeps the sample's nominal Redis databases (never used, see
@@ -684,14 +688,11 @@ def _run_sample_suite(
 
 
 class TestSkippedIntegrationTestsFailTheRunUnderCI:
-    """With ``CI`` set (GitHub Actions exports ``CI=true``) a run in which an
-    integration-tier test skipped exits non-zero although nothing failed;
-    without ``CI`` the skip stays a skip. REQUIRE_DB and REQUIRE_REDIS cover a
-    dead service; this hook covers every other reason an integration test
-    might skip."""
+    """Fail CI on skipped integration items while preserving ordinary local skips."""
 
     @pytest.mark.parametrize("workers", [(), ("-n", "2")], ids=["one-process", "two-xdist-workers"])
     def test_a_skipped_integration_item_fails_the_run_under_ci(self, tmp_path, workers):
+        """A skipped integration item fails the run under CI."""
         tree = _sample_tree(tmp_path, integration_body=_SKIPPING_INTEGRATION_ITEM)
         result = _run_sample_suite(tree, ci=True, extra=workers)
         assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
@@ -699,16 +700,14 @@ class TestSkippedIntegrationTestsFailTheRunUnderCI:
         assert "integration/test_integration_sample.py::test_integration_item" in result.stdout
 
     def test_the_same_skip_stays_a_skip_without_ci(self, tmp_path):
+        """The same skip stays a skip without CI."""
         tree = _sample_tree(tmp_path, integration_body=_SKIPPING_INTEGRATION_ITEM)
         result = _run_sample_suite(tree, ci=False)
         assert result.returncode == pytest.ExitCode.OK, result.stdout + result.stderr
         assert "1 passed, 1 skipped" in result.stdout
 
     def test_a_run_whose_integration_items_all_ran_passes_under_ci(self, tmp_path):
-        """Positive control and discriminator: with ``CI`` set, an integration
-        item that runs, an integration item that is an expected failure and a
-        unit-tier skip together still exit 0. The gate keys on real skips in
-        the integration tier, nothing else."""
+        """A run whose integration items all ran passes under CI."""
         tree = _sample_tree(
             tmp_path, integration_body=_RUNNING_INTEGRATION_ITEMS, unit_body=_SKIPPING_UNIT_ITEM
         )

@@ -251,7 +251,9 @@ def _smoke_test_wheel(
     """Install hashed binary dependencies and wheel in a fresh Python 3.11 venv.
 
     Requires an available 3.11 interpreter; probes packaged assets and offline
-    Alembic SQL. Writes under work and propagates installation/probe failures.
+    Alembic SQL. Install commands retain env; the three offline probes use an
+    allowlisted host environment plus fixed smoke settings. Writes under work
+    and propagates installation/probe failures.
     """
     venv = work / "smoke-venv"
     _run(
@@ -292,9 +294,13 @@ def _smoke_test_wheel(
     )
     _run(["uv", "pip", "check", "--python", str(python)], cwd=work, env=env)
 
-    defaults = _output([sys.executable, str(PROJECT_ROOT / "scripts/wheel_smoke_env.py")])
-    smoke_env = dict(env)
-    smoke_env.update(json.loads(defaults))
+    smoke_env: dict[str, str] = json.loads(
+        _output(
+            [sys.executable, "-I", str(PROJECT_ROOT / "scripts/wheel_smoke_env.py")],
+            cwd=work,
+            env=env,
+        )
+    )
     probe = work / "smoke_installed_wheel.py"
     shutil.copy2(PROJECT_ROOT / "scripts/smoke_installed_wheel.py", probe)
     _run([str(python), "-I", str(probe)], cwd=work, env=smoke_env)
@@ -374,20 +380,36 @@ def _stage_payload(
     )
     for name in (
         "Deployment.md",
+        "LICENSE",
         "README.md",
+        "THIRD_PARTY_NOTICES.md",
         "gunicorn.conf.py",
         "oralhistarchiv.service",
         "oralhistarchiv-scheduler.service",
         "oralhistarchiv-migrate.service",
+        "oralhistarchiv-parser.socket",
+        "oralhistarchiv-parser@.service",
         "run_scheduler.py",
+        "run_parser.py",
     ):
         shutil.copy2(PROJECT_ROOT / name, payload / name)
 
     _copy_tree(PROJECT_ROOT / "deploy", payload / "deploy")
     _copy_tree(PROJECT_ROOT / "docs", payload / "docs")
-    for name in ("README.md", "reencrypt_totp.py", "verify_totp_reencryption.py"):
+    for name in (
+        "README.md",
+        "reencrypt_totp.py",
+        "verify_totp_reencryption.py",
+        "rebuild_search_policy.py",
+        "bootstrap_admin.py",
+        "acknowledge_source_binding.py",
+        "export_security_audit.py",
+    ):
         shutil.copy2(PROJECT_ROOT / "scripts" / name, payload / "scripts" / name)
     _copy_tree(PROJECT_ROOT / "src/app/static", payload / "src/app/static")
+    wordlist_license = Path("src/app/services/data/SECLISTS-LICENSE.txt")
+    (payload / wordlist_license).parent.mkdir(parents=True)
+    shutil.copy2(PROJECT_ROOT / wordlist_license, payload / wordlist_license)
     _write_manifest(payload, commit=commit, wheel=wheel)
     # Validate the assembled artifact with the same consumer used on the host.
     # This runs in PR/wheel-smoke builds as well as the release job.
@@ -398,7 +420,7 @@ def _stage_payload(
         raise RuntimeError("release installer module is unavailable")
     installer = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(installer)
-    installer._verify_payload(payload)
+    installer.verify_payload(payload)
     return payload
 
 

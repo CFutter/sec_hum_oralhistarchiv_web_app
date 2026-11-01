@@ -1,42 +1,28 @@
-"""Root conftest — test environment bootstrap and shared fixtures.
+"""Configure tests before application settings are imported.
 
-ENVIRONMENT BOOTSTRAP (must happen before anything imports `config`):
-`config.settings` constructs `Settings()` at import time, and several modules
-freeze settings-derived values at import (the rate limiter's default limits,
-the cookie signer, the CSRF HMAC key). This file is imported by pytest before
-any test module, so the `os.environ.setdefault` block below is the single
-place the test configuration is defined.
+Defaults use disposable local PostgreSQL and Redis instances. Existing environment
+values override defaults except debug/source selection and the limiter Redis URL.
+Every test resets limiter counters; REDIS_URL must identify disposable Redis.
+TEST_RATE_LIMIT_REDIS_DB selects its base database (0 by default); worker gwN uses
+base + N + 1, restricted to 0..15. Concurrent runs need disjoint ranges or servers.
 
-DATABASE_URL is read from the environment with a local default, so the SAME
-suite runs against local docker-compose (`docker compose up -d db`) and the
-CI service container with no code difference. Because the app itself reads
-DATABASE_URL through Settings, pointing the env var at the test database is
-all it takes for integration tests to hit it.
-
-Tiering: everything under src/tests/integration/ is auto-marked `integration`
-by the collection hook below. The unit tier (`pytest -m "not integration"`)
-must stay green with no database, Redis, or SMTP available.
-
-Parallel workers (pytest-xdist, `-n auto`): each worker process gets a private
-integration database whose name carries the worker id
-(oralhistarchiv_test -> oralhistarchiv_test_gw0) and a Redis database of its
-own for the rate limiter's counters, so two workers can never truncate each
-other's tables or reset each other's counters. Both are settled below, before
-the application freezes the values into `Settings`.
+xdist workers suffix DATABASE_URL with their worker ID; integration fixtures create
+missing worker databases. Integration paths are marked integration automatically.
+The source configuration and fixed test secrets here are unsuitable for deployment.
 """
 
 import logging
 import os
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 
 _TEST_ENV_DEFAULTS = {
     "ENV_STATE": "dev",
+    "PARSER_EXECUTION_MODE": "local",
     # Launcher-agnostic DB selection: CI sets DATABASE_URL on the job; locally
     # the default matches docker-compose.yml exactly (user test / pw test).
     "DATABASE_URL": "postgresql://test:test@localhost:5432/oralhistarchiv_test",
     "PUBLIC_BASE_URL": "http://127.0.0.1:5000",
-    "SWISSUBASE_OAI_PMH_URL": "https://www.swissubase.ch/oai-pmh/v1/oai",
     # Fixed, strong-looking secrets: >=43 chars and high character diversity so
     # the startup strength validator stays quiet even when left unpatched.
     "SECRET_KEY": "kR9vT2xW7pL4qN8mZ3cB6fH1jD5gS0aY4eU9iO2wQ7rM5tK8",
@@ -45,7 +31,6 @@ _TEST_ENV_DEFAULTS = {
     "OUTBOX_ENCRYPTION_KEYS": '["pQ8vN2rL6xB9mD4sF7hJ1kC5wY0zA3eR6tU9iO2gH5bV8nM4"]',
     "HEALTH_DETAIL_TOKEN": "hT7dK2mQ9wX4vB8zN1cR5jF0aG3sL6eY9uP2iO5tM8kW3qE7",
     "ALLOWED_HOSTS": '["localhost", "127.0.0.1", "testserver"]',
-    "OAI_INSTITUTION_FILTER": "Universität Kassel",
     # Rate limiting ON with a low per-minute default: the route-level rate-limit
     # tests trip it with ~31 requests. The autouse reset below isolates tests from each
     # other (TestClient requests all share the "testclient" client IP).
@@ -53,6 +38,10 @@ _TEST_ENV_DEFAULTS = {
     "RATE_LIMIT_PER_MINUTE": "30",
     "RATE_LIMIT_PER_HOUR": "1000",
     "RATE_LIMIT_PER_DAY": "10000",
+    # Most route tests exercise rendering/authorization rather than admission.
+    # Dedicated admission tests install their own deliberately small budgets.
+    "SEARCH_GLOBAL_RATE_PER_SECOND": "500",
+    "SEARCH_GLOBAL_BURST": "500",
     # Threshold 3 keeps the HTTP lockout test under /login's 5/minute limit.
     "LOGIN_FAILURE_THRESHOLD": "3",
     "LOGIN_LOCKOUT_MINUTES": "15",
@@ -69,39 +58,28 @@ _TEST_ENV_DEFAULTS = {
 for _k, _v in _TEST_ENV_DEFAULTS.items():
     os.environ.setdefault(_k, _v)
 
-# FORCED, not setdefault: a developer shell that exports FASTAPI_DEBUG=true
-# (direnv/nix devshell sourcing .env) would otherwise open /docs and the
-# unauthenticated /health/detail branch, breaking the fail-secure health
-# tests. (Mock seeding is no longer tied to this flag — it is driven by
-# SEED_MOCK_DATA below.) Tests that need debug behaviour patch `settings`
-# directly (see test_health_routes.py), so pinning it here is safe.
+# FORCED: ambient debug configuration must not open unauthenticated diagnostics.
+# Tests that need debug behavior patch settings directly.
 os.environ["FASTAPI_DEBUG"] = "false"
 
-# FORCED for the same reason: SEED_MOCK_DATA=true in a developer's .env or
-# shell would make the integration tier's REAL lifespan insert mock rows into
-# the test database, breaking every dataset-count and search-result assertion.
-# (The client tier is immune — fixtures autospec seed_mock_data — but the
-# integration tier runs the real thing.)
-os.environ["SEED_MOCK_DATA"] = "false"
+# Never inherit an operator's source selection. Real dev lifespans load this
+# explicit test-owned configuration; specialized tests override it themselves.
+os.environ["SOURCES_CONFIG_FILE"] = str(Path(__file__).resolve().with_name("sources.toml"))
+os.environ["ALLOW_FIXTURE_SOURCE"] = "false"
 
 # pytest-xdist sets PYTEST_XDIST_WORKER (gw0, gw1, ...) in the worker process
 # before pytest starts. Both pins below key off it; a serial run has no worker.
 _XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER")
 _XDIST_WORKER_INDEX = int(_XDIST_WORKER.removeprefix("gw")) if _XDIST_WORKER else None
 
-# FORCED: the limiter's counters are pinned to a Redis database of this
-# process's own. The application refuses to start in its documented
-# process-local memory mode (validate_rate_limit_configuration treats the
-# "memory://" fallback as a Redis URL; recorded in docs/known-defects.md), so
-# the suite cannot simply leave RATE_LIMIT_REDIS_URL empty. Left to the
-# environment, a developer's .env would put every test process's counters in
-# the same database, where the autouse reset below wipes another process's
-# counters and the low test-environment limits trip at random. A serial run
-# uses database TEST_RATE_LIMIT_REDIS_DB (default 0); xdist worker gwN uses
-# the base plus N+1, so no two workers of one run share a database. Two
-# suites run side by side serially need different bases
-# (TEST_RATE_LIMIT_REDIS_DB=15 for the second one). Redis ships sixteen
-# databases, hence the bound.
+# FORCED: use a dedicated Redis database for this process's limiter counters.
+# The autouse fixture resets this backend between tests, so REDIS_URL must
+# point to a disposable test Redis instance. A serial run uses database
+# TEST_RATE_LIMIT_REDIS_DB (default 0); xdist worker gwN uses the base plus
+# N+1, so workers in one run cannot reset each other's counters. Concurrent
+# runs must use separate Redis instances or non-overlapping database ranges.
+# Redis has sixteen databases under the supported test configuration, hence
+# the bound below.
 _REDIS_TEST_INSTANCE = urlsplit(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
 _RATE_LIMIT_REDIS_DB = int(os.environ.get("TEST_RATE_LIMIT_REDIS_DB", "0"))
 if _XDIST_WORKER_INDEX is not None:
@@ -131,7 +109,7 @@ if _XDIST_WORKER:
 
 import pytest  # noqa: E402
 
-from app.middleware.rate_limiting import limiter  # noqa: E402
+from app.middleware.rate_limiting import get_search_start_gate, limiter  # noqa: E402
 
 
 def pytest_collection_modifyitems(items):
@@ -153,12 +131,11 @@ def _reset_rate_limiter():
     reach another worker's counters.
     """
     limiter.reset()
+    get_search_start_gate().reset()
     yield
 
 
-# ---------------------------------------------------------------------------
 # Client fixtures (unit tier — mocked pool, real middleware stack)
-# ---------------------------------------------------------------------------
 
 from tests.fixtures import build_client, make_sample_user, teardown_client  # noqa: E402
 
@@ -188,7 +165,7 @@ def admin_client():
     """TestClient authenticated as an admin user."""
     admin = make_sample_user(
         id=99,
-        email="admin@uzh.ch",
+        email="admin@example.org",
         display_name="Admin User",
         access_tier="vetted",
         is_admin=True,
@@ -221,6 +198,7 @@ def client_builder():
     built = []
 
     def _build(**kwargs):
+        """Build and track a client for automatic fixture teardown."""
         client = build_client(**kwargs)
         built.append(client)
         return client
@@ -237,9 +215,7 @@ def client_builder():
             teardown_client(client)
 
 
-# ---------------------------------------------------------------------------
 # Skipping is opt-in: under CI a skipped integration test fails the run.
-# ---------------------------------------------------------------------------
 
 
 def running_under_ci() -> bool:
@@ -330,6 +306,13 @@ def restore_logging():
         audit.level,
         audit.propagate,
     )
+    server_loggers = [
+        logging.getLogger(name)
+        for name in ("uvicorn", "uvicorn.error", "gunicorn", "gunicorn.error")
+    ]
+    server_state = [
+        (logger.handlers[:], logger.level, logger.propagate) for logger in server_loggers
+    ]
     try:
         yield
     finally:
@@ -338,6 +321,10 @@ def restore_logging():
         audit.handlers[:] = saved[2]
         audit.setLevel(saved[3])
         audit.propagate = saved[4]
+        for logger, (handlers, level, propagate) in zip(server_loggers, server_state, strict=True):
+            logger.handlers = handlers
+            logger.setLevel(level)
+            logger.propagate = propagate
 
 
 @pytest.fixture

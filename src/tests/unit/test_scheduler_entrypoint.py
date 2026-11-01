@@ -1,13 +1,4 @@
-"""Tests for the standalone scheduler process lifecycle (run_scheduler.py).
-
-The scheduler process must validate its database before submitting work,
-pause new submissions during shutdown, let every tracked job finish, and only
-then ask APScheduler to shut down. Cache and pool resources must be released
-even when preflight, draining, or APScheduler shutdown fails.
-
-Every stand-in is autospecced from the imported production object so signature
-drift fails at the call site instead of being accepted by a permissive mock.
-"""
+"""Tests for the standalone scheduler process lifecycle (run_scheduler.py)."""
 
 import asyncio
 import importlib.util
@@ -19,7 +10,15 @@ import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from psycopg_pool import AsyncConnectionPool
 
+from app.sources import (
+    FixtureAdapter,
+    FixtureConfig,
+    OaiPmhCmdiAdapter,
+    SourceDisplay,
+    configure_sources,
+)
 from config import settings
+from tests.source_fixtures import legacy_source
 
 _ROOT = Path(__file__).resolve().parents[3]
 _spec = importlib.util.spec_from_file_location("run_scheduler", _ROOT / "run_scheduler.py")
@@ -35,6 +34,8 @@ _REAL = {
         "CatalogueStatsCache",
         "RunningJobTracker",
         "create_scheduler",
+        "ensure_source_status_rows",
+        "load_runtime_sources",
         "validate_security_settings",
         "validate_runtime_schema",
     )
@@ -43,6 +44,9 @@ _REAL = {
 
 def _patched_main(stack: ExitStack):
     """Install lifecycle stand-ins and return pool/scheduler/tracker/spies."""
+    stack.enter_context(patch.object(settings, "app_process_role", "scheduler"))
+    stack.enter_context(patch.object(settings, "totp_encryption_keys", []))
+    stack.enter_context(patch.object(run_scheduler, "validate_parser_service", autospec=True))
     pool = create_autospec(AsyncConnectionPool, instance=True)
     scheduler = create_autospec(AsyncIOScheduler, instance=True)
     tracker = create_autospec(_REAL["RunningJobTracker"], instance=True)
@@ -68,6 +72,16 @@ def _patched_main(stack: ExitStack):
                 run_scheduler,
                 "create_pool",
                 new=create_autospec(_REAL["create_pool"], return_value=pool),
+            )
+        ),
+        "load_runtime_sources": stack.enter_context(
+            patch.object(
+                run_scheduler,
+                "load_runtime_sources",
+                new=create_autospec(
+                    _REAL["load_runtime_sources"],
+                    return_value=(legacy_source(),),
+                ),
             )
         ),
         "CatalogueStatsCache": stack.enter_context(
@@ -97,6 +111,13 @@ def _patched_main(stack: ExitStack):
                 ),
             )
         ),
+        "ensure_source_status_rows": stack.enter_context(
+            patch.object(
+                run_scheduler,
+                "ensure_source_status_rows",
+                new=create_autospec(_REAL["ensure_source_status_rows"]),
+            )
+        ),
         "validate_runtime_schema": stack.enter_context(
             patch.object(
                 run_scheduler,
@@ -123,16 +144,54 @@ class TestMainShutdownSequencing:
     resources, and resource release survives failures at every stage.
     """
 
-    async def test_clean_shutdown_pauses_drains_shuts_down_then_releases_resources(self):
-        """Clean shutdown runs in the exact order: pause, drain, shutdown,
-        drain again, stop the cache, then close the pool.
-        """
+    @pytest.mark.parametrize("environment", ["dev", "staging"])
+    async def test_clean_shutdown_pauses_drains_shuts_down_then_releases_resources(
+        self, monkeypatch, environment
+    ):
+        """Startup retains sources; shutdown releases resources in order."""
+        monkeypatch.setattr(settings, "env_state", environment)
         order: list[str] = []
-
         with ExitStack() as stack:
             pool, scheduler, tracker, spies = _patched_main(stack)
-            stats_cache = spies["CatalogueStatsCache"].return_value
+            fixture_fetch = stack.enter_context(
+                patch.object(
+                    FixtureAdapter,
+                    "fetch",
+                    autospec=True,
+                    side_effect=AssertionError("Scheduler startup must leave ingestion to jobs"),
+                )
+            )
 
+            stats_cache = spies["CatalogueStatsCache"].return_value
+            selected_sources = configure_sources(
+                (
+                    FixtureConfig(name="archive_one", display=SourceDisplay(label="Archive one")),
+                    FixtureConfig(name="archive_two", display=SourceDisplay(label="Archive two")),
+                )
+            )
+
+            spies["validate_security_settings"].side_effect = lambda: order.append("security")
+
+            def construct_source():
+                """Record source construction and return the selected sources."""
+                order.append("source")
+                return selected_sources
+
+            def construct_pool(**_kwargs):
+                """Record pool construction and return the configured fake pool."""
+                order.append("pool")
+                return pool
+
+            spies["load_runtime_sources"].side_effect = construct_source
+            spies["create_pool"].side_effect = construct_pool
+            pool.open.side_effect = lambda: order.append("pool_open")
+            spies["validate_runtime_schema"].side_effect = lambda *_args, **_kwargs: order.append(
+                "preflight"
+            )
+            spies["ensure_source_status_rows"].side_effect = lambda *_args: order.append(
+                "provision"
+            )
+            scheduler.start.side_effect = lambda: order.append("start")
             scheduler.pause.side_effect = lambda: order.append("pause")
             tracker.wait_until_empty.side_effect = lambda: order.append("wait")
             scheduler.shutdown.side_effect = lambda **_kwargs: order.append("shutdown")
@@ -141,23 +200,38 @@ class TestMainShutdownSequencing:
 
             await run_scheduler.main()
 
+        fixture_fetch.assert_not_called()
+        pool.connection.assert_not_called()
+
         spies["setup_logging"].assert_called_once_with(
             log_level=settings.log_level,
             log_format=settings.log_format,
         )
         spies["validate_security_settings"].assert_called_once_with()
+        spies["load_runtime_sources"].assert_called_once_with()
         spies["create_pool"].assert_called_once_with(
             application_name="oralhistarchiv-scheduler",
             statement_timeout=settings.scheduler_statement_timeout,
         )
         pool.open.assert_awaited_once_with()
         spies["validate_runtime_schema"].assert_awaited_once_with(pool, process="scheduler")
-        spies["CatalogueStatsCache"].assert_called_once_with(pool, subscribe=False)
+        spies["CatalogueStatsCache"].assert_called_once_with(
+            pool,
+            source_names=tuple(source.name for source in selected_sources),
+            policy_fingerprint=run_scheduler.build_catalogue_policy(selected_sources).fingerprint,
+            subscribe=False,
+        )
         spies["RunningJobTracker"].assert_called_once_with()
         spies["create_scheduler"].assert_called_once_with(
             pool,
             stats_cache,
             tracker,
+            selected_sources,
+        )
+        assert spies["create_scheduler"].call_args.args[3] is selected_sources
+        spies["ensure_source_status_rows"].assert_awaited_once_with(
+            pool,
+            tuple(source.name for source in selected_sources),
         )
 
         assert spies["add_signal_handler"].call_count == 2
@@ -165,10 +239,16 @@ class TestMainShutdownSequencing:
         scheduler.pause.assert_called_once_with()
         scheduler.shutdown.assert_called_once_with(wait=False)
         assert tracker.wait_until_empty.await_count == 2
-
         stats_cache.stop.assert_called_once_with()
         pool.close.assert_awaited_once_with()
         assert order == [
+            "security",
+            "source",
+            "pool",
+            "pool_open",
+            "preflight",
+            "provision",
+            "start",
             "pause",
             "wait",
             "shutdown",
@@ -191,6 +271,7 @@ class TestMainShutdownSequencing:
             tracker.wait_until_empty.side_effect = lambda: order.append("wait")
 
             def fail_shutdown(*, wait: bool) -> None:
+                """Require nonwaiting scheduler shutdown, record it, and raise the injected failure."""
                 assert wait is False
                 order.append("shutdown")
                 raise RuntimeError("shutdown failed")
@@ -266,9 +347,38 @@ class TestMainPreflightFailures:
             log_format=settings.log_format,
         )
         spies["validate_security_settings"].assert_called_once_with()
+        spies["load_runtime_sources"].assert_not_called()
         spies["create_pool"].assert_not_called()
         pool.open.assert_not_awaited()
         spies["validate_runtime_schema"].assert_not_awaited()
+        spies["ensure_source_status_rows"].assert_not_awaited()
+        spies["CatalogueStatsCache"].assert_not_called()
+        spies["RunningJobTracker"].assert_not_called()
+        spies["create_scheduler"].assert_not_called()
+        spies["add_signal_handler"].assert_not_called()
+        scheduler.start.assert_not_called()
+        scheduler.pause.assert_not_called()
+        scheduler.shutdown.assert_not_called()
+        tracker.wait_until_empty.assert_not_awaited()
+        pool.close.assert_not_awaited()
+
+    async def test_invalid_source_configuration_stops_before_any_pool_or_job(self):
+        """Source construction must finish before database resources open."""
+        with ExitStack() as stack:
+            pool, scheduler, tracker, spies = _patched_main(stack)
+            spies["load_runtime_sources"].side_effect = ValueError(
+                "invalid legacy source configuration"
+            )
+
+            with pytest.raises(ValueError, match="invalid legacy source configuration"):
+                await run_scheduler.main()
+
+        spies["validate_security_settings"].assert_called_once_with()
+        spies["load_runtime_sources"].assert_called_once_with()
+        spies["create_pool"].assert_not_called()
+        pool.open.assert_not_awaited()
+        spies["validate_runtime_schema"].assert_not_awaited()
+        spies["ensure_source_status_rows"].assert_not_awaited()
         spies["CatalogueStatsCache"].assert_not_called()
         spies["RunningJobTracker"].assert_not_called()
         spies["create_scheduler"].assert_not_called()
@@ -303,14 +413,32 @@ class TestMainPreflightFailures:
         tracker.wait_until_empty.assert_not_awaited()
         pool.close.assert_awaited_once_with()
 
+    async def test_source_provisioning_failure_closes_pool_before_jobs(self):
+        """Unprovisioned durable state prevents job construction."""
+        with ExitStack() as stack:
+            pool, scheduler, _tracker, spies = _patched_main(stack)
+            spies["ensure_source_status_rows"].side_effect = RuntimeError(
+                "source provisioning failed"
+            )
+
+            with pytest.raises(RuntimeError, match="source provisioning failed"):
+                await run_scheduler.main()
+
+        spies["validate_runtime_schema"].assert_awaited_once_with(pool, process="scheduler")
+        spies["ensure_source_status_rows"].assert_awaited_once_with(
+            pool,
+            tuple(source.name for source in spies["load_runtime_sources"].return_value),
+        )
+        spies["CatalogueStatsCache"].assert_not_called()
+        spies["RunningJobTracker"].assert_not_called()
+        spies["create_scheduler"].assert_not_called()
+        scheduler.start.assert_not_called()
+        pool.close.assert_awaited_once_with()
+
 
 class TestUpstreamTransportPreflight:
-    """The scheduler harvests from the upstream catalogue on its own, in its
-    own process, so it has to apply the same transport policy the web process
-    does. Over plaintext HTTP an on-path attacker could rewrite the metadata
-    the archive then publishes, so a hardened deployment must not start a
-    scheduler pointed at an http:// endpoint — and must stop before the
-    database is even opened.
+    """The scheduler harvests from the upstream catalogue on its own, in its own process, so it has to
+    apply the same transport policy the web process does.
     """
 
     @pytest.fixture(autouse=True)
@@ -322,73 +450,109 @@ class TestUpstreamTransportPreflight:
         monkeypatch.setattr(settings, "rate_limit_trust_proxy", True)
         monkeypatch.setattr(settings, "shibboleth_internal_secret", None)
 
-    async def test_a_plaintext_upstream_url_stops_the_scheduler_before_the_database(
-        self, monkeypatch
+    @pytest.mark.parametrize(
+        ("selected_path", "endpoint", "message"),
+        [
+            (
+                None,
+                "https://archive.example.edu/oai",
+                r"SOURCES_CONFIG_FILE.*required",
+            ),
+            (
+                "/etc/oralhistarchiv-sources/sources.toml",
+                "http://archive.example.edu/oai",
+                r"requires.*HTTPS endpoint",
+            ),
+            (
+                "/etc/oralhistarchiv-sources/sources.toml",
+                "https://archive.example.org/oai",
+                "placeholder endpoint host",
+            ),
+        ],
+        ids=["missing-selection", "plaintext", "placeholder"],
+    )
+    async def test_source_refusal_stops_scheduler_before_resources(
+        self, monkeypatch, selected_path, endpoint, message
     ):
-        monkeypatch.setattr(settings, "swissubase_oai_pmh_url", "http://demo.swissubase.ch/oai")
+        """Check source refusal stops scheduler before resources (ValueError)."""
+        monkeypatch.setattr(settings, "sources_config_file", selected_path)
+        document = (
+            "[[sources]]\n"
+            'name = "selected_archive"\n'
+            'adapter = "oai_pmh_cmdi"\n'
+            'label = "Selected archive"\n'
+            'institution_filter = "Configured archive"\n'
+            f'endpoint = "{endpoint}"\n'
+        )
 
         with ExitStack() as stack:
-            pool, scheduler, _tracker, spies = _patched_main(stack)
-            # Run the production validator itself, not a stand-in: the point
-            # of the check is that the scheduler reaches this exact policy.
-            stack.enter_context(
-                patch.object(
-                    run_scheduler,
-                    "validate_security_settings",
-                    _REAL["validate_security_settings"],
+            pool, scheduler, tracker, spies = _patched_main(stack)
+            reader = stack.enter_context(
+                patch(
+                    "app.sources.startup_file._read_hardened_file",
+                    autospec=True,
+                    return_value=document,
                 )
             )
+            spies["validate_security_settings"].side_effect = _REAL["validate_security_settings"]
+            spies["load_runtime_sources"].side_effect = _REAL["load_runtime_sources"]
 
-            with pytest.raises(RuntimeError) as refusal:
+            with pytest.raises(ValueError, match=message):
                 await run_scheduler.main()
 
-        assert "SWISSUBASE_OAI_PMH_URL" in str(refusal.value)
+        assert reader.call_count == int(selected_path is not None)
+        spies["validate_security_settings"].assert_called_once_with()
+        spies["load_runtime_sources"].assert_called_once_with()
         spies["create_pool"].assert_not_called()
         pool.open.assert_not_awaited()
+        spies["validate_runtime_schema"].assert_not_awaited()
+        spies["ensure_source_status_rows"].assert_not_awaited()
+        spies["CatalogueStatsCache"].assert_not_called()
+        spies["RunningJobTracker"].assert_not_called()
         spies["create_scheduler"].assert_not_called()
+        spies["add_signal_handler"].assert_not_called()
         scheduler.start.assert_not_called()
+        scheduler.pause.assert_not_called()
+        scheduler.shutdown.assert_not_called()
+        tracker.wait_until_empty.assert_not_awaited()
+        pool.close.assert_not_awaited()
 
-    async def test_the_same_scheduler_starts_against_an_https_upstream(self, monkeypatch):
-        """Positive control: only the scheme is at fault above. With an
-        https:// endpoint and the same hardened settings, the scheduler
-        opens its pool and starts."""
-        monkeypatch.setattr(settings, "swissubase_oai_pmh_url", "https://demo.swissubase.ch/oai")
+    async def test_the_same_scheduler_starts_against_a_selected_https_upstream(self, monkeypatch):
+        """Check the same scheduler starts against a selected https upstream."""
+        monkeypatch.setattr(
+            settings, "sources_config_file", "/etc/oralhistarchiv-sources/sources.toml"
+        )
+        document = (
+            "[[sources]]\n"
+            'name = "selected_archive"\n'
+            'adapter = "oai_pmh_cmdi"\n'
+            'label = "Selected archive"\n'
+            'institution_filter = "Configured archive"\n'
+            'endpoint = "https://archive.example.edu/oai"\n'
+        )
 
         with ExitStack() as stack:
             pool, scheduler, _tracker, spies = _patched_main(stack)
-            stack.enter_context(
-                patch.object(
-                    run_scheduler,
-                    "validate_security_settings",
-                    _REAL["validate_security_settings"],
+            reader = stack.enter_context(
+                patch(
+                    "app.sources.startup_file._read_hardened_file",
+                    autospec=True,
+                    return_value=document,
                 )
             )
+            fetch = stack.enter_context(patch.object(OaiPmhCmdiAdapter, "fetch", autospec=True))
+            spies["validate_security_settings"].side_effect = _REAL["validate_security_settings"]
+            spies["load_runtime_sources"].side_effect = _REAL["load_runtime_sources"]
 
             await run_scheduler.main()
 
+        reader.assert_called_once()
+        spies["load_runtime_sources"].assert_called_once_with()
         spies["create_pool"].assert_called_once()
         pool.open.assert_awaited_once_with()
+        spies["ensure_source_status_rows"].assert_awaited_once_with(pool, ("selected_archive",))
+        sources = spies["create_scheduler"].call_args.args[3]
+        assert tuple(source.name for source in sources) == ("selected_archive",)
+        assert isinstance(sources[0].adapter, OaiPmhCmdiAdapter)
         scheduler.start.assert_called_once_with()
-
-
-class TestMainStagingMockDataSeed:
-    """On staging with mock-data seeding enabled, seeding must run after the
-    schema preflight and before the scheduler is constructed.
-    """
-
-    async def test_staging_seeds_mock_data_after_its_schema_preflight(self, monkeypatch):
-        monkeypatch.setattr(settings, "env_state", "staging")
-        monkeypatch.setattr(settings, "seed_mock_data", True)
-        order = []
-        with ExitStack() as stack:
-            pool, _scheduler, _tracker, spies = _patched_main(stack)
-            seed = stack.enter_context(
-                patch("app.services.seed_mock_data.seed_mock_data", autospec=True)
-            )
-            spies["validate_runtime_schema"].side_effect = lambda *_args, **_kwargs: order.append(
-                "preflight"
-            )
-            seed.side_effect = lambda *_args: order.append("seed")
-            await run_scheduler.main()
-        seed.assert_awaited_once_with(pool)
-        assert order == ["preflight", "seed"]
+        fetch.assert_not_called()

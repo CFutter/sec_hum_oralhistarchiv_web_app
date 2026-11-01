@@ -1,35 +1,4 @@
-"""Email service unit tests: SMTP transport, message builders, address normalization.
-
-Covers `app.services.email` (the SMTP transport, its TLS/credential handling,
-the never-raises delivery contract, the security-email audit hook, and the
-plain-text message builders) and `app.services.email_utils` (the single
-normalization point re-exported as `app.services.normalize_email`).
-
-Pinned invariants:
-- every `smtplib.SMTP(...)` construction passes a bounded `timeout=` keyword
-  argument, and the TLS branch additionally calls `starttls` with an explicit
-  SSL context;
-- `send_email` never raises: every SMTP or transport failure is classified
-  into a `DeliveryResult`, so callers (registration, password reset, lockout
-  notices) cannot fail because delivery failed;
-- login (`_maybe_login`) is attempted only when `smtp_user` is configured;
-- when SMTP is disabled (the test-environment default), the message is saved
-  to the private development mailbox instead, and the action link never
-  reaches the application log;
-- `_send_security_email` attributes delivery failure to an audit event keyed
-  by a hashed recipient, never the raw address;
-- builder bodies carry their link and absolute expiry, and the
-  duplicate-registration notice goes only to the address that already exists
-  (the designed enumeration channel);
-- `normalize_email` lowercases and Unicode-normalizes (NFC) an address so two
-  visually identical addresses in different Unicode forms collapse to the
-  same stored/looked-up string, is idempotent, returns `None` (never raises)
-  on syntactically invalid input, and is the same function object whether
-  imported from `app.services` or `app.services.email_utils`.
-
-Pure unit tests: no DB, no client, no real SMTP. `smtplib.SMTP` is patched in
-the email module's namespace.
-"""
+"""Classified SMTP failures, action-email builders and email normalization."""
 
 import logging
 import smtplib
@@ -39,6 +8,7 @@ from datetime import UTC, datetime
 from email import policy
 from email.parser import BytesParser
 from unittest.mock import MagicMock, create_autospec, patch
+from urllib.parse import urlsplit
 
 import pytest
 from pydantic import SecretStr
@@ -57,7 +27,9 @@ from app.services.email import (
     send_email,
 )
 from app.services.email_utils import normalize_email
+from app.services.tokens import action_token_url
 from config import settings
+from tests.action_links import token_from_action_email
 
 _SMTP_PATCH_TARGET = "app.services.email.smtplib.SMTP"
 
@@ -94,22 +66,16 @@ class TestTransportConfiguration:
     @pytest.mark.usefixtures("smtp_on")
     @pytest.mark.parametrize("use_tls", [True, False], ids=["tls", "plain"])
     def test_send_email_constructs_smtp_with_bounded_keyword_timeout(self, monkeypatch, use_tls):
-        """Both send branches construct SMTP with `timeout=` as a keyword
-        argument; the TLS branch additionally calls starttls with an
-        explicit SSL context. A positional or missing timeout would let a
-        hung relay pin a threadpool slot per send, unbounded.
-        """
+        """Pass SMTP timeout by keyword and an explicit SSL context to STARTTLS."""
         monkeypatch.setattr(settings, "smtp_use_tls", use_tls)
         smtp_cls, server = _make_smtp_mock()
 
         with patch(_SMTP_PATCH_TARGET, smtp_cls):
-            result = send_email("alice@uzh.ch", "subject", "body")
+            result = send_email("alice@example.org", "subject", "body")
 
         assert result.status == "sent"
         assert result.reason == "smtp_accepted"
 
-        # Exact-call match: timeout matches only as a kwarg (mock
-        # distinguishes positional from keyword), proving the kwarg form.
         smtp_cls.assert_called_once_with(
             "relay.test", 2525, timeout=email_module._SMTP_SEND_TIMEOUT
         )
@@ -123,14 +89,7 @@ class TestTransportConfiguration:
 
 
 class TestInternationalizedAddressDelivery:
-    """IDN sender/recipient addresses are sent as IDNA ASCII, never by
-    negotiating the SMTPUTF8 extension.
-
-    These exercise the real stdlib envelope and MIME implementation (only
-    `smtplib.SMTP` is replaced, with a real, unconnected `smtplib.SMTP()`
-    instance) instead of a full mock, so a change to smtplib's own
-    ASCII-only envelope encoding would be caught here.
-    """
+    """Encode IDN mailbox domains with IDNA without negotiating SMTPUTF8."""
 
     @pytest.mark.parametrize(
         "domain",
@@ -138,10 +97,7 @@ class TestInternationalizedAddressDelivery:
         ids=["unicode_domain", "punycode_domain"],
     )
     def test_idn_sender_and_recipient_are_idna_encoded_without_smtputf8(self, monkeypatch, domain):
-        """Whether the configured sender domain is typed as Unicode or
-        already as punycode, the outgoing envelope's sender and recipient
-        are always the punycode (IDNA) form, and the SMTPUTF8 extension is
-        never relied on (`has_extn` is stubbed to report it unsupported)."""
+        """Use IDNA ASCII sender/recipient domains without SMTPUTF8."""
         server = smtplib.SMTP()
         server.ehlo_or_helo_if_needed = MagicMock()
         server.has_extn = MagicMock(return_value=False)
@@ -166,17 +122,10 @@ class TestInternationalizedAddressDelivery:
 
 
 class TestSenderIdentityEncoding:
-    """The configured sender display name is encoded as a single mailbox
-    address in the From header, even when it contains characters (a comma,
-    an embedded quote) that would otherwise be mistaken for a second,
-    comma-separated address.
-    """
+    """Keep the configured From display name in a single encoded mailbox."""
 
     def test_display_name_with_comma_and_quote_stays_a_single_mailbox(self, monkeypatch):
-        """A comma and an embedded quote inside `smtp_from_name` must not
-        split the From header into multiple addresses: the whole
-        configured string remains one mailbox's display name.
-        """
+        """Keep commas and quotes inside the single From display name."""
         monkeypatch.setattr(settings, "smtp_enabled", True)
         monkeypatch.setattr(settings, "smtp_from_name", 'Archive, University "Zurich"')
         monkeypatch.setattr(settings, "smtp_from_address", "archive@example.org")
@@ -201,15 +150,12 @@ class TestSendFailureClassification:
         ids=["socket_timeout", "oserror"],
     )
     def test_connection_failure_is_reported_as_temporary_failure(self, monkeypatch, exc):
-        """A TimeoutError/OSError raised while connecting is swallowed and
-        `send_email` reports a temporary failure — a hung or dead relay must
-        never take the caller (e.g. the registration request) down with it.
-        """
+        """Connection failure is reported as temporary failure."""
         monkeypatch.setattr(settings, "smtp_use_tls", False)
         smtp_cls = create_autospec(smtplib.SMTP, spec_set=True, side_effect=exc)
 
         with patch(_SMTP_PATCH_TARGET, smtp_cls):
-            result = send_email("alice@uzh.ch", "subject", "body")
+            result = send_email("alice@example.org", "subject", "body")
 
         assert result.status == "temporary_failure"
         assert result.reason == "smtp_transport_error"
@@ -231,29 +177,20 @@ class TestSendFailureClassification:
     def test_send_message_failure_is_classified_as_temporary(
         self, monkeypatch, exc, expected_reason
     ):
-        """A failure raised from `send_message` — a refused-recipients
-        reply, a plain `smtplib.SMTPException` (e.g. an unexpected
-        disconnect), or a completely unrelated exception — is always caught
-        and reported as a temporary failure, never propagated to the caller.
-        """
+        """Send message failure is classified as temporary."""
         monkeypatch.setattr(settings, "smtp_use_tls", False)
         smtp_cls, server = _make_smtp_mock()
         server.send_message.side_effect = exc
 
         with patch(_SMTP_PATCH_TARGET, smtp_cls):
-            result = send_email("alice@uzh.ch", "subject", "body")
+            result = send_email("alice@example.org", "subject", "body")
 
         assert result.status == "temporary_failure"
         assert result.reason == expected_reason
 
     @pytest.mark.usefixtures("smtp_on")
     def test_authentication_failure_reports_code_and_logs_error(self, monkeypatch, caplog):
-        """`SMTPAuthenticationError` from `login()` becomes a temporary
-        failure carrying the SMTP code (never raised), and a
-        'smtp_auth_failed' event is logged at ERROR so a broken relay
-        credential is visible in ops logs instead of vanishing into a
-        generic failure.
-        """
+        """Authentication failure reports code and logs error."""
         monkeypatch.setattr(settings, "smtp_use_tls", False)
         monkeypatch.setattr(settings, "smtp_user", "mailer")
         monkeypatch.setattr(settings, "smtp_password", SecretStr("s3cret"))
@@ -264,7 +201,7 @@ class TestSendFailureClassification:
             patch(_SMTP_PATCH_TARGET, smtp_cls),
             caplog.at_level(logging.ERROR, logger="app.services.email"),
         ):
-            result = send_email("alice@uzh.ch", "subject", "body")
+            result = send_email("alice@example.org", "subject", "body")
 
         assert result.status == "temporary_failure"
         assert result.reason == "smtp_authentication_failed"
@@ -276,16 +213,12 @@ class TestSendFailureClassification:
 
     @pytest.mark.usefixtures("smtp_on")
     def test_acceptance_is_reported_sent_even_when_connection_cleanup_fails(self):
-        """The message is already accepted by the relay (`send_message`
-        returned) before the `with` block exits; a subsequent OSError from
-        the server's own `close()` during cleanup must not downgrade a
-        successful send to a failure, and `quit()` must not be attempted
-        against a connection that failed to close."""
+        """Acceptance is reported sent even when connection cleanup fails."""
         smtp_cls, server = _make_smtp_mock()
         server.close.side_effect = OSError("cleanup failed after acceptance")
 
         with patch(_SMTP_PATCH_TARGET, smtp_cls):
-            result = send_email("alice@uzh.ch", "subject", "body")
+            result = send_email("alice@example.org", "subject", "body")
 
         assert result.status == "sent"
         assert result.reason == "smtp_accepted"
@@ -294,13 +227,9 @@ class TestSendFailureClassification:
 
     @pytest.mark.usefixtures("smtp_on")
     def test_message_construction_failure_is_caught_by_the_no_raise_backstop(self):
-        """A message that fails to construct (e.g. a header-injection
-        subject) never reaches `smtplib.SMTP` at all, and is classified as a
-        temporary failure by the same backstop that catches unexpected
-        exceptions — `send_email` never raises regardless of which stage
-        fails."""
+        """Message construction failure is caught by the no raise backstop."""
         with patch(_SMTP_PATCH_TARGET) as smtp:
-            result = send_email("alice@uzh.ch", "subject\nInjected: header", "body")
+            result = send_email("alice@example.org", "subject\nInjected: header", "body")
 
         assert result.status == "temporary_failure"
         assert result.reason == "email_unexpected_error"
@@ -322,7 +251,7 @@ class TestAuthenticationGating:
         smtp_cls, server = _make_smtp_mock()
 
         with patch(_SMTP_PATCH_TARGET, smtp_cls):
-            result = send_email("alice@uzh.ch", "subject", "body")
+            result = send_email("alice@example.org", "subject", "body")
 
         assert result.status == "sent"
         server.login.assert_called_once_with("mailer", "s3cret")
@@ -336,9 +265,21 @@ class TestAuthenticationGating:
         smtp_cls, server = _make_smtp_mock()
 
         with patch(_SMTP_PATCH_TARGET, smtp_cls):
-            result = send_email("alice@uzh.ch", "subject", "body")
+            result = send_email("alice@example.org", "subject", "body")
 
         assert result.status == "sent"
+        server.login.assert_not_called()
+
+    @pytest.mark.usefixtures("smtp_on")
+    def test_configured_username_requires_a_password_at_runtime(self, monkeypatch):
+        """Reject malformed runtime credentials before attempting SMTP AUTH."""
+        monkeypatch.setattr(settings, "smtp_user", "mailer")
+        monkeypatch.setattr(settings, "smtp_password", None)
+        _, server = _make_smtp_mock()
+
+        with pytest.raises(RuntimeError, match="SMTP_PASSWORD is required when SMTP_USER is set"):
+            email_module._maybe_login(server)
+
         server.login.assert_not_called()
 
 
@@ -348,16 +289,12 @@ class TestDevelopmentMailbox:
     def test_disabled_smtp_saves_usable_private_message_without_logging_body(
         self, caplog, tmp_path, monkeypatch
     ):
-        """With SMTP disabled, the full message is saved atomically to a
-        0700 mailbox directory as a 0600 `.eml` file usable by the
-        copy-the-link dev affordance, while the action link never reaches
-        the application log.
-        """
+        """Disabled SMTP saves usable private message without logging body."""
         mailbox = tmp_path / "mailbox"
         monkeypatch.setattr(settings, "dev_mailbox_dir", str(mailbox))
         body = "Click here: http://127.0.0.1:5000/reset-password/tok-abc123"
         with patch(_SMTP_PATCH_TARGET) as smtp, caplog.at_level(logging.DEBUG):
-            result = send_email("alice@uzh.ch", "Reset", body)
+            result = send_email("alice@example.org", "Reset", body)
         assert result.status == "sent"
         assert result.reason == "development_mailbox_saved"
         smtp.assert_not_called()
@@ -375,10 +312,7 @@ class TestDevelopmentMailbox:
     def test_disabled_smtp_outside_development_never_reaches_the_mailbox(
         self, environment, monkeypatch, tmp_path
     ):
-        """Outside development, disabled SMTP is a temporary failure and
-        never falls back to the private mailbox — that fallback exists only
-        to make the local developer experience usable without a real relay,
-        never as a substitute delivery path in staging or production."""
+        """Disabled SMTP outside development never reaches the mailbox."""
         monkeypatch.setattr(settings, "env_state", environment)
         monkeypatch.setattr(settings, "smtp_enabled", False)
         monkeypatch.setattr(settings, "dev_mailbox_dir", str(tmp_path / "mailbox"))
@@ -388,11 +322,7 @@ class TestDevelopmentMailbox:
         assert not (tmp_path / "mailbox").exists()
 
     def test_mailbox_write_failure_does_not_report_delivery_success(self, monkeypatch, tmp_path):
-        """A mailbox directory that fails the private-directory check (here:
-        pre-existing with permissive 0755 permissions) must be reported as a
-        temporary failure, never as `sent` — a silently swallowed write
-        failure would look like a delivered password reset or verification
-        email that the recipient never gets."""
+        """Mailbox write failure does not report delivery success."""
         mailbox = tmp_path / "mailbox"
         mailbox.mkdir(mode=0o755)
         monkeypatch.setattr(settings, "dev_mailbox_dir", str(mailbox))
@@ -406,13 +336,8 @@ class TestSecurityEmailAuditAttribution:
     """`_send_security_email` attributes failure without leaking the address."""
 
     def test_failure_emits_hashed_audit_event(self, caplog):
-        """A non-sent `DeliveryResult` makes `_send_security_email` emit an
-        audit-channel 'security_email_failed' record carrying the
-        email_type tag and a keyed recipient_hash — and never the raw
-        address (SIEM operators must not be able to harvest addresses from
-        logs).
-        """
-        raw_email = "victim@uzh.ch"
+        """Failure emits hashed audit event."""
+        raw_email = "victim@example.org"
         failure = email_module.DeliveryResult(
             status="temporary_failure", reason="smtp_transport_error"
         )
@@ -435,22 +360,18 @@ class TestSecurityEmailAuditAttribution:
         assert record.event_type == "security_email_failed"
         assert record.email_type == "password_reset"
         assert record.recipient_hash == audit_email_hash(raw_email)
-        # The raw address must not leak through ANY field of the record.
         for key, value in vars(record).items():
             assert raw_email not in str(value), f"raw email leaked via record.{key}"
 
     def test_success_emits_no_audit_error(self, caplog):
-        """A sent `DeliveryResult` passes through unchanged and stays silent
-        on the audit channel (no false alarms for the SIEM to page on) —
-        the positive control for the failure case above.
-        """
+        """Return successful delivery unchanged without emitting an audit error."""
         sent = email_module.DeliveryResult(status="sent", reason="smtp_accepted")
         with (
             patch("app.services.email.send_email", autospec=True) as send_mock,
             caplog.at_level(logging.ERROR, logger="audit"),
         ):
             send_mock.return_value = sent
-            result = _send_security_email("password_reset", "a@uzh.ch", "s", "b")
+            result = _send_security_email("password_reset", "a@example.org", "s", "b")
 
         assert result.status == "sent"
         assert [r for r in caplog.records if r.name == "audit"] == []
@@ -460,19 +381,26 @@ class TestMessageBuilders:
     """Builder bodies carry their link, absolute expiry, and scoped recipient."""
 
     def test_password_reset_email_body_has_link_and_absolute_expiry(self):
-        """The rendered reset email contains its link and signed expiry."""
-        link = "http://127.0.0.1:5000/reset-password/tok-xyz789"
+        """The reset email has a public link and a separately entered security code."""
+        token = "reset-capability-canary.for-mail.7f8120"
+        link = f"http://127.0.0.1:5000{action_token_url('/reset-password', token)}"
 
         email = build_password_reset_email(
-            "alice@uzh.ch",
+            "alice@example.org",
             link,
             expires_at=datetime(2030, 1, 1, 12, 0, tzinfo=UTC),
+            security_code=token,
         )
 
         assert email.message_type == "password_reset"
-        assert email.recipient == "alice@uzh.ch"
+        assert email.recipient == "alice@example.org"
         assert "Password Reset" in email.subject
         assert link in email.body
+        target = urlsplit(link)
+        assert token not in link
+        assert not target.query and not target.fragment
+        assert token_from_action_email(email.body, link) == token
+        assert "copy this code into the form, then submit" in email.body
         assert "expires at 2030-01-01 12:00:00 UTC" in email.body
         assert "expires in" not in email.body
 
@@ -480,139 +408,116 @@ class TestMessageBuilders:
         """The notice targets only the already-registered address — the
         single designed channel that confirms account existence.
         """
-        email = build_duplicate_registration_notice("existing@uzh.ch")
+        email = build_duplicate_registration_notice("existing@example.org")
 
         assert email.message_type == "duplicate_registration_notice"
-        assert email.recipient == "existing@uzh.ch"
+        assert email.recipient == "existing@example.org"
         assert "already have an account" in email.subject
         assert f"{settings.public_base_url}/login" in email.body
         assert f"{settings.public_base_url}/forgot-password" in email.body
 
     def test_verification_email_body_has_link_expiry_and_reaper_notice(self):
         """The rendered verification email contains all operational details."""
-        link = "https://archive.example/verify-email/tok123"
+        token = "verification-capability-canary.for-mail.9c4301"
+        link = f"https://archive.example{action_token_url('/verify-email', token)}"
 
         email = build_verification_email(
-            "newcomer@uzh.ch",
+            "newcomer@example.org",
             link,
             expires_at=datetime(2030, 1, 1, 12, 0, tzinfo=UTC),
+            security_code=token,
         )
 
         assert email.message_type == "email_verification"
-        assert email.recipient == "newcomer@uzh.ch"
+        assert email.recipient == "newcomer@example.org"
         assert "Verify your email" in email.subject
         assert link in email.body
+        target = urlsplit(link)
+        assert token not in link
+        assert not target.query and not target.fragment
+        assert token_from_action_email(email.body, link) == token
+        assert "copy this code into the form, then submit" in email.body
         assert "expires at 2030-01-01 12:00:00 UTC" in email.body
         assert "expires in" not in email.body
         assert str(settings.unverified_reap_after_days) in email.body
 
 
+@pytest.mark.parametrize(
+    ("builder", "flow"),
+    [
+        (email_module.build_password_reset_email, "/reset-password"),
+        (email_module.build_verification_email, "/verify-email"),
+        (email_module.build_email_change_verification, "/account/confirm-email"),
+    ],
+)
+class TestActionEmailCodeContract:
+    """Require a separate nonempty security code in action-email builders."""
+
+    def test_security_code_is_required(self, builder, flow):
+        """Security code is required."""
+        link = f"https://archive.example.org{action_token_url(flow, 'required-code')}"
+        with pytest.raises(TypeError, match="security_code"):
+            builder("recipient@example.org", link, expires_at=datetime(2030, 1, 1, tzinfo=UTC))
+
+    @pytest.mark.parametrize("code", [None, "", " ", "\t\r\n", "\u2003", 1, False, b"code", [], {}])
+    def test_invalid_security_code_is_rejected(self, builder, flow, code):
+        """Invalid security code is rejected."""
+        link = f"https://archive.example.org{action_token_url(flow, 'required-code')}"
+        with pytest.raises(ValueError, match=r"^Action email requires a nonempty security code$"):
+            builder(
+                "recipient@example.org",
+                link,
+                expires_at=datetime(2030, 1, 1, tzinfo=UTC),
+                security_code=code,
+            )
+
+    def test_valid_security_code_is_preserved_separately(self, builder, flow):
+        """Valid security code is preserved separately."""
+        code = "Exact-action_code.signed-7f81"
+        link = f"https://archive.example.org{action_token_url(flow, code)}"
+        message = builder(
+            "recipient@example.org",
+            link,
+            expires_at=datetime(2030, 1, 1, tzinfo=UTC),
+            security_code=code,
+        )
+        assert code not in link
+        assert f"\n\nSecurity code:\n\n{code}\n\n" in message.body
+        assert token_from_action_email(message.body, link) == code
+
+
 class TestAddressNormalization:
-    """`normalize_email` — the single normalization point for stored addresses.
-
-    Pins `app.services.email_utils.normalize_email`, the helper that
-    registration, password-reset and login now all call instead of each
-    carrying its own inline `email_validator.validate_email(...)` block.
-    Its whole reason to exist is that `.strip().lower()` is NOT a safe
-    stand-in: `email_validator` also does Unicode normalization (NFC) on the
-    local/domain parts, so two visually identical addresses typed in
-    different Unicode forms must collapse to the same stored/looked-up
-    string. Losing that behavior in a future simplification would silently
-    reopen a bug where a user who registers with one Unicode form of their
-    address and later logs in with an equally valid other form gets
-    rejected, because a naive lowercase-only comparison sees two different
-    strings.
-
-    Pure unit tier: no DB, no client, no network — `check_deliverability=False`
-    keeps `email_validator` fully offline.
-    """
+    """`normalize_email` — the single normalization point for stored addresses."""
 
     def test_valid_mixed_case_address_is_lowercased_and_normalized(self):
-        """A syntactically valid, mixed-case address comes back fully
-        lowercased. This is the common case every registration/login
-        submission hits; losing the casing rule would make email-based
-        lookups miss on any address that wasn't already all-lowercase in
-        storage.
-        """
+        """A syntactically valid, mixed-case address comes back fully lowercased."""
         assert normalize_email("User@Example.COM") == "user@example.com"
 
     def test_invalid_input_returns_none_never_raises(self):
-        """Syntactically invalid input yields None, never a raised exception.
-
-        Every caller (register/login/password-reset) treats None as "reject
-        the form input" without a try/except of its own, so a raised
-        EmailNotValidError here would surface as an unhandled 500 at each
-        call site.
-
-        Positive control: "not-an-email" (no @) and "" (empty) are
-        unambiguous garbage. "a@b" is a domain-shape negative — verified by
-        running the helper directly against the installed email_validator:
-        it rejects a single-label domain (no dot, so no discoverable TLD)
-        with EmailNotValidError, distinct from "a@b.c" which email_validator
-        DOES accept (single-character TLDs are syntactically legal) and is
-        used below as that assertion's positive control.
-        """
+        """Return None for the parametrized syntactically invalid addresses."""
         assert normalize_email("not-an-email") is None
         assert normalize_email("") is None
         assert normalize_email("a@b") is None
-        # Positive control: same shape, minimal-but-present TLD label -> valid.
         assert normalize_email("a@b.c") == "a@b.c"
 
     def test_idn_unicode_forms_normalize_to_the_same_stable_string(self):
-        """NFC and NFD spellings of the same Unicode email collapse identically.
+        """NFC and NFD spellings of the same Unicode email collapse identically."""
+        base = "u@exämple.com"
+        nfc_form = unicodedata.normalize("NFC", base)
+        nfd_form = unicodedata.normalize("NFD", base)
+        assert nfc_form != nfd_form
 
-        This is the concrete case that justifies the helper's existence over
-        plain `.strip().lower()`: the letter a-with-diaeresis can be encoded
-        either as one precomposed codepoint (NFC) or as "a" plus a separate
-        combining-diaeresis codepoint (NFD). Both spellings are the same
-        email address to a human and to any mail system, but `str.lower()`
-        alone would leave them as two different Python strings, breaking a
-        DB lookup keyed on the stored (registration) form when a user later
-        logs in with the other form.
-
-        The two input forms are built via unicodedata.normalize rather than
-        typed as two source literals: a source file (and most tools in a
-        write pipeline) can silently coerce typed Unicode to one canonical
-        form, which would make "two forms" collapse into the same string by
-        accident and defeat the point of the test.
-
-        Expected value computed by running normalize_email() directly
-        against the installed email_validator (not asserted structurally) so
-        this test pins the actual behavior of the dependency, not an
-        assumption about it; a dependency upgrade that changes the
-        normalized form will legitimately fail this test and must be
-        re-verified deliberately.
-        """
-        base = "u@exämple.com"  # domain contains a-with-diaeresis
-        nfc_form = unicodedata.normalize("NFC", base)  # precomposed ä
-        nfd_form = unicodedata.normalize("NFD", base)  # "a" + combining ̈
-        assert nfc_form != nfd_form  # distinct Python strings going in
-
-        expected = "u@exämple.com"  # verified: email_validator's NFC output
+        expected = "u@exämple.com"
         assert normalize_email(nfc_form) == expected
         assert normalize_email(nfd_form) == expected
 
     def test_idempotent_for_a_valid_address(self):
-        """Re-normalizing an already-normalized address is a no-op.
-
-        Callers may pass a value through the helper more than once across a
-        multi-step flow (e.g. validate on submit, then again on confirm);
-        the helper must be a stable fixed point, not something that keeps
-        mutating its own output.
-        """
+        """Re-normalizing an already-normalized address is a no-op."""
         raw = "User@Example.COM"
         once = normalize_email(raw)
         twice = normalize_email(once)
         assert once == twice == "user@example.com"
 
     def test_reexport_from_services_package_is_the_same_object(self):
-        """`app.services.normalize_email` is the identical function object as
-        `app.services.email_utils.normalize_email`, not a copy or wrapper.
-
-        Callers import it via `from app.services import normalize_email`,
-        and a future refactor that shadows/rebinds the name at the package
-        level (rather than re-exporting the real thing) would desync
-        behavior between the two import paths without any test noticing
-        unless identity is checked directly.
-        """
+        """Re-export the identical normalize_email function from app.services."""
         assert reexported_normalize_email is normalize_email

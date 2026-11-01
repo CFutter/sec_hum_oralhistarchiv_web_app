@@ -1,6 +1,6 @@
 # Run after stopping web/scheduler and reviewing the installed release. The
-# oneshot holds an exclusive deployment flock and waits for shared holders;
-# unlike installer acquisition, it is not nonblocking. It loads only migration.env
+# oneshot holds an exclusive deployment flock and waits at most 60 seconds for
+# shared holders. It loads only migration.env
 # and requires ENV_STATE=production. See Deployment.md for grants/verification.
 [Unit]
 Description=Oral History Archive — reviewed database migration
@@ -13,12 +13,13 @@ Before=oralhistarchiv.service oralhistarchiv-scheduler.service
 Type=oneshot
 User=oralhistarchiv-migrate
 Group=oralhistarchiv-migrate
+SupplementaryGroups=oralhistarchiv-deploy-lock
 UMask=0077
 WorkingDirectory=/opt/oralhistarchiv
 EnvironmentFile=/etc/oralhistarchiv/migration.env
 ExecStartPre=/usr/bin/test ${ENV_STATE} = production
 UnsetEnvironment=PYTHONPATH PYTHONHOME VIRTUAL_ENV RATE_LIMIT_REDIS_URL RATE_LIMIT_MONITOR_REDIS_URL
-ExecStart=/usr/bin/flock --exclusive --no-fork /run/lock/oralhistarchiv-deploy.lock /opt/oralhistarchiv/.venv/bin/python -I /opt/oralhistarchiv/deploy/migrate_release.py
+ExecStart=/usr/bin/flock --exclusive --timeout 60 --conflict-exit-code 75 --no-fork /run/lock/oralhistarchiv-deploy.lock /opt/oralhistarchiv/.venv/bin/python -I /opt/oralhistarchiv/deploy/migrate_release.py
 SyslogIdentifier=oralhistarchiv-migrate
 StandardOutput=journal
 StandardError=journal

@@ -7,19 +7,26 @@ unhandled storage failures propagate.
 """
 
 import logging
-import math
+from typing import Annotated
 from urllib.parse import urlencode
 
+from email_validator import EmailNotValidError, validate_email
 from fastapi import Form, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from psycopg_pool import AsyncConnectionPool
+from pydantic import AfterValidator
 
-from ...credentials import LOCAL_EMAIL_MAX_CHARS
+from app.service_errors import UserNotFound
+from app.sources import AccessTier
+
+from ...credentials import LOCAL_EMAIL_MAX_CHARS, TOTP_CODE_RAW_MAX_CHARS
+from ...federation_contract import EMAIL_MAX_LENGTH as FEDERATED_EMAIL_MAX_CHARS
+from ...federation_contract import ISSUER_MAX_LENGTH, REVIEW_REVISION_MAX, SUBJECT_MAX_LENGTH
 from ...jinja_helpers import url_for_query
 from ...middleware import clear_session_cookie, limiter
+from ...reason_contracts import require_reason_coverage
 from ...route_security import RouteAccess, SecureAPIRouter
 from ...services import (
-    AccessTier,
     AdminActionRejected,
     AdminEmailChangeRejected,
     AdminPromotionRejected,
@@ -28,7 +35,9 @@ from ...services import (
     audit_admin_action,
     audit_email_hash,
     cancel_admin_promotion,
+    get_user_by_email,
     list_admin_promotion_states,
+    list_federated_reviews,
     list_users,
     request_admin_promotion,
     set_flash_if_exists,
@@ -37,9 +46,11 @@ from ...services import (
     stage_admin_email_change,
     update_access_tier,
 )
+from ...services.email_change import AdminEmailChangeReason
 from ...services.totp_recover import (
     TOTP_RECOVERY_AUTHORIZATION_MAX_AGE_SECONDS,
     TotpRecoveryRejected,
+    TotpRecoveryRejectionReason,
     TotpRecoveryTarget,
     authorize_totp_recovery,
     get_totp_recovery_target,
@@ -54,12 +65,14 @@ routers = (router,)
 _PAGE_SIZE_OPTIONS = (5, 10, 20, 50)
 _DEFAULT_PAGE_SIZE = 20
 _MAX_PAGE = 10_000
+_ADMIN_LOOKUP_EMAIL_MAX_CHARS = max(LOCAL_EMAIL_MAX_CHARS, FEDERATED_EMAIL_MAX_CHARS)
 
 _ADMIN_EMAIL_CHANGE_ERRORS = {
     "invalid_email": "Invalid email address.",
     "user_not_found": "User not found.",
     "federated_account": "Cannot change email for a federated account.",
     "inactive_account": "Activate the account before changing its email.",
+    "self_change": "Use Change Email on your account page to change your own email.",
     "same_email": "That is already the user's email.",
     "email_in_use": "That email is already in use.",
 }
@@ -86,6 +99,10 @@ _TOTP_RECOVERY_ERRORS = {
         "Wait for the next code and try again."
     ),
 }
+
+
+require_reason_coverage(AdminEmailChangeReason, _ADMIN_EMAIL_CHANGE_ERRORS)
+require_reason_coverage(TotpRecoveryRejectionReason, _TOTP_RECOVERY_ERRORS)
 
 
 def _clamp_page_size(page_size: int) -> int:
@@ -121,28 +138,69 @@ async def _admin_redirect(
     )
 
 
+def _normalize_admin_lookup_email(value: str) -> str:
+    """Return stripped/lowercase SMTPUTF8-capable email, or empty text for blank input.
+
+    Skip DNS checks; raise ValueError for invalid or over-320-character addresses.
+    """
+    value = value.strip()
+    if not value:
+        return ""
+    try:
+        normalized = validate_email(
+            value, check_deliverability=False, allow_smtputf8=True
+        ).normalized.lower()
+    except EmailNotValidError as exc:
+        raise ValueError("Enter a valid email address") from exc
+    if len(normalized) > _ADMIN_LOOKUP_EMAIL_MAX_CHARS:
+        raise ValueError("Enter a valid email address")
+    return normalized
+
+
 @router.get("", response_class=HTMLResponse)
 async def admin_dashboard(
     request: Request,
     page: int = Query(default=1, ge=1, le=_MAX_PAGE),
     page_size: int = Query(default=_DEFAULT_PAGE_SIZE),
+    email: Annotated[
+        str,
+        Query(max_length=_ADMIN_LOOKUP_EMAIL_MAX_CHARS),
+        AfterValidator(_normalize_admin_lookup_email),
+    ] = "",
 ) -> Response:
-    """Render users and promotion states; redirect empty later pages to the last page.
+    """Render a bounded user list or one exact-email lookup with account actions.
 
-    page_size accepts 5/10/20/50, otherwise 20. The computed last-page count is
-    not capped to the route's 10,000-page input limit.
+    page_size accepts 5/10/20/50, otherwise 20. Exact lookups bypass the
+    numbered window and use page 1; existing action redirects return to the
+    ordinary list. Empty later list pages redirect within the supported window.
     """
     page_size = _clamp_page_size(page_size)
     pool = request.app.state.db_pool
-    users, total = await list_users(pool, page=page, page_size=page_size)
+    if email:
+        target = await get_user_by_email(pool, email)
+        users = [target] if target is not None else []
+        total = len(users)
+        page = 1
+    else:
+        users, total = await list_users(pool, page=page, page_size=page_size)
+
+    actual_total_pages = max(1, (total + page_size - 1) // page_size)
+    total_pages = min(actual_total_pages, _MAX_PAGE)
+    if not users and page > 1:
+        # The fallback count may observe new rows after the empty-page query.
+        return_page = total_pages if total_pages < page else 1
+        return RedirectResponse(url_for_query(request, page=return_page), status_code=303)
+
     promotion_states = await list_admin_promotion_states(
         pool,
         [user.id for user in users],
     )
-    total_pages = max(1, math.ceil(total / page_size))
-    if not users and page > 1:
-        return RedirectResponse(url_for_query(request, page=total_pages), status_code=303)
-    return templates.TemplateResponse(
+    federated_reviews = (
+        await list_federated_reviews(pool, user_ids=[user.id for user in users])
+        if any(user.auth_method == "shibboleth" for user in users)
+        else {}
+    )
+    response = templates.TemplateResponse(
         request,
         "admin.html",
         {
@@ -152,16 +210,22 @@ async def admin_dashboard(
             "total_pages": total_pages,
             "page_size": page_size,
             "page_size_options": _PAGE_SIZE_OPTIONS,
+            "lookup_email": email,
+            "email_max_chars": _ADMIN_LOOKUP_EMAIL_MAX_CHARS,
+            "window_limited": actual_total_pages > _MAX_PAGE,
+            "max_numbered_pages": _MAX_PAGE,
             "admin_promotion_states": promotion_states,
+            "federated_reviews": federated_reviews,
         },
     )
+    return _no_store(response)
 
 
 def _no_store(response: Response) -> Response:
-    """Set no-store/no-cache/no-referrer headers on and return the same response."""
+    """Keep responses uncached and limit referrers to the origin."""
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Referrer-Policy"] = "strict-origin"
     return response
 
 
@@ -279,18 +343,18 @@ async def admin_totp_recovery_page(
 async def admin_authorize_totp_recovery(
     request: Request,
     user_id: int,
-    admin_totp_code: str = Form(..., max_length=16),
+    admin_totp_code: str = Form(..., max_length=TOTP_CODE_RAW_MAX_CHARS),
     confirm_reset: bool = Form(default=False),
     page: int = Form(default=1, ge=1, le=_MAX_PAGE),
     page_size: int = Form(default=_DEFAULT_PAGE_SIZE),
 ) -> Response:
-    """Authorize target recovery after confirmation and fresh admin TOTP.
+    """Authorize recovery with confirm_reset and fresh administrator TOTP.
 
-    No plaintext target code is produced. Missing consent or expected proof
-    failures render 422; decryption failure renders 503. Invalid/exhausted actor
-    sessions clear cookies and redirect to login; other target/lock rejections
-    redirect with feedback. Success audits and redirects to the dashboard after
-    services.authorize_totp_recovery commits its reset/revocation.
+    No target plaintext code is produced. Missing consent/proof/target-policy
+    refusals render 422; unreadable administrator TOTP renders 503. Invalid/
+    exhausted authority clears cookies and redirects to login; preliminary
+    ineligible/missing targets and account lockout redirect with dashboard flash.
+    Success audits after reset/revocation commit and redirects 303 to dashboard.
     """
     pool = request.app.state.db_pool
     actor = request.state.user
@@ -429,13 +493,14 @@ async def admin_authorize_totp_recovery(
 async def admin_approve_federated(
     request: Request,
     user_id: int,
-    expected_issuer: str = Form(..., max_length=2048),
-    expected_subject_id: str = Form(..., max_length=512),
+    expected_issuer: str = Form(..., max_length=ISSUER_MAX_LENGTH),
+    expected_subject_id: str = Form(..., max_length=SUBJECT_MAX_LENGTH),
+    expected_review_revision: int = Form(..., ge=1, le=REVIEW_REVISION_MAX),
     access_tier: AccessTier = Form(...),
     page: int = Form(default=1, ge=1, le=_MAX_PAGE),
     page_size: int = Form(default=_DEFAULT_PAGE_SIZE),
 ) -> Response:
-    """Approve the exact reviewed issuer/subject/tier through approve_federated_user.
+    """Approve the exact identity and proposal revision through approve_federated_user.
 
     Audit success and redirect with feedback; policy or missing-target errors
     also redirect without approval.
@@ -449,6 +514,7 @@ async def admin_approve_federated(
             user_id,
             expected_issuer=expected_issuer,
             expected_subject_id=expected_subject_id,
+            expected_review_revision=expected_review_revision,
             access_tier=access_tier,
             actor_id=request.state.user.id,
             actor_session_id=session_id,
@@ -461,7 +527,7 @@ async def admin_approve_federated(
             page=page,
             page_size=page_size,
         )
-    except ValueError:
+    except UserNotFound:
         return await _admin_redirect(
             pool,
             session_id,
@@ -474,15 +540,17 @@ async def admin_approve_federated(
         level=logging.INFO,
         request=request,
         event_type="admin_federated_user_approved",
-        target_user_id=approved.id,
+        target_user_id=approved.user.id,
         old_value="pending",
         new_value="approved",
-        access_tier=approved.access_tier,
+        access_tier=approved.user.access_tier,
+        proposed_tier=approved.proposed_tier,
+        proposed_rule=approved.proposed_rule,
     )
     return await _admin_redirect(
         pool,
         session_id,
-        f"Federated identity approved at tier '{approved.access_tier}'.",
+        f"Federated identity approved at tier '{approved.user.access_tier}'.",
         "success",
         page=page,
         page_size=page_size,
@@ -530,7 +598,7 @@ async def admin_set_active(
             page=page,
             page_size=page_size,
         )
-    except ValueError:
+    except UserNotFound:
         return await _admin_redirect(
             pool, session_id, "User not found.", page=page, page_size=page_size
         )
@@ -616,7 +684,7 @@ async def admin_set_tier(
             page=page,
             page_size=page_size,
         )
-    except ValueError:
+    except UserNotFound:
         return await _admin_redirect(
             pool, session_id, "User not found.", page=page, page_size=page_size
         )
@@ -739,7 +807,7 @@ async def admin_set_admin(
             page=page,
             page_size=page_size,
         )
-    except ValueError:
+    except UserNotFound:
         return await _admin_redirect(
             pool, session_id, "User not found.", page=page, page_size=page_size
         )
@@ -833,8 +901,9 @@ async def admin_change_email(
 ) -> Response:
     """Stage an active local target's email change using current administrator authority.
 
-    Self-change is allowed without password proof. Queue confirmation to the new
-    address and notice to the old one; only the confirmation POST changes email.
+    Self-change requires the separate password/TOTP-protected account flow.
+    Queue confirmation to the new address and notice to the old one; only the
+    confirmation POST changes email.
     Audit address hashes and redirect with feedback; expected actor/target
     rejections also redirect. A mistyped address is not proof of ownership.
     """

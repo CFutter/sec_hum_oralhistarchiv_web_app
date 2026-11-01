@@ -1,27 +1,20 @@
-"""Integration tests: the service-level lockout contract against the real
-database.
-
-Covers `verify_password`'s PasswordCheck contract (user, password_ok,
-locked_until, failure_reason, auth_revision), the verify_dummy timing
-equalization on every non-success path, the dummy-only verify on locked
-accounts, the transparent rehash upgrade, and `record_login_failure`'s
-threshold/transition behaviour. The same contract observed through HTTP is
-covered in `test_login_lockout_routes_db.py`.
-"""
+"""Integration tests: the service-level lockout contract against the real database."""
 
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import psycopg
+import pyotp
 import pytest
 from argon2 import PasswordHasher
 from starlette.concurrency import run_in_threadpool as real_run_in_threadpool
 
 from app.routes.auth.login import _record_failure_and_queue_notice
-from app.services import authentication, password_reset, users
+from app.services import authentication, password_reset, password_verification, users
 from app.services.authentication import record_login_failure, verify_password
 from app.services.db import get_db_cursor
 from app.services.tokens import hash_token
+from app.services.totp_crypto import encrypt_value
 from config import settings
 from tests.integration.conftest import DEFAULT_PASSWORD
 
@@ -36,6 +29,7 @@ def _user_lock_state(sync_conn, user_id):
 
 
 def _set_locked_until(sync_conn, user_id, dt):
+    """Set the user's lock deadline and commit."""
     sync_conn.execute("UPDATE users SET locked_until = %s WHERE id = %s", (dt, user_id))
     sync_conn.commit()
 
@@ -58,11 +52,7 @@ class TestPasswordCheckOutcomes:
         assert check.auth_revision is not None
 
     async def test_wrong_password_returns_user_for_failure_recording(self, db_pool, user_factory):
-        """Wrong password -> (user, False, None, "wrong_password") with user
-        NON-None. The PasswordCheck design point: the route needs the user id
-        to record the failure. Also pins that argon2's VerifyMismatchError was
-        CAUGHT inside verify_password (argon2 raises, it never returns
-        False) — a leak here would 500 the login route."""
+        """Verify wrong password returns user for failure recording."""
         u = user_factory()
         check = await verify_password(db_pool, u.email, "definitely-not-the-password")
 
@@ -146,13 +136,7 @@ class TestPasswordCheckOutcomes:
         failure_reason,
         auth_revision,
     ):
-        """Every non-success branch of verify_password (unknown email,
-        Shibboleth account, inactive account, an unparseable hash) still runs
-        verify_dummy — the user-enumeration timing guard, asserted by CALL
-        (spy on verify_dummy) rather than wall-clock. Losing the dummy verify
-        on any of these branches would reopen the enumeration oracle, and for
-        the corrupt-hash branch a shifted argon2 exception hierarchy that let
-        it escape would also 500 the login route."""
+        """Verify rejected password check runs dummy verify for timing parity."""
         u = user_factory(**factory_kwargs) if factory_kwargs is not None else None
         real = authentication.verify_dummy
         with patch(
@@ -179,15 +163,12 @@ class TestPasswordCheckOutcomes:
 
 
 class TestLockedAccountPasswordCheck:
+    """Check locked Account Password Check."""
+
     async def test_locked_account_rejects_correct_password_using_dummy_hash_only(
         self, db_pool, user_factory, sync_conn
     ):
-        """A currently locked account rejects EVEN the correct password,
-        returns locked_until non-None, and the REAL hash is never
-        Argon2-verified — every _ph.verify call on the locked path uses
-        _DUMMY_HASH only. Guards the lockout-check ordering inside the
-        consolidated function (locked must short-circuit before the real
-        verify)."""
+        """Verify locked account rejects correct password using dummy hash only."""
         u = user_factory()
         lock_expiry = datetime.now(UTC) + timedelta(minutes=15)
         _set_locked_until(sync_conn, u.id, lock_expiry)
@@ -195,11 +176,16 @@ class TestLockedAccountPasswordCheck:
         calls = []
 
         async def recording(func, *args, **kwargs):
+            """Record password-work invocation arguments and delegate to the real threadpool
+            helper.
+            """
             calls.append((func, args))
             return await real_run_in_threadpool(func, *args, **kwargs)
 
         with patch(
-            "app.services.authentication.run_password_work", autospec=True, side_effect=recording
+            "app.services.password_verification.run_password_work",
+            autospec=True,
+            side_effect=recording,
         ):
             check = await verify_password(db_pool, u.email, DEFAULT_PASSWORD)
 
@@ -218,21 +204,18 @@ class TestLockedAccountPasswordCheck:
         ]
         assert verify_calls, "dummy verify must run on the locked path (timing parity)"
         for args in verify_calls:
-            assert args[0] == authentication._DUMMY_HASH, (
+            assert args[0] == password_verification._DUMMY_HASH, (
                 "real password hash was Argon2-verified on the locked path"
             )
 
 
 class TestLockoutThreshold:
+    """Check lockout Threshold."""
+
     async def test_lockout_engages_exactly_at_threshold_and_does_not_refire(
         self, db_pool, user_factory, sync_conn
     ):
-        """The NEGATIVE side of the threshold. Existing tests prove locking
-        AT 3 failures; nothing proves NOT locked at 2. A `>=` -> `>` drift in
-        record_login_failure's CASE weakens lockout by one attempt with no
-        test turning red. The tail also pins that just_locked fires EXACTLY
-        once — a `==` -> `>=` drift re-fires the account_locked audit event
-        and the locked-notice email on every further attempt."""
+        """Verify lockout engages exactly at threshold and does not refire."""
         u = user_factory()
         threshold = settings.login_failure_threshold  # 3 in the test env
 
@@ -261,11 +244,7 @@ class TestLockoutThreshold:
     async def test_a_failure_arriving_while_the_account_is_locked_changes_nothing(
         self, db_pool, user_factory, sync_conn
     ):
-        """Attempts that land while the lock is live must leave both the
-        counter and the expiry exactly where the locking failure left them.
-        Incrementing would silently deepen the streak, and rewriting the
-        expiry would let an attacker keep the owner locked out indefinitely
-        by guessing once per window."""
+        """Verify a failure arriving while the account is locked changes nothing."""
         threshold = settings.login_failure_threshold
         user = user_factory(failed_login_count=threshold - 1)
 
@@ -318,12 +297,13 @@ class TestLockoutThreshold:
 
 
 class TestPasswordHashInvariants:
+    """Check password Hash Invariants."""
+
     async def test_local_account_password_hash_cannot_be_null(self, db_pool, user_factory):
-        """The verify_password NULL-hash branch is UNREACHABLE for local
-        accounts because a DB CHECK constraint (users_local_password_required)
-        forbids that state. Pin the constraint itself — it is what keeps a
-        local login from ever reaching a NULL-hash ambiguity. A migration
-        that drops it would make this test the tripwire."""
+        """Active local accounts require a password; inactive, unverified,
+        nonadministrator registration shells may remain passwordless.
+        The inactive-account guard rejects those shells before hash verification.
+        """
         u = user_factory()
 
         with pytest.raises(psycopg.errors.CheckViolation, match="local_password_required"):
@@ -382,21 +362,16 @@ class TestStaleFailureAfterRecovery:
     async def test_obsolete_password_failures_cannot_relock_recovered_accounts(
         self, db_pool, sync_conn, user_factory, admin_actor, monkeypatch, recovery, broken_hash
     ):
-        """A failure captured against auth_revision 0 is recorded AFTER the
-        account was already recovered (revision bumped to 1): the CAS in
-        record_login_failure_cur must see the mismatch and discard the
-        failure entirely — failed_login_count and locked_until stay at
-        their recovered values, auth_revision is left at 1 (not
-        incremented again), and no lockout notice is queued for a
-        credential state the account no longer has."""
-        token_hash = hash_token("reset-token")
-        columns = {
-            "password_reset_token_hash": token_hash,
-            "password_reset_created_at": datetime.now(UTC),
-        }
+        """Verify obsolete password failures cannot relock recovered accounts."""
+        secret = pyotp.random_base32()
+        columns = {"totp_secret": encrypt_value(secret)}
         if broken_hash:
             columns["password_hash"] = "unusable-hash"
         user = user_factory(**columns)
+        token = password_reset.generate_reset_token(user.id, user.email)
+        await password_reset.store_reset_token_hash(
+            db_pool, user.id, hash_token(token), expected_email=user.email
+        )
         monkeypatch.setattr(settings, "login_failure_threshold", 1)
         check = await authentication.verify_password(db_pool, user.email, "wrong-password")
         assert check.password_ok is False
@@ -406,9 +381,10 @@ class TestStaleFailureAfterRecovery:
             await password_reset.update_password_with_token(
                 db_pool,
                 user.id,
-                token_hash,
+                token,
                 "Fresh-Password-Without-Common-Words-824!",
                 expected_email=user.email,
+                totp_code=pyotp.TOTP(secret).now(),
             )
         else:
             await users.set_user_active(
@@ -428,7 +404,9 @@ class TestStaleFailureAfterRecovery:
         ).fetchone() == (1, 0, None)
         assert (
             sync_conn.execute(
-                "SELECT count(*) FROM email_outbox WHERE user_id = %s", (user.id,)
+                "SELECT count(*) FROM email_outbox "
+                "WHERE user_id = %s AND message_type = 'account_locked_notice'",
+                (user.id,),
             ).fetchone()[0]
             == 0
         )

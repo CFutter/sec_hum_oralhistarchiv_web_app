@@ -1,0 +1,18 @@
+# Explicit test-owned OAI configuration. Tests control the transport.
+
+[[sources]]
+name = "swissubase"
+adapter = "oai_pmh_cmdi"
+label = "SWISSUbase"
+resource_link_label = "Access dataset on SWISSUbase"
+landing_link_label = "View on SWISSUbase"
+endpoint = "https://www.swissubase.ch/oai-pmh/v1/oai"
+institution_filter = "Universität Beispielstadt"
+# Serving tests seed mixed record tiers; this source permits public metadata.
+# Stricter source policies are selected explicitly by the tests exercising them.
+max_visibility = "public"
+requires_record_tier = false
+incremental_interval_seconds = 3600
+rebuild_interval_seconds = 86400
+write_timeout_seconds = 120
+max_pages = 500

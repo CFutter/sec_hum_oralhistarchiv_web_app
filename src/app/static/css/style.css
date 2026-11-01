@@ -1,9 +1,5 @@
-/* ============================================================
-   Digital Oral History Archive — Stylesheet
-   Mirrors the UZH Oral History Guide design language.
-   ============================================================ */
+/* Shared catalogue and account styles. */
 
-/* ── Variables ────────────────────────────────────────────── */
 
 :root {
   --blue: #0028a5;
@@ -19,7 +15,6 @@
 }
 
 
-/* ── Fonts ────────────────────────────────────────────── */
 
 @font-face {
   font-family: 'Source Sans 3';
@@ -54,7 +49,6 @@
 }
 
 
-/* ── Reset & Base ─────────────────────────────────────────── */
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -85,7 +79,6 @@ code {
 }
 
 
-/* ── Layout ───────────────────────────────────────────────── */
 
 .container {
   max-width: 64rem;
@@ -96,7 +89,6 @@ code {
 .site-main { flex: 1; }
 
 
-/* ── Header ───────────────────────────────────────────────── */
 
 .site-header {
   background: var(--blue);
@@ -139,7 +131,6 @@ code {
 .nav-link.active { color: white !important; background: rgba(255,255,255,0.15); }
 
 
-/* ── Footer ───────────────────────────────────────────────── */
 
 .site-footer {
   background: var(--blue);
@@ -163,7 +154,6 @@ code {
 .footer-right a:hover { color: white; }
 
 
-/* ── Hero (Home) ──────────────────────────────────────────── */
 
 .hero {
   background: linear-gradient(135deg, #0028a5 0%, #001d7a 100%);
@@ -231,7 +221,6 @@ code {
 .hero-search button:hover { background: var(--blue-pale); }
 
 
-/* ── Stats Row ────────────────────────────────────────────── */
 
 .stats-row {
   display: flex;
@@ -264,7 +253,6 @@ code {
 }
 
 
-/* ── Section Headings & CTA ───────────────────────────────── */
 
 .section-heading {
   font-size: 1.25rem;
@@ -278,7 +266,6 @@ code {
 }
 
 
-/* ── Dataset Cards (desktop grid) ───────────────────────── */
 
 .card-grid {
   display: grid;
@@ -366,7 +353,6 @@ code {
   margin-bottom: 1.5rem;
 }
 
-/* ── Buttons ──────────────────────────────────────────────── */
 
 .btn {
   display: inline-block;
@@ -387,7 +373,6 @@ code {
 .btn-primary:hover { background: var(--blue-hover); }
 
 
-/* ── Search Page ──────────────────────────────────────────── */
 
 .search-header { margin-bottom: 1.5rem; }
 .search-header h1 { font-size: 1.6rem; margin-bottom: 0.75rem; }
@@ -431,7 +416,6 @@ code {
 }
 
 
-/* ── Filters ──────────────────────────────────────────────── */
 
 .filters {
   background: var(--surface);
@@ -488,7 +472,6 @@ code {
 }
 
 
-/* ── Search Results ───────────────────────────────────────── */
 
 .results-meta {
   font-size: 0.85rem;
@@ -554,7 +537,6 @@ code {
 }
 .results-empty strong { color: var(--text); }
 
-/* Pagination */
 .pagination {
   display: flex;
   align-items: center;
@@ -594,7 +576,6 @@ code {
 }
 
 
-/* ── Detail Page ──────────────────────────────────────────── */
 
 .back-link {
   display: inline-block;
@@ -642,7 +623,6 @@ code {
   color: var(--text);
 }
 
-/* Files table */
 .files-table-wrap { overflow-x: auto; margin-top: 0.5rem; }
 .files-table {
   width: 100%;
@@ -682,7 +662,6 @@ code {
 .file-type-badge.data { background: var(--blue-pale); color: var(--blue); }
 .file-type-badge.document { background: #e8f5e9; color: #2e7d32; }
 
-/* Author lines (cards + results) */
 .card-authors,
 .result-authors {
   font-size: 0.85rem;
@@ -726,7 +705,6 @@ code {
 }
 
 
-/* ── About Page ───────────────────────────────────────────── */
 
 .about-page h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
 .about-intro {
@@ -799,9 +777,17 @@ code {
   border-radius: 3px;
 }
 .status-badge.active { background: #e8f5e9; color: #2e7d32; }
+.status-badge.pending {
+  background: var(--blue-pale);
+  color: var(--blue);
+}
+
+.status-badge.degraded {
+  background: #fff3e0;
+  color: #8a4300;
+}
 .status-badge.planned { background: var(--blue-pale); color: var(--blue); }
 
-/* ── Error Page ──────────────────────────────────────────── */
 
 .error-page {
   text-align: center;
@@ -814,16 +800,13 @@ code {
 }
 
 
-/* ── Responsive ───────────────────────────────────────────── */
 
-/* Tablet */
 @media (max-width: 900px) {
   .card-grid { grid-template-columns: 1fr 1fr; }
   .detail-layout { grid-template-columns: 1fr; }
   .about-grid { grid-template-columns: 1fr; }
 }
 
-/* Mobile: cards become list items */
 @media (max-width: 640px) {
   .hero { padding: 2.5rem 1rem; }
   .hero h1 { font-size: 1.6rem; }
@@ -871,7 +854,6 @@ code {
 
   .footer-inner { flex-direction: column; gap: 0.75rem; text-align: center; }
 
-  /* Auth pages — mobile */
   .auth-page { padding-top: 0.5rem; }
   .totp-setup { flex-direction: column; align-items: center; }
   .totp-qr { text-align: center; }
@@ -879,7 +861,6 @@ code {
   .detail-restricted { padding: 1.5rem 1rem; }
 }
 
-/* ── Auth Navigation ─────────────────────────────────── */
 
 .nav-user {
   color: rgba(255,255,255,0.85);
@@ -900,23 +881,22 @@ code {
   margin-left: 0.15rem;
 }
 
-/* ── Auth Pages (Login / Register / Account) ─────────── */
 
 .auth-page {
-  max-width: 480px;  /* slightly narrower than about-intro's 580px for form focus */
+  max-width: 480px;  /* Keep forms visually focused. */
   margin: 0 auto;
   padding-top: 1rem;
 }
 
 .auth-page h1 {
-  font-size: 1.8rem;  /* matches about-page h1, detail-header h1 */
+  font-size: 1.8rem;
   margin-bottom: 0.5rem;
 }
 
 .auth-intro {
   font-size: 1rem;
   color: var(--text-muted);
-  line-height: 1.65;  /* matches about-intro */
+  line-height: 1.65;
   margin-bottom: 2rem;
 }
 
@@ -950,7 +930,6 @@ code {
   line-height: 1.5;
 }
 
-/* Wraps each auth method (institutional / local) in a card */
 .auth-section {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -960,7 +939,7 @@ code {
 }
 
 .auth-section h2 {
-  font-size: 1.1rem;  /* matches detail-main h2, about-card h2 */
+  font-size: 1.1rem;
   margin-bottom: 0.5rem;
   color: var(--text);
 }
@@ -981,7 +960,7 @@ code {
   font-size: 0.82rem;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;  /* matches stat-label */
+  letter-spacing: 0.06em;
 }
 
 .auth-divider::before,
@@ -1007,7 +986,6 @@ code {
   color: var(--blue-hover);
 }
 
-/* ── Auth Forms ──────────────────────────────────────── */
 
 .auth-form {
   display: flex;
@@ -1026,7 +1004,7 @@ code {
   font-size: 0.78rem;
   color: var(--text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.04em;  /* matches meta-list dt */
+  letter-spacing: 0.04em;
 }
 
 .form-group input {
@@ -1075,7 +1053,6 @@ code {
   margin-bottom: 0.75rem;
 }
 
-/* Submit buttons inherit .btn .btn-primary but need full width in forms */
 .auth-form .btn-primary {
   width: 100%;
   text-align: center;
@@ -1113,7 +1090,6 @@ code {
 }
 
 
-/* ── TOTP Setup ──────────────────────────────────────── */
 
 .totp-setup {
   display: flex;
@@ -1161,7 +1137,6 @@ code {
 }
 
 
-/* ── Account Page ────────────────────────────────────── */
 
 .account-card {
   background: var(--surface);
@@ -1193,7 +1168,6 @@ code {
   gap: 0.75rem;
 }
 
-/* ── Admin Page ────────────────────────────────────── */
 .admin-page {
   max-width: 1100px;
 }
@@ -1215,6 +1189,14 @@ code {
   text-align: left;
   border-bottom: 1px solid var(--border, #e0e0e0);
   white-space: nowrap;
+}
+
+
+.admin-table td.federated-tier-review {
+  white-space: normal;
+  min-width: 18rem;
+  max-width: 28rem;
+  overflow-wrap: anywhere;
 }
 
 .admin-table th {
@@ -1336,7 +1318,6 @@ code {
   color: #666;
 }
 
-/* ── Restricted Content (search results + detail) ────── */
 
 .result-restricted {
   font-size: 0.85rem;
@@ -1346,7 +1327,7 @@ code {
   padding: 0.6rem 0.85rem;
   background: var(--bg);
   border-radius: var(--radius);
-  border-left: 3px solid #e65100;  /* matches .card-access.restricted color */
+  border-left: 3px solid #e65100;
 }
 
 .result-restricted a {
@@ -1393,4 +1374,86 @@ code {
 .detail-restricted a:not(.btn) {
   color: var(--blue);
   font-weight: 500;
+}
+
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.card-access.vetted {
+  background: #fff3e0;
+  color: #9a3412;
+}
+
+.badge-inactive {
+  display: inline-block;
+  padding: 0.1rem 0.4rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.recovery-code-list {
+  display: grid;
+  gap: 0.5rem;
+  margin: 1rem 0;
+  padding-left: 1.5rem;
+}
+
+.recovery-code-list li {
+  min-width: 0;
+}
+
+.recovery-code-list code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.admin-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.page-size {
+  display: inline-block;
+  min-width: 2.5rem;
+  padding: 0.3rem 0.6rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  text-align: center;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+a.page-size:hover {
+  background: var(--blue-pale);
+  border-color: var(--blue-light);
+}
+
+a.page-size:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 3px;
+}
+
+.page-size.active {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: white;
 }

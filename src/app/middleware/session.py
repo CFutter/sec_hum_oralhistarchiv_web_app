@@ -14,12 +14,12 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from app.duration_contract import validate_session_max_age_seconds
 from config import settings
 
 from ..exceptions import UserFacingForbidden
 from ..services import consume_flash, get_session_user, restore_flash_if_empty
 from .cookies import SESSION_SIGNER, get_session_id_from_cookie
-from .csrf import CSRF_COOKIE_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,28 @@ _TOTP_RECOVERY_ROUTE_KEYS = frozenset(
         ("POST", "/logout"),
     }
 )
+
+
+def get_resolved_session_id(request: Request) -> str | None:
+    """Return the resolved authority token, or None for completed anonymous resolution.
+
+    Raise RuntimeError for incomplete resolution or a nonstring token; never
+    reparse browser cookies. Protected handlers must run after resolution.
+    """
+    if getattr(request.state, "session_resolution_completed", False) is not True:
+        raise RuntimeError("Session resolution must complete before reading session authority")
+    session_id = request.state.session_id
+    if session_id is not None and not isinstance(session_id, str):
+        raise RuntimeError("Resolved session ID has an invalid type")
+    return session_id
+
+
+def require_resolved_session_id(request: Request) -> str:
+    """Return the resolved token; raise RuntimeError for incomplete or anonymous resolution."""
+    session_id = get_resolved_session_id(request)
+    if not session_id:
+        raise RuntimeError("Protected route reached without a resolved session ID")
+    return session_id
 
 
 def _skip_session_resolution(request: Request) -> bool:
@@ -67,11 +89,12 @@ class SessionResolutionMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        """Resolve user/purpose/token/flash state unless the request is exempt.
+        """Initialize session state, resolve eligible cookies/users and consume GET flash.
 
-        Redirect recovery sessions outside setup/logout to /setup-totp. Consume
-        flash on GET and restore it if downstream redirects and no newer flash
-        exists. Do not delete stale browser cookies on passive responses.
+        Skip DB-free/unmatched requests with resolution left incomplete. Return 400
+        for ambiguous cookies and redirect confined recovery sessions to /setup-totp.
+        Restore consumed flash after redirects if no newer flash exists. Database
+        errors propagate; passive responses never delete browser session cookies.
         """
         request.state.user = None
         request.state.session_purpose = None
@@ -83,7 +106,14 @@ class SessionResolutionMiddleware(BaseHTTPMiddleware):
         if _skip_session_resolution(request):
             return await call_next(request)
 
-        session_id = get_session_id_from_cookie(request)
+        try:
+            session_id = get_session_id_from_cookie(request)
+        except HTTPException as error:
+            return Response(
+                "Ambiguous security cookies.",
+                status_code=error.status_code,
+                headers={"Cache-Control": "no-store"},
+            )
         if session_id:
             pool = request.app.state.db_pool
             user, purpose, flash_present = await get_session_user(pool, session_id)
@@ -144,12 +174,14 @@ def set_session_cookie(
     """Set a signed HttpOnly, SameSite=Strict root-path session cookie.
 
     Secure follows COOKIES_SECURE. None max_age_seconds uses the configured
-    session age; nonpositive ages raise ValueError. Does not create a DB session.
+    session age. Require an integer lifetime of 60..31536000 seconds before
+    signing or setting a cookie; invalid ages raise ValueError.
+    Does not create a DB session.
     """
+    max_age = validate_session_max_age_seconds(
+        settings.session_max_age_seconds if max_age_seconds is None else max_age_seconds
+    )
     signed_value = SESSION_SIGNER.dumps(session_id)
-    max_age = settings.session_max_age_seconds if max_age_seconds is None else max_age_seconds
-    if max_age <= 0:
-        raise ValueError("Session cookie max age must be positive")
 
     response.set_cookie(
         key=settings.session_cookie_name,
@@ -163,15 +195,19 @@ def set_session_cookie(
 
 
 def clear_session_cookie(response: Response) -> None:
-    """Expire browser session and CSRF cookies; this does not revoke the database session."""
-    response.delete_cookie(
-        key=settings.session_cookie_name,
-        path="/",
-    )
-    response.delete_cookie(
-        key=CSRF_COOKIE_NAME,
-        path="/",
-    )
+    """Expire all active browser security cookies without revoking database state."""
+    for name in (
+        settings.session_cookie_name,
+        settings.csrf_cookie_name,
+        settings.pre_session_cookie_name,
+    ):
+        response.delete_cookie(
+            key=name,
+            path="/",
+            secure=settings.cookies_secure,
+            httponly=True,
+            samesite="strict",
+        )
 
 
 def setup_session_middleware(app: FastAPI) -> None:
@@ -253,9 +289,7 @@ def require_full_session(request: Request) -> None:
 
 
 def require_public_or_full_session(request: Request) -> None:
-    """Allow guests; present users must satisfy require_full_session
-    and may receive its redirects/errors.
-    """
+    """Allow guests; require full-session authority for present users, propagating refusals."""
     if request.state.user is not None:
         require_full_session(request)
 

@@ -1,26 +1,12 @@
-"""Unit tests for the pending-secret half of app.services.totp:
+"""Contract tests for TOTP pending secret issuance."""
 
-`get_or_create_pending_totp_secret` (atomic read-check-write of the
-enrollment/recovery pending secret) and `get_pending_totp_secret` (the
-read-only redisplay path), plus the session-purpose helpers they both use.
-
-Both entry points lock the user row FOR UPDATE and must reject every
-ineligible account state, and every mismatched or expired authorizing
-session, before ever generating or displaying secret material. Each
-rejection test below has a positive control in the same class proving the
-permitted case still reaches (and returns) the pending secret.
-
-Pure unit tests: no DB. `get_db_cursor` is patched with an async context
-manager over a mock cursor (tests.fixtures.make_async_cursor /
-FakeCursorCtx), matching the idiom in test_totp.py and test_credential_budgets.py.
-"""
-
+from datetime import UTC, datetime, timedelta
 from unittest.mock import create_autospec, patch
 
 import pytest
 
 import app.services.totp as totp_module
-from app.services.crypto import decrypt_value, encrypt_value
+from app.services.session_ids import hash_session_id
 from app.services.totp import (
     PendingTotpOutcome,
     PendingTotpPurpose,
@@ -29,15 +15,22 @@ from app.services.totp import (
     get_or_create_pending_totp_secret,
     get_pending_totp_secret,
 )
-from app.services.totp_recovery_codes import PendingRecoveryCodeSet
+from app.services.totp_crypto import decrypt_value, encrypt_value
+from app.services.totp_recovery_codes import (
+    PendingRecoveryCodeSet,
+    generate_recovery_codes,
+    stage_recovery_code_set_cur,
+)
 from tests.fixtures import FakeCursorCtx, make_async_cursor, make_mock_pool
 
+DATABASE_NOW = datetime(2031, 1, 1, tzinfo=UTC)
 USER_ID = 501
 SESSION_ID = "pending-secret-authorizing-session"
 FIXED_CODES = tuple(f"CODE{i}-GROUP{i}-VALUE{i}" for i in range(10))
 
 
 def _user_row(**overrides) -> dict[str, object]:
+    """Build an eligible user with no pending TOTP seed and caller field overrides."""
     row = {
         "is_active": True,
         "auth_method": "local",
@@ -45,19 +38,18 @@ def _user_row(**overrides) -> dict[str, object]:
         "totp_secret": None,
         "totp_recovery_required": False,
         "pending_totp_secret": None,
-        "pending_is_current": False,
+        "pending_totp_created_at": None,
+        "pending_totp_session_hash": hash_session_id(SESSION_ID),
     }
     row.update(overrides)
     return row
 
 
 def _patched_recovery_codes(generation: int = 9):
-    """Isolate get_or_create_pending_totp_secret from totp_recovery_codes internals."""
-    generate = create_autospec(
-        totp_module.generate_recovery_codes, return_value=FIXED_CODES, spec_set=True
-    )
+    """Build signature-checked doubles from the recovery-code service definitions."""
+    generate = create_autospec(generate_recovery_codes, return_value=FIXED_CODES, spec_set=True)
     stage = create_autospec(
-        totp_module.stage_recovery_code_set_cur,
+        stage_recovery_code_set_cur,
         return_value=PendingRecoveryCodeSet(generation=generation, codes=FIXED_CODES),
         spec_set=True,
     )
@@ -73,17 +65,19 @@ class TestSessionPurposeMatching:
         ids=["full_session_authorizes_enrollment", "totp_setup_session_authorizes_enrollment"],
     )
     def test_enrollment_purpose_accepts_full_and_totp_setup_sessions(self, session_purpose):
+        """Check enrollment purpose accepts full and TOTP setup sessions."""
         assert _session_purpose_matches(session_purpose, PendingTotpPurpose.ENROLLMENT) is True
 
     def test_enrollment_purpose_rejects_a_recovery_session(self):
-        """Positive control above: a recovery-scoped session must not double as enrollment authority."""
+        """Check enrollment purpose rejects a recovery session."""
         assert _session_purpose_matches("totp_recovery", PendingTotpPurpose.ENROLLMENT) is False
 
     def test_recovery_purpose_accepts_only_a_totp_recovery_session(self):
+        """Check recovery purpose accepts only a TOTP recovery session."""
         assert _session_purpose_matches("totp_recovery", PendingTotpPurpose.RECOVERY) is True
 
     def test_recovery_purpose_rejects_a_full_session(self):
-        """Positive control above: an ordinary full session cannot authorize recovery."""
+        """Check recovery purpose rejects a full session."""
         assert _session_purpose_matches("full", PendingTotpPurpose.RECOVERY) is False
 
     def test_unhandled_pending_purpose_raises_value_error(self):
@@ -96,20 +90,30 @@ class TestLockAuthorizingSessionCur:
     """`_lock_authorizing_session_cur`: the FOR UPDATE session lookup both callers share."""
 
     async def test_locks_and_accepts_a_live_session_with_the_matching_purpose(self):
-        cur = make_async_cursor(fetchone={"purpose": "full"})
+        """Check locks and accepts a live session with the matching purpose."""
+        cur = make_async_cursor(
+            fetchone=[
+                {
+                    "purpose": "full",
+                    "last_activity_at": DATABASE_NOW,
+                    "expires_at": DATABASE_NOW + timedelta(hours=1),
+                },
+                {"database_now": DATABASE_NOW},
+            ]
+        )
         matched = await _lock_authorizing_session_cur(
             cur,
             user_id=USER_ID,
             session_id=SESSION_ID,
             pending_purpose=PendingTotpPurpose.ENROLLMENT,
         )
-        assert matched is True
-        statement, params = cur.execute.await_args.args
+        assert matched == DATABASE_NOW
+        statement, params = cur.execute.await_args_list[0].args
         assert "FOR UPDATE" in statement
         assert params[1] == USER_ID
 
     async def test_missing_session_row_is_rejected(self):
-        """Positive control above: the same helper accepts a live session with the right purpose."""
+        """Check missing session row is rejected."""
         cur = make_async_cursor(fetchone=None)
         matched = await _lock_authorizing_session_cur(
             cur,
@@ -117,7 +121,7 @@ class TestLockAuthorizingSessionCur:
             session_id=SESSION_ID,
             pending_purpose=PendingTotpPurpose.ENROLLMENT,
         )
-        assert matched is False
+        assert matched is None
 
 
 class TestGetOrCreatePendingTotpSecretEligibility:
@@ -133,6 +137,7 @@ class TestGetOrCreatePendingTotpSecretEligibility:
         ids=["no_such_user", "inactive_account", "non_local_auth_method"],
     )
     async def test_account_gate_rejects_before_any_purpose_check(self, row):
+        """Check account gate rejects before any purpose check."""
         cur = make_async_cursor(fetchone=row)
         acquire = create_autospec(
             totp_module.get_db_cursor, return_value=FakeCursorCtx(cur), spec_set=True
@@ -156,6 +161,7 @@ class TestGetOrCreatePendingTotpSecretEligibility:
         ids=["enrollment_requires_verified_email", "enrollment_blocked_during_active_recovery"],
     )
     async def test_enrollment_purpose_rejects_ineligible_local_accounts(self, row):
+        """Check enrollment purpose rejects ineligible local accounts."""
         cur = make_async_cursor(fetchone=row)
         acquire = create_autospec(
             totp_module.get_db_cursor, return_value=FakeCursorCtx(cur), spec_set=True
@@ -171,8 +177,7 @@ class TestGetOrCreatePendingTotpSecretEligibility:
         assert cur.execute.await_count == 1
 
     async def test_enrollment_purpose_reports_already_configured(self):
-        """Positive control lives in TestGetOrCreatePendingTotpSecretReuseAndFallback below:
-        an eligible, unenrolled account reaches secret issuance."""
+        """Check enrollment purpose reports already configured."""
         row = _user_row(totp_secret=encrypt_value("EXISTING"))
         cur = make_async_cursor(fetchone=row)
         acquire = create_autospec(
@@ -202,6 +207,7 @@ class TestGetOrCreatePendingTotpSecretEligibility:
         ],
     )
     async def test_recovery_purpose_rejects_ineligible_accounts(self, row):
+        """Check recovery purpose rejects ineligible accounts."""
         cur = make_async_cursor(fetchone=row)
         acquire = create_autospec(
             totp_module.get_db_cursor, return_value=FakeCursorCtx(cur), spec_set=True
@@ -217,6 +223,7 @@ class TestGetOrCreatePendingTotpSecretEligibility:
         assert cur.execute.await_count == 1
 
     async def test_unhandled_purpose_raises_value_error_after_the_account_gate(self):
+        """Check unhandled purpose raises value error after the account gate."""
         cur = make_async_cursor(fetchone=_user_row())
         acquire = create_autospec(
             totp_module.get_db_cursor, return_value=FakeCursorCtx(cur), spec_set=True
@@ -237,6 +244,7 @@ class TestGetOrCreatePendingTotpSecretSessionAuthorization:
     """An eligible account still needs its exact authorizing session to be live."""
 
     async def test_session_expired_returns_session_expired_without_writing_a_secret(self):
+        """Check session expired returns session expired without writing a secret."""
         cur = make_async_cursor(fetchone=[_user_row(), None])
         acquire = create_autospec(
             totp_module.get_db_cursor, return_value=FakeCursorCtx(cur), spec_set=True
@@ -254,8 +262,18 @@ class TestGetOrCreatePendingTotpSecretSessionAuthorization:
         assert not any(statement.strip().startswith("UPDATE") for statement in statements)
 
     async def test_live_authorizing_session_allows_secret_issuance(self):
-        """Positive control above: the same eligible account with a live session proceeds."""
-        cur = make_async_cursor(fetchone=[_user_row(), {"purpose": "full"}])
+        """Check live authorizing session allows secret issuance."""
+        cur = make_async_cursor(
+            fetchone=[
+                _user_row(),
+                {
+                    "purpose": "full",
+                    "last_activity_at": DATABASE_NOW,
+                    "expires_at": DATABASE_NOW + timedelta(hours=1),
+                },
+                {"database_now": DATABASE_NOW},
+            ]
+        )
         acquire = create_autospec(
             totp_module.get_db_cursor, return_value=FakeCursorCtx(cur), spec_set=True
         )
@@ -279,12 +297,23 @@ class TestGetOrCreatePendingTotpSecretReuseAndFallback:
     """A current, decryptable pending secret is reused; anything else is replaced."""
 
     async def test_current_decryptable_pending_secret_is_reused_without_a_write(self):
+        """Check current decryptable pending secret is reused without a write."""
         existing_secret = "EXISTINGSECRETVALUE"
         row = _user_row(
             pending_totp_secret=encrypt_value(existing_secret),
-            pending_is_current=True,
+            pending_totp_created_at=DATABASE_NOW,
         )
-        cur = make_async_cursor(fetchone=[row, {"purpose": "full"}])
+        cur = make_async_cursor(
+            fetchone=[
+                row,
+                {
+                    "purpose": "full",
+                    "last_activity_at": DATABASE_NOW,
+                    "expires_at": DATABASE_NOW + timedelta(hours=1),
+                },
+                {"database_now": DATABASE_NOW},
+            ]
+        )
         acquire = create_autospec(
             totp_module.get_db_cursor, return_value=FakeCursorCtx(cur), spec_set=True
         )
@@ -304,22 +333,28 @@ class TestGetOrCreatePendingTotpSecretReuseAndFallback:
         assert result.outcome is PendingTotpOutcome.READY
         assert result.secret == existing_secret
         assert result.recovery_codes == FIXED_CODES
-        # Only the two reads (user row, session row) happen — no UPDATE regenerates the secret.
-        assert cur.execute.await_count == 2
+        assert cur.execute.await_count == 3
         statements = [str(call.args[0]).upper() for call in cur.execute.await_args_list]
         assert not any(statement.strip().startswith("UPDATE") for statement in statements)
         stage.assert_awaited_once_with(cur, user_id=USER_ID, codes=FIXED_CODES)
 
     async def test_undecryptable_pending_secret_is_replaced_rather_than_raising(self):
-        """A corrupted/mis-keyed pending secret fails closed by regenerating, not by
-        raising TotpDecryptionError — that fail-closed contract is reserved for the
-        *active* secret (verify_and_consume_totp_cur), not the not-yet-trusted pending one.
-        """
+        """Check undecryptable pending secret is replaced rather than raising."""
         row = _user_row(
             pending_totp_secret="not-a-valid-fernet-token",
-            pending_is_current=True,
+            pending_totp_created_at=DATABASE_NOW,
         )
-        cur = make_async_cursor(fetchone=[row, {"purpose": "full"}])
+        cur = make_async_cursor(
+            fetchone=[
+                row,
+                {
+                    "purpose": "full",
+                    "last_activity_at": DATABASE_NOW,
+                    "expires_at": DATABASE_NOW + timedelta(hours=1),
+                },
+                {"database_now": DATABASE_NOW},
+            ]
+        )
         acquire = create_autospec(
             totp_module.get_db_cursor, return_value=FakeCursorCtx(cur), spec_set=True
         )
@@ -347,18 +382,30 @@ class TestGetOrCreatePendingTotpSecretReuseAndFallback:
             for call in cur.execute.await_args_list
             if str(call.args[0]).strip().upper().startswith("UPDATE")
         )
-        new_ciphertext, updated_user_id = update_call.args[1]
+        new_ciphertext, owner_hash, updated_user_id = update_call.args[1]
+        assert owner_hash == hash_session_id(SESSION_ID)
         assert updated_user_id == USER_ID
         assert decrypt_value(new_ciphertext) == "FRESHLYGENERATEDSECRET"
         assert result.recovery_codes == FIXED_CODES
 
     async def test_expired_pending_secret_is_replaced_with_a_freshly_generated_one(self):
+        """Check expired pending secret is replaced with a freshly generated one."""
         row = _user_row(
             totp_recovery_required=True,
             pending_totp_secret=encrypt_value("STALESECRETVALUE"),
-            pending_is_current=False,
+            pending_totp_created_at=DATABASE_NOW - timedelta(seconds=600),
         )
-        cur = make_async_cursor(fetchone=[row, {"purpose": "totp_recovery"}])
+        cur = make_async_cursor(
+            fetchone=[
+                row,
+                {
+                    "purpose": "totp_recovery",
+                    "last_activity_at": DATABASE_NOW,
+                    "expires_at": DATABASE_NOW + timedelta(hours=1),
+                },
+                {"database_now": DATABASE_NOW},
+            ]
+        )
         acquire = create_autospec(
             totp_module.get_db_cursor, return_value=FakeCursorCtx(cur), spec_set=True
         )
@@ -390,6 +437,7 @@ class TestGetPendingTotpSecretStateMatching:
     """
 
     def _row(self, **overrides) -> dict[str, object]:
+        """Build a redisplayable pending-secret row bound to SESSION_ID with caller field overrides."""
         row = {
             "is_active": True,
             "auth_method": "local",
@@ -397,15 +445,23 @@ class TestGetPendingTotpSecretStateMatching:
             "totp_secret": None,
             "totp_recovery_required": False,
             "pending_totp_secret": encrypt_value("REDISPLAYABLESECRET"),
-            "pending_is_current": True,
+            "pending_totp_created_at": DATABASE_NOW,
+            "pending_totp_session_hash": hash_session_id(SESSION_ID),
         }
         row.update(overrides)
         return row
 
     async def _call(self, purpose, row, session_row=None, *, session_missing=False):
+        """Read pending-secret state with scripted account/session rows; return the result and cursor."""
         if session_row is None and not session_missing:
             session_row = {"purpose": "full"}
-        cur = make_async_cursor(fetchone=[row, session_row])
+        if session_row is not None:
+            session_row = {
+                "last_activity_at": DATABASE_NOW,
+                **session_row,
+                "expires_at": DATABASE_NOW + timedelta(hours=1),
+            }
+        cur = make_async_cursor(fetchone=[row, session_row, {"database_now": DATABASE_NOW}])
         acquire = create_autospec(
             totp_module.get_db_cursor, return_value=FakeCursorCtx(cur), spec_set=True
         )
@@ -420,19 +476,17 @@ class TestGetPendingTotpSecretStateMatching:
             None,
             {"is_active": False},
             {"pending_totp_secret": None},
-            {"pending_is_current": False},
+            {"pending_totp_created_at": None},
         ],
         ids=[
             "no_such_user",
             "inactive_account",
             "no_pending_secret_staged",
-            "stale_pending_secret",
+            "missing_pending_timestamp",
         ],
     )
     async def test_account_or_pending_secret_gate_returns_none_before_purpose_checks(self, row):
-        """Positive control below: a live, current pending secret and matching
-        purpose does return the plaintext secret.
-        """
+        """Check account or pending secret gate returns none before purpose checks."""
         full_row = row if row is None else self._row(**row)
         cur = make_async_cursor(fetchone=full_row)
         acquire = create_autospec(
@@ -449,19 +503,20 @@ class TestGetPendingTotpSecretStateMatching:
         assert cur.execute.await_count == 1
 
     async def test_enrollment_purpose_returns_the_secret_for_an_unenrolled_account(self):
+        """Check enrollment purpose returns the secret for an unenrolled account."""
         result, _ = await self._call(PendingTotpPurpose.ENROLLMENT, self._row())
         assert result == "REDISPLAYABLESECRET"
 
     async def test_enrollment_purpose_returns_none_while_recovery_is_required(self):
-        """Positive control above: the same account without recovery pending gets its secret back."""
+        """Check enrollment purpose returns none while recovery is required."""
         result, cur = await self._call(
             PendingTotpPurpose.ENROLLMENT, self._row(totp_recovery_required=True)
         )
         assert result is None
-        # State mismatch is checked before the session lock query is issued.
         assert cur.execute.await_count == 1
 
     async def test_recovery_purpose_returns_the_secret_when_recovery_is_required(self):
+        """Check recovery purpose returns the secret when recovery is required."""
         result, _ = await self._call(
             PendingTotpPurpose.RECOVERY,
             self._row(totp_recovery_required=True),
@@ -470,12 +525,13 @@ class TestGetPendingTotpSecretStateMatching:
         assert result == "REDISPLAYABLESECRET"
 
     async def test_recovery_purpose_returns_none_when_recovery_is_not_required(self):
-        """Positive control above: recovery redisplay succeeds once the flag is actually set."""
+        """Check recovery purpose returns none when recovery is not required."""
         result, cur = await self._call(PendingTotpPurpose.RECOVERY, self._row())
         assert result is None
         assert cur.execute.await_count == 1
 
     async def test_unhandled_purpose_raises_value_error(self):
+        """Check unhandled purpose raises value error."""
         cur = make_async_cursor(fetchone=self._row())
         acquire = create_autospec(
             totp_module.get_db_cursor, return_value=FakeCursorCtx(cur), spec_set=True
@@ -489,9 +545,7 @@ class TestGetPendingTotpSecretStateMatching:
             )
 
     async def test_returns_none_when_the_authorizing_session_is_not_live(self):
-        """Positive control is test_enrollment_purpose_returns_the_secret_for_an_unenrolled_account:
-        state matches there AND the session is live, and the secret comes back.
-        """
+        """Check returns none when the authorizing session is not live."""
         result, cur = await self._call(
             PendingTotpPurpose.ENROLLMENT, self._row(), session_missing=True
         )

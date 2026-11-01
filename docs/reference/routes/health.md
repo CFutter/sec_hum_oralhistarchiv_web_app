@@ -12,6 +12,17 @@
 
 Statement cancellation/diagnostic SQL failure after a successful probe is degraded rather than unhealthy. Inspect the JSON `status` and `checks`, not HTTP alone. No connection-pool internals are returned.
 
+Source diagnostics are grouped under `checks.sources.<name>`, in configuration
+order. Each source reports its own `status`, numeric `harvest_age_seconds` and
+`rebuild_age_seconds` (null when unavailable), and the applicable harvest,
+rebuild, staleness and error fields. Staleness uses twice that source's own
+configured interval. Missing or unreadable state degrades the affected source;
+with the database reachable, any degraded source degrades the overall response.
+
+Only configured source identities are queried. Database and outbox diagnostics
+remain global under `checks.database` and `checks.outbox`. Source-specific
+fields previously at the root of `checks` now belong to their source object.
+
 Outbox diagnostics include live pending/sending ages, overdue retention, and recent terminal delivery/body-decryption failures. `counts_capped_at=1000` means a count of 1,000 is a lower bound; ages remain exact. The 24-hour failure window is an alert window, not proof older failures were repaired. Ordinary cancellation/supersession/unused-token expiry is not delivery failure; expiry after a failed delivery attempt is.
 
 ::: app.routes.health

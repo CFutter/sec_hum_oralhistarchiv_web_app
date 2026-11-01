@@ -1,24 +1,20 @@
 {% extends "base.html" %}
 {% set active_page = "" %}
-{% block title %}Confirm Email Change — Oral History Archive{% endblock %}
+{% block title %}Confirm Email Change — {{ site_name }}{% endblock %}
 
 {% block content %}
 <section class="container auth-page">
 
   <h1>Confirm Email Change</h1>
   <p class="auth-intro">
-    {% if is_admin_initiated %}
-    An administrator requested to change the email address on your account to:
-    {% else %}
-    You requested to change the email address on your account to:
-    {% endif %}
+    Confirm the email-address change requested in the email that brought you here.
+    Submitting this form proves access to the requested new mailbox.
   </p>
 
-  <p class="auth-intro"><strong>{{ new_email }}</strong></p>
 
   <div class="auth-section">
     <form class="auth-form" action="{{ path_for(request, 'confirm_email_submit') }}" method="post">
-      <input type="hidden" name="token" value="{{ token }}">
+      {% include "action_token_fields.html" %}
       <button type="submit" class="btn btn-primary">Confirm Change</button>
     </form>
     <p class="auth-link"><a href="{{ path_for(request, 'account_page') }}">Cancel</a></p>

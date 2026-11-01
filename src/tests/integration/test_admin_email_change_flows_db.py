@@ -1,35 +1,21 @@
-"""Administrator-initiated email-change confirmation — real PostgreSQL, real routes, real services.
-
-Covers the acting_admin_id variant of POST /account/confirm-email
-(src/app/routes/auth/email_change.py) against src/app/services/email_change.py:
-the distinct audit event, the previously-unverified-account interaction, and
-the bystander-admin session-cookie boundary.
-
-Confirmation is staged directly through the service so each test controls
-the exact signed token under test. The self-service staging and confirmation
-flows live in test_email_change_flows_db.py and
-test_email_change_confirmation_db.py; delivery to SMTP and enqueue-failure
-rollback live in test_email_change_delivery_db.py.
-"""
+"""Administrator-initiated email-change confirmation — real PostgreSQL, real routes, real services."""
 
 import logging
 
 import pyotp
 from fastapi import status
 
-from app.services.crypto import encrypt_value
 from app.services.db import get_db_cursor
 from app.services.email_change import generate_email_change_token, store_pending_email
-from app.services.tokens import hash_token
+from app.services.tokens import action_token_public_id, hash_token
+from app.services.totp_crypto import encrypt_value
 from config import settings
 from tests.integration.conftest import DEFAULT_PASSWORD, do_login
 
-NEW_EMAIL = "new@uzh.ch"
+NEW_EMAIL = "new@example.org"
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_totp_user(user_factory, **overrides):
@@ -57,12 +43,14 @@ def _pending_state(sync_conn, user_id):
 
 
 def _session_count(sync_conn, user_id):
+    """Count stored sessions for the user, including expired rows."""
     return sync_conn.execute(
         "SELECT COUNT(*) FROM sessions WHERE user_id = %s", (user_id,)
     ).fetchone()[0]
 
 
 def _audit_events(caplog, event_type):
+    """Select the requested audit event from captured log records."""
     return [
         r
         for r in caplog.records
@@ -96,12 +84,12 @@ async def _stage_via_service(db_pool, user_id, new_email, acting_admin_id=None):
     return token
 
 
-# ---------------------------------------------------------------------------
 # Confirmation of an administrator-staged change
-# ---------------------------------------------------------------------------
 
 
 class TestAdminInitiatedConfirmation:
+    """Check admin Initiated Confirmation."""
+
     async def test_admin_initiated_confirm_logs_admin_audit_event(
         self, e2e_client, db_pool, user_factory, sync_conn, caplog
     ):
@@ -116,7 +104,7 @@ class TestAdminInitiatedConfirmation:
         with caplog.at_level(logging.INFO, logger="audit"):
             resp = e2e_client.post(
                 "/account/confirm-email",
-                data={"token": token},
+                data={"token": token, "public_id": action_token_public_id(token)},
                 follow_redirects=False,
             )
         assert resp.status_code == status.HTTP_303_SEE_OTHER
@@ -133,13 +121,7 @@ class TestAdminInitiatedConfirmation:
     async def test_admin_confirm_verifies_previously_unverified_account(
         self, e2e_client, db_pool, user_factory, sync_conn
     ):
-        """An admin stages an email change for an UNVERIFIED
-        account (e.g. the user mistyped their address at signup and can't receive
-        the verification mail). Clicking the confirm link — sent to the NEW
-        address — proves control of it, so confirm_email_change sets
-        email_verified=true and clears the stale verification-token columns bound
-        to the old address: the account must not commit the new email while
-        staying unverified and unable to log in."""
+        """Verify admin confirm verifies previously unverified account."""
         target = user_factory(email_verified=False)
         admin = user_factory(is_admin=True)
 
@@ -149,7 +131,9 @@ class TestAdminInitiatedConfirmation:
         token = await _stage_via_service(db_pool, target.id, NEW_EMAIL, acting_admin_id=admin.id)
 
         resp = e2e_client.post(
-            "/account/confirm-email", data={"token": token}, follow_redirects=False
+            "/account/confirm-email",
+            data={"token": token, "public_id": action_token_public_id(token)},
+            follow_redirects=False,
         )
         assert resp.status_code == status.HTTP_303_SEE_OTHER
 
@@ -170,16 +154,7 @@ class TestAdminInitiatedConfirmation:
     async def test_bystander_admin_confirming_others_change_keeps_admin_logged_in(
         self, e2e_client, db_pool, user_factory, sync_conn
     ):
-        """The confirm POST clears the
-        session cookie only when `request.state.user.id == data["user_id"]` —
-        the PRESENTING browser's own session must belong to the account whose
-        email just changed. Here an admin who staged an admin-initiated change
-        for a DIFFERENT user submits the confirm from their OWN full session
-        (e.g. testing the link, or simply being the party that clicked it): the
-        target's email still commits and delete_user_sessions(pool, target.id)
-        still tears down the TARGET's sessions, but
-        the admin's own cookie must survive untouched.
-        """
+        """Verify bystander admin confirming others change keeps admin logged in."""
         admin, admin_secret = _make_totp_user(user_factory, is_admin=True)
         _login(e2e_client, admin, admin_secret)
         admin_cookie_before = e2e_client.cookies.get(settings.session_cookie_name)
@@ -189,10 +164,12 @@ class TestAdminInitiatedConfirmation:
         token = await _stage_via_service(db_pool, target.id, NEW_EMAIL, acting_admin_id=admin.id)
 
         resp = e2e_client.post(
-            "/account/confirm-email", data={"token": token}, follow_redirects=False
+            "/account/confirm-email",
+            data={"token": token, "public_id": action_token_public_id(token)},
+            follow_redirects=False,
         )
         assert resp.status_code == status.HTTP_303_SEE_OTHER
-        assert resp.headers["location"] == "/login?email_changed=1"
+        assert resp.headers["location"] == "/login?notice=email_changed"
 
         # No Set-Cookie for the session cookie at all on this response: the
         # mismatch (admin.id != target.id) skips clear_session_cookie entirely,

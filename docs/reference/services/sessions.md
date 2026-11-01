@@ -1,8 +1,10 @@
 # Sessions Service
 
-The signed cookie carries a raw random token; PostgreSQL stores its hash with user, expiry, IP, purpose, and flash state.
+The signed cookie carries a raw random token; PostgreSQL stores its hash with user, absolute expiry, last activity, IP, purpose, and flash state.
 
-`full`, `totp_setup`, and `totp_recovery` are distinct authorities. Exact route policies limit setup sessions. Recovery sessions have an additional middleware restriction to enrollment/logout. Initial enrollment upgrades its exact setup session to full; recovery enrollment deletes sessions and requires a new login.
+`full`, `totp_setup`, and `totp_recovery` are distinct authorities. Exact route policies limit setup sessions. Recovery sessions have an additional middleware restriction to enrollment/logout. Both initial and recovery enrollment delete all sessions and require a new login.
+
+Full sessions expire after thirty minutes without eligible application activity by default. Activity writes are throttled to once per minute and never extend the fixed absolute deadline or revive expiry. Hardened full-session lifetimes are capped at eight hours; setup and recovery sessions are capped at ten minutes.
 
 Federated lookup requires an active approved identity under the live flag and exact issuer allowlist; rejected presented sessions are deleted. Flash helpers consume messages once and preserve them across redirects.
 

@@ -1,18 +1,4 @@
-"""Signed double-submit CSRF — cookie minting middleware + verify_csrf dependency.
-
-Covers src/app/middleware/csrf.py (CSRFCookieMiddleware, verify_csrf,
-_compute_csrf_token) and its cookies.py identifier plumbing, exercised through
-the real middleware stack via the unit-tier TestClient harness.
-
-The property under guard: the CSRF token is HMAC(secret-derived key, identifier)
-— NOT a random value — so (a) the cookie rotates automatically whenever the
-identifier changes (pre-session -> session), and (b) an attacker who can plant
-a matching cookie/form pair but lacks the server secret still fails the HMAC
-recompute (the double-submit-with-HMAC upgrade over plain double-submit).
-
-POST /logout is the probe route for verify_csrf. SecureAPIRouter installs the
-standard mutation chain [validate_form_content_type, verify_csrf].
-"""
+"""Signed double-submit CSRF — cookie minting middleware + verify_csrf dependency."""
 
 import logging
 from unittest.mock import patch
@@ -46,6 +32,7 @@ CONTENT_TYPE_VALUE_CANARY = "CONTENT-TYPE-VALUE-MUST-NOT-ENTER-LOGS"
 
 
 def _both_guard_routes():
+    """List POST routes that require both CSRF verification and a session guard."""
     session_guards = {
         require_full_session,
         require_local_auth,
@@ -84,21 +71,13 @@ def _assert_canary_absent_from_records(caplog, canary: str) -> None:
         assert canary not in repr(record.__dict__)
 
 
-# ---------------------------------------------------------------------------
-# Cookie minting (CSRFCookieMiddleware on GET)
-# ---------------------------------------------------------------------------
-
-
 def test_first_get_mints_pre_session_and_hmac_bound_csrf_cookie(client_builder):
-    """A cookie-less GET mints a pre-session id AND a CSRF cookie, and the
-    CSRF value is exactly HMAC-bound to that fresh pre-session id — not an
-    independent random token. Guards the binding invariant the whole scheme
-    rests on (csrf.py dispatch: new_pre_session -> _compute_csrf_token)."""
+    """Check first GET mints pre session and HMAC bound CSRF cookie (HTTP 200)."""
     client = client_builder(session_user=None)
     client.cookies.clear()
 
-    # /about is a static, DB-free GET — the middleware minting under test
-    # runs on every GET, and this route keeps the mocked pool untouched.
+    # /about is a public GET whose source diagnostics are mocked by the
+    # client harness; the cookie preparation under test runs on every GET.
     response = client.get("/about")
     assert response.status_code == 200
 
@@ -110,21 +89,18 @@ def test_first_get_mints_pre_session_and_hmac_bound_csrf_cookie(client_builder):
     pre_session_value = _cookie_value(pre_headers[0])
     csrf_value = _cookie_value(csrf_headers[0])
     assert pre_session_value, "pre-session id must be non-empty"
-    # THE binding assertion: cookie == HMAC(key, just-minted pre-session id).
     assert csrf_value == csrf_token_for(pre_session_value)
 
 
 def test_second_get_with_valid_cookies_does_not_remint(client_builder):
-    """Steady state: once the pre-session + matching CSRF cookies exist, a
-    follow-up GET sets NO csrf_token cookie (and no new pre-session). Guards
-    against re-minting on every request, which would break multi-tab forms
-    and hammer Set-Cookie for no reason."""
+    """Steady state: once the pre-session + matching CSRF cookies exist, a follow-up GET sets NO
+    csrf_token cookie (and no new pre-session).
+    """
     client = client_builder(session_user=None)
     client.cookies.clear()
 
     first = client.get("/about")
-    assert _set_cookie_headers(first, CSRF_COOKIE_NAME)  # minted once
-    # TestClient's jar persisted the minted cookies; replay them.
+    assert _set_cookie_headers(first, CSRF_COOKIE_NAME)
     second = client.get("/about")
 
     assert second.status_code == 200
@@ -151,21 +127,13 @@ def test_get_transition_deletes_pre_session_and_rebinds_csrf_to_session_id(
     csrf_headers = _set_cookie_headers(response, CSRF_COOKIE_NAME)
     minted = [h for h in csrf_headers if not _is_deletion(h)]
     assert len(minted) == 1, "expected exactly one CSRF re-mint"
-    # Re-minted token is bound to the session id, not the old pre-session id.
     assert _cookie_value(minted[0]) == csrf_token_for(RAW_SESSION_ID)
 
 
-# ---------------------------------------------------------------------------
-# verify_csrf rejections (POST /logout, guest)
-# ---------------------------------------------------------------------------
-
-
 def test_post_without_csrf_form_field_rejected_403(guest_client, caplog):
-    """POST with a CSRF cookie but no csrf_token form field -> 403 via the
-    presence check (verify_csrf's first gate); the rejection detail moved
-    from the response body to the log when the branded 403 page landed."""
+    """Reject a missing CSRF field with HTTP 403."""
     with caplog.at_level(logging.WARNING, logger="app.middleware.csrf"):
-        response = guest_client.post("/logout", data={"unrelated": "field"})
+        response = guest_client.post("/reset-password", data={"unrelated": "field"})
 
     assert response.status_code == 403
     assert "Request could not be verified" in response.text
@@ -173,13 +141,7 @@ def test_post_without_csrf_form_field_rejected_403(guest_client, caplog):
 
 
 def test_reset_capability_not_logged_when_csrf_rejects(guest_client, caplog):
-    """A still-live form capability token must not escape on a CSRF failure.
-
-    Password reset now posts to a tokenless route. The dependency necessarily
-    parses the form before it locates the missing CSRF field, so this
-    verifies that neither its message nor structured extras retain the reset
-    token.
-    """
+    """A still-live form capability token must not escape on a CSRF failure."""
     with caplog.at_level(logging.WARNING):
         response = guest_client.post(
             "/reset-password",
@@ -207,6 +169,7 @@ def test_csrf_logger_uses_route_template_for_token_path(caplog):
         dependencies=[Depends(verify_csrf)],
     )
     async def csrf_probe(token: str) -> dict[str, str]:
+        """Echo the token only if the installed dependency accepts the request."""
         return {"token": token}
 
     with (
@@ -231,7 +194,7 @@ def test_post_with_cookie_form_mismatch_rejected_403(guest_client, caplog):
     # Cookie half is the fixture's real token bound to GUEST_PRE_SESSION_ID;
     # the form half deliberately disagrees.
     with caplog.at_level(logging.WARNING, logger="app.middleware.csrf"):
-        response = guest_client.post("/logout", data={"csrf_token": "not-the-cookie-value"})
+        response = guest_client.post("/reset-password", data={"csrf_token": "not-the-cookie-value"})
 
     assert response.status_code == 403
     assert "Request could not be verified" in response.text
@@ -239,13 +202,12 @@ def test_post_with_cookie_form_mismatch_rejected_403(guest_client, caplog):
 
 
 def test_post_with_self_minted_matching_pair_rejected_403(guest_client, caplog):
-    """Cookie and form MATCH but carry a value not derived from the server
-    secret -> 403 via the HMAC recompute. This is THE property that upgrades
-    plain double-submit: an attacker who can plant a cookie (e.g. via a
-    subdomain) still cannot forge a passing pair without the secret."""
+    """Cookie and form MATCH but carry a value not derived from the server secret -> 403 via the HMAC
+    recompute.
+    """
     guest_client.cookies.set(CSRF_COOKIE_NAME, BOGUS_TOKEN)
     with caplog.at_level(logging.WARNING, logger="app.middleware.csrf"):
-        response = guest_client.post("/logout", data={"csrf_token": BOGUS_TOKEN})
+        response = guest_client.post("/reset-password", data={"csrf_token": BOGUS_TOKEN})
 
     assert response.status_code == 403
     assert "Request could not be verified" in response.text
@@ -257,11 +219,9 @@ def test_post_with_self_minted_matching_pair_rejected_403(guest_client, caplog):
 
 
 def test_post_with_valid_pair_passes_csrf_as_guest(guest_client):
-    """The real HMAC pair (cookie + form, bound to the guest pre-session)
-    passes verify_csrf: logout proceeds to its 303 redirect. With no session
-    cookie present, get_session_id_from_cookie yields None so delete_session
-    is never awaited — CSRF acceptance, not session teardown, is what this
-    request exercises."""
+    """The real HMAC pair (cookie + form, bound to the guest pre-session) passes verify_csrf: logout
+    proceeds to its 303 redirect.
+    """
     with patch("app.routes.auth.login.delete_session", autospec=True) as mock_delete:
         response = guest_client.post(
             "/logout",
@@ -290,9 +250,9 @@ def test_csrf_login_ordering_surface_is_nonempty():
     ],
 )
 def test_bad_csrf_anonymous_post_is_403_not_redirect(guest_client, path):
-    """An anonymous POST with a bad CSRF token must be rejected by
-    verify_csrf (403), not redirected by the later session-policy dependency.
-    Pins the dependency ordering by its observable effect."""
+    """An anonymous POST with a bad CSRF token must be rejected by verify_csrf (403), not redirected by
+    the later session-policy dependency.
+    """
     resp = guest_client.post(
         path,
         data={"csrf_token": "wrong"},
@@ -302,18 +262,10 @@ def test_bad_csrf_anonymous_post_is_403_not_redirect(guest_client, path):
     assert resp.status_code == 403, f"{path} redirected instead of rejecting CSRF"
 
 
-# ---------------------------------------------------------------------------
-# Authenticated logout with a valid pair
-# ---------------------------------------------------------------------------
-
-
 def test_authenticated_logout_with_valid_pair_deletes_session_and_rotates_cookies(
     authenticated_client,
 ):
-    """Authenticated POST /logout with the valid session-bound pair -> 303,
-    delete_session awaited with (pool, raw session id), and the response
-    expires BOTH the session cookie and the CSRF cookie (rotate on logout, so
-    a stale token cannot straddle the session boundary)."""
+    """Require authenticated logout to revoke the exact session and expire both authentication cookies."""
     with patch("app.routes.auth.login.delete_session", autospec=True) as mock_delete:
         response = authenticated_client.post(
             "/logout",
@@ -333,17 +285,8 @@ def test_authenticated_logout_with_valid_pair_deletes_session_and_rotates_cookie
     assert csrf_headers and all(_is_deletion(h) for h in csrf_headers)
 
 
-# ---------------------------------------------------------------------------
-# Content-type gate ordering
-# ---------------------------------------------------------------------------
-
-
 def test_json_post_rejected_415_before_csrf_runs(authenticated_client):
-    """POST /logout as application/json -> 415, NOT 403: the body carries a
-    perfectly valid csrf_token, so a 403 would mean verify_csrf ran (and
-    failed on the unparseable-as-form body). Getting 415 pins that
-    validate_form_content_type is first in the dependency chain — the
-    cheapest-rejection-first convention on every form POST route."""
+    """Check JSON POST rejected 415 before CSRF runs."""
     response = authenticated_client.post(
         "/logout", json={"csrf_token": authenticated_client.csrf_token}
     )
@@ -371,6 +314,7 @@ def test_content_type_prefix_smuggling_is_rejected_without_logging_value(
         dependencies=[Depends(validate_form_content_type)],
     )
     async def content_type_probe(token: str) -> dict[str, str]:
+        """Echo the token only if the installed dependency accepts the request."""
         return {"token": token}
 
     with (
@@ -403,20 +347,11 @@ def test_form_content_type_parameters_remain_supported(guest_client):
         },
     )
 
-    # Content type passed; the deliberately absent CSRF field is the next gate.
     assert response.status_code == 403
 
 
-# ---------------------------------------------------------------------------
-# Anti-cookie-planting: the session id outranks a planted
-# pre-session for the HMAC recompute (get_current_identifier precedence)
-# ---------------------------------------------------------------------------
-
-
 def test_planted_pre_session_pair_rejected_for_authenticated_user(client_builder, caplog):
-    """An attacker who plants a pre-session id + its matching HMAC token on an
-    AUTHENTICATED victim still fails: get_current_identifier prefers the real
-    session id, so the recompute binds to the session, not the planted id."""
+    """Check planted pre session pair rejected for authenticated user (HTTP 403)."""
     client = client_builder(session_user=make_sample_user())
     planted_id = "attacker-planted-pre-session"
     planted_token = csrf_token_for(planted_id)
@@ -440,9 +375,7 @@ def test_planted_pre_session_pair_rejected_for_authenticated_user(client_builder
 def test_session_bound_pair_still_passes_with_planted_pre_session(
     authenticated_client,
 ):
-    """Positive control for the precedence pin: with the same hostile
-    pre-session cookie planted, the REAL session-bound pair still passes —
-    the defence rejects the attacker's token, not the legitimate user's."""
+    """Check session bound pair still passes with planted pre session (HTTP 303)."""
     authenticated_client.cookies.set(PRE_SESSION_COOKIE_NAME, "attacker-harvested-pre-session")
     session_token = csrf_token_for(RAW_SESSION_ID)
     authenticated_client.cookies.set(CSRF_COOKIE_NAME, session_token)
@@ -455,11 +388,6 @@ def test_session_bound_pair_still_passes_with_planted_pre_session(
         )
     assert response.status_code == 303
     assert response.headers["location"] == "/"
-
-
-# ---------------------------------------------------------------------------
-# Malformed CSRF inputs are a clean 403, never a 500
-# ---------------------------------------------------------------------------
 
 
 def test_multipart_file_csrf_token_is_403_not_500(authenticated_client, caplog):
@@ -481,12 +409,12 @@ def test_missing_identifier_is_403_not_500(client_builder, caplog):
     the identifier lookup returns None and must 403, not NoneType-crash into
     the HMAC recompute."""
     client = client_builder(session_user=None)
-    client.cookies.delete(PRE_SESSION_COOKIE_NAME)  # strip the fixture's guest identifier
+    client.cookies.delete(PRE_SESSION_COOKIE_NAME)
     matching = "a-matching-but-unbindable-token-value"
     client.cookies.set(CSRF_COOKIE_NAME, matching)
 
     with caplog.at_level(logging.WARNING, logger="app.middleware.csrf"):
-        response = client.post("/logout", data={"csrf_token": matching})
+        response = client.post("/reset-password", data={"csrf_token": matching})
 
     assert response.status_code == 403
     assert "Request could not be verified" in response.text
@@ -498,6 +426,7 @@ def test_missing_identifier_is_403_not_500(client_builder, caplog):
 def test_revoked_session_form_roundtrip_uses_surviving_anonymous_cookie(
     guest_client, first_method, has_pre_session
 ):
+    """Check revoked session form roundtrip uses surviving anonymous cookie."""
     from lxml import html  # noqa: PLC0415
 
     from app.services.authentication import PasswordCheck  # noqa: PLC0415
@@ -524,24 +453,26 @@ def test_revoked_session_form_roundtrip_uses_surviving_anonymous_cookie(
             response = guest_client.post(
                 "/login",
                 data={
-                    "email": "nobody@uzh.ch",
+                    "email": "nobody@example.org",
                     "password": "wrong",
                     "csrf_token": csrf_token_for("revoked-session"),
                 },
             )
-            assert response.status_code == 401  # Incoming snapshot was accepted.
+            assert response.status_code == 401
         form_token = html.fromstring(response.text).xpath('//input[@name="csrf_token"]/@value')[0]
         assert settings.session_cookie_name in guest_client.cookies
         identifier = "revoked-session"
         assert form_token == guest_client.cookies[CSRF_COOKIE_NAME] == csrf_token_for(identifier)
         followup = guest_client.post(
-            "/login", data={"email": "nobody@uzh.ch", "password": "wrong", "csrf_token": form_token}
+            "/login",
+            data={"email": "nobody@example.org", "password": "wrong", "csrf_token": form_token},
         )
-        assert followup.status_code == 401  # Valid form, ordinary failed credentials.
+        assert followup.status_code == 401
 
 
 @pytest.mark.parametrize("path", ["/health", "/static/css/style.css"])
 def test_requests_that_skip_session_lookup_cannot_overwrite_form_cookies(guest_client, path):
+    """Check requests that skip session lookup cannot overwrite form cookies (HTTP 200)."""
     guest_client.cookies.clear()
     guest_client.cookies.set(
         settings.session_cookie_name,

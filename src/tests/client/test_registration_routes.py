@@ -1,289 +1,507 @@
-"""Registration, rename and resend-verification routes (client tier).
+"""Email-only requests and mailbox-bound credential setup through real guards."""
 
-Pins, at the route level (real app + middleware, mocked pool):
-
-- A display name with a control character gets a friendly 422 render of
-  register.html, never a 500. Two invariants: `_register_error` must not
-  re-validate the preserved input (the error renderer itself would crash),
-  and the route must catch the plain `ValueError` around
-  `register_local_user`. The route validates up front, before any DB/Argon2 work.
-- Enumeration guard on /register: duplicate and successful registrations have
-  the same client-visible status, rendered body, and lack of Set-Cookie.
-  Their intended database/outbox work and destination-side emails differ, so
-  these tests do not claim equal complete-request latency or identical
-  external side effects.
-- Except-ordering: `UserAlreadyExistsError` is a `ValueError` subclass; the
-  specific handler must stay ordered before `except ValueError` AND the
-  generic handler must still catch plain ValueErrors. Both misorderings are
-  distinguishable and tested.
-- /account/change-name rejects the exact same input through the same
-  `normalize_display_name` gate, surfacing the message as an 'error' flash
-  instead of a 422 page.
-- Enumeration guard on /send_verification: unknown, already-verified,
-  non-local, and eligible unverified-local addresses all return the same
-  status and rendered page. Only the eligible account receives a replacement
-  token and email; these tests therefore do not claim equal request latency
-  or identical email side effects.
-
-Rate-limit budgets: POST /register is 3/minute and POST /send_verification is
-3/hour in the test environment; no test here issues more POSTs than that
-budget allows (the limiter resets between tests).
-"""
-
-from contextlib import asynccontextmanager
-from datetime import UTC, datetime
-from unittest.mock import patch, sentinel
+import json
+import logging
+from unittest.mock import create_autospec, patch
 
 import pytest
-from psycopg_pool import PoolTimeout, TooManyRequests
+from psycopg import Error as DatabaseError
+from psycopg_pool import PoolTimeout
 
-from app.services import UserAlreadyExistsError
-from app.services.password_validation import MIN_PASSWORD_LENGTH
-from app.services.tokens import ActionEmailMetadata
+from app.credentials import LOCAL_PASSWORD_MAX_CHARS
+from app.middleware.csrf import CSRF_COOKIE_NAME
+from app.routes.auth import account, register, verify_email
+from app.service_errors import UserInputRejected, UserStateChanged
+from app.services import registration_setup
+from app.services.audit import audit_user_event as _REAL_AUDIT
+from app.services.sessions import set_flash_if_exists as _REAL_FLASH
+from app.services.tokens import action_token_public_id
+from app.services.users import update_display_name as _REAL_RENAME
 from config import settings
+from config.logging import JSONFormatter, RedactingFormatter
 from tests.fixtures import RAW_SESSION_ID, make_sample_user
 
-# Stable markers for which template actually rendered.
-REGISTER_PAGE_MARKER = "Create Account"  # register.html <h1>
-PENDING_PAGE_MARKER = "Check your email"  # send_verification.html success branch
-LENGTH_MSG = f"Password must be at least {MIN_PASSWORD_LENGTH} characters long."
-GENERIC_SUCCESS = "If this address belongs to an unverified account,"
-
-VALID_FORM = {
-    "email": "alice.new@example.com",
-    "display_name": "Alice Example",
-    "affiliation": "University of Zurich",
+_EMAIL = "owner@example.org"
+_TOKEN = "mailbox-capability-private-canary"
+_PASSWORD = "Mailbox-Owner-Chose-739!Quartz"
+_SETUP = registration_setup.RegistrationSetup(7, _EMAIL)
+_PROFILE = {
+    "display_name": "Mailbox Owner",
+    "affiliation": "University",
     "country": "Switzerland",
-    "password": "correct-horse-battery-staple-9",
-    "password_confirm": "correct-horse-battery-staple-9",
+    "password": _PASSWORD,
+    "password_confirm": _PASSWORD,
 }
 
 
-def _post_register(client, **overrides):
-    data = {**VALID_FORM, "csrf_token": client.csrf_token, **overrides}
-    return client.post("/register", data=data)
+def _service(module, name, **kwargs):
+    # Capture the defining collaborator before replacing its route-local alias.
+    """Patch a registration service with a strict signature-checked mock."""
+    real = getattr(registration_setup, name)
+    return patch.object(module, name, create_autospec(real, spec_set=True, **kwargs))
 
 
-def _post_send_verification(client, email):
+def _post_register(client, **fields):
+    """Submit the valid CSRF-protected form without following redirects."""
     return client.post(
-        "/send_verification",
-        data={"email": email, "csrf_token": client.csrf_token},
+        "/register",
+        data={"email": _EMAIL, "csrf_token": client.csrf_token, **fields},
+        follow_redirects=False,
     )
 
 
-class TestRegisterFailsClosedBeforePool:
-    """Input rejected before any DB/Argon2 work gets a friendly 422 render."""
-
-    @pytest.mark.parametrize(
-        ("overrides", "expected_message"),
-        [
-            pytest.param(
-                {"display_name": "Alice\x07"},
-                "Display name cannot contain control characters.",
-                id="control_character_display_name",
-            ),
-            pytest.param(
-                {"email": "not-an-email"},
-                "Please enter a valid email address.",
-                id="syntactically_invalid_email",
-            ),
-            pytest.param(
-                {"password_confirm": "different-horse-battery-staple-9"},
-                "Passwords do not match.",
-                id="password_confirmation_mismatch",
-            ),
-            pytest.param(
-                {"password": "Ab1!Ab1!Ab1", "password_confirm": "Ab1!Ab1!Ab1"},
-                LENGTH_MSG,
-                id="password_below_minimum_length",
-            ),
-        ],
+def _post_complete(client, **fields):
+    """Submit the valid CSRF-protected form without following redirects."""
+    return client.post(
+        "/verify-email",
+        data={
+            "token": _TOKEN,
+            "public_id": action_token_public_id(_TOKEN),
+            **_PROFILE,
+            "csrf_token": client.csrf_token,
+            **fields,
+        },
+        follow_redirects=False,
     )
-    def test_invalid_submission_renders_friendly_422_without_touching_pool(
-        self, guest_client, overrides, expected_message
-    ):
-        """Every fail-fast validation error renders register.html at 422
-        with its specific message, decided entirely before the pool is used."""
-        response = _post_register(guest_client, **overrides)
 
-        assert response.status_code == 422
-        assert REGISTER_PAGE_MARKER in response.text
-        assert expected_message in response.text
-        guest_client.mock_pool.connection.assert_not_called()
 
-    def test_control_character_display_name_preserves_submitted_email(self, guest_client):
-        """The re-rendered form echoes the submitted email back to the user.
+def _post_resend(client, email=_EMAIL):
+    """Submit a CSRF-protected verification resend for the selected email."""
+    return client.post("/send_verification", data={"email": email, "csrf_token": client.csrf_token})
 
-        Two invariants: `_register_error` must not re-validate the preserved
-        input (the error renderer itself would crash), and the route must
-        catch `normalize_display_name`'s `ValueError`.
-        """
-        response = _post_register(guest_client, display_name="Alice\x07")
 
-        assert response.status_code == 422
-        assert "alice.new@example.com" in response.text
+def _assert_sensitive_headers(response):
+    """Require uncached responses with the strict-origin referrer policy."""
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["referrer-policy"] == "strict-origin"
 
 
 class TestRegisterPageAccess:
-    """GET /register is the entry point to local registration for guests."""
+    """Cover register page access."""
 
     def test_guest_sees_the_registration_form(self, guest_client):
+        """Check guest sees the registration form (HTTP 200)."""
         response = guest_client.get("/register")
-        assert response.status_code == 200
-        assert REGISTER_PAGE_MARKER in response.text
+        assert response.status_code == 200 and 'name="email"' in response.text
+        for field in ("password", "password_confirm", "display_name", "affiliation", "country"):
+            assert f'name="{field}"' not in response.text
 
     def test_authenticated_full_session_is_redirected_home(self, authenticated_client):
+        """Check authenticated full session is redirected home (HTTP 303)."""
         response = authenticated_client.get("/register", follow_redirects=False)
-        assert response.status_code == 303
-        assert response.headers["location"] == "/"
+        assert response.status_code == 303 and response.headers["location"] == "/"
 
 
 class TestRegisterEnumerationGuard:
-    """Duplicate and new registrations are indistinguishable to the client."""
+    """Cover register enumeration guard."""
 
     def test_duplicate_registration_indistinguishable_from_success(self, guest_client):
-        """Duplicate and new registrations return the same HTTP representation.
+        """A void service result cannot disclose new/duplicate state; no timing claim."""
+        with _service(register, "begin_local_registration", return_value=None) as begin:
+            first = _post_register(guest_client)
+            second = _post_register(guest_client)
+        assert first.status_code == second.status_code == 200
+        assert first.text == second.text and "Check your email" in first.text
+        assert "set-cookie" not in first.headers and "set-cookie" not in second.headers
+        assert begin.await_count == 2
+        begin.assert_awaited_with(guest_client.mock_pool, email=_EMAIL)
 
-        The duplicate path queues an account-existence notice to the submitted
-        address; the new path delegates to the verification-token/outbox helper.
-        The assertion is deliberately limited to response status, body, and
-        session-cookie behavior, not server timing or recipient-side mail.
-        """
-
-        @asynccontextmanager
-        async def fake_get_db_cursor(_pool):
-            yield sentinel.cursor
-
-        with (
-            patch(
-                "app.routes.auth.register.get_db_cursor",
-                autospec=True,
-                side_effect=fake_get_db_cursor,
-            ) as get_cursor,
-            patch(
-                "app.routes.auth.register.build_duplicate_registration_notice",
-                autospec=True,
-                return_value=sentinel.duplicate_notice,
-            ) as build_notice,
-            patch(
-                "app.routes.auth.register.enqueue_outbound_email_cur",
-                autospec=True,
-                action=None,
-            ) as enqueue,
-            patch(
-                "app.routes.auth.register._queue_verification_email",
-                autospec=True,
-            ) as queue_verification,
-        ):
-            with patch(
-                "app.routes.auth.register.register_local_user",
-                autospec=True,
-                side_effect=UserAlreadyExistsError("a@b.com"),
-            ):
-                duplicate = _post_register(guest_client)
-
-            assert duplicate.status_code == 200
-            assert PENDING_PAGE_MARKER in duplicate.text
-            assert "already exists" not in duplicate.text
-            assert "set-cookie" not in duplicate.headers
-
-            build_notice.assert_called_once_with(
-                "alice.new@example.com",
+    def test_hostile_extra_fields_cannot_supply_credentials_or_privilege(self, guest_client):
+        """Check hostile extra fields cannot supply credentials or privilege (HTTP 200)."""
+        with _service(register, "begin_local_registration", return_value=None) as begin:
+            response = _post_register(
+                guest_client,
+                email=" OWNER@EXAMPLE.ORG ",
+                password="attacker-password",
+                password_confirm="attacker-password",
+                display_name="Attacker",
+                affiliation="Attacker Org",
+                country="Elsewhere",
+                is_admin="true",
+                access_tier="vetted",
+                email_verified="true",
+                is_active="true",
             )
-            get_cursor.assert_called_once_with(
-                guest_client.mock_pool,
-            )
-            enqueue.assert_awaited_once_with(
-                sentinel.cursor,
-                user_id=None,
-                email=sentinel.duplicate_notice,
-                action=None,
-            )
-            queue_verification.assert_not_awaited()
+        assert response.status_code == 200
+        begin.assert_awaited_once_with(guest_client.mock_pool, email=_EMAIL)
+        assert "attacker-password" not in response.text and "Attacker Org" not in response.text
 
-            user = make_sample_user(
-                email="alice.new@example.com",
-            )
-            with patch(
-                "app.routes.auth.register.register_local_user",
-                autospec=True,
-                return_value=user,
-            ):
-                success = _post_register(guest_client)
+    @pytest.mark.parametrize("email", ["not-an-email", "owner@example.org\nInjected"])
+    def test_invalid_email_never_reaches_service(self, guest_client, email):
+        """Check invalid email never reaches service (HTTP 422)."""
+        with _service(register, "begin_local_registration") as begin:
+            response = _post_register(guest_client, email=email)
+        assert response.status_code == 422 and "valid email address" in response.text
+        begin.assert_not_awaited()
+        guest_client.mock_pool.connection.assert_not_called()
 
-            assert success.status_code == 200
-            assert PENDING_PAGE_MARKER in success.text
-            assert "already exists" not in success.text
-            assert "set-cookie" not in success.headers
-
-            # The registration service has already committed its own queued mail.
-            queue_verification.assert_not_awaited()
-
-            build_notice.assert_called_once()
-            get_cursor.assert_called_once()
-            enqueue.assert_awaited_once()
-
-        assert duplicate.text == success.text
-
-    def test_plain_valueerror_from_create_user_renders_message_not_neutral_page(self, guest_client):
-        """A plain ValueError from register_local_user must render register.html
-        (422) WITH the error message, not the neutral pending page.
-
-        Because `UserAlreadyExistsError` subclasses `ValueError`, both
-        misorderings of the route's except clauses are detectable here: if
-        `except ValueError` came first, duplicates would leak the 'already
-        exists' message; if `except UserAlreadyExistsError` swallowed all
-        ValueErrors, this test would see the neutral pending page instead.
-        """
-        with patch(
-            "app.routes.auth.register.register_local_user",
-            autospec=True,
-            side_effect=ValueError("Display name cannot be empty."),
-        ):
+    @pytest.mark.parametrize(
+        ("error", "status"),
+        [
+            (UserInputRejected("Please enter a valid email address."), 422),
+            (DatabaseError("database unavailable"), 500),
+            (PoolTimeout("capacity"), 500),
+        ],
+        ids=["validation", "database", "capacity"],
+    )
+    def test_service_failures_share_the_same_route_boundary(self, guest_client, error, status):
+        """Check service failures share the same route boundary."""
+        with _service(register, "begin_local_registration", side_effect=error):
             response = _post_register(guest_client)
+        assert response.status_code == status and "Check your email" not in response.text
 
+
+class TestRegistrationDisabled:
+    """Cover registration disabled."""
+
+    def test_register_disabled_get_and_post_redirect_to_login(self, guest_client, monkeypatch):
+        """Check register disabled GET and POST redirect to login (HTTP 303)."""
+        monkeypatch.setattr(settings, "local_registration_enabled", False)
+        with _service(register, "begin_local_registration") as begin:
+            responses = [
+                guest_client.get("/register", follow_redirects=False),
+                _post_register(guest_client),
+            ]
+        for response in responses:
+            assert response.status_code == 303 and response.headers["location"] == "/login"
+        begin.assert_not_awaited()
+
+    def test_existing_mailbox_proof_and_resend_remain_usable(self, guest_client, monkeypatch):
+        """Check existing mailbox proof and resend remain usable."""
+        monkeypatch.setattr(settings, "local_registration_enabled", False)
+        with (
+            _service(verify_email, "inspect_local_registration", return_value=_SETUP),
+            _service(
+                verify_email,
+                "complete_local_registration",
+                return_value=make_sample_user(id=7, email=_EMAIL),
+            ),
+            _service(register, "resend_local_registration", return_value=None) as resend,
+            patch.object(verify_email, "audit_user_event", create_autospec(_REAL_AUDIT)),
+        ):
+            assert (
+                guest_client.get(f"/verify-email/{action_token_public_id(_TOKEN)}").status_code
+                == 200
+            )
+            response = _post_complete(guest_client)
+            assert _post_resend(guest_client).status_code == 200
+        assert response.status_code == 303
+        assert response.headers["location"] == "/login?notice=registration_complete"
+        resend.assert_awaited_once()
+
+
+class TestSendVerificationPage:
+    """Cover send verification page."""
+
+    def test_get_page_prefills_email(self, guest_client):
+        """Check GET page prefills email (HTTP 200)."""
+        response = guest_client.get("/send_verification?email=owner%40example.org")
+        assert response.status_code == 200 and _EMAIL in response.text
+
+
+class TestSendVerificationEnumerationGuard:
+    """Cover send verification enumeration guard."""
+
+    def test_unverified_local_user_gets_resend(self, guest_client):
+        """Check unverified local user gets resend (HTTP 200)."""
+        with _service(register, "resend_local_registration", return_value=None) as resend:
+            response = _post_resend(guest_client, " OWNER@EXAMPLE.ORG ")
+        assert response.status_code == 200
+        assert "If this address belongs to an unverified account," in response.text
+        resend.assert_awaited_once_with(guest_client.mock_pool, email=" OWNER@EXAMPLE.ORG ")
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            None,
+            UserStateChanged("ineligible"),
+            DatabaseError("unavailable"),
+            PoolTimeout("capacity"),
+        ],
+        ids=["void", "ineligible", "database", "capacity"],
+    )
+    def test_eligibility_and_storage_outcomes_are_neutral(self, guest_client, error):
+        """Check eligibility and storage outcomes are neutral (HTTP 200)."""
+        with _service(register, "resend_local_registration", return_value=None) as resend:
+            baseline = _post_resend(guest_client)
+            resend.side_effect = error
+            response = _post_resend(guest_client)
+        assert baseline.status_code == response.status_code == 200
+        assert baseline.text == response.text
+        assert "If this address belongs to an unverified account," in response.text
+        assert "set-cookie" not in response.headers
+
+    def test_invalid_email_has_the_same_generic_page_without_database(self, guest_client):
+        """Check invalid email has the same generic page without database (HTTP 200)."""
+        with _service(
+            register,
+            "resend_local_registration",
+            side_effect=registration_setup.resend_local_registration,
+        ) as resend:
+            response = _post_resend(guest_client, "not-an-email")
+        assert response.status_code == 200
+        assert "If this address belongs to an unverified account," in response.text
+        resend.assert_awaited_once_with(guest_client.mock_pool, email="not-an-email")
+        guest_client.mock_pool.connection.assert_not_called()
+
+
+class TestVerifyEmailCapabilityRoute:
+    """Cover verify email capability route."""
+
+    def test_get_page_does_not_consume_the_token(self, guest_client):
+        """Check GET page does not consume the token (HTTP 200)."""
+        with (
+            _service(verify_email, "inspect_local_registration", return_value=_SETUP) as inspect,
+            _service(verify_email, "complete_local_registration") as complete,
+        ):
+            response = guest_client.get(f"/verify-email/{action_token_public_id(_TOKEN)}")
+        assert response.status_code == 200 and _EMAIL not in response.text
+        assert _TOKEN not in response.text
+        for field in (
+            "public_id",
+            "token",
+            "display_name",
+            "affiliation",
+            "country",
+            "password",
+            "password_confirm",
+            "csrf_token",
+        ):
+            assert f'name="{field}"' in response.text
+        inspect.assert_not_awaited()
+        complete.assert_not_awaited()
+        guest_client.mock_pool.connection.assert_not_called()
+        _assert_sensitive_headers(response)
+
+    def test_get_rejects_stale_live_state(self, guest_client):
+        """Only POST can check state: identifier-only GET reveals no capability status."""
+        with _service(verify_email, "inspect_local_registration", return_value=None) as inspect:
+            response = _post_complete(guest_client)
+        assert response.status_code == 400 and 'name="password"' not in response.text
+        inspect.assert_awaited_once_with(guest_client.mock_pool, _TOKEN)
+        _assert_sensitive_headers(response)
+
+    @pytest.mark.parametrize("fixture", ["guest_client", "totp_setup_client"])
+    def test_completion_uses_mailbox_identity_and_does_not_log_in(self, request, fixture):
+        """Check completion uses mailbox identity and does not log in (HTTP 303)."""
+        client = request.getfixturevalue(fixture)
+        with (
+            _service(verify_email, "inspect_local_registration", return_value=_SETUP) as inspect,
+            _service(
+                verify_email,
+                "complete_local_registration",
+                return_value=make_sample_user(id=7, email=_EMAIL),
+            ) as complete,
+            patch.object(verify_email, "audit_user_event", create_autospec(_REAL_AUDIT)) as audit,
+        ):
+            response = _post_complete(
+                client,
+                email="attacker@example.org",
+                user_id="999",
+                is_admin="true",
+                access_tier="vetted",
+            )
+        assert response.status_code == 303
+        assert response.headers["location"] == "/login?notice=registration_complete"
+        inspect.assert_awaited_once_with(client.mock_pool, _TOKEN)
+        complete.assert_awaited_once_with(
+            client.mock_pool,
+            token=_TOKEN,
+            display_name="Mailbox Owner",
+            password=_PASSWORD,
+            affiliation="University",
+            country="Switzerland",
+        )
+        audit.assert_called_once()
+        assert audit.call_args.kwargs["event_type"] == "email_verified"
+        assert audit.call_args.kwargs["user_id"] == 7
+        assert "set-cookie" not in response.headers
+        _assert_sensitive_headers(response)
+
+    @pytest.mark.parametrize("fixture", ["guest_client", "totp_setup_client"])
+    @pytest.mark.parametrize(
+        "failure", ["missing_form", "wrong_form", "missing_cookie", "forged_pair"]
+    )
+    def test_completion_requires_the_current_first_party_csrf_pair(self, request, fixture, failure):
+        """Check completion requires the current first party CSRF pair (HTTP 403)."""
+        client = request.getfixturevalue(fixture)
+        fields = {
+            "token": _TOKEN,
+            "public_id": action_token_public_id(_TOKEN),
+            **_PROFILE,
+            "csrf_token": client.csrf_token,
+        }
+        if failure == "missing_form":
+            fields.pop("csrf_token")
+        elif failure == "wrong_form":
+            fields["csrf_token"] = "wrong"
+        elif failure == "missing_cookie":
+            client.cookies.delete(CSRF_COOKIE_NAME)
+        else:
+            fields["csrf_token"] = "a" * 64
+            client.cookies.set(CSRF_COOKIE_NAME, fields["csrf_token"])
+        with (
+            _service(verify_email, "inspect_local_registration") as inspect,
+            _service(verify_email, "complete_local_registration") as complete,
+        ):
+            response = client.post("/verify-email", data=fields, follow_redirects=False)
+        assert response.status_code == 403
+        inspect.assert_not_awaited()
+        complete.assert_not_awaited()
+        _assert_sensitive_headers(response)
+
+    @pytest.mark.parametrize("content_type", ["application/json", "text/plain"])
+    def test_post_with_unsupported_body_is_415(self, guest_client, content_type):
+        """Check POST with unsupported body is 415."""
+        with _service(verify_email, "complete_local_registration") as complete:
+            response = guest_client.post(
+                "/verify-email",
+                content='{"token":"private"}',
+                headers={"content-type": content_type},
+            )
+        assert response.status_code == 415
+        complete.assert_not_awaited()
+        _assert_sensitive_headers(response)
+
+    def test_token_only_post_cannot_activate_an_account(self, guest_client):
+        """Check token only POST cannot activate an account (HTTP 422)."""
+        with _service(verify_email, "complete_local_registration") as complete:
+            response = guest_client.post(
+                "/verify-email",
+                data={
+                    "token": _TOKEN,
+                    "public_id": action_token_public_id(_TOKEN),
+                    "csrf_token": guest_client.csrf_token,
+                },
+            )
         assert response.status_code == 422
-        assert REGISTER_PAGE_MARKER in response.text
-        assert "Display name cannot be empty." in response.text
-        assert PENDING_PAGE_MARKER not in response.text  # not the neutral page
+        complete.assert_not_awaited()
+        _assert_sensitive_headers(response)
+
+    @pytest.mark.parametrize("live", [False, True], ids=["stale", "live"])
+    def test_capability_is_checked_before_password_confirmation(self, guest_client, live):
+        """Check capability is checked before password confirmation."""
+        with (
+            _service(
+                verify_email, "inspect_local_registration", return_value=_SETUP if live else None
+            ),
+            _service(verify_email, "complete_local_registration") as complete,
+        ):
+            response = _post_complete(guest_client, password_confirm="mismatch")
+        assert response.status_code == (422 if live else 400)
+        complete.assert_not_awaited()
+        assert _PASSWORD not in response.text and "mismatch" not in response.text
+        if live:
+            assert "Passwords do not match." in response.text
+            assert "Mailbox Owner" in response.text and "University" in response.text
+        _assert_sensitive_headers(response)
+
+    @pytest.mark.parametrize(
+        "result",
+        [None, UserInputRejected("Display name cannot contain control characters.")],
+        ids=["changed_capability", "invalid_profile"],
+    )
+    def test_completion_rejection_never_audits_success(self, guest_client, result):
+        """Check completion rejection never audits success."""
+        with (
+            _service(verify_email, "inspect_local_registration", return_value=_SETUP),
+            _service(
+                verify_email,
+                "complete_local_registration",
+                side_effect=result if isinstance(result, Exception) else None,
+                return_value=None,
+            ),
+            patch.object(verify_email, "audit_user_event", create_autospec(_REAL_AUDIT)) as audit,
+        ):
+            response = _post_complete(guest_client, display_name="Bad\x01Name")
+        assert response.status_code == (422 if isinstance(result, Exception) else 400)
+        assert _PASSWORD not in response.text
+        assert all(call.kwargs["event_type"] != "email_verified" for call in audit.call_args_list)
+        _assert_sensitive_headers(response)
+
+    @pytest.mark.parametrize("stage", ["inspect", "complete"])
+    @pytest.mark.parametrize("error_type", [DatabaseError, PoolTimeout])
+    def test_storage_errors_are_generic_and_do_not_disclose_credentials(
+        self, guest_client, caplog, stage, error_type
+    ):
+        """Check storage errors are generic and do not disclose credentials (HTTP 500)."""
+        caplog.set_level(logging.WARNING, logger=verify_email.__name__)
+        with (
+            _service(
+                verify_email,
+                "inspect_local_registration",
+                return_value=_SETUP,
+                side_effect=error_type(f"{_TOKEN} {_PASSWORD}") if stage == "inspect" else None,
+            ),
+            _service(
+                verify_email,
+                "complete_local_registration",
+                side_effect=error_type(f"{_TOKEN} {_PASSWORD}"),
+            ),
+            patch.object(verify_email, "audit_user_event", create_autospec(_REAL_AUDIT)) as audit,
+        ):
+            response = _post_complete(guest_client)
+        assert response.status_code == 500
+        assert _TOKEN not in response.text and _PASSWORD not in response.text
+        records = [record for record in caplog.records if record.name == verify_email.__name__]
+        assert len(records) == 1
+        record = records[0]
+        assert record.exc_info is not None
+        for formatter in (JSONFormatter(), RedactingFormatter()):
+            rendered = formatter.format(record)
+            assert _TOKEN not in rendered and _PASSWORD not in rendered
+            assert response.headers["x-request-id"] in rendered
+        entry = json.loads(JSONFormatter().format(record))
+        assert entry["phase"] == stage
+        assert entry["exception"]["type"] == (f"{error_type.__module__}.{error_type.__qualname__}")
+        assert all(call.kwargs["event_type"] != "email_verified" for call in audit.call_args_list)
+        _assert_sensitive_headers(response)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("token", "t" * 2001),
+            ("display_name", "n" * 201),
+            ("affiliation", "a" * 201),
+            ("country", "c" * 101),
+            ("password", "p" * (LOCAL_PASSWORD_MAX_CHARS + 1)),
+        ],
+        ids=["token", "display_name", "affiliation", "country", "password"],
+    )
+    def test_oversized_fields_never_reach_the_service(self, guest_client, field, value):
+        """Check oversized fields never reach the service (HTTP 422)."""
+        with _service(verify_email, "complete_local_registration") as complete:
+            response = _post_complete(guest_client, **{field: value})
+        assert response.status_code == 422
+        complete.assert_not_awaited()
+        assert _PASSWORD not in response.text
+        _assert_sensitive_headers(response)
 
 
 class TestChangeDisplayNameValidation:
-    """/account/change-name rejects and accepts through the same gate."""
+    """Cover change display name validation."""
 
     def test_change_name_rejects_control_char_with_error_flash(self, authenticated_client):
-        """A control character is rejected by the same normalize_display_name
-        gate as registration — 303 back to /account with the validator's
-        message flashed as 'error'. The ValueError fires before
-        update_display_name touches the DB (pool untouched apart from the
-        patched set_flash_if_exists).
-        """
-        with patch("app.routes.auth.account.set_flash_if_exists", autospec=True) as flash:
+        """Check change name rejects control char with error flash (HTTP 303)."""
+        with patch.object(account, "set_flash_if_exists", create_autospec(_REAL_FLASH)) as flash:
             response = authenticated_client.post(
                 "/account/change-name",
-                data={
-                    "display_name": "Alice\x07",
-                    "csrf_token": authenticated_client.csrf_token,
-                },
+                data={"display_name": "Alice\x07", "csrf_token": authenticated_client.csrf_token},
                 follow_redirects=False,
             )
-
-        assert response.status_code == 303
-        assert response.headers["location"] == "/account"
-        flash.assert_awaited_once()
-        args = flash.await_args.args
-        assert args[1] == RAW_SESSION_ID  # flash bound to the caller's session
-        assert args[2] == "Display name cannot contain control characters."
-        assert args[3] == "error"
-        # normalize_display_name raised before the UPDATE ran.
+        assert response.status_code == 303 and response.headers["location"] == "/account"
+        assert flash.await_args.args[1:] == (
+            RAW_SESSION_ID,
+            "Display name cannot contain control characters.",
+            "error",
+        )
         authenticated_client.mock_pool.connection.assert_not_called()
 
     def test_change_name_happy_path_updates_and_flashes_success(self, authenticated_client):
-        """Happy rename: update_display_name is awaited with the submitted
-        name and the user is redirected to /account with a 'success' flash."""
+        """Check change name happy path updates and flashes success (HTTP 303)."""
         with (
-            patch("app.routes.auth.account.update_display_name", autospec=True) as update,
-            patch("app.routes.auth.account.set_flash_if_exists", autospec=True) as flash,
+            patch.object(account, "update_display_name", create_autospec(_REAL_RENAME)) as update,
+            patch.object(account, "set_flash_if_exists", create_autospec(_REAL_FLASH)) as flash,
         ):
             response = authenticated_client.post(
                 "/account/change-name",
@@ -293,320 +511,6 @@ class TestChangeDisplayNameValidation:
                 },
                 follow_redirects=False,
             )
-
-        assert response.status_code == 303
-        assert response.headers["location"] == "/account"
-        update.assert_awaited_once()
-        assert update.await_args.args[1] == 1  # authenticated user's id
-        assert update.await_args.args[2] == "Alice Renamed"
-        flash.assert_awaited_once()
-        assert flash.await_args.args[2] == "Display name updated."
-        assert flash.await_args.args[3] == "success"
-
-
-class TestRegistrationDisabled:
-    """Both verbs bounce to /login while local registration is switched off."""
-
-    def test_register_disabled_get_and_post_redirect_to_login(self, guest_client, monkeypatch):
-        """With settings.local_registration_enabled=False, GET /register 303s
-        to /login and a fully valid POST 303s too, without ever attempting
-        user creation. (The enabled case is exercised by every other test in
-        this module, which all register against a guest client with the
-        default, enabled setting.)
-        """
-        monkeypatch.setattr(settings, "local_registration_enabled", False)
-
-        get_response = guest_client.get("/register", follow_redirects=False)
-        assert get_response.status_code == 303
-        assert get_response.headers["location"] == "/login"
-
-        with patch("app.routes.auth.register.register_local_user", autospec=True) as create:
-            post_response = guest_client.post(
-                "/register",
-                data={**VALID_FORM, "csrf_token": guest_client.csrf_token},
-                follow_redirects=False,
-            )
-        assert post_response.status_code == 303
-        assert post_response.headers["location"] == "/login"
-        create.assert_not_awaited()
-
-
-class TestSendVerificationPage:
-    """GET /send_verification renders the request form."""
-
-    def test_get_page_prefills_email(self, guest_client):
-        response = guest_client.get("/send_verification?email=alice%40uzh.ch")
-        assert response.status_code == 200
-        assert "alice@uzh.ch" in response.text
-
-
-class TestSendVerificationEnumerationGuard:
-    """Every account state returns the same page; only eligible ones resend."""
-
-    def test_unverified_local_user_gets_resend(self, guest_client):
-        """An unverified local account gets a new token and outbox message.
-
-        The token hash and email are written through the same database cursor,
-        ensuring they participate in one transaction.
-        """
-        user = make_sample_user(email_verified=False)
-        action = ActionEmailMetadata(
-            "fresh-token-hash",
-            datetime(2030, 1, 1, tzinfo=UTC),
-        )
-
-        @asynccontextmanager
-        async def fake_get_db_cursor(_pool):
-            yield sentinel.cursor
-
-        with (
-            patch(
-                "app.routes.auth.register.get_user_by_email",
-                autospec=True,
-                return_value=user,
-            ),
-            patch(
-                "app.services.registration.generate_verification_token",
-                autospec=True,
-                return_value="fresh-token",
-            ) as generate,
-            patch(
-                "app.services.registration.build_verification_email",
-                autospec=True,
-                return_value=sentinel.verification_email,
-            ) as build_email,
-            patch(
-                "app.routes.auth.register.get_db_cursor",
-                autospec=True,
-                side_effect=fake_get_db_cursor,
-            ) as get_cursor,
-            patch(
-                "app.services.registration.store_verification_token_hash_cur",
-                autospec=True,
-            ) as store,
-            patch(
-                "app.services.registration.enqueue_outbound_email_cur",
-                autospec=True,
-            ) as enqueue,
-            patch(
-                "app.services.registration.verification_token_email_metadata",
-                autospec=True,
-                return_value=action,
-            ) as metadata,
-        ):
-            response = _post_send_verification(guest_client, user.email)
-
-        assert response.status_code == 200
-        assert GENERIC_SUCCESS in response.text
-        assert "We&#39;ve sent a verification link" not in response.text
-        assert "We've sent a verification link" not in response.text
-
-        generate.assert_called_once_with(
-            user.id,
-            user.email,
-        )
-        metadata.assert_called_once_with("fresh-token")
-
-        build_email.assert_called_once_with(
-            user.email,
-            f"{settings.public_base_url}/verify-email/fresh-token",
-            expires_at=action.expires_at,
-        )
-
-        enqueue.assert_awaited_once_with(
-            sentinel.cursor,
-            user_id=user.id,
-            email=sentinel.verification_email,
-            action=action,
-        )
-        get_cursor.assert_called_once_with(
-            guest_client.mock_pool,
-        )
-        store.assert_awaited_once_with(
-            sentinel.cursor,
-            user.id,
-            "fresh-token-hash",
-            expected_email=user.email,
-        )
-
-    def test_verified_and_unknown_emails_are_indistinguishable(self, guest_client):
-        """Already-verified and unknown addresses produce the same HTTP
-        representation."""
-        verified_user = make_sample_user(
-            email="probe@uzh.ch",
-            email_verified=True,
-        )
-
-        with (
-            patch(
-                "app.routes.auth.register.get_user_by_email",
-                autospec=True,
-                side_effect=[verified_user, None],
-            ),
-            patch(
-                "app.routes.auth.register._queue_verification_email",
-                autospec=True,
-            ) as queue_verification,
-        ):
-            exists = _post_send_verification(guest_client, "probe@uzh.ch")
-            unknown = _post_send_verification(guest_client, "probe@uzh.ch")
-
-        assert exists.status_code == unknown.status_code == 200
-        assert exists.text == unknown.text
-        assert GENERIC_SUCCESS in exists.text
-        queue_verification.assert_not_awaited()
-
-    def test_invalid_email_gets_same_generic_page(self, guest_client):
-        """A syntactically invalid address short-circuits before any lookup
-        but still renders the same success page — validation errors must not
-        become an enumeration side channel either."""
-        with patch("app.routes.auth.register.get_user_by_email", autospec=True) as lookup:
-            response = _post_send_verification(guest_client, "not-an-email")
-        assert response.status_code == 200
-        assert GENERIC_SUCCESS in response.text
-        assert "We&#39;ve sent a verification link" not in response.text
-        assert "We've sent a verification link" not in response.text
-        lookup.assert_not_awaited()
-
-    def test_shibboleth_account_never_resent(self, guest_client):
-        """Federated accounts never receive local verification messages."""
-        shib = make_sample_user(
-            auth_method="shibboleth",
-            email_verified=False,
-        )
-
-        with (
-            patch(
-                "app.routes.auth.register.get_user_by_email",
-                autospec=True,
-                return_value=shib,
-            ),
-            patch(
-                "app.routes.auth.register._queue_verification_email",
-                autospec=True,
-            ) as queue_verification,
-        ):
-            response = _post_send_verification(guest_client, shib.email)
-
-        assert response.status_code == 200
-        assert GENERIC_SUCCESS in response.text
-        assert "We&#39;ve sent a verification link" not in response.text
-        assert "We've sent a verification link" not in response.text
-        queue_verification.assert_not_awaited()
-
-
-class TestSendVerificationCapacityFailureIsEnumerationNeutral:
-    """A pool-capacity failure at the initial lookup must produce the same
-    generic page for any address and never reach the queueing helper."""
-
-    @pytest.mark.parametrize(
-        "exception",
-        [PoolTimeout("pool exhausted"), TooManyRequests("queue full")],
-        ids=["pool_timeout", "too_many_requests"],
-    )
-    def test_lookup_failure_never_queues_and_hides_which_address_failed(
-        self, guest_client, exception
-    ):
-        with (
-            patch(
-                "app.routes.auth.register.get_user_by_email",
-                autospec=True,
-                side_effect=exception,
-            ) as lookup,
-            patch(
-                "app.routes.auth.register._queue_verification_email", autospec=True
-            ) as queue_verification,
-        ):
-            first = _post_send_verification(guest_client, "alice@uzh.ch")
-            second = _post_send_verification(guest_client, "alice@uzh.ch")
-
-        for response in (first, second):
-            assert response.status_code == 200
-            assert GENERIC_SUCCESS in response.text
-        assert lookup.await_count == 2
-        queue_verification.assert_not_awaited()
-
-    def test_healthy_lookup_still_queues_for_a_known_unverified_address(self, guest_client):
-        """Positive control: absent the injected failure, an eligible
-        address does reach the queueing helper (the full transaction is
-        proven separately by
-        TestSendVerificationEnumerationGuard.test_unverified_local_user_gets_resend;
-        this pins only that the failure-path assertion above is non-vacuous)."""
-        user = make_sample_user(email_verified=False)
-        with (
-            patch(
-                "app.routes.auth.register.get_user_by_email",
-                autospec=True,
-                return_value=user,
-            ),
-            patch(
-                "app.routes.auth.register._queue_verification_email", autospec=True
-            ) as queue_verification,
-        ):
-            response = _post_send_verification(guest_client, user.email)
-
-        assert response.status_code == 200
-        queue_verification.assert_awaited_once()
-
-
-class TestVerifyEmailCapabilityRoute:
-    """POST /verify-email is the CSRF-exempt capability route: the signed,
-    single-use token is the capability, not a session-bound CSRF pair."""
-
-    def test_post_without_csrf_pair_still_reaches_the_service(self, guest_client):
-        with (
-            patch(
-                "app.routes.auth.verify_email.validate_verification_token",
-                autospec=True,
-                return_value={"user_id": 7, "email": "alice@uzh.ch"},
-            ) as validate,
-            patch(
-                "app.routes.auth.verify_email.confirm_email_verification",
-                autospec=True,
-                return_value=True,
-            ) as confirm,
-        ):
-            response = guest_client.post(
-                "/verify-email",
-                data={"token": "a-live-verification-token"},  # no csrf_token field
-                follow_redirects=False,
-            )
-
-        assert response.status_code == 303
-        assert response.headers["location"] == "/login"
-        validate.assert_called_once_with("a-live-verification-token")
-        confirm.assert_awaited_once()
-
-    def test_post_with_json_body_is_still_415(self, guest_client):
-        """Content-Type validation is not part of CSRF and stays automatic
-        even on the CSRF-exempt capability route."""
-        with patch(
-            "app.routes.auth.verify_email.confirm_email_verification", autospec=True
-        ) as confirm:
-            response = guest_client.post(
-                "/verify-email",
-                content='{"token": "a-live-verification-token"}',
-                headers={"Content-Type": "application/json"},
-                follow_redirects=False,
-            )
-
-        assert response.status_code == 415
-        confirm.assert_not_awaited()
-
-    def test_get_page_does_not_consume_the_token(self, guest_client):
-        """The preceding GET is SAFE — it never touches confirm_email_verification."""
-        with (
-            patch(
-                "app.routes.auth.verify_email.validate_verification_token",
-                autospec=True,
-                return_value={"user_id": 7, "email": "alice@uzh.ch"},
-            ),
-            patch(
-                "app.routes.auth.verify_email.confirm_email_verification", autospec=True
-            ) as confirm,
-        ):
-            response = guest_client.get("/verify-email/a-live-verification-token")
-
-        assert response.status_code == 200
-        assert "alice@uzh.ch" in response.text
-        confirm.assert_not_awaited()
+        assert response.status_code == 303 and response.headers["location"] == "/account"
+        update.assert_awaited_once_with(authenticated_client.mock_pool, 1, "Alice Renamed")
+        assert flash.await_args.args[2:] == ("Display name updated.", "success")

@@ -1,13 +1,13 @@
 {% extends "base.html" %}
 {% set active_page = "account" %}
-{% block title %}Change Email — Oral History Archive{% endblock %}
+{% block title %}Change Email — {{ site_name }}{% endblock %}
 
 {% block content %}
 <section class="container auth-page">
 
   <h1>Change Email Address</h1>
   <p class="auth-intro">
-    Enter your new email address and confirm with your current password.
+    Enter your new email address and confirm with your current password and a fresh authentication code.
     We'll send a confirmation link to the new address — the change takes
     effect only after you click it.
   </p>
@@ -35,7 +35,7 @@
           name="new_email"
           value="{{ new_email | default('', true) }}"
           required
-          maxlength="200"
+          maxlength="{{ local_email_max_chars }}"
           autocomplete="email"
         >
       </div>
@@ -43,8 +43,17 @@
       <div class="form-group">
         <label for="current_password">Current Password</label>
         <input type="password" id="current_password" name="current_password"
-               required maxlength="200" autocomplete="current-password">
+               required maxlength="{{ local_password_max_chars }}" autocomplete="current-password">
         <span class="form-hint">Required to confirm it's really you.</span>
+      </div>
+
+      <div class="form-group">
+        <label for="totp_code">Authentication Code</label>
+        <input type="text" id="totp_code" name="totp_code" required
+               inputmode="numeric" autocomplete="one-time-code"
+               maxlength="{{ totp_code_raw_max_chars }}"
+               pattern="[0-9\s]{6,{{ totp_code_raw_max_chars }}}">
+        <span class="form-hint">Use a fresh code from your authenticator. If you just used a code, wait for the next one.</span>
       </div>
 
       <button type="submit" class="btn btn-primary">Send Confirmation Link</button>

@@ -8,44 +8,34 @@ after an expired lock, clearing its notice marker. Notices are queued once
 per streak in the caller's transaction.
 """
 
-import contextlib
 import logging
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Literal, NamedTuple
 
-from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from psycopg import AsyncCursor, sql
 from psycopg_pool import AsyncConnectionPool
 
 from config import settings
 
+from .account_clock import database_now_cur
 from .crypto import password_hasher
 from .db import get_db_cursor
 from .email import build_account_locked_notice
 from .email_outbox import OutboundEmail, enqueue_outbound_email_cur
+from .password_verification import PasswordFailureReason, PasswordVerified, verify_password_hash
+from .password_verification import (
+    verify_dummy as verify_dummy,  # noqa: PLC0414 - import compatibility
+)
+from .password_verification import (
+    warm_dummy_password_hash as warm_dummy_password_hash,  # noqa: PLC0414 - import compatibility
+)
 from .password_work import run_password_work
 from .sessions import SessionPurpose, create_session_cur
 from .totp import verify_and_consume_totp_cur
 from .users import USER_COLUMNS_SQL, User, parse_user
 
 logger = logging.getLogger(__name__)
-
-_DUMMY_HASH: str | None = None
-
-
-async def warm_dummy_password_hash() -> str:
-    """Lazily cache and return the dummy Argon2 hash using password_work.
-
-    Concurrent first calls may each hash; the last completed value is cached.
-    """
-    global _DUMMY_HASH  # noqa: PLW0603 - one process-local, non-secret cache
-    if _DUMMY_HASH is None:
-        _DUMMY_HASH = await run_password_work(
-            password_hasher.hash, "this-is-a-dummy-password-for-constant-time-verification"
-        )
-    return _DUMMY_HASH
-
 
 LoginFailureReason = Literal[
     "unknown_email",
@@ -137,6 +127,16 @@ async def verify_password(pool: AsyncConnectionPool, email: str, password: str) 
             (email,),
         )
         row = await cur.fetchone()
+        locked_until = None
+        if (
+            row is not None
+            and row["auth_method"] == "local"
+            and row["is_active"]
+            and row["locked_until"] is not None
+        ):
+            now = await database_now_cur(cur)
+            if row["locked_until"] > now:
+                locked_until = row["locked_until"]
 
     if not row:
         await verify_dummy(password)
@@ -150,9 +150,7 @@ async def verify_password(pool: AsyncConnectionPool, email: str, password: str) 
 
     user = parse_user(row)
 
-    # Non-local (e.g. Shibboleth) → no local password login. Checked before
-    # is_active so a deactivated Shibboleth account still reads "non-local"
-    # (the more fundamental cause: it could never password-login anyway).
+    # Preserve the authentication-method reason even for inactive federated users.
     if row["auth_method"] != "local":
         await verify_dummy(password)
         return PasswordCheck(
@@ -173,13 +171,6 @@ async def verify_password(pool: AsyncConnectionPool, email: str, password: str) 
             auth_revision=None,
         )
 
-    now = datetime.now(UTC)
-    locked_until = (
-        row["locked_until"]
-        if row["locked_until"] is not None and row["locked_until"] > now
-        else None
-    )
-
     if locked_until is not None:
         await verify_dummy(password)
         return PasswordCheck(
@@ -191,8 +182,7 @@ async def verify_password(pool: AsyncConnectionPool, email: str, password: str) 
         )
 
     if not row["password_hash"]:
-        # Defensive: the users_local_password_required CHECK makes a local
-        # account with a NULL hash impossible; this firing means constraint drift.
+        # Missing or empty hashes require credential repair, not another login attempt.
         await verify_dummy(password)
         return PasswordCheck(
             user=user,
@@ -202,13 +192,16 @@ async def verify_password(pool: AsyncConnectionPool, email: str, password: str) 
             auth_revision=row["auth_revision"],
         )
 
-    try:
-        await run_password_work(password_hasher.verify, row["password_hash"], password)
-        password_ok = True
-    except VerifyMismatchError:
-        password_ok = False
-    except (InvalidHashError, VerificationError):
-        logger.exception("Unverifiable password hash for user id=%s", row["id"])
+    result = await verify_password_hash(
+        password_hash=row["password_hash"],
+        password=password,
+        user_id=row["id"],
+        operation="login",
+    )
+    if (
+        not isinstance(result, PasswordVerified)
+        and result.reason is PasswordFailureReason.UNUSABLE_HASH
+    ):
         await verify_dummy(password)
         return PasswordCheck(
             user=user,
@@ -218,6 +211,7 @@ async def verify_password(pool: AsyncConnectionPool, email: str, password: str) 
             auth_revision=row["auth_revision"],
         )
 
+    password_ok = isinstance(result, PasswordVerified)
     if password_ok and password_hasher.check_needs_rehash(row["password_hash"]):
         new_hash = await run_password_work(password_hasher.hash, password)
         async with get_db_cursor(pool) as cur:
@@ -253,15 +247,15 @@ async def finalize_local_login(
     totp_code: str,
     ip_address: str,
 ) -> LocalLoginResult:
-    """Commit login after verifying the password at expected_auth_revision.
+    """Commit login after password proof at expected_auth_revision.
 
-    Lock the user, recheck active/local/verified/revision/lock/recovery state, and
-    consume required TOTP. Wrong TOTP commits failure state and any lockout
-    notice; other expected rejections return LocalLoginFailure. Success clears
-    lockout state, sets last_login, and returns a raw full-session token, or a
-    totp_setup token when no TOTP is configured. Both use SESSION_MAX_AGE_SECONDS.
-    Database errors and TotpDecryptionError roll back; RuntimeError signals a
-    locked user disappearing.
+    Lock/recheck local active verified state, revision, lockout and recovery, then
+    consume required TOTP. Wrong TOTP commits failure/notice state; other expected
+    rejections return LocalLoginFailure. Success clears lockout, sets last_login,
+    and returns a raw full-session token, or a totp_setup token without TOTP.
+    Full sessions use SESSION_MAX_AGE_SECONDS; setup sessions are capped at 600
+    seconds. Database/decryption failures roll back; a vanished locked user raises
+    RuntimeError.
     """
     async with get_db_cursor(pool) as cur:
         await cur.execute(
@@ -319,7 +313,7 @@ async def finalize_local_login(
             )
 
         locked_until = row["locked_until"]
-        if locked_until is not None and locked_until > datetime.now(UTC):
+        if locked_until is not None and locked_until > await database_now_cur(cur):
             return LocalLoginFailure(
                 reason="account_locked",
                 user=user,
@@ -402,16 +396,6 @@ async def finalize_local_login(
     return result
 
 
-async def verify_dummy(password: str) -> None:
-    """Run dummy Argon2 verification, suppressing password mismatch.
-
-    The hash is lazily cached; equal hash work does not equalize whole requests.
-    """
-    with contextlib.suppress(VerifyMismatchError):
-        dummy_hash = await warm_dummy_password_hash()
-        await run_password_work(password_hasher.verify, dummy_hash, password)
-
-
 async def queue_lockout_notice_cur(
     cur: AsyncCursor[Any],
     *,
@@ -421,19 +405,20 @@ async def queue_lockout_notice_cur(
 ) -> bool:
     """Claim and enqueue one notice per failure streak in the caller's transaction.
 
-    Call after record_login_failure_cur reports a new lock. Return False if the
-    active local user/revision/lock no longer matches or a notice was claimed.
+    The caller must hold the user row lock, acquired by record_login_failure_cur
+    or finalize_local_login, before calling. Return False if the active local
+    user/revision/lock no longer matches or a notice was claimed.
     An enqueue failure propagates so the transaction can roll back the claim.
     """
     await cur.execute(
         """
         UPDATE users
-        SET lockout_notice_enqueued_at = CURRENT_TIMESTAMP
+        SET lockout_notice_enqueued_at = clock_timestamp()
         WHERE id = %s
           AND auth_revision = %s
           AND auth_method = 'local'
           AND is_active
-          AND locked_until > CURRENT_TIMESTAMP
+          AND locked_until > clock_timestamp()
           AND lockout_notice_enqueued_at IS NULL
         RETURNING id
         """,
@@ -484,13 +469,7 @@ async def record_login_failure_cur(
 
     # Read database time after acquiring the row lock. The request may have
     # waited for another transaction while the previous lock expired.
-    await cur.execute("SELECT clock_timestamp() AS database_now")
-    clock_row = await cur.fetchone()
-    if clock_row is None:
-        raise RuntimeError("Lockout clock query returned no row")
-    database_now = clock_row["database_now"]
-    if not isinstance(database_now, datetime):
-        raise TypeError("Lockout query returned an invalid database timestamp")
+    database_now = await database_now_cur(cur)
 
     previous_locked_until = previous["locked_until"]
 

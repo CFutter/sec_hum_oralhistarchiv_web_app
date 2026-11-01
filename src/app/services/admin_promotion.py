@@ -10,18 +10,16 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
-from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from psycopg import AsyncCursor
 from psycopg_pool import AsyncConnectionPool
 
-from .authentication import verify_dummy
 from .credential_attempts import (
     SessionStepUpAttemptOutcome,
     reserve_session_step_up_attempt,
 )
-from .crypto import password_hasher
-from .db import get_db_cursor
-from .password_work import run_password_work
+from .db import Database, get_db_cursor
+from .password_verification import VerifiedPasswordSnapshot, verify_password_snapshot
+from .security_notifications import queue_security_change_notice_cur
 from .session_ids import hash_session_id
 from .session_revocation import (
     delete_user_sessions_cur,
@@ -197,42 +195,6 @@ async def _validate_requester_cur(cur: AsyncCursor[Any], requested_by: int) -> N
         or not requester["recovery_codes_available"]
     ):
         raise AdminPromotionRejected("requester_ineligible")
-
-
-async def _verify_password_snapshot(
-    pool: AsyncConnectionPool,
-    *,
-    user_id: int,
-    password: str,
-) -> tuple[str, int]:
-    """Verify off-connection and return (password_hash, auth_revision).
-
-    Raise AdminPromotionRejected(invalid_credentials) for missing/bad hashes or
-    wrong passwords; missing/unverifiable hashes also run dummy work. Does not
-    check account eligibility; callers must revalidate the snapshot under lock.
-    """
-    async with get_db_cursor(pool) as cur:
-        await cur.execute(
-            "SELECT password_hash, auth_revision FROM users WHERE id = %s",
-            (user_id,),
-        )
-        row = await cur.fetchone()
-
-    if row is None or not isinstance(row["password_hash"], str) or not row["password_hash"]:
-        await verify_dummy(password)
-        raise AdminPromotionRejected("invalid_credentials")
-
-    password_hash = row["password_hash"]
-    try:
-        await run_password_work(password_hasher.verify, password_hash, password)
-    except VerifyMismatchError as exc:
-        raise AdminPromotionRejected("invalid_credentials") from exc
-    except (InvalidHashError, VerificationError) as exc:
-        logger.exception("Unverifiable password hash during admin promotion for user %d", user_id)
-        await verify_dummy(password)
-        raise AdminPromotionRejected("invalid_credentials") from exc
-
-    return password_hash, row["auth_revision"]
 
 
 async def get_admin_promotion(
@@ -459,7 +421,11 @@ async def cancel_admin_promotion(
             (target_user_id,),
         )
         deleted = await cur.fetchone() is not None
-        await discard_pending_recovery_code_set_cur(cur, user_id=target_user_id)
+        if deleted:
+            await discard_pending_recovery_code_set_cur(
+                cur,
+                user_id=target_user_id,
+            )
 
     if deleted:
         logger.info(
@@ -469,7 +435,7 @@ async def cancel_admin_promotion(
 
 
 async def prepare_admin_promotion(
-    pool: AsyncConnectionPool,
+    pool: Database,
     *,
     user_id: int,
     session_id: str,
@@ -484,6 +450,8 @@ async def prepare_admin_promotion(
     Return plaintext codes and deadlines (at most 15 minutes or invitation
     expiry). AdminPromotionRejected carries expected failure reasons; storage
     and TOTP decryption errors propagate without committing preparation.
+
+    Use a pool or an idle connection so the attempt commits before proof work.
     """
     reservation = await reserve_session_step_up_attempt(
         pool,
@@ -503,11 +471,14 @@ async def prepare_admin_promotion(
     if normalized_totp is None:
         raise AdminPromotionRejected("invalid_totp")
 
-    password_hash, verified_revision = await _verify_password_snapshot(
+    password_snapshot = await verify_password_snapshot(
         pool,
         user_id=user_id,
         password=password,
+        operation="admin_promotion",
     )
+    if not isinstance(password_snapshot, VerifiedPasswordSnapshot):
+        raise AdminPromotionRejected("invalid_credentials") from password_snapshot.cause
     plaintext_codes = generate_recovery_codes()
 
     async with get_db_cursor(pool) as cur:
@@ -534,9 +505,10 @@ async def prepare_admin_promotion(
         _validate_target_row(target)
         if target is None:  # narrowed by _validate_target_row
             raise RuntimeError("Administrator-promotion target unexpectedly missing")
-        if not target["login_unlocked"]:
-            raise AdminPromotionRejected("account_locked")
-        if target["password_hash"] != password_hash or target["auth_revision"] != verified_revision:
+        if (
+            target["password_hash"] != password_snapshot.password_hash
+            or target["auth_revision"] != password_snapshot.auth_revision
+        ):
             raise AdminPromotionRejected("state_changed")
 
         await _lock_full_session_cur(cur, user_id=user_id, session_id=session_id)
@@ -653,8 +625,6 @@ async def accept_admin_promotion(
         _validate_target_row(target)
         if target is None:  # narrowed by _validate_target_row
             raise RuntimeError("Administrator-promotion target unexpectedly missing")
-        if not target["login_unlocked"]:
-            raise AdminPromotionRejected("account_locked")
 
         await _lock_full_session_cur(cur, user_id=user_id, session_id=session_id)
         await cur.execute(
@@ -711,6 +681,10 @@ async def accept_admin_promotion(
         )
         await delete_user_sessions_cur(cur, user_id)
         await invalidate_pending_authentication_state_cur(cur, user_id)
+
+        await queue_security_change_notice_cur(
+            cur, user_id=user_id, change="admin_promotion_accepted"
+        )
 
     logger.warning(
         "User %d accepted administrator invitation issued by administrator %d",

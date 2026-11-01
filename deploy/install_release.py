@@ -44,11 +44,14 @@ _REQUIRED_PAYLOAD_FILES = frozenset(
         "oralhistarchiv.service",
         "oralhistarchiv-scheduler.service",
         "oralhistarchiv-migrate.service",
+        "oralhistarchiv-parser.socket",
+        "oralhistarchiv-parser@.service",
         "deploy/migrate_release.py",
         "deploy/oralhistarchiv-tmpfiles.conf",
         "deploy/bootstrap-database-roles.sql",
         "deploy/database-runtime-grants.sql",
         "deploy/verify-runtime-database-access.sql",
+        "deploy/invalidate-action-email-capabilities.sql",
         "deploy/redis-security.conf.example",
         "deploy/oralhistarchiv-rate-limit-redis.service",
         "deploy/nginx.conf.example",
@@ -57,6 +60,11 @@ _REQUIRED_PAYLOAD_FILES = frozenset(
         "deploy/nginx-shibboleth-secret.conf.example",
         "requirements-runtime.txt",
         "run_scheduler.py",
+        "run_parser.py",
+        "scripts/rebuild_search_policy.py",
+        "scripts/bootstrap_admin.py",
+        "scripts/acknowledge_source_binding.py",
+        "scripts/export_security_audit.py",
         "src/app/static/css/style.css",
         "provenance/build-requirements.txt",
         "provenance/ci.yml",
@@ -105,6 +113,8 @@ def _inspect_archive(bundle: tarfile.TarFile) -> tuple[str, list[tarfile.TarInfo
     total_size = 0
     for member in members:
         parts = _member_parts(member.name)
+        if ".venv" in parts:
+            raise ValueError("release archive must not contain virtual environments")
         normalized = PurePosixPath(*parts).as_posix()
         if normalized in names:
             raise ValueError(f"duplicate archive member: {normalized}")
@@ -167,11 +177,14 @@ def _load_manifest(root: Path) -> dict[str, Any]:
     return manifest
 
 
-def _verify_payload(root: Path) -> dict[str, Any]:
+def verify_payload(root: Path, *, generated_environment: bool = False) -> dict[str, Any]:
     """Return the manifest after checking release identity, required files and hashes.
 
-    Ignores .venv contents and the completion marker. Raises ValueError for contract
-    violations; file errors propagate. Hash agreement does not authenticate the release.
+    Incoming payloads may not contain virtual environments. Only callers verifying
+    a completed installer-owned release may exempt its exact root environment with
+    generated_environment=True. The completion marker is generated separately.
+    Raises ValueError for contract violations; filesystem errors propagate. Hash
+    agreement does not authenticate the release.
     """
     top_match = _TOP_LEVEL_RE.fullmatch(root.name)
     if top_match is None:
@@ -196,12 +209,24 @@ def _verify_payload(root: Path) -> dict[str, Any]:
     ):
         raise ValueError("manifest files map contains an invalid entry")
 
+    for name in expected:
+        parts = _member_parts(name)
+        if ".venv" in parts:
+            raise ValueError("release manifest must not contain virtual environments")
+
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if ".venv" in relative.parts and not (
+            generated_environment and relative.parts[0] == ".venv"
+        ):
+            raise ValueError("release payload contains an unexpected virtual environment")
+
     actual = {
         path.relative_to(root).as_posix(): _sha256(path)
         for path in sorted(root.rglob("*"))
         if path.is_file()
         and path.relative_to(root).as_posix() not in {"release-manifest.json", _COMPLETE_MARKER}
-        and ".venv" not in path.relative_to(root).parts
+        and not (generated_environment and path.relative_to(root).parts[0] == ".venv")
     }
     if actual != expected:
         missing = sorted(set(expected) - set(actual))
@@ -269,6 +294,8 @@ def _install_python_environment(root: Path, manifest: dict[str, Any]) -> None:
     """
     env = _clean_pip_environment()
     venv = root / ".venv"
+    if venv.exists() or venv.is_symlink():
+        raise ValueError("installer requires an absent virtual environment path")
     _run([sys.executable, "-m", "venv", str(venv)], env=env)
     python = venv / "bin/python"
     pip = [str(python), "-m", "pip"]
@@ -387,7 +414,7 @@ def _prepare_final_release(extracted: Path, manifest: dict[str, Any]) -> Path:
         if CURRENT_LINK.resolve() == final.resolve():
             raise RuntimeError(f"refusing to replace the current release: {final}")
         if (final / _COMPLETE_MARKER).is_file():
-            if _verify_payload(final) != manifest:
+            if verify_payload(final, generated_environment=True) != manifest:
                 raise ValueError("installed release differs from the requested artifact")
             _verify_installed_import(final)
             return final
@@ -399,7 +426,7 @@ def _prepare_final_release(extracted: Path, manifest: dict[str, Any]) -> Path:
     try:
         # Console-script shebangs require the venv to be built at its final path.
         _install_python_environment(final, manifest)
-        _verify_payload(final)
+        verify_payload(final, generated_environment=True)
         (final / _COMPLETE_MARKER).write_text(manifest["source_commit"] + "\n", encoding="ascii")
     except BaseException:
         # Cancellation must leave a safely retryable state; never suppress it.
@@ -425,10 +452,9 @@ def _install_locked(archive: Path) -> Path:
     INSTALL_ROOT.chmod(0o755)
 
     temporary = Path(tempfile.mkdtemp(prefix=".incoming-", dir=INSTALL_ROOT))
-    final: Path | None = None
     try:
         extracted = _extract_safely(archive.resolve(), temporary)
-        manifest = _verify_payload(extracted)
+        manifest = verify_payload(extracted)
 
         final = _prepare_final_release(extracted, manifest)
         _require_services_stopped()
@@ -444,8 +470,6 @@ def _install_locked(archive: Path) -> Path:
         shutil.rmtree(temporary, ignore_errors=True)
 
     print(f"Installed source commit: {manifest['source_commit']}")
-    if final is None:
-        raise RuntimeError("installation completed without a verified release")
     print(f"Current release: {final}")
     return final
 

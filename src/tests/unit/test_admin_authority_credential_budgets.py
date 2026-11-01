@@ -1,13 +1,4 @@
-"""Administrator-authority flows spend the credential step-up budget before
-expensive verification (app.services.admin_promotion, app.services.totp_recover).
-
-Split out of test_credential_budgets.py to stay under the module line cap;
-shares the reservation-spending scenario with TestTotpRotationSpendsReservationBeforePasswordWork
-and TestEmailChangeSpendsReservationBeforePasswordWork there, applied to the two
-call sites that act on behalf of, or target, an administrator: preparing and
-accepting an administrator-promotion invitation, and an administrator
-authorizing another user's TOTP recovery.
-"""
+"""Administrator promotion and TOTP recovery reserve attempts before expensive verification."""
 
 from datetime import UTC, datetime
 from unittest.mock import create_autospec, patch, sentinel
@@ -34,13 +25,7 @@ class _CredentialBoundaryReached(RuntimeError):
 
 
 def _reservation_mock(result):
-    """An autospecced double of reserve_session_step_up_attempt.
-
-    Every caller-module binding (admin_promotion, totp_recover) imports the
-    exact same function object from credential_attempts, so autospeccing
-    against the defining module's reference enforces the real signature
-    regardless of which binding a test patches.
-    """
+    """Return a signature-checked reservation double with the requested outcome."""
     if isinstance(result, Exception):
         return create_autospec(
             credential_attempts.reserve_session_step_up_attempt,
@@ -70,8 +55,9 @@ class TestAdminPromotionPrepareSpendsReservationBeforePasswordWork:
         reservation,
         expected_reason,
     ):
+        """Rejected reservation stops before password work."""
         password_work = create_autospec(
-            admin_promotion._verify_password_snapshot,
+            admin_promotion.verify_password_snapshot,
             side_effect=AssertionError("password work must not run"),
             spec_set=True,
         )
@@ -82,7 +68,7 @@ class TestAdminPromotionPrepareSpendsReservationBeforePasswordWork:
                 "reserve_session_step_up_attempt",
                 _reservation_mock(reservation),
             ),
-            patch.object(admin_promotion, "_verify_password_snapshot", password_work),
+            patch.object(admin_promotion, "verify_password_snapshot", password_work),
             pytest.raises(admin_promotion.AdminPromotionRejected) as caught,
         ):
             await admin_promotion.prepare_admin_promotion(
@@ -97,9 +83,10 @@ class TestAdminPromotionPrepareSpendsReservationBeforePasswordWork:
         password_work.assert_not_awaited()
 
     async def test_reservation_storage_error_stops_before_password_work(self):
+        """Reservation storage error stops before password work."""
         storage_error = _ReservationStorageError("reservation unavailable")
         password_work = create_autospec(
-            admin_promotion._verify_password_snapshot,
+            admin_promotion.verify_password_snapshot,
             side_effect=AssertionError("password work must not run"),
             spec_set=True,
         )
@@ -110,7 +97,7 @@ class TestAdminPromotionPrepareSpendsReservationBeforePasswordWork:
                 "reserve_session_step_up_attempt",
                 _reservation_mock(storage_error),
             ),
-            patch.object(admin_promotion, "_verify_password_snapshot", password_work),
+            patch.object(admin_promotion, "verify_password_snapshot", password_work),
             pytest.raises(_ReservationStorageError) as caught,
         ):
             await admin_promotion.prepare_admin_promotion(
@@ -125,14 +112,16 @@ class TestAdminPromotionPrepareSpendsReservationBeforePasswordWork:
         password_work.assert_not_awaited()
 
     async def test_reservation_succeeds_before_password_work_runs(self):
-        """Positive control: a granted reservation runs before password work, in that order."""
+        """A granted reservation runs before password work, in that order."""
         events: list[str] = []
 
         async def reserve(*_args, **_kwargs):
+            """Record reservation and return RESERVED before credential verification."""
             events.append("reserve")
             return SessionStepUpAttemptOutcome.RESERVED
 
         async def password_work(*_args, **_kwargs):
+            """Record password verification and raise the boundary sentinel."""
             events.append("password")
             raise _CredentialBoundaryReached
 
@@ -148,9 +137,9 @@ class TestAdminPromotionPrepareSpendsReservationBeforePasswordWork:
             ) as reserve_attempt,
             patch.object(
                 admin_promotion,
-                "_verify_password_snapshot",
+                "verify_password_snapshot",
                 new=create_autospec(
-                    admin_promotion._verify_password_snapshot,
+                    admin_promotion.verify_password_snapshot,
                     side_effect=password_work,
                     spec_set=True,
                 ),
@@ -173,8 +162,9 @@ class TestAdminPromotionPrepareSpendsReservationBeforePasswordWork:
         )
 
     async def test_malformed_totp_is_rejected_after_the_reservation_without_a_type_error(self):
+        """Malformed TOTP is rejected after the reservation without a type error."""
         password_work = create_autospec(
-            admin_promotion._verify_password_snapshot,
+            admin_promotion.verify_password_snapshot,
             side_effect=AssertionError("password work must not run"),
             spec_set=True,
         )
@@ -185,7 +175,7 @@ class TestAdminPromotionPrepareSpendsReservationBeforePasswordWork:
                 "reserve_session_step_up_attempt",
                 _reservation_mock(SessionStepUpAttemptOutcome.RESERVED),
             ) as reserve,
-            patch.object(admin_promotion, "_verify_password_snapshot", password_work),
+            patch.object(admin_promotion, "verify_password_snapshot", password_work),
             pytest.raises(admin_promotion.AdminPromotionRejected) as caught,
         ):
             await admin_promotion.prepare_admin_promotion(
@@ -221,6 +211,7 @@ class TestAdminPromotionAcceptSpendsReservationBeforeRecoveryCodeWork:
         reservation,
         expected_reason,
     ):
+        """Rejected reservation stops before code verification."""
         acquire_cursor = create_autospec(
             admin_promotion.get_db_cursor,
             side_effect=AssertionError("recovery-code work must not run"),
@@ -247,6 +238,7 @@ class TestAdminPromotionAcceptSpendsReservationBeforeRecoveryCodeWork:
         acquire_cursor.assert_not_called()
 
     async def test_reservation_storage_error_stops_before_code_verification(self):
+        """Reservation storage error stops before code verification."""
         storage_error = _ReservationStorageError("reservation unavailable")
         acquire_cursor = create_autospec(
             admin_promotion.get_db_cursor,
@@ -274,7 +266,7 @@ class TestAdminPromotionAcceptSpendsReservationBeforeRecoveryCodeWork:
         acquire_cursor.assert_not_called()
 
     async def test_reservation_succeeds_before_recovery_code_verification_runs(self):
-        """Positive control: a granted reservation runs before recovery-code verification, in that order."""
+        """A granted reservation runs before recovery-code verification, in that order."""
         events: list[str] = []
         now = datetime.now(UTC)
         cursor = make_async_cursor(
@@ -301,10 +293,12 @@ class TestAdminPromotionAcceptSpendsReservationBeforeRecoveryCodeWork:
         )
 
         async def reserve(*_args, **_kwargs):
+            """Record reservation and return RESERVED before credential verification."""
             events.append("reserve")
             return SessionStepUpAttemptOutcome.RESERVED
 
         async def verify_code(*_args, **_kwargs):
+            """Record recovery-code verification and raise the boundary sentinel."""
             events.append("recovery_code")
             raise _CredentialBoundaryReached
 
@@ -384,6 +378,7 @@ class TestAdminTotpRecoverySpendsReservationBeforeTotpVerification:
         reservation,
         expected_reason,
     ):
+        """Rejected reservation stops before TOTP verification."""
         acquire_cursor = create_autospec(
             totp_recover.get_db_cursor,
             side_effect=AssertionError("administrator TOTP work must not run"),
@@ -411,6 +406,7 @@ class TestAdminTotpRecoverySpendsReservationBeforeTotpVerification:
         acquire_cursor.assert_not_called()
 
     async def test_reservation_storage_error_stops_before_totp_verification(self):
+        """Reservation storage error stops before TOTP verification."""
         storage_error = _ReservationStorageError("reservation unavailable")
         acquire_cursor = create_autospec(
             totp_recover.get_db_cursor,
@@ -439,7 +435,7 @@ class TestAdminTotpRecoverySpendsReservationBeforeTotpVerification:
         acquire_cursor.assert_not_called()
 
     async def test_reservation_succeeds_before_totp_verification_runs(self):
-        """Positive control: a granted reservation runs before the administrator's TOTP check, in that order."""
+        """A granted reservation runs before the administrator's TOTP check, in that order."""
         events: list[str] = []
         cursor = make_async_cursor(
             fetchone={
@@ -450,10 +446,12 @@ class TestAdminTotpRecoverySpendsReservationBeforeTotpVerification:
         )
 
         async def reserve(*_args, **_kwargs):
+            """Record reservation and return RESERVED before credential verification."""
             events.append("reserve")
             return SessionStepUpAttemptOutcome.RESERVED
 
         async def verify_totp(*_args, **_kwargs):
+            """Record TOTP verification and raise the boundary sentinel."""
             events.append("totp")
             raise _CredentialBoundaryReached
 
@@ -508,6 +506,7 @@ class TestAdminTotpRecoverySpendsReservationBeforeTotpVerification:
         )
 
     async def test_malformed_totp_is_rejected_after_the_reservation_without_a_type_error(self):
+        """Malformed TOTP is rejected after the reservation without a type error."""
         acquire_cursor = create_autospec(
             totp_recover.get_db_cursor,
             side_effect=AssertionError("administrator TOTP work must not run"),

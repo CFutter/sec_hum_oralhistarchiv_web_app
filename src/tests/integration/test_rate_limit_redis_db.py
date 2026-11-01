@@ -1,24 +1,9 @@
-"""Rate-limit admission against a real Redis backend and the real database.
+"""Rate-limit admission against a real Redis backend and the real database."""
 
-``BoundedRateLimitMiddleware`` (app/middleware/rate_limiting.py) resolves a
-per-request identity and endpoint, evaluates SlowAPI limits against whatever
-storage ``limiter.limiter.storage`` currently points at, and fails closed
-(503) when that storage is unreachable or overloaded. These tests exercise
-the real, pinned-per-process Redis database, independent private
-``redis-server`` processes for outage/persistence/memory-pressure scenarios,
-a real PostgreSQL-backed ``e2e_client`` for admission ordering, and real
-multi-worker Gunicorn traffic for cross-worker counter sharing.
-
-``test_redis_tier.py::test_two_limiters_share_counters_via_redis`` already
-proves two independent ``Limiter`` instances share one Redis-backed counter;
-it is not duplicated here.
-"""
-
-import contextlib
 import os
+import re
 import shutil
 import signal
-import socket
 import subprocess
 import time
 from collections.abc import Iterator
@@ -36,15 +21,19 @@ from limits.storage.redis import RedisStorage
 from limits.strategies import FixedWindowRateLimiter
 
 import app.middleware.session as _session_module
+from app.middleware.bounded_rate_limit_storage import CONTROL_KEYS, bounded_redis_uri
 from app.middleware.rate_limiting import (
     _RATE_LIMIT_KEY_PREFIX,
+    bounded_storage_options,
     limiter,
-    redis_storage_options,
 )
 from app.services.sessions import get_session_user as _real_get_session_user
 from config import settings
 
 from .conftest import login_with_totp
+from .server_processes import free_port as _free_port
+from .server_processes import start_private_redis as _start_private_redis
+from .server_processes import terminate_process as _terminate
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -54,97 +43,17 @@ _GUNICORN_BIN = shutil.which("gunicorn") or str(_REPO_SRC_DIR.parent / ".venv" /
 
 
 def _rate_limit_redis_url() -> str:
+    """Return the configured limiter Redis URL as plain text."""
     return settings.rate_limit_redis_url.get_secret_value()
 
 
 def _inspection_client() -> redis_lib.Redis:
+    """Create a decoded-response Redis client for the limiter database."""
     return redis_lib.Redis.from_url(_rate_limit_redis_url(), decode_responses=True)
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _wait_for_redis_ping(port: int, *, timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    last_exc: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            client = redis_lib.Redis(host="127.0.0.1", port=port, socket_connect_timeout=0.5)
-            try:
-                if client.ping():
-                    return
-            finally:
-                client.close()
-        except Exception as exc:
-            last_exc = exc
-        time.sleep(0.05)
-    raise RuntimeError(f"private redis-server on port {port} never answered PING: {last_exc}")
-
-
-def _terminate(proc: subprocess.Popen, *, timeout: float = 5.0) -> None:
-    """Stop a spawned server and everything it forked.
-
-    The child is started in a session of its own, so its process group is
-    the master plus every worker it forked. A graceful stop goes to the
-    master first; a master that does not finish inside the deadline, and any
-    worker that outlives it, is killed by process group so no test leaves an
-    orphaned server behind.
-    """
-    try:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=timeout)
-    finally:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-
-
-def _start_private_redis(tmp_path, port: int, *extra_args: str) -> subprocess.Popen:
-    proc = subprocess.Popen(
-        [
-            "redis-server",
-            "--port",
-            str(port),
-            "--bind",
-            "127.0.0.1",
-            "--save",
-            "",
-            "--dir",
-            str(tmp_path),
-            *extra_args,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    try:
-        _wait_for_redis_ping(port)
-    except Exception:
-        _terminate(proc)
-        raise
-    return proc
-
-
-@pytest.fixture
-def private_redis(tmp_path) -> Iterator[tuple[int, object]]:
-    """A private, disposable redis-server with no persistence."""
-    port = _free_port()
-    proc = _start_private_redis(tmp_path, port, "--appendonly", "no")
-    try:
-        yield port, proc
-    finally:
-        _terminate(proc)
-
-
 @contextmanager
-def _limiter_pointed_at(storage_uri: str):
+def _limiter_pointed_at(storage_uri: str) -> Iterator[RedisStorage]:
     """Swap only the real global limiter's storage backend for the duration.
 
     Preserves every other production wire-up on the SAME ``Limiter``
@@ -153,7 +62,9 @@ def _limiter_pointed_at(storage_uri: str):
     remains exempt and named-route budgets keep applying while only the
     Redis backend changes.
     """
-    storage = storage_from_string(storage_uri, **redis_storage_options())
+    storage = storage_from_string(bounded_redis_uri(storage_uri), **bounded_storage_options())
+    assert isinstance(storage, RedisStorage), "test limiter requires synchronous Redis storage"
+
     original_storage = limiter.limiter.storage
     limiter.limiter.storage = storage
     try:
@@ -174,13 +85,14 @@ def _route_segment(redis_key: str) -> str:
     return redis_key.split("/")[-4]
 
 
-# ---------------------------------------------------------------------------
 # Unmatched-route sentinel sharing and named-route independence
-# ---------------------------------------------------------------------------
 
 
 class TestUnmatchedRouteSentinelIsSharedAndIndependentOfNamedBudgets:
+    """Check unmatched Route Sentinel Is Shared And Independent Of Named Budgets."""
+
     def test_404_and_405_traffic_share_one_sentinel_allowance(self, e2e_client):
+        """Verify 404 and 405 traffic share one sentinel allowance."""
         per_minute = settings.rate_limit_per_minute
         responses = []
         for i in range(per_minute):
@@ -209,20 +121,24 @@ class TestUnmatchedRouteSentinelIsSharedAndIndependentOfNamedBudgets:
         )
 
 
-# ---------------------------------------------------------------------------
 # Concurrent admission against the real, pinned Redis
-# ---------------------------------------------------------------------------
 
 
 class TestConcurrentAdmissionAgainstRealRedis:
+    """Check concurrent Admission Against Real Redis."""
+
     def test_concurrent_hits_from_independent_connections_admit_exactly_the_limit(self):
+        """Verify concurrent hits from independent connections admit exactly the limit."""
         item = RateLimitItemPerMinute(10, 1)
         key = f"concurrent-admission-{os.getpid()}-{time.time_ns()}"
         contenders = 25
 
         def _hit() -> bool:
             # Independent Storage/connection per contender.
-            storage = storage_from_string(_rate_limit_redis_url(), **redis_storage_options())
+            """Attempt admission through a real Redis-backed fixed-window limiter."""
+            storage = storage_from_string(
+                bounded_redis_uri(_rate_limit_redis_url()), **bounded_storage_options()
+            )
             strategy = FixedWindowRateLimiter(storage)
             return strategy.hit(item, key)
 
@@ -234,15 +150,17 @@ class TestConcurrentAdmissionAgainstRealRedis:
                 f"expected exactly {item.amount} admissions, got {admitted}"
             )
         finally:
-            storage_from_string(_rate_limit_redis_url(), **redis_storage_options()).clear(
-                item.key_for(key)
-            )
+            storage_from_string(
+                bounded_redis_uri(_rate_limit_redis_url()), **bounded_storage_options()
+            ).clear(item.key_for(key))
 
     def test_a_single_contender_is_admitted_up_to_the_limit(self):
         """Positive control: sequential hits admit until the same limit, no more."""
         item = RateLimitItemPerMinute(4, 1)
         key = f"sequential-admission-{os.getpid()}-{time.time_ns()}"
-        storage = storage_from_string(_rate_limit_redis_url(), **redis_storage_options())
+        storage = storage_from_string(
+            bounded_redis_uri(_rate_limit_redis_url()), **bounded_storage_options()
+        )
         strategy = FixedWindowRateLimiter(storage)
         try:
             results = [strategy.hit(item, key) for _ in range(6)]
@@ -251,21 +169,26 @@ class TestConcurrentAdmissionAgainstRealRedis:
             storage.clear(item.key_for(key))
 
 
-# ---------------------------------------------------------------------------
 # Key namespace, HMAC-only identity, bounded TTL, single sentinel scope
-# ---------------------------------------------------------------------------
 
 
 class TestLimiterKeysCarryOnlyTheReviewedNamespaceIdentityAndTtl:
+    """Check limiter Keys Carry Only The Reviewed Namespace Identity And TTL."""
+
     def test_keys_created_by_real_traffic_use_the_reviewed_prefix_identity_and_ttl(
         self, e2e_client
     ):
+        """Verify keys created by real traffic use the reviewed prefix identity and TTL."""
         e2e_client.get("/login")
         e2e_client.put("/login")  # 405, feeds the sentinel bucket too
 
         inspector = _inspection_client()
         try:
-            keys = [k for k in inspector.scan_iter(match="*") if _RATE_LIMIT_KEY_PREFIX in k]
+            keys = [
+                k
+                for k in inspector.scan_iter(match="*")
+                if _RATE_LIMIT_KEY_PREFIX in k and k not in CONTROL_KEYS
+            ]
             assert keys, "no limiter keys were created by real traffic"
             largest_window_seconds = 24 * 60 * 60  # the configured per-day window
             for key in keys:
@@ -320,12 +243,17 @@ class TestLimiterKeysCarryOnlyTheReviewedNamespaceIdentityAndTtl:
             inspector.close()
 
     def test_unknown_paths_collapse_into_one_sentinel_key_scope(self, e2e_client):
+        """Verify unknown paths collapse into one sentinel key scope."""
         for i in range(12):
             e2e_client.get(f"/definitely-not-a-real-endpoint-{i}/{'x' * i}")
 
         inspector = _inspection_client()
         try:
-            keys = [k for k in inspector.scan_iter(match="*") if _RATE_LIMIT_KEY_PREFIX in k]
+            keys = [
+                k
+                for k in inspector.scan_iter(match="*")
+                if _RATE_LIMIT_KEY_PREFIX in k and k not in CONTROL_KEYS
+            ]
             assert keys, "no limiter keys were created by the unknown-path traffic"
             routes = {_route_segment(k) for k in keys}
             # However the route segment is spelled, all 12 distinct unknown
@@ -336,15 +264,16 @@ class TestLimiterKeysCarryOnlyTheReviewedNamespaceIdentityAndTtl:
             inspector.close()
 
 
-# ---------------------------------------------------------------------------
 # A private redis-server outage (SIGSTOP) and recovery
-# ---------------------------------------------------------------------------
 
 
 class TestPrivateRedisOutageFailsClosedAndRecoversOnItsOwnWindow:
+    """Check private Redis Outage Fails Closed And Recovers On Its Own Window."""
+
     def test_a_stopped_backend_returns_503_without_running_the_endpoint_then_429_after_resume(
         self, e2e_client, private_redis
     ):
+        """Verify a stopped backend returns 503 without running the endpoint then 429 after resume."""
         port, proc = private_redis
         with _limiter_pointed_at(f"redis://127.0.0.1:{port}/0"):
             for _ in range(settings.rate_limit_per_minute):
@@ -383,15 +312,16 @@ class TestPrivateRedisOutageFailsClosedAndRecoversOnItsOwnWindow:
             assert e2e_client.get("/login").status_code == 200
 
 
-# ---------------------------------------------------------------------------
 # Memory pressure with noeviction rejects writes without a fallback
-# ---------------------------------------------------------------------------
 
 
 class TestPrivateRedisMemoryPressureFailsClosedWithoutAnInMemoryFallback:
+    """Check private Redis Memory Pressure Fails Closed Without An In Memory Fallback."""
+
     def test_a_write_rejected_under_maxmemory_returns_503_and_keeps_existing_keys(
         self, tmp_path, e2e_client
     ):
+        """Verify a write rejected under maxmemory returns 503 and keeps existing keys."""
         port = _free_port()
         proc = _start_private_redis(
             tmp_path,
@@ -445,13 +375,14 @@ class TestPrivateRedisMemoryPressureFailsClosedWithoutAnInMemoryFallback:
             _terminate(proc)
 
 
-# ---------------------------------------------------------------------------
 # Persistence across a server restart
-# ---------------------------------------------------------------------------
 
 
 class TestPrivateRedisPersistenceSurvivesARestart:
+    """Check private Redis Persistence Survives ARestart."""
+
     def test_counter_and_ttl_survive_a_server_restart_with_appendonly(self, tmp_path, e2e_client):
+        """Verify counter and TTL survive a server restart with appendonly."""
         port = _free_port()
         proc = _start_private_redis(tmp_path, port, "--appendonly", "yes")
         try:
@@ -492,18 +423,14 @@ class TestPrivateRedisPersistenceSurvivesARestart:
             _terminate(proc)
 
 
-# ---------------------------------------------------------------------------
 # The cache Redis database and the limiter's Redis database stay separate
-# ---------------------------------------------------------------------------
 
 
 class TestLimiterCountersAreIsolatedFromTheApplicationCacheDatabase:
+    """Check limiter Counters Are Isolated From The Application Cache Database."""
+
     def test_flushing_the_cache_database_leaves_limiter_counters_intact(self, tmp_path, e2e_client):
-        """Credential separation (distinct ACL users) is not expressible with a
-        single private redis-server; this proves the weaker, still-real
-        property that the limiter's counters live in a distinct logical
-        database from whatever the application cache would use, so clearing
-        one cannot clear the other."""
+        """Verify flushing the cache database leaves limiter counters intact."""
         port = _free_port()
         proc = _start_private_redis(tmp_path, port, "--appendonly", "no")
         try:
@@ -554,9 +481,7 @@ class TestLimiterCountersAreIsolatedFromTheApplicationCacheDatabase:
             _terminate(proc)
 
 
-# ---------------------------------------------------------------------------
 # Admission ordering against the real stack
-# ---------------------------------------------------------------------------
 
 
 class TestAdmissionOrderingAgainstTheLiveStack:
@@ -570,6 +495,7 @@ class TestAdmissionOrderingAgainstTheLiveStack:
     async def test_an_exhausted_bucket_rejects_authenticated_traffic_without_running_the_route(
         self, e2e_client, user_factory, monkeypatch
     ):
+        """Verify an exhausted bucket rejects authenticated traffic without running the route."""
         login_with_totp(e2e_client, user_factory)
 
         spy = create_autospec(_real_get_session_user, side_effect=_real_get_session_user)
@@ -595,6 +521,7 @@ class TestAdmissionOrderingAgainstTheLiveStack:
     async def test_an_exhausted_bucket_rejects_traffic_before_any_session_lookup(
         self, e2e_client, user_factory, monkeypatch
     ):
+        """Verify an exhausted bucket rejects traffic before any session lookup."""
         login_with_totp(e2e_client, user_factory)
 
         spy = create_autospec(_real_get_session_user, side_effect=_real_get_session_user)
@@ -612,6 +539,7 @@ class TestAdmissionOrderingAgainstTheLiveStack:
         )
 
     def test_redis_unavailable_rejects_every_request_with_503(self, e2e_client, user_factory):
+        """Verify Redis unavailable rejects every request with 503."""
         login_with_totp(e2e_client, user_factory)
         closed_port = _free_port()  # nothing is listening; connection refused
         with _limiter_pointed_at(f"redis://127.0.0.1:{closed_port}/0"):
@@ -621,6 +549,7 @@ class TestAdmissionOrderingAgainstTheLiveStack:
     async def test_redis_unavailable_rejects_before_any_pool_checkout(
         self, e2e_client, user_factory, monkeypatch
     ):
+        """Verify Redis unavailable rejects before any pool checkout."""
         login_with_totp(e2e_client, user_factory)
 
         spy = create_autospec(_real_get_session_user, side_effect=_real_get_session_user)
@@ -641,14 +570,13 @@ class TestAdmissionOrderingAgainstTheLiveStack:
         assert response.status_code == 200
 
 
-# ---------------------------------------------------------------------------
 # Two real Gunicorn workers sharing one Redis-backed bucket
-# ---------------------------------------------------------------------------
 
 
 def _http_get(base_url: str, path: str) -> httpx.Response:
     # A fresh, non-keep-alive connection per call so consecutive requests are
     # free to land on either worker instead of pinning one TCP connection.
+    """GET a path with a fresh five-second HTTP client and a close connection header."""
     with httpx.Client(base_url=base_url, headers={"Connection": "close"}, timeout=5.0) as client:
         return client.get(path)
 
@@ -678,15 +606,20 @@ def _http_get_through_worker_recycling(
     raise RuntimeError(f"{path} kept failing through worker recycling: {last_exc}")
 
 
-def _spawn_gunicorn(port: int, *, extra_args: tuple[str, ...] = ()) -> subprocess.Popen:
+def _spawn_gunicorn(
+    port: int, *, extra_args: tuple[str, ...] = (), hourly_quota: int | None = None
+) -> subprocess.Popen[bytes]:
+    """Launch real workers, optionally retaining a focused process test's quota for an hour."""
     env = os.environ.copy()
     env["ENV_STATE"] = "dev"
+    if hourly_quota is not None:
+        env["RATE_LIMIT_PER_HOUR"] = str(hourly_quota)
     cmd = [
         _GUNICORN_BIN,
         "-w",
         "2",
         "-k",
-        "uvicorn_worker.UvicornWorker",
+        "app.server_worker.SafeUvicornWorker",
         "-b",
         f"127.0.0.1:{port}",
         *extra_args,
@@ -706,6 +639,7 @@ def _spawn_gunicorn(port: int, *, extra_args: tuple[str, ...] = ()) -> subproces
 
 
 def _wait_for_http_ready(base_url: str, *, timeout: float = 20.0) -> None:
+    """Poll /health for HTTP 200; raise RuntimeError after the timeout in seconds."""
     deadline = time.monotonic() + timeout
     last_exc: Exception | None = None
     while time.monotonic() < deadline:
@@ -719,14 +653,14 @@ def _wait_for_http_ready(base_url: str, *, timeout: float = 20.0) -> None:
     raise RuntimeError(f"gunicorn at {base_url} never became ready: {last_exc}")
 
 
-def _worker_pids(proc: subprocess.Popen) -> set[int]:
+def _worker_pids(proc: subprocess.Popen[bytes]) -> set[int]:
     """PIDs of the gunicorn master's current worker processes (Linux)."""
     children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children")
     return {int(pid) for pid in children.read_text().split()}
 
 
 def _wait_for_worker_replacement(
-    proc: subprocess.Popen, old_workers: set[int], *, workers: int = 2, timeout: float = 30.0
+    proc: subprocess.Popen[bytes], old_workers: set[int], *, workers: int = 2, timeout: float = 30.0
 ) -> None:
     """Wait until a SIGHUP reload has replaced every pre-reload worker, so a
     readiness probe cannot be answered by a worker that is about to exit."""
@@ -740,7 +674,8 @@ def _wait_for_worker_replacement(
 
 
 @pytest.fixture
-def gunicorn_pair() -> Iterator[tuple[str, subprocess.Popen]]:
+def gunicorn_pair() -> Iterator[tuple[str, subprocess.Popen[bytes]]]:
+    """Start the configured two-worker Gunicorn master and terminate its process group on teardown."""
     if not Path(_GUNICORN_BIN).exists():
         pytest.fail(f"gunicorn binary not found at {_GUNICORN_BIN}")
     port = _free_port()
@@ -753,7 +688,10 @@ def gunicorn_pair() -> Iterator[tuple[str, subprocess.Popen]]:
 
 
 class TestTwoGunicornWorkersShareOneRedisBackedBucket:
+    """Check two Gunicorn Workers Share One Redis Backed Bucket."""
+
     def test_every_worker_rejects_once_the_shared_bucket_is_exhausted(self, gunicorn_pair):
+        """Verify every worker rejects once the shared bucket is exhausted."""
         base_url, _proc = gunicorn_pair
         for _ in range(settings.rate_limit_per_minute):
             response = _http_get(base_url, "/login")
@@ -763,6 +701,7 @@ class TestTwoGunicornWorkersShareOneRedisBackedBucket:
         assert all(status == 429 for status in rejections), rejections
 
     def test_a_graceful_reload_does_not_restore_the_exhausted_quota(self, gunicorn_pair):
+        """Verify a graceful reload does not restore the exhausted quota."""
         base_url, proc = gunicorn_pair
         for _ in range(settings.rate_limit_per_minute):
             _http_get(base_url, "/login")
@@ -775,29 +714,76 @@ class TestTwoGunicornWorkersShareOneRedisBackedBucket:
 
         assert _http_get(base_url, "/login").status_code == 429
 
-    def test_worker_recycling_via_max_requests_does_not_restore_the_quota(self):
+    def test_worker_recycling_via_max_requests_does_not_restore_the_quota(self, tmp_path):
+        # Process startup/recycling can outlive a legitimate one-minute window
+        # on a loaded host. Exhaust the same request allowance in a real hourly
+        # Redis bucket as well, then prove that bucket survived actual recycling.
+        """Verify worker recycling via max requests does not restore the quota."""
+        quota = settings.rate_limit_per_minute
+        worker_log = tmp_path / "gunicorn-workers.log"
         port = _free_port()
-        proc = _spawn_gunicorn(port, extra_args=("--max-requests", "5"))
+        proc = _spawn_gunicorn(
+            port,
+            extra_args=("--max-requests", "5", "--error-logfile", str(worker_log)),
+            hourly_quota=quota,
+        )
+        inspector = _inspection_client()
+
+        def booted_workers() -> set[int]:
+            """Extract distinct Gunicorn worker PIDs from the captured log."""
+            return {
+                int(pid)
+                for pid in re.findall(r"Booting worker with pid: (\d+)", worker_log.read_text())
+            }
+
         try:
             base_url = f"http://127.0.0.1:{port}"
             _wait_for_http_ready(base_url)
-
-            # Every request may land in a recycle gap once --max-requests is
-            # this low, the exhausting burst included.
-            for _ in range(settings.rate_limit_per_minute):
+            # Transport retries can charge an admission whose response was lost
+            # mid-recycle. The stored counter, rather than an exact HTTP count,
+            # establishes exhaustion of the real shared bucket.
+            for _ in range(quota):
                 _http_get_through_worker_recycling(base_url, "/login")
             assert _http_get_through_worker_recycling(base_url, "/login").status_code == 429
+            hourly_keys = [
+                key
+                for key in inspector.scan_iter(match="*")
+                if _RATE_LIMIT_KEY_PREFIX in key
+                and "login_page" in key
+                and key.endswith(f"/{quota}/1/hour")
+            ]
+            assert len(hourly_keys) == 1, hourly_keys
+            key = hourly_keys[0]
+            before = inspector.get(key)
+            assert before is not None and int(before) >= quota
+            ttl_before = inspector.pttl(key)
+            assert ttl_before > RateLimitItemPerMinute(1).get_expiry() * 1000
+            workers_before = booted_workers()
+            assert workers_before
 
-            # /health is rate-limit exempt; enough traffic to force at least
-            # one worker past --max-requests=5 and get recycled.
+            # /health is exempt from rate limiting but counts toward Gunicorn's
+            # max_requests. Its boot log proves a new worker actually started.
             for _ in range(30):
                 response = _http_get_through_worker_recycling(base_url, "/health")
                 assert response.status_code == 200
-
+            # Uvicorn checks max_requests on its periodic server tick; a fast
+            # burst may finish before shutdown/replacement has begun.
+            deadline = time.monotonic() + _BOUNDED_WAIT_SECONDS
+            while not booted_workers() - workers_before and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert booted_workers() - workers_before, "no worker recycled during health traffic"
+            after = inspector.get(key)
+            assert after is not None and int(after) >= int(before), (
+                "worker recycling removed or reduced the exhausted hourly counter"
+            )
+            assert 0 < inspector.pttl(key) <= ttl_before, (
+                "the exhausted hourly bucket expired or acquired a fresh window"
+            )
             assert _http_get_through_worker_recycling(base_url, "/login").status_code == 429, (
                 "worker recycling restored the exhausted quota"
             )
         finally:
+            inspector.close()
             _terminate(proc, timeout=10.0)
 
     def test_a_freshly_started_pair_admits_normal_traffic(self, gunicorn_pair):

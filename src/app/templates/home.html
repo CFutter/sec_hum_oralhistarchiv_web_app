@@ -1,12 +1,16 @@
 {% extends "base.html" %}
 {% set active_page = "home" %}
-{% block title %}Digital Oral History Archive{% endblock %}
+{% block title %}{{ site_name }}{% endblock %}
 
 {% block content %}
+{# Render a labeled field-tier restriction using item and configured_sources. #}
+{% macro restricted(item, field, label) -%}
+<p class="metadata-restricted" data-field="{{ field }}">{{ label }} requires <strong>{{ field_required_tier(item, field, configured_sources=configured_sources) }}</strong> access or higher.</p>
+{%- endmacro %}
 <section class="hero">
   <div class="hero-content">
-    <h1>Digital Oral History Archive</h1>
-    <p>Search and explore interview metadata from oral history research collections at the University of Zurich.</p>
+    <h1>{{ site_name }}</h1>
+    <p>{{ about_summary }}</p>
     <form class="hero-search" role="search" action="{{ path_for(request, 'search_page') }}" method="get">
       <input type="text" name="q" maxlength="200" placeholder="Search by keyword, title, author, topic…" autocomplete="off" aria-label="Search datasets">
       <button type="submit">Search</button>
@@ -21,14 +25,6 @@
       <span class="stat-number">{{ total_datasets }}</span>
       <span class="stat-label">Datasets</span>
     </div>
-    <div class="stat-card">
-      <span class="stat-number">{{ total_languages }}</span>
-      <span class="stat-label">Languages</span>
-    </div>
-    <div class="stat-card">
-      <span class="stat-number">{{ total_keywords }}</span>
-      <span class="stat-label">Keywords</span>
-    </div>
   </div>
 
   <p class="data-freshness">Data last fully updated: {{ last_full_rebuild | utc_datetime }}</p>
@@ -41,22 +37,39 @@
       <div class="card-access {{ item.access_level }}">{{ item.access_level }}</div>
       <h3>{{ item.title }}</h3>
 
-      {% if can_view_full(item, user_tier) %}
-      <p class="card-authors">{{ item.authors | map(attribute='name')| join('; ') }}</p>
-      <p class="card-summary">{{ (item.description or '')[:120] }}{% if item.description and item.description|length > 120 %}…{% endif %}</p>
+      {% if can_view_field(item, user_tier, 'authors', configured_sources=configured_sources) %}
+      <p class="card-authors" data-field="authors">{{ item.authors | map(attribute='name')| join('; ') }}</p>
+      {% else %}
+      {{ restricted(item, 'authors', 'Authors') }}
+      {% endif %}
+      {% if can_view_field(item, user_tier, 'description', configured_sources=configured_sources) %}
+      <p class="card-summary" data-field="description">{{ (item.description or '')[:120] }}{% if item.description and item.description|length > 120 %}…{% endif %}</p>
+      {% else %}
+      {{ restricted(item, 'description', 'Description') }}
+      {% endif %}
       <div class="card-meta">
+        {% if can_view_field(item, user_tier, 'languages', configured_sources=configured_sources) %}
+        <span data-field="languages">
         {% for lang in item.languages %}<span>{{ lang }}</span>{% endfor %}
-              {% if item.version %}<span>v{{ item.version }}</span>{% endif %}
+        </span>
+        {% else %}
+        {{ restricted(item, 'languages', 'Languages') }}
+        {% endif %}
+        {% if item.version %}<span>v{{ item.version }}</span>{% endif %}
       </div>
-      <div class="card-topics">
+      {% if can_view_field(item, user_tier, 'keywords', configured_sources=configured_sources) %}
+      <div class="card-topics" data-field="keywords">
         {% for keyword in item.keywords[:4] %}
         <span class="tag">{{ keyword }}</span>
         {% endfor %}
       </div>
       {% else %}
+      {{ restricted(item, 'keywords', 'Keywords') }}
+      {% endif %}
+      {% if not can_view_full(item, user_tier, configured_sources=configured_sources) %}
       <p class="result-restricted">
         Extended metadata available to authorized researchers.<br>
-        Log in or request access to view.
+        Full metadata requires <strong>{{ full_required_tier(item, configured_sources=configured_sources) }}</strong> access or higher. Log in or request access to view.
       </p>
       {% endif %}
 

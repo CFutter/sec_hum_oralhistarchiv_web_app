@@ -28,7 +28,7 @@ def safe_redirect_url(request: Request, fallback: str = "/") -> str:
     """Return stripped next if it is a single-slash same-site path, else fallback.
 
     Reject protocol-relative/backslash prefixes, CR/LF/NUL, schemes, and hosts;
-    log rejected nonempty values. Query/fragment text is retained. fallback is
+    log categorical rejection reasons. Query/fragment text is retained. fallback is
     returned without validation and must be trusted.
     """
     url = request.query_params.get("next", "").strip()
@@ -38,18 +38,18 @@ def safe_redirect_url(request: Request, fallback: str = "/") -> str:
 
     # Browsers can interpret a leading backslash as a host separator.
     if not url.startswith("/") or url.startswith(("//", "/\\")):
-        logger.warning("Blocked unsafe redirect target: %r", url)
+        logger.warning("Blocked unsafe redirect target", extra={"reason": "invalid_target"})
         return fallback
 
     # Defense-in-depth against CRLF / null injection.
     if any(c in url for c in ("\r", "\n", "\0")):
-        logger.warning("Blocked unsafe redirect target: %r", url)
+        logger.warning("Blocked unsafe redirect target", extra={"reason": "control_character"})
         return fallback
 
     # Parse structure so colons inside paths/query strings remain allowed.
     parts = urlsplit(url)
     if parts.scheme or parts.netloc:
-        logger.warning("Blocked unsafe redirect target: %r", url)
+        logger.warning("Blocked unsafe redirect target", extra={"reason": "invalid_authority"})
         return fallback
 
     return url

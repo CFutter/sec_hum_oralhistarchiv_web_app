@@ -1,0 +1,42 @@
+# Schema example for required SOURCES_CONFIG_FILE runtime selection.
+# Selecting this file enables BOTH entries below; it is not an offline demo.
+# For offline development, select deploy/environment/sources.dev.toml instead.
+#
+# Replace the OAI placeholder endpoint/filter and review source identities,
+# visibility policies, labels and operational budgets before deployment.
+# Staging/production reject placeholder OAI hosts. Production also rejects
+# fixture sources unless ALLOW_FIXTURE_SOURCE=true is explicitly configured.
+# Permission alone does not select a fixture.
+#
+# This file contains no secrets or credential-bearing URLs. In staging and
+# production install it at a trusted direct absolute path, then select that
+# same path for both processes and restart them together after changes.
+# Preserve existing source names and interpretation inputs when retaining state.
+
+[[sources]]
+name = "example_archive"
+adapter = "oai_pmh_cmdi"
+label = "Example archive"
+resource_link_label = "Open resource"
+landing_link_label = "View source record"
+endpoint = "https://repository.example.org/oai"
+institution_filter = "Example University"
+max_visibility = "public"
+requires_record_tier = false
+incremental_interval_seconds = 3600
+rebuild_interval_seconds = 86400
+write_timeout_seconds = 120
+max_pages = 500
+
+[[sources]]
+name = "fixture_demo"
+adapter = "fixture"
+label = "Synthetic interview examples"
+sensitivity_badge = "Synthetic examples"
+dataset = "catalogue_v1"
+max_visibility = "public"
+requires_record_tier = true
+incremental_interval_seconds = 3600
+rebuild_interval_seconds = 86400
+write_timeout_seconds = 120
+max_bytes = 65536

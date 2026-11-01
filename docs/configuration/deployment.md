@@ -5,7 +5,7 @@ This page is a high-level overview of how the application is meant to be deploye
 ## Target environment
 
 Follow [Deployment.md](../../Deployment.md) for the reference Ubuntu host:
-Python 3.11, PostgreSQL 16, nginx/TLS, isolated web/scheduler identities, a
+Python 3.11, PostgreSQL 18, nginx/TLS, isolated web/scheduler identities, a
 dedicated persistent Redis limiter, and optional separate cache Redis. Backup
 uses a read-only identity and age encryption; producer authenticity depends on
 authenticated transfer and separately controlled retention.
@@ -21,7 +21,7 @@ flowchart TD
     web <--> cache[Optional cache Redis]
     scheduler[Scheduler] --> db
     scheduler --> cache
-    scheduler --> source[SWISSUbase]
+    scheduler --> source[Configured sources]
     scheduler --> smtp[SMTP relay]
 ```
 
@@ -42,7 +42,7 @@ separate review of scheduler ownership, database roles, secrets and proxy trust.
 The web app and the background scheduler run as **separate systemd services
 and separate OS identities** (`oralhistarchiv.service` and
 `oralhistarchiv-scheduler.service`). Running the scheduler in its own process
-means the OAI-PMH syncs and maintenance jobs fire once globally rather than
+means ingestion and maintenance jobs fire once globally rather than
 once per Gunicorn worker. The distinct UID is also load-bearing: a compromised
 scheduler must not inherit the web user's access to the proxy socket or the
 web-only Shibboleth secret. The scheduler has no HTTP surface; it is monitored
@@ -71,17 +71,47 @@ best-effort catalogue-statistics pub/sub. With no dedicated limiter URL, develop
 uses a single Gunicorn worker. Hardened web startup requires the dedicated
 limiter regardless of the general Redis setting.
 
+The bounded backend caps live fixed-window counter allocations and refuses new
+allocations without deleting live quotas. Startup validates retained registry
+state and refuses unregistered legacy counters. Upgrade all web writers
+together: preserve Redis/AOF, stop old writers and wait for their actual
+remaining TTLs before starting the new release. This release requires that
+maintenance-window procedure; never flush/reset the store or weaken `noeviction`. Capacity sizing,
+ACL commands and restart validation are in the [main deployment procedure](../../Deployment.md#limiter-capacity-and-existing-counters).
+
+### Search isolation and database capacity
+
+Each web worker opens an additional one-connection search pool under the same
+web database role. Include that extra connection per worker when sizing
+PostgreSQL; the scheduler keeps its separate existing pool. Search does not
+fall back to the ordinary pool. A deployment-wide start budget runs before
+session lookup, and a nonblocking PostgreSQL transaction advisory lock limits
+active search operations to one across workers using the same database.
+
+The default start rate is one operation every two seconds, with burst one,
+a 500 ms SQL timeout, a one-second complete-operation deadline and 100 ms
+connection acquisition. Staging/production rejects a burst greater than one
+or a start-rate/deadline product above 0.5. The controls apply to every
+`GET /search` mode and remain enabled when ordinary per-client limits are
+disabled. Busy or expired work returns retryable, non-cacheable 503.
+
+Run the [search load acceptance](../runbooks/search-fulltext.md#capacity-and-load-acceptance)
+against representative data and record login/ordinary-request latency during
+search saturation. Separate pools and bounded concurrency do not reserve CPU,
+disk bandwidth or PostgreSQL memory. Keep the independent edge limits.
+
 ### nginx in front, with the Shibboleth SP at the edge
 
-nginx is what UZH IT operates and audits. In Phase 1 the exact
+nginx provides the reviewed edge boundary. While federation is closed, the exact
 `/auth/shibboleth/callback` location returns `404`, does not proxy to the
 application, and `SHIBBOLETH_INTERNAL_SECRET` remains unset.
 
 When Shibboleth comes online in Phase 2, the SP runs at the nginx layer. The
 FastCGI authorizer must populate and nginx must overwrite the fixed private
 headers `X-OHA-Shib-Subject`, `X-OHA-Shib-Issuer`, `X-OHA-Shib-Mail`,
-`X-OHA-Shib-Display-Name`, `X-OHA-Shib-Affiliation`, `X-OHA-Shib-Country`,
-and `X-OHA-Shib-Authn-Context`, plus `X-OHA-Internal-Auth`, on the exact
+`X-OHA-Shib-Display-Name`, `X-OHA-Shib-Affiliation`, `X-OHA-Shib-Entitlement`,
+`X-OHA-Shib-Country`, and `X-OHA-Shib-Authn-Context`, plus
+`X-OHA-Internal-Auth`, on the exact
 callback location. Ordinary proxy locations clear all of these and the legacy
 Shibboleth header names; client input is never forwarded as identity data.
 The callback explicitly sets `satisfy all` (so an inherited access-policy
@@ -105,9 +135,19 @@ non-admin, unverified pending row keyed by `(issuer, subject)` and issues no
 session. An administrator must use the dedicated approval action, which
 re-matches that exact pair, assigns the selected tier, activates the row, and
 records approval actor/time, bumps `auth_revision`, and deletes every target
-session atomically. Generic tier/admin/reactivation actions cannot release
-pending or legacy-quarantined identities. Only a later matching assertion can
-log in.
+session atomically. Generic tier, administrator and reactivation actions cannot
+approve pending identities. Dedicated approval itself requires enabled,
+currently trusted federation; only a later matching assertion can log in.
+The [WP F acceptance record](../runbooks/federated-tier-acceptance.md) maps
+application evidence and the separate open Gate F requirements. Follow the
+[generic federation integration runbook](../runbooks/federation-integration.md)
+for the ordered SP preparation, pre-flip checks, production canary and
+rollback procedure; synthetic application tests do not complete that host
+acceptance. With federation enabled, every valid-token `POST /logout` uses the
+fixed same-origin SP logout handler, including local and anonymous callers.
+An invalid-token retry with completed anonymous session resolution and no
+session cookie only redirects to `/`, without cookie changes or SP handoff;
+see [CSRF](../architecture/security.md#csrf).
 
 Federated session eligibility is also fail-closed after login. Each lookup
 requires the flag, active/approved state, and a still-trusted exact issuer.
@@ -133,6 +173,20 @@ encryption does not authenticate who produced an archive. The deployment
 runbook's filesystem, authenticated-transfer/provenance, failure, monitoring,
 off-host-copy and isolated-restore checks are mandatory host controls, not
 properties the application can verify at startup.
+
+WP M1 adds an optional nonsecret publication marker in a separate backup-owned
+status directory. Install `deploy/oralhistarchiv-backup-tmpfiles.conf` only after
+the backup OS identity exists; the ordinary application tmpfiles contract and
+its stable deployment-lock inode stay unchanged. Configure `BACKUP_STATUS_DIR`
+for the backup writer and the matching `BACKUP_STATUS_FILE` in web.env. The web
+identity gains no backup-directory, recovery-key or database privilege. The
+[monitoring checklist](../runbooks/monitoring.md) explains marker age, unknown
+states and independent timer/off-host/restore checks.
+
+The [PITR runbook](../runbooks/point-in-time-recovery.md) is a template for a
+separately reviewed physical-base/WAL deployment with independently encrypted
+retention and an isolated replay drill. It does not turn the logical dump unit
+into continuous archiving or establish a successful production recovery.
 
 ## Operational procedures
 
@@ -168,8 +222,9 @@ Run it through an equivalently sandboxed owner-only one-shot while web and
 scheduler remain stopped, reapply the matching deny-first grant manifest,
 deploy matching application code, and require both runtime preflights before
 reopening traffic. Never run `alembic` as a runtime OS/DB identity. The
-federation-specific rollback ordering in `Deployment.md` - "9. Shibboleth SP" 
-still takes precedence.
+[federation-specific rollback ordering](../runbooks/federation-integration.md#federation-rollback-boundary)
+still takes precedence. Suspected internal-credential disclosure requires
+the stopped-web-first incident procedure in the key-rotation runbook.
 
 
 ## Terminal email retention and delivery monitoring
@@ -237,3 +292,31 @@ the CLI exclusively through the static/manual
 both runtime units through `Conflicts=`, and reapplies the reviewed runtime
 grants. Never add Alembic to a runtime unit's `ExecStartPre` and never load
 `migration.env` into a wheel-only web or scheduler process.
+
+## Email-action link cutover
+
+Reset, registration-verification and email-change emails now use a non-secret
+public path ID and a separately printed security code. URLs contain no token,
+query or fragment. The GET page is generic; the user copies the code into the
+HTML form and submits it. POST binds the ID to the secret and applies the
+existing signature/account checks. No JavaScript, Node test step or database
+migration is needed. Deploy the matching application and templates together.
+
+Before delivery resumes, follow the
+[action-link cutover and reissue procedure](../runbooks/action-links.md#deploying-the-link-format-change)
+for queued old-format messages and already-issued links. Do not rewrite
+ciphertext or requeue obsolete message bodies manually. The new transport
+cannot erase secrets already recorded in mail systems, browsers or edge logs.
+
+## Registration activation (Gate R)
+
+Keep `LOCAL_REGISTRATION_ENABLED=false` on the deployment until the mailbox-first
+registration release is accepted and deployed. Before opening registration,
+complete a real flow through the production SMTP relay with a disposable
+mailbox: email-only request, delivered setup link, password/profile completion,
+single-use rejection on replay, then password login and authenticator/recovery
+code enrollment. Check missing/wrong CSRF rejection and that an attacker-supplied
+initial password never becomes a login credential. Verify rate limits and
+lockout against the public endpoint. Record revision, date, HTTP outcomes and
+the mailbox/relay result without recording passwords or raw capability URLs.
+Enable the flag only after that acceptance.

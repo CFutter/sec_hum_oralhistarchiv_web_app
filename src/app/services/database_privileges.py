@@ -12,7 +12,7 @@ from psycopg_pool import AsyncConnectionPool
 from config import settings
 
 from .db import get_db_cursor
-from .db_schema_contract import SESSION_COLUMN_CONTRACT, USER_COLUMN_CONTRACT
+from .db_schema_contract import SESSION_COLUMN_CONTRACT, USER_COLUMN_CONTRACT, VIEW_CONTRACTS
 
 RuntimeProcess = Literal["web", "scheduler"]
 
@@ -30,16 +30,31 @@ _ALL_TABLE_PRIVILEGES: Final = (
     "TRUNCATE",
     "REFERENCES",
     "TRIGGER",
+    "MAINTAIN",
 )
 _ALL_SEQUENCE_PRIVILEGES: Final = ("USAGE", "SELECT", "UPDATE")
 
 TABLE_PRIVILEGES: Final[dict[RuntimeProcess, dict[str, frozenset[str]]]] = {
     "web": {
         "alembic_version": frozenset({"SELECT"}),
+        "anonymous_mail_issuance": frozenset({"SELECT", "INSERT", "DELETE"}),
+        "source_security_state": frozenset(),
+        "source_binding_acknowledgements": frozenset(),
+        "security_audit_events": frozenset({"INSERT"}),
+        "security_audit_receipts": frozenset(),
+        "catalogue_search_policy": frozenset(),
+        "catalogue_search_public": frozenset(),
+        "catalogue_search_registered": frozenset(),
+        "catalogue_search_vetted": frozenset(),
         "oral_history_datasets": frozenset({"SELECT"}),
+        "catalogue_discovery": frozenset({"SELECT"}),
+        "catalogue_search_candidates": frozenset({"SELECT"}),
+        "dataset_admin_catalogue": frozenset({"SELECT"}),
+        "dataset_admin_state": frozenset({"SELECT", "INSERT", "UPDATE"}),
         "sync_status": frozenset({"SELECT"}),
         "ingestion_failures": frozenset(),
-        "users": frozenset({"SELECT", "INSERT", "UPDATE"}),
+        "ingestion_quarantine": frozenset({"SELECT"}),
+        "users": frozenset({"SELECT", "INSERT", "UPDATE", "DELETE"}),
         "federation_policy_state": frozenset({"SELECT", "INSERT", "UPDATE"}),
         "email_outbox": frozenset({"SELECT", "INSERT", "UPDATE"}),
         "sessions": frozenset({"SELECT", "INSERT", "UPDATE", "DELETE"}),
@@ -49,10 +64,24 @@ TABLE_PRIVILEGES: Final[dict[RuntimeProcess, dict[str, frozenset[str]]]] = {
     },
     "scheduler": {
         "alembic_version": frozenset({"SELECT"}),
+        "anonymous_mail_issuance": frozenset(),
+        "source_security_state": frozenset(),
+        "source_binding_acknowledgements": frozenset({"SELECT"}),
+        "security_audit_events": frozenset({"INSERT"}),
+        "security_audit_receipts": frozenset(),
+        "catalogue_search_policy": frozenset(),
+        "catalogue_search_public": frozenset(),
+        "catalogue_search_registered": frozenset(),
+        "catalogue_search_vetted": frozenset(),
         "oral_history_datasets": frozenset({"SELECT", "INSERT", "UPDATE", "DELETE"}),
-        "sync_status": frozenset({"SELECT", "UPDATE"}),
+        "catalogue_discovery": frozenset(),
+        "catalogue_search_candidates": frozenset(),
+        "dataset_admin_catalogue": frozenset(),
+        "dataset_admin_state": frozenset({"SELECT"}),
+        "sync_status": frozenset({"SELECT", "INSERT", "UPDATE"}),
         "ingestion_failures": frozenset({"SELECT", "INSERT", "UPDATE", "DELETE"}),
-        "users": frozenset({"SELECT", "DELETE"}),
+        "ingestion_quarantine": frozenset({"SELECT", "INSERT", "UPDATE", "DELETE"}),
+        "users": frozenset({"DELETE"}),
         "federation_policy_state": frozenset(),
         "email_outbox": frozenset({"SELECT", "UPDATE", "DELETE"}),
         "sessions": frozenset({"SELECT", "DELETE"}),
@@ -70,7 +99,24 @@ USER_COLUMN_PRIVILEGES: Final[dict[RuntimeProcess, dict[str, frozenset[str]]]] =
         "REFERENCES": frozenset(),
     },
     "scheduler": {
-        "SELECT": frozenset(USER_COLUMN_CONTRACT),
+        "SELECT": frozenset(
+            {
+                "id",
+                "email",
+                "is_active",
+                "is_admin",
+                "auth_method",
+                "email_verified",
+                "created_at",
+                "password_reset_token_hash",
+                "password_reset_created_at",
+                "email_verification_token_hash",
+                "email_verification_created_at",
+                "pending_email",
+                "pending_email_token_hash",
+                "pending_email_created_at",
+            }
+        ),
         "INSERT": frozenset(),
         # PostgreSQL requires UPDATE on at least one column for SELECT ... FOR
         # UPDATE. Outbox delivery locks users but never changes authority data.
@@ -101,19 +147,26 @@ SEQUENCE_PRIVILEGES: Final[dict[RuntimeProcess, dict[str, frozenset[str]]]] = {
     },
 }
 
-# These are schema-qualified identity signatures returned by PostgreSQL. The
-# current application calls no stored function directly; trigger functions do
-# not belong in this allowlist.
+# Match PostgreSQL-rendered identity signatures, including argument names;
+# allow only catalogue entrypoints, never trigger/maintenance functions.
 EXECUTABLE_APPLICATION_FUNCTIONS: Final[dict[RuntimeProcess, frozenset[str]]] = {
-    "web": frozenset(),
+    "web": frozenset(
+        {
+            "public.catalogue_scan_ceiling()",
+            "public.catalogue_guard_search_policy(p_fingerprint text)",
+            "public.catalogue_initialize_search_policy(p_fingerprint text, p_masks jsonb)",
+            "public.catalogue_match_ids(p_query jsonb)",
+            "public.catalogue_search_candidates()",
+            "public.catalogue_page_ids(p_anchor integer, p_ceiling integer, "
+            "p_backward boolean, p_limit integer, p_offset integer, p_query jsonb)",
+        }
+    ),
     "scheduler": frozenset(),
 }
 
 
 def _role_problems(role: Mapping[str, Any], process: RuntimeProcess) -> list[str]:
-    """Return role identity, elevated privilege, membership, ownership,
-    and function-EXECUTE mismatches.
-    """
+    """Report runtime identity, privilege, membership, ownership and function-EXECUTE drift."""
     expected_role = ROLE_BY_PROCESS[process]
     problems: list[str] = []
     if role["current_user"] != expected_role:
@@ -154,9 +207,7 @@ def _role_problems(role: Mapping[str, Any], process: RuntimeProcess) -> list[str
 
 
 def _expected_relation_access(process: RuntimeProcess) -> frozenset[str]:
-    """Return public-qualified relations accessible
-    under the process's table/user-column contract.
-    """
+    """Return allowed public relation names, including column-only users access."""
     return frozenset(
         f"public.{relation}"
         for relation, privileges in TABLE_PRIVILEGES[process].items()
@@ -202,9 +253,7 @@ async def _required_row(
 async def _read_accessible_object_inventory(
     cur: AsyncCursor[Mapping[str, Any]],
 ) -> Mapping[str, Any]:
-    """Query accessible public relations/sequences,
-    excluding extension members; require one result row.
-    """
+    """Read accessible public relations/sequences excluding extension members; require one row."""
     await cur.execute(
         """
         SELECT COALESCE(
@@ -216,7 +265,7 @@ async def _read_accessible_object_inventory(
                                  has_table_privilege(
                                      current_user,
                                      relation.oid,
-                                     'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+                                     'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN'
                                  )
                                  OR has_any_column_privilege(
                                      current_user,
@@ -383,6 +432,36 @@ async def _scheduler_session_column_privilege_problems(
     )
 
 
+async def _view_column_privilege_problems(
+    cur: AsyncCursor[Mapping[str, Any]], process: RuntimeProcess
+) -> list[str]:
+    """Reject legacy column grants that would escape the views' SELECT-only matrix."""
+    privileges = ("SELECT", "INSERT", "UPDATE", "REFERENCES")
+    problems: list[str] = []
+    for view_name, view_spec in VIEW_CONTRACTS.items():
+        columns = [name for name, _ in view_spec.columns]
+        await cur.execute(
+            """SELECT object_name, privilege,
+                      has_column_privilege(current_user, %s, object_name, privilege) AS allowed
+               FROM unnest(%s::text[]) AS objects(object_name)
+               CROSS JOIN unnest(%s::text[]) AS privileges(privilege)""",
+            (f"public.{view_name}", columns, list(privileges)),
+        )
+        problems.extend(
+            await _privilege_mismatches(
+                cur,
+                {
+                    (column, privilege): privilege == "SELECT"
+                    and "SELECT" in TABLE_PRIVILEGES[process][view_name]
+                    for column in columns
+                    for privilege in privileges
+                },
+                prefix=f"{view_name}.",
+            )
+        )
+    return problems
+
+
 async def validate_runtime_database_role(
     pool: AsyncConnectionPool,
     process: RuntimeProcess,
@@ -508,6 +587,7 @@ async def validate_runtime_database_role(
         problems.extend(await _sequence_privilege_problems(cur, process))
         problems.extend(await _user_column_privilege_problems(cur, process))
         problems.extend(await _scheduler_session_column_privilege_problems(cur, process))
+        problems.extend(await _view_column_privilege_problems(cur, process))
 
     if problems:
         raise RuntimeError(f"Unsafe PostgreSQL role for {process}: " + "; ".join(problems))

@@ -1,0 +1,80 @@
+{
+    "matching_records": [
+      {
+        "uuid": "fixture:public",
+        "title": "Public sample interview",
+        "project_title": null,
+        "description": "Synthetic example; no real interview or participant.",
+        "resource_description": null,
+        "languages": ["en"],
+        "project_description": null,
+        "authors": ["Example narrator"],
+        "keywords": ["sample", "public"],
+        "resource_proxies": [
+          {"type": "Resource", "ref": "https://archive.example.org/resources/public"}
+        ],
+        "license_val": "Public access",
+        "license_url": null,
+        "version": "1",
+        "doi": null,
+        "resource_type": "interview",
+        "institutions": ["Example Archive"],
+        "main_disciplines": [],
+        "bibliographical_citation": null,
+        "upstream_modified_at": "2020-01-01T12:00:00+00:00",
+        "visibility_tier": "public"
+      },
+      {
+        "uuid": "fixture:registered",
+        "title": "Registered sample interview",
+        "project_title": null,
+        "description": "Synthetic example; no real interview or participant.",
+        "resource_description": null,
+        "languages": ["en"],
+        "project_description": null,
+        "authors": ["Example narrator"],
+        "keywords": ["sample", "registered"],
+        "resource_proxies": [
+          {"type": "Resource", "ref": "https://archive.example.org/resources/registered"}
+        ],
+        "license_val": "Restricted access",
+        "license_url": null,
+        "version": "1",
+        "doi": null,
+        "resource_type": "interview",
+        "institutions": ["Example Archive"],
+        "main_disciplines": [],
+        "bibliographical_citation": null,
+        "upstream_modified_at": "2020-01-02T12:00:00+00:00",
+        "visibility_tier": "registered"
+      },
+      {
+        "uuid": "fixture:vetted",
+        "title": "Vetted sample interview",
+        "project_title": null,
+        "description": "Synthetic example; no real interview or participant.",
+        "resource_description": null,
+        "languages": ["en"],
+        "project_description": null,
+        "authors": ["Example narrator"],
+        "keywords": ["sample", "vetted"],
+        "resource_proxies": [
+          {"type": "Resource", "ref": "https://archive.example.org/resources/vetted"}
+        ],
+        "license_val": "Restricted access",
+        "license_url": null,
+        "version": "1",
+        "doi": null,
+        "resource_type": "interview",
+        "institutions": ["Example Archive"],
+        "main_disciplines": [],
+        "bibliographical_citation": null,
+        "upstream_modified_at": "2020-01-03T12:00:00+00:00",
+        "visibility_tier": "vetted"
+      }
+    ],
+    "deleted_uuids": [],
+    "nonmatching_uuids": [],
+    "uncertain_records": {},
+    "source_cursor": "2020-01-04T00:00:00+00:00"
+  }

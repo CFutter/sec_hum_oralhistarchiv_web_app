@@ -1,22 +1,5 @@
-"""TOTP rotation routes (`POST /account/reset-totp[/confirm]`) — the MFA
-step-up flow that replaces an already-enrolled authenticator.
-
-Authenticator rotation is a two-step, freshly authenticated flow: POST
-/account/reset-totp (`begin_totp_rotation`) proves the current password and
-authenticator, then discloses one replacement seed exactly once on the
-confirm page; POST /account/reset-totp/confirm (`confirm_totp_rotation`)
-proves the new code and atomically promotes it, revoking every session. GET
-/account/reset-totp performs no service call at all — it only renders the
-fresh-authentication form. These tests pin every typed outcome's route
-mapping for both steps without recreating transaction logic in route mocks,
-that CSRF is enforced before either service call, and that backend faults
-(pool saturation, QR-encoding failure) fail closed without leaking or
-promoting the once-disclosed seed.
-
-The enrollment flow (`/setup-totp`) is the sibling scenario class, in
-test_totp_enrollment_routes.py; each module is named for the scenario it
-proves. All service calls are patched with autospec so arity drift fails
-loudly. The integration tier drives both flows against the real database.
+"""TOTP rotation routes (`POST /account/reset-totp[/confirm]`) — the MFA step-up flow that replaces an
+already-enrolled authenticator.
 """
 
 import re
@@ -39,6 +22,7 @@ NEW_SECRET = "GEZDGNBVGY3TQOJQ"
 
 
 def _patch(name, **kw):
+    """Patch the route collaborator with its real signature."""
     return patch(f"app.routes.auth.totp.{name}", autospec=True, **kw)
 
 
@@ -47,22 +31,21 @@ _QR_DATA_URI_RE = re.compile(r'data:image/png;base64,([A-Za-z0-9+/=]+)"')
 
 
 def _extract_new_secret(text: str) -> str:
-    """Pull the once-disclosed replacement seed out of reset_totp_confirm.html
-    — the same markup the integration tier's `_extract_new_secret` reads, so
-    an absence assertion here is bound to what the page would actually show,
-    not to a string that merely happens not to appear."""
+    """Extract the replacement seed from the actual rotation-confirmation markup."""
     match = _NEW_SECRET_RE.search(text)
     assert match, "no replacement secret disclosed on the confirm page"
     return match.group(1)
 
 
 def _extract_qr_data_uri(text: str) -> str:
+    """Extract the QR data URI, failing if the confirmation page has none."""
     match = _QR_DATA_URI_RE.search(text)
     assert match, "no QR data URI on the confirm page"
     return match.group(1)
 
 
 def _assert_auth_cookies_cleared(response):
+    """Require deletion headers for the authentication cookies."""
     set_cookie_headers = response.headers.get_list("set-cookie")
     for cookie_name in (settings.session_cookie_name, CSRF_COOKIE_NAME):
         assert any(
@@ -72,6 +55,7 @@ def _assert_auth_cookies_cleared(response):
 
 
 def _post_reset_start(client, current_password="Password123!", current_totp_code="111111"):
+    """Submit current password and TOTP proof to start rotation without following redirects."""
     return client.post(
         "/account/reset-totp",
         data={
@@ -84,6 +68,7 @@ def _post_reset_start(client, current_password="Password123!", current_totp_code
 
 
 def _post_reset_confirm(client, new_totp_code="222222"):
+    """Submit the replacement TOTP code with CSRF without following redirects."""
     return client.post(
         "/account/reset-totp/confirm",
         data={
@@ -95,10 +80,7 @@ def _post_reset_confirm(client, new_totp_code="222222"):
 
 
 def _disclose_rotation_seed(client, secret=NEW_SECRET):
-    """Perform one legitimate rotation-start call and return the exact
-    (seed, qr_data) pair reset_totp_confirm.html discloses, so a later
-    assertion that a *different* response leaks neither is bound to a real
-    issued secret rather than an arbitrary literal."""
+    """Start rotation legitimately and return the disclosed seed and QR data URI."""
     with _patch(
         "begin_totp_rotation",
         return_value=TotpRotationStartResult(TotpRotationStartOutcome.READY, secret),
@@ -108,11 +90,6 @@ def _disclose_rotation_seed(client, secret=NEW_SECRET):
     return _extract_new_secret(resp.text), _extract_qr_data_uri(resp.text)
 
 
-# ---------------------------------------------------------------------------
-# GET /account/reset-totp — rotation page
-# ---------------------------------------------------------------------------
-
-
 class TestResetTotpPage:
     """GET /account/reset-totp never touches the rotation service; it only
     decides which form (or redirect) a full session is allowed to see."""
@@ -120,11 +97,7 @@ class TestResetTotpPage:
     def test_reset_totp_page_renders_fresh_auth_form_without_calling_any_service(
         self, authenticated_client
     ):
-        """GET performs no secret access at all: the replacement seed is
-        minted only by the POST start step (totp.py:603-625). GET only
-        renders the fresh-authentication form, so it can neither disclose a
-        pending secret nor fail on decryption — the positive control for the
-        secret-access tests of the POST steps."""
+        """Check reset TOTP page renders fresh auth form without calling any service (HTTP 200)."""
         with (
             _patch("get_or_create_pending_totp_secret") as pending,
             _patch("begin_totp_rotation") as begin,
@@ -132,13 +105,13 @@ class TestResetTotpPage:
             resp = authenticated_client.get("/account/reset-totp", follow_redirects=False)
 
         assert resp.status_code == 200
-        assert "current_totp_code" in resp.text  # fresh-authentication form only
+        assert "current_totp_code" in resp.text
         pending.assert_not_awaited()
         begin.assert_not_awaited()
 
     def test_reset_totp_page_shibboleth_user_flashed_to_account(self, client_builder):
         """Non-local accounts manage MFA at the IdP: 303 to /account with the
-        SWITCH edu-ID info flash, and no TOTP work happens."""
+        identity-provider info flash, and no TOTP work happens."""
         shib = make_sample_user(auth_method="shibboleth")
         client = client_builder(session_user=shib)
         with (
@@ -152,17 +125,13 @@ class TestResetTotpPage:
         begin.assert_not_awaited()
         flash.assert_awaited_once()
         assert flash.await_args.args[1] == RAW_SESSION_ID
-        assert "SWITCH edu-ID" in flash.await_args.args[2]
+        assert "is managed by your identity provider." in flash.await_args.args[2]
         assert flash.await_args.args[3] == "info"
 
     def test_reset_totp_page_for_unenrolled_local_user_redirects_to_enrollment(
         self, client_builder
     ):
-        """A local account that has never enrolled an authenticator has
-        nothing to rotate: GET /account/reset-totp sends it to first-time
-        enrollment (303 /setup-totp) and no rotation service is consulted,
-        whichever layer (the full-session policy or the handler's own
-        ``totp_configured`` check) makes the decision."""
+        """Check reset TOTP page for unenrolled local user redirects to enrollment (HTTP 303)."""
         unenrolled = make_sample_user(totp_configured=False)
         client = client_builder(session_user=unenrolled)
         with (
@@ -175,11 +144,6 @@ class TestResetTotpPage:
         assert resp.headers["location"] == "/setup-totp"
         pending.assert_not_awaited()
         begin.assert_not_awaited()
-
-
-# ---------------------------------------------------------------------------
-# POST /account/reset-totp — rotation start (fresh authentication)
-# ---------------------------------------------------------------------------
 
 
 class TestResetTotpStart:
@@ -197,7 +161,7 @@ class TestResetTotpStart:
 
         assert resp.status_code == 200
         assert _extract_new_secret(resp.text) == NEW_SECRET
-        assert _extract_qr_data_uri(resp.text)  # a real QR image was rendered
+        assert _extract_qr_data_uri(resp.text)
         begin.assert_awaited_once_with(
             authenticated_client.mock_pool,
             1,
@@ -225,10 +189,9 @@ class TestResetTotpStart:
     def test_reset_totp_start_invalid_current_proof_is_reported(
         self, authenticated_client, outcome, message, absent_message
     ):
-        """An invalid password/current-authenticator proof renders its own
-        error, and a replayed current-authenticator code is distinguishable
-        from a plain-wrong one. Neither response leaks a seed disclosed by an
-        earlier, legitimate rotation-start on the same session."""
+        """An invalid password/current-authenticator proof renders its own error, and a replayed
+        current-authenticator code is distinguishable from a plain-wrong one.
+        """
         seed, qr_data = _disclose_rotation_seed(authenticated_client)
 
         with _patch(
@@ -282,9 +245,7 @@ class TestResetTotpStart:
     def test_reset_totp_start_rejected_by_policy_renders_terminal_page(
         self, authenticated_client, outcome, status_code, message
     ):
-        """The service's eligibility decision maps to a terminal error page,
-        and an account-locked step-up reservation renders 423, not a generic
-        422 — and leaks no seed disclosed by an earlier legitimate start."""
+        """Check reset TOTP start rejected by policy renders terminal page."""
         seed, qr_data = _disclose_rotation_seed(authenticated_client)
 
         with _patch(
@@ -299,10 +260,7 @@ class TestResetTotpStart:
         assert qr_data not in resp.text
 
     def test_reset_totp_start_session_expired_redirects_to_login(self, authenticated_client):
-        """An expired or replay-exhausted step-up session is sent back to
-        login with its cookies cleared, never trapped on the reset-totp
-        form, and the fresh login page carries no seed disclosed earlier on
-        the same session."""
+        """Check reset TOTP start session expired redirects to login (HTTP 303)."""
         seed, qr_data = _disclose_rotation_seed(authenticated_client)
 
         with _patch(
@@ -350,11 +308,6 @@ class TestResetTotpStart:
         begin.assert_not_awaited()
 
 
-# ---------------------------------------------------------------------------
-# POST /account/reset-totp/confirm — rotation confirmation
-# ---------------------------------------------------------------------------
-
-
 class TestResetTotpConfirm:
     """POST /account/reset-totp/confirm proves the new code and atomically
     promotes it, revoking every other session."""
@@ -369,7 +322,7 @@ class TestResetTotpConfirm:
             resp = _post_reset_confirm(authenticated_client)
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == "/login?totp_changed=1"
+        assert resp.headers["location"] == "/login?notice=totp_changed"
         _assert_auth_cookies_cleared(resp)
         confirm.assert_awaited_once_with(
             authenticated_client.mock_pool,
@@ -379,12 +332,7 @@ class TestResetTotpConfirm:
         )
 
     def test_reset_totp_invalid_new_code_is_reported(self, authenticated_client):
-        """An invalid new-authenticator proof re-renders the confirm page with
-        its own error and deliberately does not redisclose the seed
-        (routes/auth/totp.py:613-624): the confirm step never rereads the
-        staged secret for display. The bound check: the exact seed and QR
-        data URI disclosed by this same session's rotation start must not
-        reappear here."""
+        """Check reset TOTP invalid new code is reported (HTTP 422)."""
         seed, qr_data = _disclose_rotation_seed(authenticated_client)
 
         with _patch(
@@ -395,7 +343,7 @@ class TestResetTotpConfirm:
 
         assert resp.status_code == 422
         assert "The new authenticator code is incorrect." in resp.text
-        assert 'class="totp-key"' not in resp.text  # the seed is never shown again
+        assert 'class="totp-key"' not in resp.text
         assert seed not in resp.text
         assert qr_data not in resp.text
 
@@ -418,10 +366,7 @@ class TestResetTotpConfirm:
     def test_reset_totp_confirm_account_locked_restarts_at_fresh_authentication(
         self, authenticated_client
     ):
-        """An account-locked confirmation attempt restarts the whole flow at
-        step one (fresh password + current code), distinct from the
-        attempts-exhausted case, which shares the same destination but a
-        different flash message and audit reason."""
+        """Check reset TOTP confirm account locked restarts at fresh authentication (HTTP 303)."""
         with (
             _patch(
                 "confirm_totp_rotation",
@@ -437,9 +382,7 @@ class TestResetTotpConfirm:
         confirm.assert_awaited_once()
 
     def test_reset_totp_confirm_decryption_error_fails_closed_503(self, authenticated_client):
-        """A corrupt staged secret fails closed on the confirmation step too,
-        the same as the rotation-start decryption failure pinned in
-        TestResetTotpStart.test_reset_totp_start_decryption_error_fails_closed_503."""
+        """Check reset TOTP confirm decryption error fails closed 503."""
         with _patch(
             "confirm_totp_rotation",
             side_effect=TotpDecryptionError(1),
@@ -463,10 +406,7 @@ class TestResetTotpConfirm:
     def test_reset_totp_confirm_session_invalidated_redirects_to_fresh_login(
         self, authenticated_client, outcome
     ):
-        """Both a step-up session that expired mid-confirmation and an
-        account newly found ineligible are treated the same way: the current
-        session cannot be trusted, so they are sent to a fresh login with
-        cookies cleared, never left on the confirm form."""
+        """Check reset TOTP confirm session invalidated redirects to fresh login (HTTP 303)."""
         with _patch("confirm_totp_rotation", return_value=outcome) as confirm:
             resp = _post_reset_confirm(authenticated_client)
 
@@ -476,9 +416,7 @@ class TestResetTotpConfirm:
         confirm.assert_awaited_once()
 
     def test_reset_totp_confirm_shibboleth_user_never_calls_rotation(self, client_builder):
-        """Externally authenticated users cannot invoke local TOTP rotation
-        confirmation either — the same guard as the rotation-start POST,
-        pinned in TestResetTotpStart.test_reset_totp_post_shibboleth_user_never_calls_rotation."""
+        """Check reset TOTP confirm Shibboleth user never calls rotation (HTTP 303)."""
         shib = make_sample_user(auth_method="shibboleth")
         client = client_builder(session_user=shib)
         with _patch("confirm_totp_rotation") as confirm:
@@ -489,9 +427,7 @@ class TestResetTotpConfirm:
         confirm.assert_not_awaited()
 
     def test_reset_totp_confirm_unrecognised_outcome_fails_closed(self, authenticated_client):
-        """confirm_totp_rotation's outcome is a closed enum the route maps
-        exhaustively; an unrecognised outcome fails loudly rather than
-        silently falling through to the invalid-code re-render."""
+        """Check reset TOTP confirm unrecognised outcome fails closed (HTTP 500)."""
         with _patch("confirm_totp_rotation", return_value=object()) as confirm:
             resp = _post_reset_confirm(authenticated_client)
 
@@ -499,18 +435,11 @@ class TestResetTotpConfirm:
         confirm.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# Contract violations: begin_totp_rotation reporting READY without a secret
-# ---------------------------------------------------------------------------
-
-
 class TestRotationStartContractViolation:
-    """begin_totp_rotation's own contract requires a secret whenever it
-    reports READY; a violation fails loudly instead of rendering a QR code
-    for `None`, the same invariant guard as enrollment's equivalent
-    (test_totp_enrollment_routes.py::TestSetupTotpPendingContractViolation)."""
+    """Cover rotation start contract violation."""
 
     def test_ready_outcome_without_a_secret_fails_closed(self, authenticated_client):
+        """Check ready outcome without a secret fails closed (HTTP 500)."""
         with _patch(
             "begin_totp_rotation",
             return_value=TotpRotationStartResult(TotpRotationStartOutcome.READY, None),
@@ -521,25 +450,17 @@ class TestRotationStartContractViolation:
         begin.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# GET /account/reset-totp — best-effort flash with no derivable session id
-# ---------------------------------------------------------------------------
-
-
 class TestResetTotpPageSkipsFlashWithNoDerivableSessionId:
-    """The same re-derive-from-cookie pattern as the enrollment restart
-    helpers (test_totp_enrollment_routes.py::TestSetupTotpBestEffortRevocation):
-    when no session id can be derived, the best-effort flash is skipped
-    rather than attempted with `None`, while the redirect itself is
-    unaffected."""
+    """Cover reset TOTP page skips flash with no derivable session ID."""
 
-    def test_skips_the_flash_when_no_session_id_is_derivable_from_the_cookie(self, client_builder):
+    def test_skips_the_flash_when_no_session_id_was_resolved(self, client_builder):
+        """Check skips the flash when no session ID was resolved (HTTP 303)."""
         shib = make_sample_user(auth_method="shibboleth")
         client = client_builder(session_user=shib)
         with (
             _patch("set_flash_if_exists") as flash,
             patch(
-                "app.routes.auth.totp.get_session_id_from_cookie",
+                "app.routes.auth.totp.get_resolved_session_id",
                 autospec=True,
                 return_value=None,
             ),
@@ -551,9 +472,7 @@ class TestResetTotpPageSkipsFlashWithNoDerivableSessionId:
         flash.assert_not_awaited()
 
     def test_positive_control_flashes_when_the_session_id_is_derivable(self, client_builder):
-        """Positive control: pinned already by
-        TestResetTotpPage.test_reset_totp_page_shibboleth_user_flashed_to_account;
-        repeated here narrowly to sit beside its no-cookie counterpart."""
+        """Check positive control flashes when the session ID is derivable (HTTP 303)."""
         shib = make_sample_user(auth_method="shibboleth")
         client = client_builder(session_user=shib)
         with _patch("set_flash_if_exists") as flash:
@@ -563,19 +482,13 @@ class TestResetTotpPageSkipsFlashWithNoDerivableSessionId:
         flash.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# CSRF is enforced on both rotation POSTs before either service call
-# ---------------------------------------------------------------------------
-
-
 class TestRotationCsrfProtection:
-    """Both rotation POSTs are ordinary full-session mutations: a missing or
-    mismatched CSRF pair is refused before the corresponding service is ever
-    awaited, and the bound pair reaches it."""
+    """Cover rotation CSRF protection."""
 
     def test_reset_totp_start_missing_csrf_pair_is_refused_before_any_service_call(
         self, authenticated_client
     ):
+        """Check reset TOTP start missing CSRF pair is refused before any service call (HTTP 403)."""
         with _patch("begin_totp_rotation") as begin:
             resp = authenticated_client.post(
                 "/account/reset-totp",
@@ -589,6 +502,7 @@ class TestRotationCsrfProtection:
     def test_reset_totp_start_mismatched_csrf_pair_is_refused_before_any_service_call(
         self, authenticated_client
     ):
+        """Check reset TOTP start mismatched CSRF pair is refused before any service call (HTTP 403)."""
         with _patch("begin_totp_rotation") as begin:
             resp = authenticated_client.post(
                 "/account/reset-totp",
@@ -604,7 +518,7 @@ class TestRotationCsrfProtection:
         begin.assert_not_awaited()
 
     def test_reset_totp_start_valid_csrf_pair_reaches_the_service(self, authenticated_client):
-        """Positive control for both rejection cases above."""
+        """Check reset TOTP start valid CSRF pair reaches the service (HTTP 200)."""
         with _patch(
             "begin_totp_rotation",
             return_value=TotpRotationStartResult(TotpRotationStartOutcome.READY, NEW_SECRET),
@@ -617,6 +531,7 @@ class TestRotationCsrfProtection:
     def test_reset_totp_confirm_missing_csrf_pair_is_refused_before_any_service_call(
         self, authenticated_client
     ):
+        """Check reset TOTP confirm missing CSRF pair is refused before any service call (HTTP 403)."""
         with _patch("confirm_totp_rotation") as confirm:
             resp = authenticated_client.post(
                 "/account/reset-totp/confirm",
@@ -630,6 +545,7 @@ class TestRotationCsrfProtection:
     def test_reset_totp_confirm_mismatched_csrf_pair_is_refused_before_any_service_call(
         self, authenticated_client
     ):
+        """Check reset TOTP confirm mismatched CSRF pair is refused before any service call (HTTP 403)."""
         with _patch("confirm_totp_rotation") as confirm:
             resp = authenticated_client.post(
                 "/account/reset-totp/confirm",
@@ -641,7 +557,7 @@ class TestRotationCsrfProtection:
         confirm.assert_not_awaited()
 
     def test_reset_totp_confirm_valid_csrf_pair_reaches_the_service(self, authenticated_client):
-        """Positive control for both rejection cases above."""
+        """Check reset TOTP confirm valid CSRF pair reaches the service (HTTP 303)."""
         with _patch(
             "confirm_totp_rotation",
             return_value=TotpRotationOutcome.ROTATED,
@@ -652,27 +568,13 @@ class TestRotationCsrfProtection:
         confirm.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# Backend fault injection during rotation must fail closed without leaking
-# or promoting a seed (the decryption-failure 503 is already pinned by
-# TestResetTotpStart.test_reset_totp_start_decryption_error_fails_closed_503;
-# this covers the remaining fault axes instead of duplicating it).
-# ---------------------------------------------------------------------------
-
-
 class TestRotationFaultInjectionFailsClosed:
-    """A pool-capacity failure or a QR-encoding failure during rotation start
-    must not promote a replacement authenticator or leak the seed it was
-    about to disclose; the response stays no-store with the restrictive
-    image-source CSP and carries no redirect."""
+    """Cover rotation fault injection fails closed."""
 
     def test_healthy_rotation_start_is_unaffected_by_the_fault_injection_harness(
         self, authenticated_client
     ):
-        """Positive control: absent any injected fault, the identical request
-        reaches begin_totp_rotation and discloses its seed normally — proof
-        that the fault-injection tests below are exercising a real failure
-        path, not a harness that would 500 regardless."""
+        """Check healthy rotation start is unaffected by the fault injection harness (HTTP 200)."""
         with _patch(
             "begin_totp_rotation",
             return_value=TotpRotationStartResult(TotpRotationStartOutcome.READY, NEW_SECRET),
@@ -686,6 +588,7 @@ class TestRotationFaultInjectionFailsClosed:
     def test_pool_timeout_during_rotation_start_fails_closed_without_leaking_a_seed(
         self, authenticated_client
     ):
+        """Check pool timeout during rotation start fails closed without leaking a seed (HTTP 503)."""
         with _patch("begin_totp_rotation", side_effect=PoolTimeout("pool exhausted")) as begin:
             resp = _post_reset_start(authenticated_client)
 
@@ -699,6 +602,9 @@ class TestRotationFaultInjectionFailsClosed:
     def test_qr_generation_failure_after_a_ready_rotation_fails_closed_without_leaking_a_seed(
         self, authenticated_client
     ):
+        """Check qr generation failure after a ready rotation fails closed without leaking a seed (HTTP
+        500).
+        """
         with (
             _patch(
                 "begin_totp_rotation",
@@ -719,6 +625,7 @@ class TestRotationFaultInjectionFailsClosed:
     def test_pool_timeout_during_rotation_confirmation_fails_closed_without_promoting(
         self, authenticated_client
     ):
+        """Check pool timeout during rotation confirmation fails closed without promoting (HTTP 503)."""
         with _patch("confirm_totp_rotation", side_effect=PoolTimeout("pool exhausted")) as confirm:
             resp = _post_reset_confirm(authenticated_client)
 

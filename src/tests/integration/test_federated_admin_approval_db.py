@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 from pydantic import SecretStr
 
 from app.services import federated_session_policy, users
@@ -16,6 +17,7 @@ ROTATED_SECRET = "vR4nM8qL1xC6kJ9hF2dS5aW0eT7yU3iP6oB9gH2mN5zX8cK1"
 
 @pytest.fixture(autouse=True)
 async def _enabled_trusted_federation(monkeypatch, clean_db, db_pool):
+    """Install the test's trusted federation settings and reconcile durable policy."""
     del clean_db  # explicit ordering: reconcile only after the autouse truncate
     monkeypatch.setattr(users.settings, "shibboleth_enabled", True)
     monkeypatch.setattr(users.settings, "shibboleth_trusted_issuers", [ISSUER])
@@ -26,10 +28,15 @@ async def _enabled_trusted_federation(monkeypatch, clean_db, db_pool):
 async def test_pending_identity_approval_is_one_atomic_authority_transition(
     db_pool, user_factory, session_factory, admin_actor, sync_conn
 ):
+    """Verify pending identity approval is one atomic authority transition."""
     pending = user_factory(
         auth_method="shibboleth",
         is_active=False,
         federated_status="pending",
+        federated_review_revision=1,
+        federated_review=Jsonb(
+            {"issuer": ISSUER, "affiliation": None, "entitlement": None, "proposal": None}
+        ),
         shibboleth_issuer=ISSUER,
         shibboleth_subject_id=SUBJECT,
         access_tier="public",
@@ -44,18 +51,19 @@ async def test_pending_identity_approval_is_one_atomic_authority_transition(
         pending.id,
         expected_issuer=ISSUER,
         expected_subject_id=SUBJECT,
+        expected_review_revision=1,
         access_tier="vetted",
         actor_id=admin_actor.id,
         actor_session_id=admin_actor.session_id,
     )
 
-    assert approved.federated_status == "approved"
-    assert approved.is_active is True
-    assert approved.access_tier == "vetted"
-    assert approved.is_admin is False
-    assert approved.email_verified is False
-    assert approved.federated_approved_at is not None
-    assert approved.federated_approved_by == admin_actor.id
+    assert approved.user.federated_status == "approved"
+    assert approved.user.is_active is True
+    assert approved.user.access_tier == "vetted"
+    assert approved.user.is_admin is False
+    assert approved.user.email_verified is False
+    assert approved.user.federated_approved_at is not None
+    assert approved.user.federated_approved_by == admin_actor.id
     row = sync_conn.execute(
         """SELECT federated_status, is_active, access_tier, is_admin,
                   email_verified, federated_approved_at, federated_approved_by
@@ -78,6 +86,7 @@ async def test_pending_identity_approval_is_one_atomic_authority_transition(
             pending.id,
             expected_issuer=ISSUER,
             expected_subject_id=SUBJECT,
+            expected_review_revision=1,
             access_tier="public",
             actor_id=admin_actor.id,
             actor_session_id=admin_actor.session_id,
@@ -101,6 +110,10 @@ async def test_session_revocation_failure_rolls_back_the_entire_approval(
         auth_method="shibboleth",
         is_active=False,
         federated_status="pending",
+        federated_review_revision=1,
+        federated_review=Jsonb(
+            {"issuer": ISSUER, "affiliation": None, "entitlement": None, "proposal": None}
+        ),
         shibboleth_issuer=ISSUER,
         shibboleth_subject_id=f"{SUBJECT}:rollback",
         access_tier="public",
@@ -109,13 +122,14 @@ async def test_session_revocation_failure_rolls_back_the_entire_approval(
     before = sync_conn.execute(
         """SELECT federated_status, is_active, access_tier, is_admin,
                   email_verified, federated_approved_at, federated_approved_by,
-                  auth_revision
+                  auth_revision, federated_approved_proposal
              FROM users WHERE id = %s""",
         (pending.id,),
     ).fetchone()
     real_delete = users.delete_user_sessions_cur
 
     async def fail_after_delete(cur, user_id):
+        """Delete sessions with the real helper, then trigger a PostgreSQL division error."""
         await real_delete(cur, user_id)
         await cur.execute("SELECT 1 / 0")
 
@@ -126,6 +140,7 @@ async def test_session_revocation_failure_rolls_back_the_entire_approval(
             pending.id,
             expected_issuer=ISSUER,
             expected_subject_id=f"{SUBJECT}:rollback",
+            expected_review_revision=1,
             access_tier="vetted",
             actor_id=admin_actor.id,
             actor_session_id=admin_actor.session_id,
@@ -135,7 +150,7 @@ async def test_session_revocation_failure_rolls_back_the_entire_approval(
         sync_conn.execute(
             """SELECT federated_status, is_active, access_tier, is_admin,
                   email_verified, federated_approved_at, federated_approved_by,
-                  auth_revision
+                  auth_revision, federated_approved_proposal
              FROM users WHERE id = %s""",
             (pending.id,),
         ).fetchone()
@@ -154,11 +169,12 @@ async def test_session_revocation_failure_rolls_back_the_entire_approval(
         pending.id,
         expected_issuer=ISSUER,
         expected_subject_id=f"{SUBJECT}:rollback",
+        expected_review_revision=1,
         access_tier="vetted",
         actor_id=admin_actor.id,
         actor_session_id=admin_actor.session_id,
     )
-    assert approved.federated_status == "approved"
+    assert approved.user.federated_status == "approved"
     assert sync_conn.execute(
         "SELECT auth_revision FROM users WHERE id = %s",
         (pending.id,),
@@ -177,10 +193,15 @@ async def test_stale_policy_cannot_approve_or_mutate_pending_identity(
     sync_conn,
     monkeypatch,
 ):
+    """Verify stale policy cannot approve or mutate pending identity."""
     pending = user_factory(
         auth_method="shibboleth",
         is_active=False,
         federated_status="pending",
+        federated_review_revision=1,
+        federated_review=Jsonb(
+            {"issuer": ISSUER, "affiliation": None, "entitlement": None, "proposal": None}
+        ),
         shibboleth_issuer=ISSUER,
         shibboleth_subject_id=f"{SUBJECT}:stale-policy",
         access_tier="public",
@@ -203,6 +224,7 @@ async def test_stale_policy_cannot_approve_or_mutate_pending_identity(
             pending.id,
             expected_issuer=ISSUER,
             expected_subject_id=f"{SUBJECT}:stale-policy",
+            expected_review_revision=1,
             access_tier="vetted",
             actor_id=admin_actor.id,
             actor_session_id=admin_actor.session_id,
@@ -237,10 +259,15 @@ async def test_stale_or_tampered_review_identity_cannot_approve(
     expected_issuer,
     expected_subject,
 ):
+    """Verify stale or tampered review identity cannot approve."""
     pending = user_factory(
         auth_method="shibboleth",
         is_active=False,
         federated_status="pending",
+        federated_review_revision=1,
+        federated_review=Jsonb(
+            {"issuer": ISSUER, "affiliation": None, "entitlement": None, "proposal": None}
+        ),
         shibboleth_issuer=ISSUER,
         shibboleth_subject_id=SUBJECT,
     )
@@ -257,6 +284,7 @@ async def test_stale_or_tampered_review_identity_cannot_approve(
             pending.id,
             expected_issuer=expected_issuer,
             expected_subject_id=expected_subject,
+            expected_review_revision=1,
             access_tier="registered",
             actor_id=admin_actor.id,
             actor_session_id=admin_actor.session_id,
@@ -270,11 +298,12 @@ async def test_stale_or_tampered_review_identity_cannot_approve(
     ).fetchone() == ("pending", False, "public", None, None)
 
 
-@pytest.mark.parametrize("status", ["pending", "legacy_quarantined"])
+@pytest.mark.parametrize("status", ["pending"])
 @pytest.mark.parametrize("operation", ["activate", "tier"])
 async def test_generic_admin_mutations_cannot_bypass_federated_review(
     db_pool, user_factory, admin_actor, sync_conn, status, operation
 ):
+    """Verify generic admin mutations cannot bypass federated review."""
     target = user_factory(
         auth_method="shibboleth",
         federated_status=status,
@@ -298,7 +327,7 @@ async def test_generic_admin_mutations_cannot_bypass_federated_review(
     ).fetchone() == (status, False, "public", False)
 
 
-@pytest.mark.parametrize("status", ["pending", "legacy_quarantined"])
+@pytest.mark.parametrize("status", ["pending"])
 async def test_admin_grant_on_unreviewed_federated_identity_is_rejected_by_the_promotion_workflow(
     db_pool, user_factory, admin_actor, sync_conn, status
 ):
@@ -331,6 +360,7 @@ async def test_admin_grant_on_unreviewed_federated_identity_is_rejected_by_the_p
 async def test_approved_disable_and_reactivation_preserve_review_provenance(
     db_pool, user_factory, session_factory, admin_actor, sync_conn
 ):
+    """Verify approved disable and reactivation preserve review provenance."""
     approved_at = datetime(2026, 2, 3, tzinfo=UTC)
     target = user_factory(
         auth_method="shibboleth",

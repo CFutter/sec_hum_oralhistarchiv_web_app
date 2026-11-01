@@ -1,18 +1,4 @@
-"""Pure-unit tests for app.services.users and app.services.registration.
-
-Covers the model plumbing everything else builds on (parse_user row mapping,
-the USER_COLUMNS/User schema-sync validator, the SELECT builder
-user_columns_sql, and the UserAlreadyExistsError contract), the shared
-normalize_display_name validator that both registration and rename call, the
-administrator-membership guard that update_access_tier / set_user_active /
-set_user_admin / stage_admin_email_change all run before touching the
-database, the isolation of self-service email-change staging from candidate
-membership state, and the removal of the totp_secret parameter from local
-account creation.
-
-No database, no TestClient — everything here is import-and-call or a mocked
-cursor proving what a service will and will not do before it reaches one.
-"""
+"""Pure-unit tests for app.services.users and app.services.registration."""
 
 import datetime
 from contextlib import asynccontextmanager
@@ -22,15 +8,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, create_autospec, patch, sentinel
 
 import pytest
+from psycopg.errors import UniqueViolation
+from psycopg.pq import DiagnosticField
 
 from app.credentials import normalize_email, validate_seed_credentials
-from app.services import email_change, users
-from app.services.registration import register_local_user as create_local_user
+from app.services import email_change, password_verification, registration_setup, users
 from app.services.session_ids import hash_session_id
+from app.services.tokens import action_token_url
 from app.services.users import (
     DISPLAY_NAME_MAX_LENGTH,
     User,
-    UserAlreadyExistsError,
     normalize_display_name,
     parse_user,
     user_columns_sql,
@@ -92,26 +79,19 @@ class TestDisplayNameNormalization:
 
 
 class TestSharedEmailNormalization:
-    """`app.credentials.normalize_email` is the single normalization point
-    both the admin-seed bootstrap (`validate_seed_credentials`) and local
-    account creation (`insert_unverified_local_user_cur`) call — so a seeded
-    admin and a self-registered user with the same address always collide
-    on the same stored identity."""
+    """Require bootstrap and registration to use the shared email normalization contract."""
 
     def test_seed_and_local_registration_normalize_an_address_identically(self):
-        raw = "  ALICE@UZH.CH  "
+        """Check seed and local registration normalize an address identically."""
+        raw = "  ALICE@EXAMPLE.ORG  "
         assert (
             validate_seed_credentials(raw, "a-supported-long-password")
             == normalize_email(raw)
-            == "alice@uzh.ch"
+            == "alice@example.org"
         )
 
     def test_normalization_rejects_smtputf8_local_parts_but_allows_idn_domains(self):
-        """Local-account normalization pins `allow_smtputf8=False`: a
-        non-ASCII local part is rejected (no downstream SMTP relay is
-        guaranteed to support the SMTPUTF8 extension), while a non-ASCII
-        (IDN) domain with a plain ASCII local part is accepted and
-        NFC-normalized — the positive control for the rejection."""
+        """Check normalization rejects SMTPUTF8 local parts but allows idn domains."""
         assert normalize_email("réader@example.org") is None
         assert normalize_email("reader@bücher.ch") == "reader@bücher.ch"
 
@@ -120,10 +100,9 @@ class TestUserRowParsing:
     """parse_user maps a database row dict onto the User dataclass."""
 
     def test_full_row_maps_every_field(self):
-        """A full DB row (fixtures.make_sample_user_row) maps 1:1 onto the
-        User dataclass: every dataclass field equals the row value of the
-        same name. A field silently dropped or renamed in parse_user fails
-        here."""
+        """A full DB row (fixtures.make_sample_user_row) maps 1:1 onto the User dataclass: every
+        dataclass field equals the row value of the same name.
+        """
         row = make_sample_user_row()
         user = parse_user(row)
 
@@ -132,14 +111,11 @@ class TestUserRowParsing:
             assert getattr(user, f.name) == row[f.name], f"field {f.name} not mapped"
 
     def test_row_missing_a_required_key_raises_key_error(self):
-        """parse_user reads every dataclass field straight off the row
-        (`row[field.name]`, no defaulting): a row missing a required key
-        such as display_name raises KeyError naming it, rather than
-        silently defaulting."""
+        """Check row missing a required key raises key error."""
         created = datetime.datetime(2026, 5, 1, tzinfo=datetime.UTC)
         row = {
             "id": 7,
-            "email": "min@uzh.ch",
+            "email": "min@example.org",
             "auth_method": "local",
             "access_tier": "public",
             "is_active": True,
@@ -153,10 +129,14 @@ class TestUserSchemaValidation:
     """validate_user_schema keeps USER_COLUMNS and the User dataclass in sync."""
 
     def test_passes_on_real_lists(self):
-        """The shipped USER_COLUMNS and User dataclass are in sync: the
-        startup validator must not raise on the real module state. This is
-        the positive control for the two drift checks below."""
-        validate_user_schema()  # must not raise
+        """Check passes on real lists."""
+        validate_user_schema()
+
+    def test_flags_duplicate_sql_column(self, monkeypatch):
+        """Check flags duplicate SQL column (AssertionError)."""
+        monkeypatch.setattr(users, "USER_COLUMNS", [*users.USER_COLUMNS, "email"])
+        with pytest.raises(AssertionError, match=r"USER_COLUMNS.*duplicate.*email"):
+            validate_user_schema()
 
     def test_flags_extra_sql_column(self, monkeypatch):
         """A column present in USER_COLUMNS but missing on the dataclass
@@ -167,9 +147,7 @@ class TestUserSchemaValidation:
         assert "not on User" in str(excinfo.value)
 
     def test_flags_missing_sql_column(self, monkeypatch):
-        """A dataclass field absent from USER_COLUMNS raises AssertionError
-        the other direction ('Fields on User but not in USER_COLUMNS'):
-        dropping 'email' from the SELECT list must be caught at startup."""
+        """Check flags missing SQL column (AssertionError)."""
         monkeypatch.setattr(users, "USER_COLUMNS", [c for c in users.USER_COLUMNS if c != "email"])
         with pytest.raises(AssertionError, match="email") as excinfo:
             validate_user_schema()
@@ -180,10 +158,7 @@ class TestUserColumnsSql:
     """user_columns_sql renders the SELECT column list (psycopg3 as_string(None))."""
 
     def test_unaliased_rendering_quotes_every_column_and_computes_totp_flag(self):
-        """Unaliased build: every USER_COLUMNS column renders as a quoted
-        identifier ('"id"', ...) and the computed totp flag renders as
-        '(totp_secret IS NOT NULL) AS totp_configured' — the encrypted
-        secret itself is never selected as a column of its own."""
+        """Check unaliased rendering quotes every column and computes TOTP flag."""
         rendered = user_columns_sql().as_string(None)
 
         assert '"id"' in rendered
@@ -193,10 +168,7 @@ class TestUserColumnsSql:
         assert '"totp_secret"' not in rendered
 
     def test_aliased_rendering_table_qualifies_every_column(self):
-        """Alias 'u': every column is table-qualified ('"u"."id"') and the
-        computed totp flag reads from the aliased table
-        ('("u".totp_secret IS NOT NULL) AS totp_configured') — guards joined
-        queries picking columns from the right table."""
+        """Check aliased rendering table qualifies every column."""
         rendered = user_columns_sql("u").as_string(None)
 
         assert '"u"."id"' in rendered
@@ -210,23 +182,46 @@ class TestUserColumnsSql:
         assert users.USER_COLUMNS_SQL.as_string(None) == user_columns_sql().as_string(None)
 
 
-class TestUserAlreadyExistsError:
-    """UserAlreadyExistsError's except-ordering contract for the register route."""
+class TestPendingLocalActivation:
+    """Administrator activation cannot bypass mailbox-bound credential setup."""
 
-    def test_is_value_error_carrying_email(self):
-        """UserAlreadyExistsError subclasses ValueError and carries .email.
-        The register route relies on `except UserAlreadyExistsError` staying
-        ordered before `except ValueError` — which only works because of
-        this subclass relationship; a plain `except ValueError` handler
-        would swallow it too."""
-        err = UserAlreadyExistsError("dup@uzh.ch")
-
-        assert isinstance(err, ValueError)
-        assert err.email == "dup@uzh.ch"
-        assert "dup@uzh.ch" in str(err)
-
-        with pytest.raises(ValueError):
-            raise UserAlreadyExistsError("dup@uzh.ch")
+    async def test_passwordless_target_is_rejected_before_activation(self):
+        """Check passwordless target is rejected before activation."""
+        actor = {
+            "is_active": True,
+            "is_admin": True,
+            "auth_method": "local",
+            "totp_secret": "encrypted-secret",
+            "totp_recovery_code_generation": 1,
+            "recovery_codes_available": True,
+        }
+        pending = {
+            "is_active": False,
+            "is_admin": False,
+            "auth_method": "local",
+            "federated_status": None,
+            "password_configured": False,
+        }
+        cursor = make_async_cursor(fetchone=[actor, {"session": 1}, pending])
+        with (
+            patch.object(
+                users,
+                "get_db_cursor",
+                autospec=True,
+                return_value=FakeCursorCtx(cursor),
+            ),
+            pytest.raises(users.AdminActionRejected, match="complete email setup"),
+        ):
+            await users.set_user_active(
+                make_mock_pool(),
+                2,
+                True,
+                actor_id=1,
+                actor_session_id="resolved-session",
+            )
+        statements = [str(call.args[0]).strip() for call in cursor.execute.await_args_list]
+        assert all(statement.startswith("SELECT") for statement in statements)
+        assert "password_configured" in statements[-1]
 
 
 class TestAdminMembershipActorGuard:
@@ -265,7 +260,7 @@ class TestAdminMembershipActorGuard:
                 make_mock_pool(),
                 actor_id=1,
                 target_user_id=2,
-                new_email="new@uzh.ch",
+                new_email="new@example.org",
             )
         db.assert_not_called()
 
@@ -278,9 +273,7 @@ class TestAdminMembershipActorGuard:
         ids=["actor_row_missing", "actor_inactive", "actor_not_admin"],
     )
     async def test_stale_actor_prevents_all_writes(self, service, actor):
-        """A missing, inactive, or non-admin actor is rejected by the
-        session guard before any write statement executes: every statement
-        the service issued is a SELECT, starting with the advisory lock."""
+        """Check stale actor prevents all writes."""
         cur = make_async_cursor(fetchone=actor)
         with (
             patch.object(
@@ -306,9 +299,7 @@ class TestAdminMembershipActorGuard:
         "service", _ADMIN_MEMBERSHIP_SERVICES, ids=_ADMIN_MEMBERSHIP_SERVICE_IDS
     )
     async def test_missing_exact_session_prevents_target_lock_and_write(self, service):
-        """A healthy actor whose exact session was revoked is still
-        rejected: the session lookup locks on the exact session id, user id
-        and 'full' purpose, and no target row lock or write follows it."""
+        """Check missing exact session prevents target lock and write."""
         healthy_actor = {
             "is_active": True,
             "is_admin": True,
@@ -348,10 +339,7 @@ class TestAdminMembershipActorGuard:
         )
 
     async def test_healthy_actor_with_live_exact_session_reaches_target_lock_and_write(self):
-        """The positive control for the guard above: a healthy administrator
-        actor holding the exact, live 'full' session named in the call is
-        not rejected. `update_access_tier` reaches its target-row lock and
-        issues the UPDATE with the target user id and the requested tier."""
+        """Check healthy actor with live exact session reaches target lock and write."""
         healthy_actor = {
             "is_active": True,
             "is_admin": True,
@@ -389,10 +377,8 @@ class TestEmailChangeMembership:
     """Self-service email-change staging must not query destination-email membership."""
 
     async def test_self_service_staging_never_queries_candidate_membership(self):
-        """stage_self_email_change issues exactly the actor-lookup,
-        actor-refetch, and session-insert statements; none of them look at
-        the candidate email's own membership or admin state (no
-        LOWER(email) lookup against the candidate)."""
+        """Self-service staging reads the actor, locks the exact session,
+        and samples database time without checking candidate-email membership."""
         cursor = AsyncMock()
         cursor.fetchone = AsyncMock(
             side_effect=[
@@ -404,19 +390,24 @@ class TestEmailChangeMembership:
                     "login_unlocked": True,
                 },
                 {
-                    "email": "actor@uzh.ch",
+                    "email_verified": True,
+                    "totp_secret": "encrypted-secret",
+                    "totp_recovery_required": False,
+                    "email": "actor@example.org",
                     "password_hash": "argon-hash",
                     "auth_revision": 4,
                     "is_active": True,
                     "auth_method": "local",
-                    "login_unlocked": True,
+                    "locked_until": None,
                 },
-                {"session": 1},
+                {"expires_at": datetime.datetime(2030, 1, 1, tzinfo=UTC)},
+                {"database_now": datetime.datetime(2026, 1, 1, tzinfo=UTC)},
             ]
         )
 
         @asynccontextmanager
         async def cursor_context(_pool):
+            """Yield the scripted cursor without a real database connection."""
             yield cursor
 
         action = SimpleNamespace(
@@ -441,9 +432,9 @@ class TestEmailChangeMembership:
                 ),
             ),
             patch.object(
-                email_change,
+                password_verification,
                 "run_password_work",
-                new=create_autospec(email_change.run_password_work),
+                new=create_autospec(password_verification.run_password_work),
             ),
             patch.object(
                 email_change,
@@ -474,6 +465,12 @@ class TestEmailChangeMembership:
                     return_value=sentinel.verification,
                 ),
             ),
+            patch.object(
+                email_change,
+                "verify_and_consume_totp_cur",
+                autospec=True,
+                return_value=True,
+            ) as consume_totp,
             patch.object(email_change, "store_pending_email_cur", new=store_pending),
             patch.object(email_change, "enqueue_outbound_email_cur", new=enqueue),
         ):
@@ -482,21 +479,24 @@ class TestEmailChangeMembership:
                 user_id=7,
                 session_id="raw-session-id",
                 current_password="correct password",
-                new_email="candidate@uzh.ch",
+                new_email="candidate@example.org",
+                totp_code="111111",
             )
 
         statements = [" ".join(call.args[0].split()) for call in cursor.execute.await_args_list]
-        assert len(statements) == 3
+        assert len(statements) == 4
+        assert statements[-1] == "SELECT clock_timestamp() AS database_now"
         assert all("LOWER(email)" not in statement for statement in statements)
         assert result == email_change.SelfEmailChangeResult(
             user_id=7,
-            old_email="actor@uzh.ch",
-            new_email="candidate@uzh.ch",
+            old_email="actor@example.org",
+            new_email="candidate@example.org",
         )
+        consume_totp.assert_awaited_once_with(cursor, 7, "111111")
         store_pending.assert_awaited_once_with(
             cursor,
             7,
-            "candidate@uzh.ch",
+            "candidate@example.org",
             "token-hash",
             expected_auth_revision=4,
         )
@@ -506,10 +506,7 @@ class TestEmailChangeMembership:
         ]
 
     async def test_valid_session_reaches_the_staging_write(self):
-        """The positive control for the guard above: a request presenting
-        the exact, live, unchanged-revision session it names reaches
-        `store_pending_email_cur` and returns the staged result, rather than
-        being rejected before ever writing."""
+        """Check valid session reaches the staging write."""
         cursor = AsyncMock()
         cursor.fetchone = AsyncMock(
             side_effect=[
@@ -521,19 +518,24 @@ class TestEmailChangeMembership:
                     "login_unlocked": True,
                 },
                 {
-                    "email": "actor@uzh.ch",
+                    "email_verified": True,
+                    "totp_secret": "encrypted-secret",
+                    "totp_recovery_required": False,
+                    "email": "actor@example.org",
                     "password_hash": "argon-hash",
                     "auth_revision": 4,
                     "is_active": True,
                     "auth_method": "local",
-                    "login_unlocked": True,
+                    "locked_until": None,
                 },
-                {"session": 1},
+                {"expires_at": datetime.datetime(2030, 1, 1, tzinfo=UTC)},
+                {"database_now": datetime.datetime(2026, 1, 1, tzinfo=UTC)},
             ]
         )
 
         @asynccontextmanager
         async def cursor_context(_pool):
+            """Yield the scripted cursor without a real database connection."""
             yield cursor
 
         action = SimpleNamespace(
@@ -557,9 +559,9 @@ class TestEmailChangeMembership:
                 ),
             ),
             patch.object(
-                email_change,
+                password_verification,
                 "run_password_work",
-                new=create_autospec(email_change.run_password_work),
+                new=create_autospec(password_verification.run_password_work),
             ),
             patch.object(
                 email_change,
@@ -589,7 +591,13 @@ class TestEmailChangeMembership:
                     email_change.build_email_change_verification,
                     return_value=sentinel.verification,
                 ),
-            ),
+            ) as verification_builder,
+            patch.object(
+                email_change,
+                "verify_and_consume_totp_cur",
+                autospec=True,
+                return_value=True,
+            ) as consume_totp,
             patch.object(email_change, "store_pending_email_cur", new=store_pending),
             patch.object(
                 email_change,
@@ -602,47 +610,81 @@ class TestEmailChangeMembership:
                 user_id=7,
                 session_id="raw-session-id",
                 current_password="correct password",
-                new_email="candidate@uzh.ch",
+                new_email="candidate@example.org",
+                totp_code="111111",
             )
 
         assert result == email_change.SelfEmailChangeResult(
             user_id=7,
-            old_email="actor@uzh.ch",
-            new_email="candidate@uzh.ch",
+            old_email="actor@example.org",
+            new_email="candidate@example.org",
         )
+        consume_totp.assert_awaited_once_with(cursor, 7, "111111")
         store_pending.assert_awaited_once_with(
             cursor,
             7,
-            "candidate@uzh.ch",
+            "candidate@example.org",
             "token-hash",
             expected_auth_revision=4,
         )
 
+        verification_builder.assert_called_once_with(
+            "candidate@example.org",
+            f"{email_change.settings.public_base_url}"
+            f"{action_token_url('/account/confirm-email', 'signed-token')}",
+            expires_at=action.expires_at,
+            security_code="signed-token",
+        )
+
 
 class TestLocalUserEnrollmentBoundary:
-    """Local account creation cannot accept a caller-supplied TOTP secret."""
+    """Mailbox registration cannot accept a caller-supplied TOTP secret."""
 
     @pytest.mark.parametrize(
         "secret",
         [None, "JBSWY3DPEHPK3PXP", "encrypted-secret"],
         ids=["totp_secret_none", "totp_secret_base32_value", "totp_secret_already_encrypted"],
     )
-    async def test_creation_rejects_removed_totp_parameter_before_any_work(self, secret):
-        """register_local_user no longer accepts a totp_secret keyword at
-        all (enrollment is a separate, later step): passing one raises
-        TypeError before password hashing or any database access, whatever
-        value is passed."""
+    async def test_creation_rejects_totp_parameter_before_any_work(self, secret):
+        """Enrollment happens after credential setup, never in the email request."""
         with (
-            patch("app.services.registration.get_db_cursor", autospec=True) as db,
-            patch("app.services.registration.run_password_work", autospec=True) as hash_password,
+            patch.object(registration_setup, "get_db_cursor", autospec=True) as db,
+            patch.object(registration_setup, "run_password_work", autospec=True) as hash_password,
             pytest.raises(TypeError, match="totp_secret"),
         ):
-            await create_local_user(
+            await registration_setup.begin_local_registration(
                 make_mock_pool(),
                 email="person@example.org",
-                display_name="Person",
-                password="not-used",
                 **{"totp_secret": secret},
             )
         db.assert_not_called()
         hash_password.assert_not_awaited()
+
+
+async def test_registration_preserves_unrelated_unique_violation():
+    """Only the email conflict target becomes a duplicate notice; other failures escape."""
+    cursor = make_async_cursor()
+    violation = UniqueViolation(
+        "unrelated unique constraint",
+        info={DiagnosticField.CONSTRAINT_NAME: b"other_unique_constraint"},
+    )
+    cursor.execute.side_effect = violation
+    with (
+        patch.object(
+            registration_setup,
+            "get_db_cursor",
+            autospec=True,
+            return_value=FakeCursorCtx(cursor),
+        ),
+        patch.object(
+            registration_setup,
+            "enqueue_outbound_email_cur",
+            autospec=True,
+        ) as queue,
+        patch.object(registration_setup, "run_password_work", autospec=True) as hash_password,
+        pytest.raises(UniqueViolation) as caught,
+    ):
+        await registration_setup.begin_local_registration(make_mock_pool(), email="new@example.org")
+    assert caught.value is violation
+    queue.assert_not_awaited()
+    hash_password.assert_not_awaited()

@@ -1,13 +1,4 @@
-"""The two-party administrator-promotion flow against real PostgreSQL.
-
-An administrator's invitation grants nothing by itself: the target must
-reauthenticate with their password and a fresh TOTP step to stage a new
-recovery-code set, then confirm one of those codes from the exact session
-that staged it. Only that final confirmation is a privilege-escalation
-event, so this module exercises the real services in
-`app.services.admin_promotion` end to end against the database, reading
-every outcome back through an independent connection.
-"""
+"""The two-party administrator-promotion flow against real PostgreSQL."""
 
 from types import SimpleNamespace
 
@@ -15,8 +6,9 @@ import pyotp
 import pytest
 
 from app.services import admin_promotion, totp
-from app.services.crypto import encrypt_value
 from app.services.session_ids import hash_session_id
+from app.services.totp import TotpDecryptionError
+from app.services.totp_crypto import encrypt_value
 from tests.integration.conftest import DEFAULT_PASSWORD
 
 pytestmark = pytest.mark.integration
@@ -25,12 +17,14 @@ _TOTP_TIME = 1_800_000_000
 
 
 def _revision(sync_conn, user_id: int) -> int:
+    """Read the user's current authentication revision."""
     return sync_conn.execute(
         "SELECT auth_revision FROM users WHERE id = %s", (user_id,)
     ).fetchone()[0]
 
 
 def _request_row(sync_conn, user_id: int):
+    """Read the promotion requester, revision and bound preparation session."""
     return sync_conn.execute(
         """SELECT requested_by, expected_auth_revision, prepared_session_id, prepared_at
            FROM admin_promotion_requests WHERE user_id = %s""",
@@ -39,16 +33,19 @@ def _request_row(sync_conn, user_id: int):
 
 
 def _is_admin(sync_conn, user_id: int) -> bool:
+    """Read the stored administrator flag."""
     return sync_conn.execute("SELECT is_admin FROM users WHERE id = %s", (user_id,)).fetchone()[0]
 
 
 def _active_recovery_generation(sync_conn, user_id: int) -> int:
+    """Read the user's active recovery-code generation."""
     return sync_conn.execute(
         "SELECT totp_recovery_code_generation FROM users WHERE id = %s", (user_id,)
     ).fetchone()[0]
 
 
 def _unused_codes_for_generation(sync_conn, user_id: int, generation: int) -> int:
+    """Count unused recovery codes for the supplied generation."""
     return sync_conn.execute(
         """SELECT count(*) FROM totp_recovery_codes
            WHERE user_id = %s AND generation = %s AND used_at IS NULL""",
@@ -57,6 +54,7 @@ def _unused_codes_for_generation(sync_conn, user_id: int, generation: int) -> in
 
 
 def _session_count(sync_conn, user_id: int) -> int:
+    """Count stored sessions for the user, including expired rows."""
     return sync_conn.execute(
         "SELECT count(*) FROM sessions WHERE user_id = %s", (user_id,)
     ).fetchone()[0]
@@ -64,16 +62,19 @@ def _session_count(sync_conn, user_id: int) -> int:
 
 @pytest.fixture(autouse=True)
 def _fixed_totp_clock(monkeypatch):
+    """Freeze the TOTP service's wall clock at the test instant."""
     monkeypatch.setattr(totp, "time", SimpleNamespace(time=lambda: _TOTP_TIME))
 
 
 @pytest.fixture
 def target_secret():
+    """Return the promotion target's plaintext TOTP seed."""
     return pyotp.random_base32()
 
 
 @pytest.fixture
 def admin_and_target(user_factory, session_factory, target_secret):
+    """Create an administrator actor and the promotion target."""
     admin = user_factory(is_admin=True)
     admin_session = session_factory(admin.id, purpose="full")
     target = user_factory(totp_secret=encrypt_value(target_secret))
@@ -81,6 +82,7 @@ def admin_and_target(user_factory, session_factory, target_secret):
 
 
 async def _prepare(db_pool, target, target_session, target_secret):
+    """Prepare the target's administrator-promotion challenge."""
     code = pyotp.TOTP(target_secret).at(_TOTP_TIME)
     return await admin_promotion.prepare_admin_promotion(
         db_pool,
@@ -92,9 +94,12 @@ async def _prepare(db_pool, target, target_session, target_secret):
 
 
 class TestPreparationIsBoundToItsSessionAndRevision:
+    """Check preparation Is Bound To Its Session And Revision."""
+
     async def test_request_captures_the_targets_current_auth_revision(
         self, db_pool, sync_conn, admin_and_target
     ):
+        """Verify request captures the targets current auth revision."""
         admin, admin_session, target = admin_and_target
         revision = _revision(sync_conn, target.id)
 
@@ -114,6 +119,7 @@ class TestPreparationIsBoundToItsSessionAndRevision:
     async def test_preparation_binds_the_prepared_session_id(
         self, db_pool, session_factory, sync_conn, admin_and_target, target_secret
     ):
+        """Verify preparation binds the prepared session ID."""
         admin, admin_session, target = admin_and_target
         target_session = session_factory(target.id, purpose="full")
         await admin_promotion.request_admin_promotion(
@@ -139,6 +145,7 @@ class TestAdminPromotionAcceptance:
     async def test_acceptance_from_a_different_session_is_refused_and_grants_nothing(
         self, db_pool, session_factory, sync_conn, admin_and_target, target_secret
     ):
+        """Verify acceptance from a different session is refused and grants nothing."""
         admin, admin_session, target = admin_and_target
         preparing_session = session_factory(target.id, purpose="full")
         other_session = session_factory(target.id, purpose="full")
@@ -165,11 +172,7 @@ class TestAdminPromotionAcceptance:
     async def test_acceptance_from_the_preparing_session_grants_admin_exactly_once(
         self, db_pool, session_factory, sync_conn, admin_and_target, target_secret
     ):
-        """The positive control for the two rejections in this class: the
-        exact preparing session, with a staged recovery code, grants
-        `is_admin` and activates the staged recovery-code generation as the
-        active one -- and every target session, including bystanders, is
-        revoked by that same acceptance."""
+        """Verify acceptance from the preparing session grants admin exactly once."""
         admin, admin_session, target = admin_and_target
         preparing_session = session_factory(target.id, purpose="full")
         bystander_session = session_factory(target.id, purpose="full")
@@ -194,6 +197,14 @@ class TestAdminPromotionAcceptance:
             user_id=target.id, requested_by=admin.id
         )
         assert _is_admin(sync_conn, target.id) is True
+        assert (
+            sync_conn.execute(
+                """SELECT count(*) FROM email_outbox
+               WHERE user_id=%s AND message_type='admin_promotion_accepted_notice'""",
+                (target.id,),
+            ).fetchone()[0]
+            == 1
+        )
         active_generation = _active_recovery_generation(sync_conn, target.id)
         assert active_generation > 0
         # Confirming a code proves possession of the staged set; it does not
@@ -208,6 +219,7 @@ class TestAdminPromotionAcceptance:
     async def test_acceptance_after_the_auth_revision_moved_is_refused(
         self, db_pool, session_factory, sync_conn, admin_and_target, target_secret
     ):
+        """Verify acceptance after the auth revision moved is refused."""
         admin, admin_session, target = admin_and_target
         target_session = session_factory(target.id, purpose="full")
         await admin_promotion.request_admin_promotion(
@@ -238,6 +250,7 @@ class TestAdminPromotionAcceptance:
     async def test_the_invitation_cannot_be_accepted_twice(
         self, db_pool, session_factory, sync_conn, admin_and_target, target_secret
     ):
+        """Verify the invitation cannot be accepted twice."""
         admin, admin_session, target = admin_and_target
         preparing_session = session_factory(target.id, purpose="full")
         await admin_promotion.request_admin_promotion(
@@ -268,9 +281,12 @@ class TestAdminPromotionAcceptance:
 
 
 class TestDecliningAnAdminPromotion:
+    """Check declining An Admin Promotion."""
+
     async def test_declining_removes_the_request(
         self, db_pool, session_factory, sync_conn, admin_and_target
     ):
+        """Verify declining removes the request."""
         admin, admin_session, target = admin_and_target
         target_session = session_factory(target.id, purpose="full")
         await admin_promotion.request_admin_promotion(
@@ -302,3 +318,32 @@ class TestDecliningAnAdminPromotion:
             )
 
         assert excinfo.value.reason == "no_request"
+
+
+async def test_undecryptable_totp_spends_attempt_without_preparing_or_promoting(
+    db_pool, sync_conn, session_factory, admin_and_target, target_secret
+):
+    """Verify undecryptable TOTP spends attempt without preparing or promoting."""
+    admin, admin_session, target = admin_and_target
+    target_session = session_factory(target.id, purpose="full")
+    await admin_promotion.request_admin_promotion(
+        db_pool,
+        actor_id=admin.id,
+        actor_session_id=admin_session,
+        target_user_id=target.id,
+    )
+    sync_conn.execute(
+        "UPDATE users SET totp_secret = %s WHERE id = %s", ("unreadable-ciphertext", target.id)
+    )
+    sync_conn.commit()
+    before = _request_row(sync_conn, target.id)
+    with pytest.raises(TotpDecryptionError):
+        await _prepare(db_pool, target, target_session, target_secret)
+    assert _request_row(sync_conn, target.id) == before
+    assert not _is_admin(sync_conn, target.id)
+    assert _active_recovery_generation(sync_conn, target.id) == 0
+    row = sync_conn.execute(
+        "SELECT step_up_attempt_count FROM sessions WHERE id = %s",
+        (hash_session_id(target_session),),
+    ).fetchone()
+    assert row == (1,)

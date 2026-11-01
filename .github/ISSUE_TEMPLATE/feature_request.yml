@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a bounded improvement to an identified workflow.
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Describe the need with synthetic examples. Keep private deployment
+        inventory, credentials and sensitive source records out of this issue.
+        Possible vulnerabilities belong in the private route described by SECURITY.md.
+  - type: textarea
+    id: need
+    attributes:
+      label: User or operator need
+      description: Which concrete workflow needs to improve, and why?
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_behavior
+    attributes:
+      label: Proposed behavior and scope
+      description: Describe the observable result and relevant alternatives.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance and boundaries
+      description: >-
+        Suggest observable acceptance criteria and note affected access,
+        source, schema, deployment or documentation contracts where relevant.

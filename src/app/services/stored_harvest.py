@@ -1,15 +1,16 @@
 """Versioned serialization for resumable harvests persisted in PostgreSQL."""
 
-import hashlib
 import json
 import string
 from dataclasses import dataclass
 from typing import Final, Literal, TypeAlias
 
-from .oai_client import (
+from .harvest import (
+    HARVEST_RESULT_MAX_BYTES,
     HarvestResult,
     encode_harvest_result,
     harvest_result_from_document,
+    validate_harvest_payload_size,
 )
 from .parsed_record import PARSED_RECORD_CONTRACT_VERSION
 
@@ -141,55 +142,22 @@ def _decode_supported_stored_harvest(
     return harvest_result_from_document(raw["harvest"])
 
 
-def build_source_fingerprint(
-    *,
-    source: str,
-    oai_url: str,
-    institution_filter: str,
-) -> str:
-    """Return SHA-256 hex of canonical JSON containing the three exact,
-    unnormalized source settings.
-    """
-    document = {
-        "source": source,
-        "oai_url": oai_url,
-        "institution_filter": institution_filter,
-    }
-    canonical = json.dumps(
-        document,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
-
-
-def encode_stored_harvest(
-    harvest: HarvestResult,
-    *,
-    source_fingerprint: str,
-) -> bytes:
-    """Return a joined durable envelope; consume cached worker
-    bytes as encode_stored_harvest_parts does.
-    """
-    return encode_stored_harvest_parts(
-        harvest,
-        source_fingerprint=source_fingerprint,
-    ).joined()
-
-
 def encode_stored_harvest_parts(
     harvest: HarvestResult,
     *,
     source_fingerprint: str,
+    max_bytes: int = HARVEST_RESULT_MAX_BYTES,
 ) -> StoredHarvestParts:
-    """Validate the harvest and return versioned UTF-8 JSON envelope fragments.
+    """Return versioned envelope fragments using the shared harvest codec.
 
-    Require a lowercase SHA-256 source_fingerprint or raise ValueError.
-    Consume any cached serialized worker payload; otherwise encode under
-    the harvest size limit. Harvest validation/encoding errors propagate.
+    Require a lowercase SHA-256 fingerprint and a positive integer budget.
+    Encode the current validated state under the budget. Errors propagate.
+    The default preserves the existing 16 MiB inner-harvest limit.
+    Concurrent mutation is unsupported.
     """
     _validate_source_fingerprint(source_fingerprint)
+    # Reject invalid budgets before validating or encoding the current harvest.
+    validate_harvest_payload_size(b"", max_bytes=max_bytes)
     harvest.validate()
     envelope_header = {
         "format_version": STORED_HARVEST_FORMAT_VERSION,
@@ -204,14 +172,31 @@ def encode_stored_harvest_parts(
     if not encoded_header.endswith(_ENVELOPE_SUFFIX):
         raise RuntimeError("stored-harvest envelope header is not a JSON object")
 
-    encoded_harvest = harvest.take_serialized_worker_payload()
-    if encoded_harvest is None:
-        encoded_harvest = encode_harvest_result(harvest)
+    # Mutable records/classifications may have changed since worker decoding.
+    encoded_harvest = encode_harvest_result(harvest, max_bytes=max_bytes)
 
     return StoredHarvestParts(
         prefix=encoded_header[:-1] + b',"harvest":',
         harvest=encoded_harvest,
     )
+
+
+def encode_stored_harvest(
+    harvest: HarvestResult,
+    *,
+    source_fingerprint: str,
+    max_bytes: int = HARVEST_RESULT_MAX_BYTES,
+) -> bytes:
+    """Return a joined durable envelope under the harvest byte budget.
+
+    Encode current state as encode_stored_harvest_parts does.
+    max_bytes applies to the inner harvest, excluding envelope metadata.
+    """
+    return encode_stored_harvest_parts(
+        harvest,
+        source_fingerprint=source_fingerprint,
+        max_bytes=max_bytes,
+    ).joined()
 
 
 def decode_stored_harvest(

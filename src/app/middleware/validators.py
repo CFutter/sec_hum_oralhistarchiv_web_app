@@ -2,8 +2,9 @@
 
 import logging
 
+from app.credentials import check_secret_strength as _check_secret_strength
 from config import settings
-from config.secret_strength import check_secret_strength as _check_secret_strength
+from config.secret_inventory import collect_secret_inventory
 from config.settings import shibboleth_activation_blockers
 
 logger = logging.getLogger(__name__)
@@ -65,12 +66,12 @@ def _get_secrets_to_validate() -> list[tuple[str, str, str]]:
 
 
 def validate_security_settings() -> None:
-    """Validate secrets, CORS, upstream HTTPS, proxy trust, and federation activation.
+    """Validate secrets, CORS, hardened browser/proxy policy and federation activation.
 
-    Call before pools, outbound I/O, or ciphertext writes. Ordinary blockers
-    raise RuntimeError in staging/production and log warnings in dev;
-    federation activation blockers raise in every environment. Recommendations
-    are logged. Settings mutation after startup requires restart.
+    Call before pools, outbound I/O or ciphertext writes. Ordinary blockers raise
+    RuntimeError in staging/production and log warnings in dev; enabled
+    federation blockers raise in every mode. Log recommendations. Changes to
+    the settings singleton require process restart.
     """
     all_blockers: list[str] = []
     all_warnings: list[str] = []
@@ -84,19 +85,7 @@ def validate_security_settings() -> None:
         all_blockers.extend(named_blockers)
         all_warnings.extend(f"{name}: {w}" for w in warns)
 
-    # Settings construction and this final startup gate deliberately call the
-    # same pure activation-policy function. This catches unsafe mutation made
-    # before the app binds and prevents the two boundaries drifting. Runtime
-    # configuration changes are unsupported and require a process restart.
-    other_secret_values = {
-        settings.secret_key.get_secret_value(),
-        settings.session_secret.get_secret_value(),
-        *(key.get_secret_value() for key in settings.totp_encryption_keys),
-        *(key.get_secret_value() for key in settings.outbox_encryption_keys),
-    }
-    if settings.health_detail_token is not None:
-        other_secret_values.add(settings.health_detail_token.get_secret_value())
-
+    # Reuse construction policy to catch unsupported mutations before binding.
     federation_blockers = shibboleth_activation_blockers(
         enabled=settings.shibboleth_enabled,
         internal_secret=(
@@ -108,15 +97,23 @@ def validate_security_settings() -> None:
         public_base_url=settings.public_base_url,
         cookies_secure=settings.cookies_secure,
         allowed_hosts=settings.allowed_hosts,
-        other_secret_values=other_secret_values,
+        other_secret_values=set(collect_secret_inventory(settings).federation_peers()),
     )
 
     all_blockers.extend(_check_cors_setting())
+    if settings.is_hardened and settings.app_process_role == "web":
+        if not settings.session_cookie_name.startswith("__Host-"):
+            all_blockers.append("SESSION_COOKIE_NAME must use the __Host- prefix")
+        if not settings.cookies_secure:
+            all_blockers.append("COOKIES_SECURE must be True for hardened browser cookies")
+    if (
+        settings.is_hardened
+        and settings.app_process_role == "web"
+        and not settings.rate_limit_enabled
+    ):
+        all_blockers.append("RATE_LIMIT_ENABLED must be true for hardened web processes")
 
-    # Federation is an authentication boundary in every environment.  This
-    # second, runtime-level gate intentionally remains fatal even in dev: it
-    # protects publicly reachable demos and catches an unsafe mutation of the
-    # already-validated Settings singleton before the callback is reachable.
+    # Enabled federation remains an authentication boundary even in dev.
     if settings.shibboleth_enabled and federation_blockers:
         bullet_list = "\n  - " + "\n  - ".join(federation_blockers)
         raise RuntimeError(
@@ -124,18 +121,12 @@ def validate_security_settings() -> None:
             f"{len(federation_blockers)} issue(s) are fixed:{bullet_list}"
         )
 
-    if not settings.swissubase_oai_pmh_url.startswith("https://"):
-        msg = (
-            "SWISSUBASE_OAI_PMH_URL uses plaintext HTTP. "
-            "Metadata synced over HTTP is vulnerable to interception and "
-            "tampering. Use an https:// URL."
-        )
-        if settings.is_hardened:
-            all_blockers.append(msg)
-        else:
-            all_warnings.append(msg)
-
-    if settings.is_hardened and settings.rate_limit_enabled and not settings.rate_limit_trust_proxy:
+    if (
+        settings.is_hardened
+        and settings.app_process_role == "web"
+        and settings.rate_limit_enabled
+        and not settings.rate_limit_trust_proxy
+    ):
         all_blockers.append(
             "RATE_LIMIT_TRUST_PROXY=False in production: per-IP rate limiting is "
             "ineffective behind a reverse proxy. Set it True (and ensure nginx sets X-Real-IP)."

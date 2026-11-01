@@ -66,7 +66,8 @@ async def _deliver_claimed_email(
     Decrypt and check current account/token state before a 60-second SMTP
     deadline. Retry temporary failures with backoff up to seven claims;
     require two minutes of remaining action lifetime. Contention defers
-    delivery. Lease and database failures propagate; SMTP Exceptions are
+    delivery for up to one hour of total queue age, then marks it dead.
+    Lease and database failures propagate; SMTP Exceptions are
     converted to temporary failures, while cancellation propagates.
     """
     try:
@@ -106,8 +107,7 @@ async def _deliver_claimed_email(
             min_remaining_lifetime=_MIN_ACTION_LIFETIME,
         )
     except LockNotAvailable:
-        await defer_contended_email(pool, message)
-        return "retried"
+        return await defer_contended_email(pool, message)
     if not ready:
         logger.info("Outbox message %d discarded before SMTP", message.id)
         return "dead"
@@ -186,8 +186,7 @@ async def _deliver_claimed_email(
             min_remaining_lifetime=_MIN_ACTION_LIFETIME,
         )
     except LockNotAvailable:
-        await defer_contended_email(pool, message, smtp_attempted=True)
-        return "retried"
+        return await defer_contended_email(pool, message, smtp_attempted=True)
     if disposition == "dead":
         logger.info("Outbox message %d is no longer retryable", message.id)
         return "dead"

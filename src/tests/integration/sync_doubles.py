@@ -1,6 +1,6 @@
 """Shared doubles for the synchronisation modules of the integration tier.
 
-Several modules drive ``app.services.sync`` against the real database with a
+Several modules drive ``app.services.ingestion`` against the real database with a
 patched harvest (``FETCH``) and records shaped exactly like the parser's
 output (``make_record``). They lived in one sync module and were imported
 from there; they sit here so that no test module imports another.
@@ -9,11 +9,26 @@ from there; they sit here so that no test module imports another.
 from datetime import UTC, datetime
 from typing import Any
 
-from app.services.oai_client import HarvestResult
+import pytest
+
+from app.services.harvest import HarvestResult
+from app.sources import ConfiguredSource
 from tests.oai_fixtures import SOURCE_CURSOR
+from tests.source_fixtures import TEST_SOURCE_NAME
 
 # The patch target that replaces the isolated harvest in the sync loop.
-FETCH = "app.services.sync.fetch_updates_isolated"
+FETCH = "app.sources.oai_client.fetch_updates_isolated"
+
+
+class SourceCase:
+    """Expose the parametrized source to each inheriting test class."""
+
+    source: ConfiguredSource
+
+    @pytest.fixture(autouse=True)
+    def _select_source(self, sync_source):
+        """Attach the parametrized source to this test instance."""
+        self.source = sync_source
 
 
 def harvest_result(
@@ -38,7 +53,7 @@ def make_record(uuid, title="Oral History Interviews", **over):
     exact output shape of _parse_cmdi_to_dict (lists for the array fields,
     None-able strings elsewhere, resource_proxies as a list of dicts).
 
-    institutions carries a real filter-matching value ('Universität Kassel')
+    institutions carries a real filter-matching value ('Universität Beispielstadt')
     even though sync itself never filters — fetch_updates does — so these
     records look exactly like what the sync loop receives in production.
     """
@@ -59,7 +74,7 @@ def make_record(uuid, title="Oral History Interviews", **over):
         "doi": None,
         "resource_type": "Audio",
         "main_disciplines": ["History"],
-        "institutions": ["Universität Kassel"],
+        "institutions": ["Universität Beispielstadt"],
         "bibliographical_citation": None,
         "upstream_modified_at": datetime(2026, 1, 1, tzinfo=UTC),
     }
@@ -80,14 +95,16 @@ def count_datasets(conn, **where) -> int:
     return row[0]
 
 
-def sync_status_row(conn) -> dict[str, Any]:
-    """The singleton ``sync_status`` row's timestamps and last-error columns."""
+def sync_status_row(conn, *, source: str = TEST_SOURCE_NAME) -> dict[str, Any]:
+    """The requested source's timestamps and last-error columns."""
     row = conn.execute(
         """SELECT last_harvest_date, last_full_rebuild_date,
                   last_sync_error, last_sync_error_at,
                   last_rebuild_error, last_rebuild_error_at
-           FROM sync_status WHERE id = 1"""
+           FROM sync_status WHERE source = %s""",
+        (source,),
     ).fetchone()
+    assert row is not None
     return {
         "last_harvest_date": row[0],
         "last_full_rebuild_date": row[1],
@@ -98,13 +115,8 @@ def sync_status_row(conn) -> dict[str, Any]:
     }
 
 
-def ingestion_failure_uuids(conn, *, source: str = "swissubase") -> set[str]:
-    """Unresolved identities for a source, read from ``ingestion_failures``.
-
-    ``sync_status.incremental_failures`` is never written by production
-    (sync.py:360-503); the durable failure set lives in this table
-    (source, uuid, message, updated_at) and is replaced wholesale per run.
-    """
+def ingestion_failure_uuids(conn, *, source: str = TEST_SOURCE_NAME) -> set[str]:
+    """Unresolved identities for a source, read from ``ingestion_failures``."""
     rows = conn.execute(
         "SELECT uuid FROM ingestion_failures WHERE source = %s", (source,)
     ).fetchall()

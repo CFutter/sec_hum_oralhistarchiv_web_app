@@ -1,11 +1,33 @@
 {% extends "base.html" %}
 {% set active_page = "admin" %}
-{% block title %}Admin — Oral History Archive{% endblock %}
+{% block title %}Admin — {{ site_name }}{% endblock %}
 
 {% block content %}
 <section class="container admin-page">
 
   <h1>User Management</h1>
+  <p><a href="{{ path_for(request, 'admin_datasets') }}">Dataset administration</a></p>
+
+  <form method="get" action="{{ path_for(request, 'admin_dashboard') }}"
+      class="admin-toolbar">
+    <label for="account-email">Find account by exact email:</label>
+    <input type="text" inputmode="email" id="account-email" name="email"
+        value="{{ lookup_email }}" maxlength="{{ email_max_chars }}" required>
+    <input type="hidden" name="page_size" value="{{ page_size }}">
+    <button type="submit" class="btn btn-small">Find account</button>
+    {% if lookup_email %}
+    <a href="{{ url_for_query(request, email=None, page=None) }}">Show all users</a>
+    {% endif %}
+  </form>
+
+  {% if lookup_email %}
+    <p role="status">Exact email lookup. Account actions return to the main list.</p>
+  {% elif window_limited %}
+    <p role="status">
+    Browsing is limited to the first {{ max_numbered_pages }} pages.
+    Use the exact email lookup to find accounts beyond this range.
+    </p>
+  {% endif %}
 
   <div class="admin-toolbar">
     <span>Per page:</span>
@@ -26,6 +48,7 @@
           <th>Name</th>
           <th>Method</th>
           <th>Federated Identity</th>
+          <th>Federated Tier Review</th>
           <th>Tier</th>
           <th>Admin</th>
           <th>Active</th>
@@ -39,6 +62,7 @@
         {% set federated_managed = u.auth_method == 'shibboleth' and u.federated_status in ['approved', 'disabled'] %}
         {% set membership_controls_allowed = u.auth_method == 'local' or federated_managed %}
         {% set admin_promotion_state = admin_promotion_states.get(u.id) %}
+        {% set federated_review = federated_reviews.get(u.id) %}
         <tr class="{% if not u.is_active %}row-inactive{% endif %}">
           <td>{{ u.email }}</td>
           <td>{{ u.display_name or '—' }}</td>
@@ -55,6 +79,33 @@
               —
             {% endif %}
           </td>
+          <td class="federated-tier-review">
+            {% if federated_review %}
+              <span class="form-hint">Proposed tier</span>
+              <strong>{{ federated_review.proposed_tier if federated_review.proposed_tier is not none else 'No matching rule' }}</strong><br>
+              {% if federated_review.proposed_rule is not none %}
+                <span class="form-hint">Matched rule</span>
+                <code>{{ federated_review.proposed_rule | tojson }}</code><br>
+              {% endif %}
+              <span class="form-hint">Latest trusted assertion values</span><br>
+              <span class="form-hint">Issuer</span>
+              <code>{{ federated_review.issuer }}</code><br>
+              <span class="form-hint">Affiliation</span>
+              <code>{{ federated_review.affiliation if federated_review.affiliation is not none else 'Not supplied' }}</code><br>
+              <span class="form-hint">Entitlement (SP serialization)</span>
+              <code>{{ federated_review.entitlement if federated_review.entitlement is not none else 'Not supplied' }}</code><br>
+              {% if federated_review.mismatch %}
+                <strong class="badge-inactive">Proposal changed since approval.</strong>
+                <span class="form-hint">Assigned tier remains {{ u.access_tier }}. Review the changed proposal manually.</span>
+              {% else %}
+                <span class="form-hint">Proposals never change assigned access automatically.</span>
+              {% endif %}
+            {% elif u.auth_method == 'shibboleth' %}
+              <span class="form-hint">No trusted assertion available for tier review. A fresh federated sign-in is required.</span>
+            {% else %}
+              —
+            {% endif %}
+          </td>
         
           <td>
             {% if membership_controls_allowed %}
@@ -63,7 +114,7 @@
               <input type="hidden" name="page" value="{{ current_page }}">
               <input type="hidden" name="page_size" value="{{ page_size }}">              
               <select name="access_tier">
-                {% for tier in ['public', 'registered', 'vetted'] %}
+                {% for tier in access_tiers %}
                 <option value="{{ tier }}" {% if u.access_tier == tier %}selected{% endif %}>{{ tier }}</option>
                 {% endfor %}
               </select>
@@ -128,8 +179,6 @@
           <td>
             {% if federated_pending %}
               <span class="badge-inactive">pending review</span>
-            {% elif u.auth_method == 'shibboleth' and u.federated_status == 'legacy_quarantined' %}
-              <span class="badge-inactive">legacy quarantine</span>
             {% elif u.auth_method == 'shibboleth' and not federated_managed %}
               <span class="badge-inactive">invalid federation state</span>
             {% elif u.is_active %}
@@ -142,7 +191,7 @@
           <td>{{ u.last_login | utc_datetime }}</td>
         
           <td>
-            {% if federated_pending %}
+            {% if federated_pending and federated_review %}
               <form action="{{ path_for(request, 'admin_approve_federated', user_id=u.id) }}"
                     method="post" class="inline-form federated-approval-form">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
@@ -150,16 +199,19 @@
                 <input type="hidden" name="page_size" value="{{ page_size }}">
                 <input type="hidden" name="expected_issuer" value="{{ u.shibboleth_issuer }}">
                 <input type="hidden" name="expected_subject_id" value="{{ u.shibboleth_subject_id }}">
+                <input type="hidden" name="expected_review_revision" value="{{ federated_review.revision }}">
                 <label>
                   Approval tier
                   <select name="access_tier">
-                    {% for tier in ['public', 'registered', 'vetted'] %}
+                    {% for tier in access_tiers %}
                     <option value="{{ tier }}" {% if tier == 'public' %}selected{% endif %}>{{ tier }}</option>
                     {% endfor %}
                   </select>
                 </label>
                 <button type="submit" class="btn btn-small btn-secondary">Approve identity</button>
               </form>
+            {% elif federated_pending %}
+              <strong>A fresh trusted assertion is required before approval.</strong>
             {% elif u.auth_method == 'shibboleth' and not federated_managed %}
               <strong>Manual identity reconciliation required.</strong>
             {% elif u.id != user.id %}
@@ -216,22 +268,30 @@
               {% endif %}
             {% endif %}
 
+            {% if u.id != user.id %}
             <form action="{{ path_for(request, 'admin_change_email', user_id=u.id) }}"
                   method="post" class="inline-form admin-email-form">
               <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
               <input type="hidden" name="page" value="{{ current_page }}">
               <input type="hidden" name="page_size" value="{{ page_size }}">
-              <input type="email" name="new_email" placeholder="new@address" maxlength="200" required>
+              <input type="email" name="new_email" placeholder="new@address" maxlength="{{ local_email_max_chars }}" required>
               <button type="submit" class="btn btn-small">Change Email</button>
             </form>
+            {% else %}
+            <a href="{{ path_for(request, 'change_email_page') }}" class="btn btn-small">Change My Email</a>
+            {% endif %}
             {% if u.id == user.id %}
             <span class="form-hint">You'll be logged out after confirming the link.</span>
             {% endif %}
             {% endif %}
+            {% if u.id != user.id and user.auth_method == 'local' and user.totp_configured %}
+            <a href="{{ path_for(request, 'admin_account_delete_page', user_id=u.id) }}"
+               class="btn btn-small btn-danger">Delete Account</a>
+            {% endif %}
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="9" class="empty-state">No users to show.</td></tr>
+        <tr><td colspan="10" class="empty-state">No users to show.</td></tr>
         {% endfor %}
       </tbody>
     </table>

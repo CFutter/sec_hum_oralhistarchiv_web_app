@@ -1,11 +1,4 @@
-"""Login-route and admin-seeding integration tests — real PostgreSQL, real routes.
-
-Covers the two normalization/fallback branches on the credential lookup in
-`login_submit` (`app/routes/login.py`), the bootstrap contract of
-`app.services.seed_admin.seed_admin_user` on a database with no administrator
-yet, and that a mutation flash stored in the session survives a redirect
-chain driven by an authenticated admin session.
-"""
+"""Login-route and admin-seeding integration tests — real PostgreSQL, real routes."""
 
 from unittest.mock import patch
 
@@ -25,18 +18,7 @@ class TestLoginEmailNormalization:
     def test_login_with_nfd_unicode_variant_normalizes_to_stored_account(
         self, e2e_client, user_factory
     ):
-        """The account's STORED email is the NFC-composed form; the user
-        instead TYPES an NFD-decomposed form (same glyphs, different case)
-        that a bare `LOWER()` comparison would not match. Login only succeeds
-        because login_submit (login.py:105-107) runs the typed value through
-        normalize_email() BEFORE calling verify_password, and
-        normalize_email's email_validator backend composes to NFC + lowercases
-        (email_utils.py:14-16) — producing exactly the stored string.
-        verify_password's own SQL lookup is only a case-fold,
-        `WHERE LOWER(email) = LOWER(%s)` (authentication.py:70), which does
-        NOT perform Unicode composition, so this fails without the
-        Python-side normalize_email() step.
-        """
+        """Verify login with NFD unicode variant normalizes to stored account."""
         # ä = LATIN SMALL LETTER A WITH DIAERESIS, precomposed (NFC). This
         # is the form email_validator's `.normalized` output uses, and so the
         # form the stored row is created with below. Written as an explicit
@@ -65,16 +47,7 @@ class TestLoginEmailNormalization:
     def test_login_with_syntactically_invalid_email_falls_back_to_generic_401(
         self, e2e_client, user_factory
     ):
-        """When normalize_email() returns None for a syntactically invalid
-        address, login_submit falls back to the RAW typed value for the SQL
-        lookup (login.py:105-107: `lookup_email = normalized if normalized is
-        not None else email`), which naturally matches no user. The route
-        must still render the SAME generic 401 copy used for a real account's
-        wrong password (login.py:121 and :152 share the literal string) — the
-        enumeration defense holds even down this fallback branch, so an
-        attacker cannot distinguish "malformed address" from "wrong password
-        on a real account" by response content.
-        """
+        """Verify login with syntactically invalid email falls back to generic 401."""
         u = user_factory()
         generic_401 = "Invalid email, password, or authentication code."
 
@@ -98,37 +71,54 @@ class TestSeedAdminBootstrap:
         un-awaited fetchone made `if existing:` truthy on a fresh DB, so a new
         deployment failed to boot). Running it AGAIN skips silently — still
         exactly one admin, no raise."""
-        await seed_admin_user(db_pool, "admin@uzh.ch", SEED_PASSWORD)
+        await seed_admin_user(db_pool, "admin@example.org", SEED_PASSWORD)
 
         row = sync_conn.execute(
             """SELECT is_admin, email_verified, access_tier, auth_method
                FROM users WHERE email = %s""",
-            ("admin@uzh.ch",),
+            ("admin@example.org",),
         ).fetchone()
         assert row is not None
         assert row == (True, True, "public", "local")
 
         # Second run: idempotent skip, no error, no duplicate admin.
-        await seed_admin_user(db_pool, "admin@uzh.ch", SEED_PASSWORD)
+        await seed_admin_user(db_pool, "admin@example.org", SEED_PASSWORD)
         count = sync_conn.execute("SELECT COUNT(*) FROM users WHERE is_admin = true").fetchone()
         assert count[0] == 1
 
     async def test_seed_admin_refuses_to_promote_existing_user(self, db_pool, user_factory):
         """If a NON-admin user already owns the seed email (and no admin
         exists), seeding raises RuntimeError instead of silently elevating."""
-        user_factory(email="admin@uzh.ch")
+        user_factory(email="admin@example.org")
 
         with pytest.raises(RuntimeError, match="refusing to promote"):
-            await seed_admin_user(db_pool, "admin@uzh.ch", SEED_PASSWORD)
+            await seed_admin_user(db_pool, "admin@example.org", SEED_PASSWORD)
 
     async def test_seed_admin_rejects_short_password(self, db_pool, sync_conn):
         """A password under 12 characters is refused with RuntimeError and no
         user is created."""
         with pytest.raises(RuntimeError, match="at least 12 characters"):
-            await seed_admin_user(db_pool, "admin@uzh.ch", "Sh0rt!pw")
+            await seed_admin_user(db_pool, "admin@example.org", "Sh0rt!pw")
 
         count = sync_conn.execute("SELECT COUNT(*) FROM users").fetchone()
         assert count[0] == 0
+
+    @pytest.mark.parametrize(
+        "password",
+        [
+            "change-me-immediately-use-a-strong-password",
+            "GENERATE_STRONG_INITIAL_ADMIN_PASSWORD",
+            "REPLACE_WITH_STRONG_ADMIN_PASSWORD",
+            "REPLACE_WITH_INITIAL_ADMIN_PASSWORD",
+        ],
+    )
+    async def test_documented_placeholders_cannot_create_an_administrator(
+        self, db_pool, sync_conn, password
+    ):
+        """Verify documented placeholders cannot create an administrator."""
+        with pytest.raises(RuntimeError, match="published example"):
+            await seed_admin_user(db_pool, "operator@example.org", password)
+        assert sync_conn.execute("SELECT count(*) FROM users").fetchone()[0] == 0
 
     async def test_seed_admin_rejects_password_containing_email_local_part(
         self, db_pool, sync_conn
@@ -136,16 +126,16 @@ class TestSeedAdminBootstrap:
         """The strength check runs with the seed email — a long password that
         contains the email local part ('admin') is refused."""
         with pytest.raises(RuntimeError, match="ADMIN_SEED_PASSWORD rejected"):
-            await seed_admin_user(db_pool, "admin@uzh.ch", "admin-Xk9!mQ2#vL")
+            await seed_admin_user(db_pool, "admin@example.org", "admin-Xk9!mQ2#vL")
 
         count = sync_conn.execute("SELECT COUNT(*) FROM users").fetchone()
         assert count[0] == 0
 
     async def test_seed_admin_is_inert_when_an_admin_already_exists(self, db_pool, user_factory):
         """When an administrator already exists, seed_admin_user returns
-        before validating or hashing the seed password at all — an
-        operator's leftover/obsolete ADMIN_SEED_PASSWORD environment value
-        must never be checked against policy or hashed on every boot."""
+        before password-policy work. Repeating the operator-only command
+        against an initialized database must not alter the existing account
+        or waste credential work."""
         user_factory(is_admin=True)
         with (
             patch(
@@ -159,7 +149,7 @@ class TestSeedAdminBootstrap:
                 side_effect=AssertionError("must not hash"),
             ),
         ):
-            await seed_admin_user(db_pool, "admin@uzh.ch", "obsolete")
+            await seed_admin_user(db_pool, "admin@example.org", "obsolete")
 
 
 class TestSessionFlashAcrossRedirects:

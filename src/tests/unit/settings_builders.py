@@ -1,24 +1,22 @@
-"""Keyword-argument builders for constructing ``Settings`` in tests.
+"""Build explicit Settings test kwargs; unpinned fields still read the OS environment.
 
-Every settings test constructs ``Settings(_env_file=None, **kwargs)`` so no
-``.env`` file leaks in. Real OS environment variables still apply to *unset*
-fields, so these builders pass an explicit value for every field a test
-asserts on: one builder per environment tier, plus ``make_settings``. They
-are shared by every unit module that exercises ``config.settings``.
+make_settings disables instance dotenv reads, not OS variables. Importing this
+module also imports config and constructs its settings singleton.
 """
 
 from config.settings import Settings
 
 
 def base_kwargs(**overrides):
-    """All mandatory fields with strong dev-safe values.
+    """Return selected development defaults plus overrides; leave other fields to Settings.
 
-    Every toggle a validator inspects is pinned explicitly so ambient env vars
-    (the conftest bootstrap block or a developer's shell) cannot change what a
-    test constructs.
+    Enabling Shibboleth removes localhost from allowed_hosts unless explicitly
+    overridden. Unpinned fields can still inherit OS environment values.
     """
     kw = {
         "env_state": "dev",
+        "app_process_role": "web",
+        "parser_execution_mode": "service",
         "database_url": "postgresql://oha:db-secret-pw@localhost:5432/oha_test",
         "public_base_url": "http://localhost:8000",
         "secret_key": "unit-test-secret-key-0123456789abcdefghijklmnopqrstuv",
@@ -31,15 +29,25 @@ def base_kwargs(**overrides):
             "archive.example.org",
             "staging.archive.example.org",
         ],
-        "oai_institution_filter": "Universität Kassel",
         "cookies_secure": True,
         "fastapi_debug": False,
         "smtp_enabled": False,
         "smtp_user": "",
         "smtp_password": None,
         "redis_enabled": False,
+        "rate_limit_enabled": True,
+        "rate_limit_redis_url": "",
         "shibboleth_enabled": False,
+        "federated_tier_rules": (),
         "cors_enabled": False,
+        "sources_config_file": None,
+        "allow_fixture_source": False,
+        "password_work_admission_timeout_seconds": 1.0,
+        "search_statement_timeout_ms": 500,
+        "search_operation_timeout_seconds": 1.0,
+        "search_pool_timeout_seconds": 0.1,
+        "search_global_rate_per_second": 0.5,
+        "search_global_burst": 1,
     }
     kw.update(overrides)
     if kw["shibboleth_enabled"] and "allowed_hosts" not in overrides:
@@ -48,12 +56,7 @@ def base_kwargs(**overrides):
 
 
 def staging_kwargs(**overrides):
-    """base_kwargs adjusted to satisfy the is_hardened (staging) validators.
-
-    SMTP is on because require_smtp_when_hardened applies to staging:
-    with SMTP disabled, send_email() returns True while sending nothing, so
-    the boundary now rejects hardened deployments without SMTP.
-    """
+    """Return base kwargs with staging HTTPS, hosts and SMTP defaults, then apply overrides."""
     kw = base_kwargs(
         env_state="staging",
         public_base_url="https://staging.archive.example.org",
@@ -70,11 +73,8 @@ def staging_kwargs(**overrides):
 
 
 def prod_kwargs(**overrides):
-    """base_kwargs adjusted to satisfy every production-only validator.
-
-    Redis is enabled with a non-empty URL so construction emits no
-    'Redis is disabled in production' RuntimeWarning (keeps warns-based
-    assertions elsewhere clean without relying on the filterwarnings config).
+    """Return base kwargs with production HTTPS, health, SMTP and general Redis defaults plus
+    overrides.
     """
     kw = base_kwargs(
         env_state="production",
@@ -88,7 +88,7 @@ def prod_kwargs(**overrides):
         smtp_from_address="archive@example.org",
         smtp_use_tls=True,
         redis_enabled=True,
-        redis_url="redis://redis.internal.example.org:6379/0",
+        redis_url="rediss://redis.internal.example.org:6379/0",
     )
     kw.update(overrides)
     return kw
@@ -102,5 +102,5 @@ KWARGS_FOR_ENV = {
 
 
 def make_settings(**kwargs) -> Settings:
-    """Construct Settings without reading any .env file."""
+    """Construct Settings without dotenv; unpinned OS settings and validation errors still apply."""
     return Settings(_env_file=None, **kwargs)

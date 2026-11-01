@@ -1,5 +1,53 @@
 # Database migrations
 
-The sole revision, `4f73ae3ff827`, creates the current schema in a fresh database. It does not upgrade databases from earlier migration histories or backfill existing rows. Use the migration owner credentials and the commands in [Deployment](../../Deployment.md); runtime roles cannot run DDL.
+This pre-deployment release starts from an empty database with one initial
+revision, `4f73ae3ff827`. The migration creates schema, not users or catalogue
+records. Sources supply catalogue data; registration and explicit administrator
+bootstrap create accounts. Bundled synthetic fixtures are opt-in development/test
+inputs, not deployment data.
+
+Provision the empty database and run the manual migration unit plus runtime
+grants before starting web or scheduler. Use migration owner credentials and
+the commands in [Deployment](../../Deployment.md); runtime roles cannot run DDL.
+Recreate disposable databases made from an earlier baseline body: `upgrade head`
+does not rerun an already recorded revision, and stamping cannot install missing
+objects. Application/updater tools never drop or recreate databases.
+
+The baseline owns literal snapshots of its catalogue function bodies and search
+candidate selector. Historical revisions must not import current `app` or
+`config` code to generate DDL. `src/app/catalogue_sql.py` and the runtime schema
+contract describe the currently required database behavior; they do not define
+what an already-numbered revision creates.
+
+The current search-mask protocol is defined in `src/app/search_mask_contract.py`.
+Its page-function source and complete count-view definition must be frozen
+together when preparing a schema change. Runtime SQL is generated from the
+versioned field map; the historical revision imports neither that map nor its
+renderer. This pre-deployment reset updates the initial literal snapshots,
+includes the nullable `source_fetch_cursor` and `source_fetch_fingerprint` columns
+in `CREATE TABLE sync_status`, and updates the pinned upgrade SQL digest while
+retaining revision `4f73ae3ff827`. New source rows start with NULL clean and
+consumed cursors/fingerprints; there is no retained-data backfill.
+
+`src/tests/unit/test_migration_history.py` pins the exact ordered upgrade and
+downgrade SQL for this baseline, rejects application/configuration imports in
+revision files, and verifies that runtime SQL changes cannot alter replay.
+Do not regenerate snapshots or update those digests during builds or startup.
+
+Before the first retained deployment, an explicitly reviewed baseline reset may
+change the initial schema, its literal snapshots and the pinned SQL digests
+together. The operator must recreate any database made from the older baseline;
+the revision label alone cannot identify that older body. No reset is performed
+by application tools. Once a retained deployment exists, preserve historical
+revisions and add a new reviewed revision for every subsequent schema change.
+
+For a future catalogue SQL change, update the current runtime SQL/contract and
+add a revision containing its own literal `CREATE OR REPLACE FUNCTION` or view
+DDL. A downgrade must restore the previous literal definition. Rehearse both
+upgrade from the previous head and installation from `base`; then run live
+schema validation against the new head. Update intentional migration-head pins
+in wheel-smoke and backup/recovery checks, plus grants and recovery procedures
+when affected. A test must not require an old revision to equal the latest
+runtime SQL: newer revisions are responsible for advancing the schema.
 
 Downgrading to `base` deletes all application data and removes `pg_trgm`.

@@ -1,26 +1,21 @@
-"""Deployment-contract pins for nginx request-log confidentiality.
-
-Action credentials are carried in URL paths on their initial GET.  Every nginx
-log must therefore be safe independently of application-level log scrubbing —
-the access log, whose format is inspected here as plain configuration, and the
-error log, which is exercised by actually running the shipped logging and
-request-admission settings and reading what nginx wrote.  The real host still
-needs ``nginx -T`` verification.
-"""
+"""Deployment-contract pins for nginx request-log confidentiality."""
 
 import contextlib
 import http.client
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
 from app.paths import PROJECT_ROOT
+from app.services.tokens import action_token_public_id, action_token_url
 
 NGINX_CONFIG = PROJECT_ROOT / "deploy" / "nginx.conf.example"
 ORDINARY_PROXY_HEADERS = PROJECT_ROOT / "deploy" / "nginx-ordinary-proxy-headers.conf.example"
@@ -42,6 +37,7 @@ _FIXED_FEDERATION_HEADERS = frozenset(
         "X-OHA-Shib-Authn-Context",
         "X-OHA-Shib-Display-Name",
         "X-OHA-Shib-Affiliation",
+        "X-OHA-Shib-Entitlement",
         "X-OHA-Shib-Country",
     }
 )
@@ -54,6 +50,8 @@ _LEGACY_FEDERATION_HEADERS = frozenset(
         "mail",
         "displayName",
         "affiliation",
+        "entitlement",
+        "eduPersonEntitlement",
         "schacHomeOrganizationCountry",
         "Shib-Identity-Provider",
         "Shib-AuthnContext-Class",
@@ -68,6 +66,8 @@ _LEGACY_FEDERATION_HEADERS = frozenset(
         "mail",
         "displayName",
         "affiliation",
+        "entitlement",
+        "eduPersonEntitlement",
         "schacHomeOrganizationCountry",
         "Shib-Identity-Provider",
         "Shib-AuthnContext-Class",
@@ -96,16 +96,19 @@ def _without_comments(text: str) -> str:
 
 
 def _config_text() -> str:
+    """Read the nginx example without comments, failing if it is missing."""
     assert NGINX_CONFIG.exists(), f"nginx example not found at {NGINX_CONFIG}"
     return _without_comments(NGINX_CONFIG.read_text(encoding="utf-8"))
 
 
 def _file_without_comments(path: Path) -> str:
+    """Read the selected nginx fragment without comments, failing if it is missing."""
     assert path.exists(), f"nginx example not found at {path}"
     return _without_comments(path.read_text(encoding="utf-8"))
 
 
 def _required_executable(name: str) -> str:
+    """Find an executable; fail under REQUIRE_NGINX=1, otherwise skip when absent."""
     executable = shutil.which(name)
     if executable is not None:
         return executable
@@ -136,13 +139,28 @@ def _balanced_blocks(text: str, opener: re.Pattern[str]) -> list[str]:
 
 
 def _direct_directives(block: str, name: str) -> list[str]:
-    """Return directives at this block level, excluding nested locations."""
+    """Return this block's directives, preserving quoted semicolons and excluding nested blocks."""
     directives: list[str] = []
     current: list[str] = []
     depth = 0
+    quote: str | None = None
+    escaped = False
 
     for character in block:
-        if character == "{":
+        if quote is not None:
+            if depth == 0:
+                current.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+        elif character in {"'", '"'}:
+            quote = character
+            if depth == 0:
+                current.append(character)
+        elif character == "{":
             if depth == 0:
                 current.clear()
             depth += 1
@@ -163,6 +181,7 @@ def _direct_directives(block: str, name: str) -> list[str]:
 
 
 def _access_log_is_safe(value: str) -> bool:
+    """Accept disabled logging or an explicit reference to the safe log format."""
     tokens = value.split()
     return bool(tokens) and (tokens[0] == "off" or SAFE_LOG_FORMAT in tokens[1:])
 
@@ -176,7 +195,20 @@ def _proxy_headers(block: str) -> dict[str, list[str]]:
     return headers
 
 
+def _static_header_configuration() -> tuple[list[str], str]:
+    """Return the application server's header directives and its sole static-location body."""
+    selected = [
+        (server, location)
+        for server in _balanced_blocks(_config_text(), re.compile(r"(?m)^\s*server\s*\{"))
+        for location in _balanced_blocks(server, re.compile(r"(?m)^\s*location\s+/static/\s*\{"))
+    ]
+    assert len(selected) == 1, "expected one application static location"
+    server, location = selected[0]
+    return _direct_directives(server, "add_header"), location
+
+
 def test_safe_log_format_uses_only_reviewed_noncredential_variables():
+    """Check safe log format uses only reviewed noncredential variables."""
     config = _config_text()
     matches = re.findall(
         rf"(?ms)^\s*log_format\s+{SAFE_LOG_FORMAT}\b(?P<body>.*?);",
@@ -193,6 +225,7 @@ def test_safe_log_format_uses_only_reviewed_noncredential_variables():
 
 
 def test_every_server_selects_the_safe_access_log_format_directly():
+    """Check every server selects the safe access log format directly."""
     servers = _balanced_blocks(_config_text(), re.compile(r"(?m)^\s*server\s*\{"))
     assert servers, "nginx example contains no server blocks"
 
@@ -208,6 +241,7 @@ def test_every_server_selects_the_safe_access_log_format_directly():
 
 
 def test_no_location_can_replace_the_safe_log_with_an_unreviewed_format():
+    """Check no location can replace the safe log with an unreviewed format."""
     config = _config_text()
     access_logs = re.findall(r"(?ms)^\s*access_log\s+(?P<value>.*?);", config)
 
@@ -216,6 +250,7 @@ def test_no_location_can_replace_the_safe_log_with_an_unreviewed_format():
 
 
 def test_static_assets_inherit_or_explicitly_use_safe_logging():
+    """Check static assets inherit or explicitly use safe logging."""
     static_locations = _balanced_blocks(
         _config_text(),
         re.compile(r"(?m)^\s*location\s+/static/\s*\{"),
@@ -228,7 +263,106 @@ def test_static_assets_inherit_or_explicitly_use_safe_logging():
         )
 
 
+def test_static_cache_headers_preserve_the_server_hsts_policy():
+    """Static cache policy cannot replace or weaken the HTTPS server's HSTS policy."""
+    server_headers, location = _static_header_configuration()
+    server_hsts = [
+        value for value in server_headers if value.startswith("Strict-Transport-Security ")
+    ]
+    static_headers = _direct_directives(location, "add_header")
+    static_hsts = [
+        value for value in static_headers if value.startswith("Strict-Transport-Security ")
+    ]
+
+    assert len(server_hsts) == 1 and server_hsts[0].endswith(" always")
+    assert static_hsts == server_hsts
+    assert 'Cache-Control "public, no-cache"' in static_headers
+
+
+def test_static_hsts_survives_success_revalidation_and_missing_assets(tmp_path: Path):
+    """Run the shipped static block and require HSTS on its 200, 304 and 404 responses."""
+    nginx = _required_executable("nginx")
+    server_headers, location = _static_header_configuration()
+    server_hsts = [
+        value for value in server_headers if value.startswith("Strict-Transport-Security ")
+    ]
+    assert len(server_hsts) == 1
+    expected_hsts = shlex.split(server_hsts[0])[1]
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    (static_root / "app.css").write_text("body {}\n", encoding="utf-8")
+    location = location.replace("/opt/oralhistarchiv/src/app/static/", f"{static_root.as_posix()}/")
+    port = _free_local_port()
+    nginx_config = tmp_path / "nginx.conf"
+    nginx_config.write_text(
+        "\n".join(
+            [
+                "user root;" if os.geteuid() == 0 else "",
+                "worker_processes 1;",
+                "daemon off;",
+                f'error_log "{(tmp_path / "error.log").as_posix()}" error;',
+                f'pid "{(tmp_path / "nginx.pid").as_posix()}";',
+                "events { worker_connections 16; }",
+                "http {",
+                *(
+                    f'    {name}_temp_path "{(tmp_path / name).as_posix()}";'
+                    for name in ("client_body", "proxy", "fastcgi", "uwsgi", "scgi")
+                ),
+                "    access_log off;",
+                "    server {",
+                f"        listen 127.0.0.1:{port};",
+                *(f"        add_header {value};" for value in server_headers),
+                "        location /static/ {",
+                location,
+                "        }",
+                "    }",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    process = subprocess.Popen(
+        [nginx, "-p", f"{tmp_path}/", "-c", str(nginx_config)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_until_listening(process, port)
+        modified_at = None
+        for path, expected_status in (
+            ("/static/app.css", 200),
+            ("/static/app.css", 304),
+            ("/static/missing.css", 404),
+        ):
+            headers = {"Connection": "close"}
+            if expected_status == 304:
+                assert modified_at is not None
+                headers["If-Modified-Since"] = modified_at
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                connection.request("GET", path, headers=headers)
+                response = connection.getresponse()
+                response.read()
+                assert response.status == expected_status
+                assert response.getheader("Strict-Transport-Security") == expected_hsts
+                if expected_status in {200, 304}:
+                    assert response.getheader("Cache-Control") == "public, no-cache"
+                if expected_status == 200:
+                    modified_at = response.getheader("Last-Modified")
+            finally:
+                connection.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
 def test_health_location_preserves_the_complete_ordinary_proxy_contract():
+    """Check health location preserves the complete ordinary proxy contract."""
     health_locations = _balanced_blocks(
         _config_text(),
         re.compile(r"(?m)^\s*location\s*=\s*/health\s*\{"),
@@ -244,24 +378,17 @@ def test_health_location_preserves_the_complete_ordinary_proxy_contract():
 
 
 class TestEdgeRequestAdmissionBackstop:
-    """A coarse rate/connection budget at the edge, independent of the
-    application's own per-route limiter, so a client that never completes
-    TLS/HTTP framing (and so never reaches the application's admission
-    middleware) cannot exhaust worker connections. Positive control for the
-    unaffected safe-logging contract lives in
-    `test_every_server_selects_the_safe_access_log_format_directly`, which
-    already proves the ordinary proxy locations select
-    `oralhistarchiv_safe`."""
+    """Cover edge request admission backstop."""
 
-    @pytest.mark.unimplemented
     def test_dynamic_proxy_unknown_path_and_health_locations_are_edge_rate_limited(self):
+        """Check dynamic proxy unknown path and health locations are edge rate limited."""
         config = _config_text()
 
         assert re.search(r"(?m)^\s*limit_req_zone\b", config), "no limit_req_zone declared"
         assert re.search(r"(?m)^\s*limit_conn_zone\b", config), "no limit_conn_zone declared"
 
         for pattern in (
-            re.compile(r"(?m)^\s*location\s*/\s*\{"),  # dynamic proxy / unknown path
+            re.compile(r"(?m)^\s*location\s*/\s*\{"),
             re.compile(r"(?m)^\s*location\s*=\s*/health\s*\{"),
         ):
             for location in _balanced_blocks(config, pattern):
@@ -314,6 +441,7 @@ def test_every_ordinary_app_proxy_uses_the_shared_header_hygiene_include():
 
 
 def test_ordinary_proxy_include_is_an_exact_fail_closed_header_contract():
+    """Check ordinary proxy include is an exact fail closed header contract."""
     config = _file_without_comments(ORDINARY_PROXY_HEADERS)
 
     assert _direct_directives(config, "proxy_http_version") == ["1.1"]
@@ -335,6 +463,7 @@ def test_ordinary_proxy_include_is_an_exact_fail_closed_header_contract():
 
 
 def test_ordinary_proxy_include_parses_with_nginx(tmp_path: Path):
+    """Check ordinary proxy include parses with nginx."""
     nginx = _required_executable("nginx")
     snippet = tmp_path / "ordinary-proxy-headers.conf"
     shutil.copyfile(ORDINARY_PROXY_HEADERS, snippet)
@@ -342,6 +471,7 @@ def test_ordinary_proxy_include_parses_with_nginx(tmp_path: Path):
     nginx_config = tmp_path / "nginx.conf"
     nginx_config.write_text(
         f"""
+{"user root;" if os.geteuid() == 0 else ""}
 worker_processes 1;
 error_log stderr notice;
 pid "{(tmp_path / "nginx.pid").as_posix()}";
@@ -393,6 +523,7 @@ http {{
 
 
 def test_runbook_verifies_health_through_the_configured_tls_virtual_host():
+    """Check runbook verifies health through the configured tls virtual host."""
     text = DEPLOYMENT_RUNBOOK.read_text(encoding="utf-8")
     install = text.split("### Install nginx config", 1)[1]
     install = install.split("### Verify client IP propagation", 1)[0]
@@ -422,6 +553,7 @@ def test_runbook_verifies_health_through_the_configured_tls_virtual_host():
 
 
 def test_phase_two_callback_forwards_only_an_explicit_header_allowlist():
+    """Check phase two callback forwards only an explicit header allowlist."""
     config = _file_without_comments(SHIBBOLETH_PHASE2_CONFIG)
     callback_locations = _balanced_blocks(
         config,
@@ -456,6 +588,7 @@ def test_phase_two_callback_forwards_only_an_explicit_header_allowlist():
         "x-oha-shib-authn-context": "$oha_shib_authn_context",
         "x-oha-shib-display-name": "$oha_shib_display_name",
         "x-oha-shib-affiliation": "$oha_shib_affiliation",
+        "x-oha-shib-entitlement": "$oha_shib_entitlement",
         "x-oha-shib-country": "$oha_shib_country",
     }
     for name, value in expected_identity.items():
@@ -466,6 +599,7 @@ def test_phase_two_callback_forwards_only_an_explicit_header_allowlist():
 
 
 def test_phase_two_maps_required_identity_and_assurance_from_authorizer_output():
+    """Check phase two maps required identity and assurance from authorizer output."""
     config = _file_without_comments(SHIBBOLETH_PHASE2_CONFIG)
     required_mappings = {
         "$oha_shib_issuer": "$upstream_http_variable_shib_identity_provider",
@@ -474,6 +608,7 @@ def test_phase_two_maps_required_identity_and_assurance_from_authorizer_output()
         "$oha_shib_authn_context": "$upstream_http_variable_shib_authncontext_class",
         "$oha_shib_display_name": "$upstream_http_variable_displayname",
         "$oha_shib_affiliation": "$upstream_http_variable_affiliation",
+        "$oha_shib_entitlement": "$upstream_http_variable_entitlement",
         "$oha_shib_country": ("$upstream_http_variable_schachomeorganizationcountry"),
     }
     mappings: dict[str, str] = {}
@@ -488,6 +623,7 @@ def test_phase_two_maps_required_identity_and_assurance_from_authorizer_output()
 
 
 def test_phase_two_authorizer_is_internal_and_protocol_handler_is_not_proxied_to_app():
+    """Check phase two authorizer is internal and protocol handler is not proxied to app."""
     config = _file_without_comments(SHIBBOLETH_PHASE2_CONFIG)
     authorizers = _balanced_blocks(
         config,
@@ -511,7 +647,53 @@ def test_phase_two_authorizer_is_internal_and_protocol_handler_is_not_proxied_to
     assert _direct_directives(handlers[0], "proxy_pass") == []
 
 
+def test_phase_two_public_locations_bound_client_and_aggregate_sp_work():
+    """Check phase two public locations bound client and aggregate sp work."""
+    config = _file_without_comments(SHIBBOLETH_PHASE2_CONFIG)
+    request_zones = _http_level_directives("limit_req_zone")
+    connection_zones = _http_level_directives("limit_conn_zone")
+    assert "$binary_remote_addr zone=oralhistarchiv_sso_req:10m rate=2r/s" in request_zones
+    assert "$server_name zone=oralhistarchiv_sso_global_req:64k rate=10r/s" in request_zones
+    assert "$binary_remote_addr zone=oralhistarchiv_sso_conn:10m" in connection_zones
+    assert "$server_name zone=oralhistarchiv_sso_global_conn:64k" in connection_zones
+    https_server = next(
+        server
+        for server in _balanced_blocks(_config_text(), re.compile(r"(?m)^\s*server\s*\{"))
+        if _direct_directives(server, "client_max_body_size")
+    )
+    assert _direct_directives(https_server, "client_header_timeout") == ["10s"]
+    assert _direct_directives(https_server, "client_header_buffer_size") == ["1k"]
+    assert _direct_directives(https_server, "large_client_header_buffers") == ["4 8k"]
+    for opener in (
+        r"(?m)^\s*location\s+/Shibboleth\.sso/\s*\{",
+        r"(?m)^\s*location\s*=\s*/auth/shibboleth/callback\s*\{",
+    ):
+        location = _balanced_blocks(config, re.compile(opener))[0]
+        assert _direct_directives(location, "limit_req") == [
+            "zone=oralhistarchiv_sso_req burst=10 nodelay",
+            "zone=oralhistarchiv_sso_global_req burst=20 nodelay",
+        ]
+        assert _direct_directives(location, "limit_conn") == [
+            "oralhistarchiv_sso_conn 8",
+            "oralhistarchiv_sso_global_conn 16",
+        ]
+        assert _direct_directives(location, "client_max_body_size") == ["64k"]
+        assert _direct_directives(location, "client_body_timeout") == ["10s"]
+        assert _direct_directives(location, "send_timeout") == ["10s"]
+    for opener in (
+        r"(?m)^\s*location\s+/Shibboleth\.sso/\s*\{",
+        r"(?m)^\s*location\s*=\s*/shibauthorizer\s*\{",
+    ):
+        location = _balanced_blocks(config, re.compile(opener))[0]
+        assert _direct_directives(location, "fastcgi_connect_timeout") == ["1s"]
+        assert _direct_directives(location, "fastcgi_send_timeout") == ["5s"]
+        assert _direct_directives(location, "fastcgi_read_timeout") == ["5s"]
+        assert _direct_directives(location, "fastcgi_request_buffering") == ["on"]
+        assert _direct_directives(location, "fastcgi_next_upstream") == ["off"]
+
+
 def test_secret_template_has_one_nonempty_internal_header_and_no_identity_assertions():
+    """Check secret template has one nonempty internal header and no identity assertions."""
     headers = _proxy_headers(_file_without_comments(SHIBBOLETH_SECRET_CONFIG))
 
     assert headers == {"x-oha-internal-auth": ['"<generate-a-unique-high-entropy-secret>"']}
@@ -520,6 +702,7 @@ def test_secret_template_has_one_nonempty_internal_header_and_no_identity_assert
 
 
 def test_runbook_requires_effective_nginx_log_configuration_verification():
+    """Check runbook requires effective nginx log configuration verification."""
     text = DEPLOYMENT_RUNBOOK.read_text()
     heading = "### Nginx logs"
     assert heading in text
@@ -533,8 +716,11 @@ def test_runbook_requires_effective_nginx_log_configuration_verification():
 
 
 def test_phase_two_sp_runbook_pins_redirect_and_relay_state_safety():
-    text = DEPLOYMENT_RUNBOOK.read_text()
-    configure_sp = text.split("### Configure SP", 1)[1].split("### Register with SWITCH AAI", 1)[0]
+    """Check phase two sp runbook pins redirect and relay state safety."""
+    text = (PROJECT_ROOT / "docs/runbooks/federation-integration.md").read_text()
+    configure_sp = text.split("## Configure the SP", 1)[1].split(
+        "## Registration and attribute release", 1
+    )[0]
 
     assert 'redirectLimit="exact"' in configure_sp
     assert 'relayState="ss:mem"' in configure_sp
@@ -547,8 +733,9 @@ def test_phase_two_sp_runbook_pins_redirect_and_relay_state_safety():
 
 
 def test_federation_rollback_boundary_is_ordered_and_pre_revision_is_prohibited():
-    text = DEPLOYMENT_RUNBOOK.read_text()
-    section = text.split("### Federation rollback boundary", 1)[1].split("## 10.", 1)[0]
+    """Check federation rollback boundary is ordered and pre revision is prohibited."""
+    text = (PROJECT_ROOT / "docs/runbooks/federation-integration.md").read_text()
+    section = text.split("## Federation rollback boundary", 1)[1].split("## Evidence record", 1)[0]
     section = " ".join(section.split())
     ordered_markers = [
         "return 404",
@@ -565,6 +752,7 @@ def test_federation_rollback_boundary_is_ordered_and_pre_revision_is_prohibited(
 
 
 def test_disclosed_internal_secret_stops_web_before_edge_or_config_changes():
+    """Check disclosed internal secret stops web before edge or config changes."""
     text = KEY_ROTATION_RUNBOOK.read_text()
     section = text.split("#### Suspected disclosure", 1)[1].split("## 9.", 1)[0]
     ordered_markers = [
@@ -613,12 +801,14 @@ def _application_location_limits() -> list[str]:
 
 
 def _free_local_port() -> int:
+    """Return a released ephemeral loopback port; subsequent binding can race."""
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return int(probe.getsockname()[1])
 
 
 def _wait_until_listening(process: subprocess.Popen[str], port: int) -> None:
+    """Wait up to fifteen seconds for loopback listening, failing on exit or timeout."""
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -647,17 +837,11 @@ def _request_until_throttled(port: int, path: str, attempts: int = 200) -> list[
     return statuses
 
 
-def _run_reference_edge(tmp_path: Path, port: int) -> tuple[str, str]:
-    """Serve one request-admission-limited location with the shipped logging
-    settings and return the access-log and error-log text it produced.
-
-    The example configures the archive's own virtual host; the surrounding
-    ``/etc/nginx/nginx.conf`` supplies the worker, event and error-log
-    settings. This rebuilds the smallest runnable server around the shipped
-    logging and request-admission directives — the safe access-log format,
-    the request budget for the application location, and whatever error-log
-    settings the example itself chooses — so the logs below are the ones the
-    reference deployment would write.
+def _run_reference_edge(
+    tmp_path: Path, port: int, flow_path: str = CAPABILITY_REQUEST_PATH
+) -> tuple[str, str]:
+    """Run a loopback nginx edge with shipped logging/admission settings and return its access/error
+    logs.
     """
     nginx = _required_executable("nginx")
     document_root = tmp_path / "root"
@@ -683,6 +867,7 @@ def _run_reference_edge(tmp_path: Path, port: int) -> tuple[str, str]:
 
     configuration = "\n".join(
         [
+            "user root;" if os.geteuid() == 0 else "",
             "worker_processes 1;",
             "daemon off;",
             f'error_log "{error_log.as_posix()}" {error_log_level};',
@@ -736,9 +921,11 @@ def _run_reference_edge(tmp_path: Path, port: int) -> tuple[str, str]:
     )
     try:
         _wait_until_listening(process, port)
-        statuses = _request_until_throttled(
-            port, f"{CAPABILITY_REQUEST_PATH}/{CAPABILITY_TOKEN_CANARY}"
-        )
+        # The complete emailed URL is public; its code is a separate email field.
+        link = urlsplit(action_token_url(flow_path, CAPABILITY_TOKEN_CANARY))
+        assert not link.query and not link.fragment
+        assert CAPABILITY_TOKEN_CANARY not in link.geturl()
+        statuses = _request_until_throttled(port, link.path)
         assert 429 in statuses, (
             "the shipped request budget never rejected a request, so this test "
             f"never reached the logging path it is about: {statuses[:5]}..."
@@ -757,16 +944,20 @@ def _run_reference_edge(tmp_path: Path, port: int) -> tuple[str, str]:
     )
 
 
-def test_throttled_capability_token_stays_out_of_access_log(tmp_path: Path):
-    access_log, _ = _run_reference_edge(tmp_path, _free_local_port())
+@pytest.mark.parametrize(
+    "flow_path", ["/reset-password", "/verify-email", "/account/confirm-email"]
+)
+def test_throttled_capability_token_stays_out_of_access_log(tmp_path: Path, flow_path: str):
+    """Check throttled capability token stays out of access log."""
+    access_log, _ = _run_reference_edge(tmp_path, _free_local_port(), flow_path)
     assert CAPABILITY_TOKEN_CANARY not in access_log
 
 
-@pytest.mark.known_defect
-@pytest.mark.xfail(
-    strict=True,
-    reason="nginx logs the request URI when its rate limit rejects a token URL",
+@pytest.mark.parametrize(
+    "flow_path", ["/reset-password", "/verify-email", "/account/confirm-email"]
 )
-def test_throttled_capability_token_stays_out_of_error_log(tmp_path: Path):
-    _, error_log = _run_reference_edge(tmp_path, _free_local_port())
+def test_throttled_capability_token_stays_out_of_error_log(tmp_path: Path, flow_path: str):
+    """Check throttled capability token stays out of error log."""
+    _, error_log = _run_reference_edge(tmp_path, _free_local_port(), flow_path)
+    assert action_token_public_id(CAPABILITY_TOKEN_CANARY) in error_log
     assert CAPABILITY_TOKEN_CANARY not in error_log

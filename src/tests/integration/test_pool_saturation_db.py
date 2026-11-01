@@ -1,14 +1,4 @@
-"""Bounded PostgreSQL connection-pool admission against a real database.
-
-``create_pool()`` (app/services/db.py) constructs a psycopg_pool
-``AsyncConnectionPool`` with a bounded ``max_size`` and ``max_waiting``. These
-tests hold every pooled connection open from independent coroutines and prove
-that admission beyond the configured bound fails promptly with
-``TooManyRequests`` rather than queuing unboundedly or falling back to an
-unpooled connection, that a saturation rejection performs no partial database
-mutation, and that the two public routes documented to behave identically for
-a known and an unknown address keep that contract when the pool is exhausted.
-"""
+"""Bounded PostgreSQL connection-pool admission against a real database."""
 
 import asyncio
 import time
@@ -17,13 +7,15 @@ from unittest.mock import create_autospec, patch
 
 import httpx
 import psycopg
+import pyotp
 import pytest
 from psycopg_pool import TooManyRequests
 
 import app.main as _app_main
 from app.main import app
+from app.services import begin_local_registration
 from app.services.db import create_pool, get_db_cursor
-from app.services.registration import register_local_user
+from app.services.totp_crypto import encrypt_value
 from config import settings
 
 from .conftest import TEST_DATABASE_URL
@@ -58,6 +50,7 @@ async def _hold_connection(pool, release: asyncio.Event, ready: asyncio.Event) -
 
 
 async def _wait_until(predicate, *, timeout: float = _BOUNDED_WAIT_SECONDS, interval: float = 0.01):
+    """Poll at the supplied interval in seconds; return the final predicate value at timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -72,6 +65,7 @@ class TestExcessContendersAreRejectedWithinTheConfiguredBound:
     async def test_excess_contenders_fail_promptly_while_waiters_stay_within_the_bound(
         self, monkeypatch
     ):
+        """Verify excess contenders fail promptly while waiters stay within the bound."""
         async with _small_pool(monkeypatch, pool_size=2, max_waiting=2) as pool:
             holder_release = asyncio.Event()
             holder_ready = [asyncio.Event(), asyncio.Event()]
@@ -83,6 +77,7 @@ class TestExcessContendersAreRejectedWithinTheConfiguredBound:
             assert pool.get_stats()["pool_available"] == 0
 
             async def _contend():
+                """Acquire a cursor, execute a probe and return the admission marker."""
                 async with get_db_cursor(pool) as cur:
                     await cur.execute("SELECT 1")
                     return "admitted"
@@ -123,6 +118,7 @@ class TestExcessContendersAreRejectedWithinTheConfiguredBound:
         async with _small_pool(monkeypatch, pool_size=2, max_waiting=2) as pool:
 
             async def _contend():
+                """Acquire a cursor, execute a probe and return the admission marker."""
                 async with get_db_cursor(pool) as cur:
                     await cur.execute("SELECT 1")
                     return "admitted"
@@ -139,11 +135,13 @@ class TestPoolRecoveryAfterSaturation:
     async def test_a_new_acquire_succeeds_after_holders_release_without_leaking_transaction_state(
         self, monkeypatch
     ):
+        """Verify a new acquire succeeds after holders release without leaking transaction state."""
         async with _small_pool(monkeypatch, pool_size=1, max_waiting=1) as pool:
             release = asyncio.Event()
             ready = asyncio.Event()
 
             async def _hold_with_uncommitted_setting():
+                """Hold a pooled transaction with a local setting until released."""
                 async with pool.connection() as conn:
                     await conn.execute("SET LOCAL search_path TO pg_temp")
                     ready.set()
@@ -171,6 +169,7 @@ class TestSaturationRejectionPerformsNoPartialMutation:
     """A service call rejected by pool admission leaves no trace."""
 
     async def test_registration_rejected_by_a_saturated_pool_writes_nothing(self, monkeypatch):
+        """Verify registration rejected by a saturated pool writes nothing."""
         async with _small_pool(monkeypatch, pool_size=1, max_waiting=1) as pool:
             release = asyncio.Event()
             ready = asyncio.Event()
@@ -181,6 +180,7 @@ class TestSaturationRejectionPerformsNoPartialMutation:
             waiter_release = asyncio.Event()
 
             async def _occupy_the_waiting_slot():
+                """Enter the pool wait queue and hold the eventual connection until released."""
                 waiter_ready.set()
                 async with pool.connection() as conn:
                     await conn.execute("SELECT 1")
@@ -190,15 +190,9 @@ class TestSaturationRejectionPerformsNoPartialMutation:
             assert await _wait_until(
                 lambda: pool.get_stats()["requests_waiting"] >= 1 or waiter.done()
             )
-
-            email = "saturation-rejected@uzh.ch"
+            email = "saturation-rejected@example.org"
             with pytest.raises(TooManyRequests):
-                await register_local_user(
-                    pool,
-                    email=email,
-                    display_name="Saturation Rejected",
-                    password="Sup3rSecret!pw-for-tests",
-                )
+                await begin_local_registration(pool, email=email)
 
             release.set()
             waiter_release.set()
@@ -224,29 +218,26 @@ class TestSaturationRejectionPerformsNoPartialMutation:
     ):
         """Positive control: the same call against a healthy pool commits both rows."""
         async with _small_pool(monkeypatch, pool_size=2, max_waiting=2) as pool:
-            email = "saturation-control@uzh.ch"
-            user = await register_local_user(
-                pool,
-                email=email,
-                display_name="Saturation Control",
-                password="Sup3rSecret!pw-for-tests",
-            )
-            assert user.email == email
+            email = "saturation-control@example.org"
+            assert await begin_local_registration(pool, email=email) is None
+            assert pool.get_stats()["requests_waiting"] == 0
 
         with psycopg.connect(TEST_DATABASE_URL) as conn:
-            user_row = conn.execute("SELECT 1 FROM users WHERE email = %s", (email,)).fetchone()
+            user_row = conn.execute(
+                "SELECT password_hash, is_active, email_verified, is_admin, display_name "
+                "FROM users WHERE email = %s",
+                (email,),
+            ).fetchone()
             outbox_row = conn.execute(
                 "SELECT 1 FROM email_outbox eo JOIN users u ON u.id = eo.user_id "
                 "WHERE u.email = %s",
                 (email,),
             ).fetchone()
-        assert user_row is not None
+        assert user_row == (None, False, False, False, None)
         assert outbox_row is not None
 
 
-# ---------------------------------------------------------------------------
 # Real HTTP traffic against a saturated application pool
-# ---------------------------------------------------------------------------
 
 _REAL_LIFESPAN_TARGETS = {
     name: getattr(_app_main, name)
@@ -255,7 +246,6 @@ _REAL_LIFESPAN_TARGETS = {
         "validate_runtime_schema",
         "reconcile_federated_session_policy",
         "setup_logging",
-        "seed_admin_user",
     )
 }
 
@@ -289,10 +279,6 @@ async def _real_app_http_client(monkeypatch, *, pool_size: int, max_waiting: int
             "app.main.setup_logging",
             new=create_autospec(_REAL_LIFESPAN_TARGETS["setup_logging"]),
         ),
-        patch(
-            "app.main.seed_admin_user",
-            new=create_autospec(_REAL_LIFESPAN_TARGETS["seed_admin_user"]),
-        ),
     ):
         async with app.router.lifespan_context(app):
             transport = httpx.ASGITransport(app=app)
@@ -312,6 +298,7 @@ async def _saturate(pool, *, waiting_slots: int):
     waiter_releases = [asyncio.Event() for _ in range(waiting_slots)]
 
     async def _wait_in_queue(evt: asyncio.Event):
+        """Acquire a pool connection and hold it until the supplied event is set."""
         async with pool.connection() as conn:
             await conn.execute("SELECT 1")
             await evt.wait()
@@ -327,7 +314,8 @@ class TestKnownAndUnknownAddressesUnderAPoolSaturatedByRealTraffic:
     async def test_forgot_password_is_identical_for_a_known_and_an_unknown_address(
         self, monkeypatch, user_factory
     ):
-        known = user_factory()
+        """Verify forgot password is identical for a known and an unknown address."""
+        known = user_factory(totp_secret=encrypt_value(pyotp.random_base32()))
         async with _real_app_http_client(monkeypatch, pool_size=1, max_waiting=1) as (
             client,
             pool,
@@ -343,7 +331,7 @@ class TestKnownAndUnknownAddressesUnderAPoolSaturatedByRealTraffic:
                 )
                 unknown_response = await client.post(
                     "/forgot-password",
-                    data={"email": "no-such-account@uzh.ch", "csrf_token": csrf},
+                    data={"email": "no-such-account@example.org", "csrf_token": csrf},
                 )
             finally:
                 release.set()
@@ -375,7 +363,7 @@ class TestKnownAndUnknownAddressesUnderAPoolSaturatedByRealTraffic:
         self, monkeypatch, user_factory
     ):
         """Positive control: outside saturation the known-address path still works."""
-        known = user_factory()
+        known = user_factory(totp_secret=encrypt_value(pyotp.random_base32()))
         async with _real_app_http_client(monkeypatch, pool_size=2, max_waiting=2) as (
             client,
             _pool,
@@ -399,9 +387,22 @@ class TestKnownAndUnknownAddressesUnderAPoolSaturatedByRealTraffic:
         assert outbox_row is not None
 
     async def test_send_verification_is_identical_for_a_known_and_an_unknown_address(
-        self, monkeypatch, user_factory
+        self, monkeypatch, db_pool, sync_conn
     ):
-        known = user_factory(email_verified=False)
+        """Verify send verification is identical for a known and an unknown address."""
+        email = "pending-mailbox@example.org"
+        await begin_local_registration(db_pool, email=email)
+        user_id, before_hash = sync_conn.execute(
+            "SELECT id, email_verification_token_hash FROM users WHERE email = %s", (email,)
+        ).fetchone()
+        sync_conn.execute(
+            "UPDATE email_outbox SET status='sent', sent_at=clock_timestamp() WHERE user_id=%s",
+            (user_id,),
+        )
+        sync_conn.execute(
+            "UPDATE anonymous_mail_issuance SET created_at=clock_timestamp()-INTERVAL '6 minutes'"
+        )
+        sync_conn.commit()
         async with _real_app_http_client(monkeypatch, pool_size=1, max_waiting=1) as (
             client,
             pool,
@@ -413,11 +414,11 @@ class TestKnownAndUnknownAddressesUnderAPoolSaturatedByRealTraffic:
             try:
                 known_response = await client.post(
                     "/send_verification",
-                    data={"email": known.email, "csrf_token": csrf},
+                    data={"email": email, "csrf_token": csrf},
                 )
                 unknown_response = await client.post(
                     "/send_verification",
-                    data={"email": "no-such-account@uzh.ch", "csrf_token": csrf},
+                    data={"email": "no-such-account@example.org", "csrf_token": csrf},
                 )
             finally:
                 release.set()
@@ -432,15 +433,32 @@ class TestKnownAndUnknownAddressesUnderAPoolSaturatedByRealTraffic:
 
         with psycopg.connect(TEST_DATABASE_URL) as conn:
             token_row = conn.execute(
-                "SELECT email_verification_token_hash FROM users WHERE id = %s", (known.id,)
+                "SELECT email_verification_token_hash FROM users WHERE id = %s", (user_id,)
             ).fetchone()
-        assert token_row[0] is None, "a saturated pool still minted a verification token"
+        assert token_row[0] == before_hash, "a saturated pool replaced the pending capability"
+        with psycopg.connect(TEST_DATABASE_URL) as conn:
+            assert conn.execute(
+                "SELECT count(*) FROM email_outbox WHERE user_id=%s", (user_id,)
+            ).fetchone() == (1,)
+            assert conn.execute("SELECT count(*) FROM anonymous_mail_issuance").fetchone() == (1,)
 
-    async def test_send_verification_mints_a_token_for_a_known_address_when_the_pool_is_healthy(
-        self, monkeypatch, user_factory
+    async def test_send_verification_preserves_a_live_capability_when_the_pool_is_healthy(
+        self, monkeypatch, db_pool, sync_conn
     ):
-        """Positive control: outside saturation the known-address path still works."""
-        known = user_factory(email_verified=False)
+        """A healthy eligible resend queues the retained proof without replacing it."""
+        email = "pending-mailbox@example.org"
+        await begin_local_registration(db_pool, email=email)
+        user_id, before_hash = sync_conn.execute(
+            "SELECT id, email_verification_token_hash FROM users WHERE email = %s", (email,)
+        ).fetchone()
+        sync_conn.execute(
+            "UPDATE email_outbox SET status='sent', sent_at=clock_timestamp() WHERE user_id=%s",
+            (user_id,),
+        )
+        sync_conn.execute(
+            "UPDATE anonymous_mail_issuance SET created_at=clock_timestamp()-INTERVAL '6 minutes'"
+        )
+        sync_conn.commit()
         async with _real_app_http_client(monkeypatch, pool_size=2, max_waiting=2) as (
             client,
             _pool,
@@ -449,12 +467,17 @@ class TestKnownAndUnknownAddressesUnderAPoolSaturatedByRealTraffic:
             csrf = csrf_response.cookies.get("csrf_token")
             response = await client.post(
                 "/send_verification",
-                data={"email": known.email, "csrf_token": csrf},
+                data={"email": email, "csrf_token": csrf},
             )
         assert response.status_code == 200
 
         with psycopg.connect(TEST_DATABASE_URL) as conn:
             token_row = conn.execute(
-                "SELECT email_verification_token_hash FROM users WHERE id = %s", (known.id,)
+                "SELECT email_verification_token_hash FROM users WHERE id = %s", (user_id,)
             ).fetchone()
-        assert token_row[0] is not None
+        assert token_row[0] is not None and token_row[0] == before_hash
+        with psycopg.connect(TEST_DATABASE_URL) as conn:
+            assert conn.execute(
+                "SELECT count(*) FROM email_outbox WHERE user_id=%s", (user_id,)
+            ).fetchone() == (2,)
+            assert conn.execute("SELECT count(*) FROM anonymous_mail_issuance").fetchone() == (2,)

@@ -1,10 +1,4 @@
-"""Client-tier contracts for `/login` and `/logout`.
-
-Covers three scenario classes exercised through `app.routes.auth.login`:
-the login page's Shibboleth entry link, the fixed (never-reflected) login
-error messages, and logout's cookie hygiene (including the federated SP
-logout hand-off).
-"""
+"""Client-tier contracts for `/login` and `/logout`."""
 
 import html
 import logging
@@ -15,6 +9,7 @@ from unittest.mock import patch, sentinel
 
 import pytest
 import starlette.requests
+from lxml import html as html_tree
 from psycopg_pool import PoolTimeout, TooManyRequests
 from pydantic import SecretStr
 from starlette.datastructures import UploadFile
@@ -32,6 +27,9 @@ from app.services.federated_authentication import FederatedLoginSuccess
 from app.services.federated_session_policy import (
     REQUIRED_SHIBBOLETH_AUTHN_CONTEXT,
 )
+from app.services.password_reset import InvalidResetTotp
+from app.services.tokens import action_token_public_id
+from app.services.totp import TotpDecryptionError
 from app.template_setup import templates
 from config import settings
 from tests.fixtures import RAW_SESSION_ID, csrf_token_for, make_sample_user, sign_session_id
@@ -58,11 +56,8 @@ def _shib_href(page: str) -> str:
 
 
 def _assert_exact_mfa_request(page: str) -> None:
-    """Pin the UI's fresh-auth/MFA request parameters.
-
-    ``forceAuthn`` here is defense in depth, not proof that every public SP
-    handler invocation requested fresh authentication; deployment acceptance
-    tests that property at the SP/IdP boundary.
+    """Require fresh-authentication and MFA parameters on the UI link; this does not prove IdP
+    enforcement.
     """
     href = _shib_href(page)
     query = urllib.parse.parse_qs(
@@ -78,13 +73,7 @@ def _assert_exact_mfa_request(page: str) -> None:
 
 
 def _recovered_next(target: str) -> str:
-    """Decode the raw target along the real redirect chain.
-
-    First unquote: what the SP receives as `target` — the URL it sends the
-    browser back to. Second unquote: the callback's query parser percent-
-    decoding that URL's `next` parameter. What this returns is the `next`
-    value the callback route would actually see.
-    """
+    """Decode the SP target once, then parse its callback query to recover next."""
     once = urllib.parse.unquote(target)
     assert once.startswith(_CALLBACK_PREFIX), once
     return urllib.parse.unquote(once[len(_CALLBACK_PREFIX) :])
@@ -95,39 +84,85 @@ def _set_cookie_headers(response, name: str) -> list[str]:
     return [h for h in response.headers.get_list("set-cookie") if h.startswith(f"{name}=")]
 
 
+class TestLoginPageLayout:
+    """Initial and rejected sign-in responses keep the complete form in its layout."""
+
+    @pytest.mark.parametrize("shibboleth_enabled", [False, True], ids=["local", "federated"])
+    @pytest.mark.parametrize("response_kind", ["success-notice", "failed-post"])
+    def test_login_content_stays_inside_one_auth_section(
+        self, guest_client, shibboleth_enabled, response_kind
+    ):
+        """Check login content stays inside one auth section."""
+        with patch.dict(templates.env.globals, {"shibboleth_enabled": shibboleth_enabled}):
+            if response_kind == "success-notice":
+                response = guest_client.get(
+                    "/login", params={"notice": "totp_setup_completed", "next": "/dataset/42"}
+                )
+            else:
+                with patch(
+                    "app.routes.auth.login.verify_password",
+                    autospec=True,
+                    return_value=PasswordCheck(
+                        user=None,
+                        password_ok=False,
+                        locked_until=None,
+                        failure_reason="unknown_user",
+                        auth_revision=None,
+                    ),
+                ):
+                    response = guest_client.post(
+                        "/login?next=%2Fdataset%2F42",
+                        data={
+                            "email": "reader@example.org",
+                            "password": "incorrect-password",
+                            "csrf_token": guest_client.csrf_token,
+                        },
+                    )
+
+        assert response.status_code == (200 if response_kind == "success-notice" else 401)
+        assert response.headers["Cache-Control"] == "no-store"
+        document = html_tree.fromstring(response.text)
+        sections = document.xpath(
+            '//section[contains(concat(" ", normalize-space(@class), " "), " auth-page ")]'
+        )
+        assert len(sections) == 1
+        section = sections[0]
+        assert "container" in section.get("class", "").split()
+        assert len(section.xpath("parent::main")) == 1
+        assert document.xpath("//main//h1") == section.xpath("./h1")
+        assert section.xpath("./h1/text()") == ["Login"]
+
+        forms = section.xpath('.//form[@class="auth-form"]')
+        assert len(forms) == 1
+        assert document.xpath('//form[@class="auth-form"]') == forms
+        assert forms[0].get("method") == "post"
+        form_url = urllib.parse.urlsplit(forms[0].get("action"))
+        assert form_url.path == "/login"
+        assert urllib.parse.parse_qs(form_url.query) == {"next": ["/dataset/42"]}
+        assert forms[0].xpath('.//input[@name="csrf_token"]/@value') == [guest_client.csrf_token]
+        assert forms[0].xpath('.//input[@name="password"]/@type') == ["password"]
+
+        messages = document.xpath('//div[@role="status" or @role="alert"]')
+        assert len(messages) == 1
+        assert section.xpath('.//div[@role="status" or @role="alert"]') == messages
+        expected_role = "status" if response_kind == "success-notice" else "alert"
+        assert messages[0].get("role") == expected_role
+
+        links = document.xpath('//a[contains(@href, "/Shibboleth.sso/Login?")]')
+        assert len(links) == int(shibboleth_enabled)
+        assert section.xpath('.//a[contains(@href, "/Shibboleth.sso/Login?")]') == links
+        if shibboleth_enabled:
+            _assert_exact_mfa_request(response.text)
+            assert _recovered_next(_shib_target(response.text)) == "/dataset/42"
+
+
 class TestLoginPageShibbolethLink:
-    """login.html's half of the federated `next` round-trip.
-
-    No Shibboleth SP exists until Phase 2, so this half is pinned here so it
-    cannot rot meanwhile. The template builds `/Shibboleth.sso/Login?target=
-    <urlencode(callback + '?next=' + urlencode(next))>` — the inner urlencode
-    protects `?`/`&` inside `next` from the callback URL's own query parsing,
-    the outer one protects the whole target inside the SP link. The tests
-    decode the href the way the real redirect chain does (SP unquotes
-    `target` once; the callback's query parser unquotes `next` once) instead
-    of asserting encoded literals, because Jinja's urlencode safe-character
-    set (it leaves `/` intact) is an implementation detail.
-
-    Decoding alone is not enough: `unquote` on already-plain text is a
-    no-op, so a template that dropped one or both urlencode layers would
-    round-trip to the identical recovered `next`. Each test therefore also
-    pins structural evidence of the encoding it claims: the raw target must
-    carry no naked `?` (outer layer applied) and, when `next` has its own
-    query string, must contain `%25` re-encoded escapes (inner layer applied
-    under the outer one). Those hold for ANY safe-character set that encodes
-    the reserved `?`/`=`/`&`/`%` — still no exact-literal assertions.
-
-    Gotcha pinned by the patching style: template_setup.py freezes
-    `shibboleth_enabled` into templates.env.globals at import time —
-    monkeypatching settings does nothing; the global itself must be patched.
-    """
+    """Require both Shibboleth URL-encoding layers; patch frozen template globals to change federation."""
 
     def test_shibboleth_href_round_trips_simple_next(self, guest_client):
-        """The template-side half of the federated `next` round-trip. A
-        dropped or doubled urlencode in login.html must fail here long
-        before an SP exists to notice. The no-naked-`?` pin is what makes
-        the decode non-vacuous: without it, a dropped outer urlencode
-        yields the same recovered `next` (see class docstring)."""
+        """Require simple next targets to round-trip with structural evidence of the outer encoding
+        layer.
+        """
         with patch.dict(templates.env.globals, {"shibboleth_enabled": True}):
             response = guest_client.get("/login?next=/dataset/42")
 
@@ -142,21 +177,16 @@ class TestLoginPageShibbolethLink:
         _assert_exact_mfa_request(response.text)
 
     def test_shibboleth_href_round_trips_next_with_embedded_query(self, guest_client):
-        """The double-encoding pin. With `next` carrying its own query
-        string, a single-encoded target lets the SP's query parser swallow
-        everything after the embedded `&` (here: `b` would be lost as a
-        separate parameter). The `%25` pin is evidence that both urlencode
-        layers ran: only inner escapes re-encoded by the outer layer produce
-        `%25xx`, and dropping either layer removes every one of them while
-        the two-hop decode still comes out identical — the blind spot a
-        decode-only assertion would miss."""
+        """Require embedded query values to round-trip with structural evidence of both encoding
+        layers.
+        """
         with patch.dict(templates.env.globals, {"shibboleth_enabled": True}):
             response = guest_client.get("/login?next=/search?q=a%26b")
 
         assert response.status_code == 200
         target = _shib_target(response.text)
         assert "%25" in target, target  # inner escapes re-encoded by the outer layer
-        assert "?" not in target and "&" not in target, target  # nothing naked
+        assert "?" not in target and "&" not in target, target
         assert _recovered_next(target) == "/search?q=a&b"
         _assert_exact_mfa_request(response.text)
 
@@ -229,24 +259,10 @@ class TestLoginErrorReporting:
 
 
 class TestLogoutCookies:
-    """Logout cookie hygiene — each auth cookie dies exactly once.
-
-    POST /logout must end the browser session by deleting BOTH auth cookies
-    (the signed session cookie and the HMAC-bound CSRF cookie), and each
-    deletion must appear exactly once on the response. A second code path
-    (handler and middleware, or a re-introduced duplicate delete_cookie
-    call) emitting the same deletion twice would hide which layer owns
-    cookie clearing and mask set+delete ordering bugs.
-
-    Runs against the mocked-pool client harness — delete_session is patched
-    at the route's namespace so the session revocation never reaches the
-    tripwire pool.
-    """
+    """Require each authentication cookie to expire exactly once on logout."""
 
     def test_logout_deletes_session_and_csrf_cookies_exactly_once(self, authenticated_client):
-        """Logout deletes both auth cookies exactly once for an authenticated
-        session (the positive control for the anonymous-session case below,
-        which must delete no session server-side)."""
+        """Check logout deletes session and CSRF cookies exactly once (HTTP 303)."""
         with patch("app.routes.auth.login.delete_session", autospec=True) as delete_spy:
             response = authenticated_client.post(
                 "/logout",
@@ -256,7 +272,6 @@ class TestLogoutCookies:
 
         assert response.status_code == 303
         assert response.headers["location"] == "/"
-        # Mock-pool tripwire: the revocation went through the patched service.
         delete_spy.assert_awaited_once_with(authenticated_client.mock_pool, RAW_SESSION_ID)
 
         for cookie_name in (settings.session_cookie_name, CSRF_COOKIE_NAME):
@@ -267,13 +282,7 @@ class TestLogoutCookies:
     def test_federated_logout_revokes_app_session_then_uses_fixed_sp_logout(
         self, client_builder, monkeypatch
     ):
-        """A federated logout also terminates the browser's Shibboleth SP
-        session.
-
-        The SP return target is derived only from PUBLIC_BASE_URL. Request
-        query values therefore cannot turn logout into a redirector or carry
-        credentials into the SP handler.
-        """
+        """Require session revocation followed by the fixed Shibboleth logout redirect."""
         federated = make_sample_user(
             auth_method="shibboleth",
             federated_status="approved",
@@ -329,16 +338,8 @@ class TestLogoutCookies:
     def test_shibboleth_hand_off_still_happens_for_a_session_that_no_longer_resolves(
         self, guest_client, monkeypatch
     ):
-        """The SP hand-off is driven only by `settings.shibboleth_enabled`,
-        never by whether the session cookie actually resolved to a user.
-
-        A session cookie that is present but already revoked/expired (here
-        simulated on the guest client, whose session lookup always resolves
-        to no user) still reaches `delete_session` and still redirects to
-        the fixed Shibboleth logout endpoint when federation is enabled —
-        the positive case for a live federated session is proven by
-        `test_federated_logout_revokes_app_session_then_uses_fixed_sp_logout`
-        above.
+        """The SP hand-off is driven only by `settings.shibboleth_enabled`, never by whether the
+        session cookie actually resolved to a user.
         """
         monkeypatch.setattr(settings, "shibboleth_enabled", True)
         guest_client.cookies.set(settings.session_cookie_name, sign_session_id(RAW_SESSION_ID))
@@ -357,23 +358,26 @@ class TestLogoutCookies:
         ids=["accepted_request", "rejected_request"],
     )
     def test_logout_closes_uploaded_multipart_files_on_both_outcomes(
-        self, guest_client, valid_csrf_token
+        self, authenticated_client, valid_csrf_token
     ):
-        """Every `UploadFile` opened while parsing the POST body is closed by
-        the time the response is returned, whether the request is accepted
-        (valid CSRF token) or rejected (invalid token) — a rejected request
-        must not leak open file descriptors for its uploaded parts."""
+        """Require multipart upload closure before both accepted and rejected logout responses return."""
         uploads = []
         original = UploadFile.__init__
 
         def retain(self, *args, **kwargs):
+            """Initialize the upload and retain it so the test can check closure."""
             original(self, *args, **kwargs)
             uploads.append(self)
 
-        with patch.object(UploadFile, "__init__", retain):
-            response = guest_client.post(
+        with (
+            patch.object(UploadFile, "__init__", retain),
+            patch("app.routes.auth.login.delete_session", autospec=True),
+        ):
+            response = authenticated_client.post(
                 "/logout",
-                data={"csrf_token": guest_client.csrf_token if valid_csrf_token else "invalid"},
+                data={
+                    "csrf_token": authenticated_client.csrf_token if valid_csrf_token else "invalid"
+                },
                 files={"extra": ("large.txt", b"x" * (1024 * 1024 + 1))},
                 follow_redirects=False,
             )
@@ -393,11 +397,8 @@ class TestLoginLockoutTransitionAudit:
     def test_entering_lockout_is_always_audited_regardless_of_the_notice_helpers_return(
         self, guest_client, notice_result, caplog
     ):
-        """record_login_failure_cur reporting an unlocked->locked transition
-        always audits `account_locked` and always calls the notice helper
-        exactly once — the helper's own return value (whether it actually
-        won the enqueue race) can never suppress that audit event."""
-        user = make_sample_user(email="alice@uzh.ch")
+        """Audit every lockout transition regardless of whether notification enqueueing wins its race."""
+        user = make_sample_user(email="alice@example.org")
         check = PasswordCheck(
             user=user,
             password_ok=False,
@@ -408,6 +409,7 @@ class TestLoginLockoutTransitionAudit:
 
         @asynccontextmanager
         async def fake_get_db_cursor(_pool):
+            """Yield the scripted cursor after checking the database boundary."""
             yield sentinel.cursor
 
         with (
@@ -454,9 +456,8 @@ class TestLoginLockoutTransitionAudit:
         assert locked_events[0].user_id == user.id
 
     def test_not_entering_lockout_never_calls_the_notice_helper(self, guest_client, caplog):
-        """Positive control: an ordinary (non-transitioning) failure neither
-        audits `account_locked` nor calls the notice helper at all."""
-        user = make_sample_user(email="alice@uzh.ch")
+        """Check not entering lockout never calls the notice helper (HTTP 401)."""
+        user = make_sample_user(email="alice@example.org")
         check = PasswordCheck(
             user=user,
             password_ok=False,
@@ -467,6 +468,7 @@ class TestLoginLockoutTransitionAudit:
 
         @asynccontextmanager
         async def fake_get_db_cursor(_pool):
+            """Yield the scripted cursor after checking the database boundary."""
             yield sentinel.cursor
 
         with (
@@ -505,190 +507,118 @@ class TestLoginLockoutTransitionAudit:
 
 
 class TestForgotPasswordRoute:
-    """GET renders the request form; POST is enumeration-neutral and
-    CSRF/content-type protected like every other mutation route."""
+    """The request boundary is generic and delegates atomic issuance to its service."""
 
     def test_guest_sees_the_request_form(self, guest_client):
+        """Check guest sees the request form (HTTP 200)."""
         response = guest_client.get("/forgot-password")
         assert response.status_code == 200
         assert 'name="email"' in response.text
 
     def test_valid_pair_reaches_the_lookup_service_and_renders_the_neutral_page(self, guest_client):
-        user = make_sample_user(email="alice@uzh.ch")
-
-        @asynccontextmanager
-        async def fake_get_db_cursor(_pool):
-            yield sentinel.cursor
-
-        with (
-            patch(
-                "app.routes.auth.password_reset.get_user_by_email",
-                autospec=True,
-                return_value=user,
-            ) as lookup,
-            patch(
-                "app.routes.auth.password_reset.get_db_cursor",
-                autospec=True,
-                side_effect=fake_get_db_cursor,
-            ),
-            patch("app.routes.auth.password_reset.store_reset_token_hash_cur", autospec=True),
-            patch(
-                "app.routes.auth.password_reset.enqueue_outbound_email_cur", autospec=True
-            ) as enqueue,
-        ):
+        """Check valid pair reaches the lookup service and renders the neutral page (HTTP 200)."""
+        with patch("app.routes.auth.password_reset.request_password_reset", autospec=True) as issue:
             response = guest_client.post(
                 "/forgot-password",
-                data={"email": user.email, "csrf_token": guest_client.csrf_token},
+                data={"email": " ALICE@example.org ", "csrf_token": guest_client.csrf_token},
             )
-
         assert response.status_code == 200
-        assert "we&#39;ll send" in response.text.lower() or "we'll send" in response.text.lower()
-        lookup.assert_awaited_once_with(guest_client.mock_pool, user.email)
-        enqueue.assert_awaited_once()
+        assert "existing code stays valid" in response.text.lower()
+        issue.assert_awaited_once_with(guest_client.mock_pool, email="alice@example.org")
 
     def test_missing_csrf_pair_is_refused_before_any_lookup(self, guest_client):
-        with patch("app.routes.auth.password_reset.get_user_by_email", autospec=True) as lookup:
-            response = guest_client.post(
-                "/forgot-password",
-                data={"email": "alice@uzh.ch"},
-            )
+        """Check missing CSRF pair is refused before any lookup (HTTP 403)."""
+        with patch("app.routes.auth.password_reset.request_password_reset", autospec=True) as issue:
+            response = guest_client.post("/forgot-password", data={"email": "alice@example.org"})
         assert response.status_code == 403
-        lookup.assert_not_awaited()
+        issue.assert_not_awaited()
 
     def test_json_body_is_415_before_any_lookup(self, guest_client):
-        with patch("app.routes.auth.password_reset.get_user_by_email", autospec=True) as lookup:
+        """Check JSON body is 415 before any lookup."""
+        with patch("app.routes.auth.password_reset.request_password_reset", autospec=True) as issue:
             response = guest_client.post(
                 "/forgot-password",
-                content='{"email": "alice@uzh.ch"}',
+                content='{"email": "alice@example.org"}',
                 headers={"Content-Type": "application/json"},
             )
         assert response.status_code == 415
-        lookup.assert_not_awaited()
+        issue.assert_not_awaited()
 
 
 class TestForgotPasswordCapacityFailureIsEnumerationNeutral:
-    """A saturated pool must fail exactly like an ordinary failure: identical
-    response for any address, and nothing durable minted."""
+    """Issuance failures preserve the same response for every submitted address."""
 
     @pytest.mark.parametrize(
-        "exception",
-        [PoolTimeout("pool exhausted"), TooManyRequests("queue full")],
-        ids=["pool_timeout", "too_many_requests"],
+        "exception", [PoolTimeout("pool exhausted"), TooManyRequests("queue full")]
     )
     def test_lookup_failure_produces_the_identical_generic_page_for_any_address(
         self, guest_client, exception
     ):
-        with (
-            patch(
-                "app.routes.auth.password_reset.get_user_by_email",
-                autospec=True,
-                side_effect=exception,
-            ) as lookup,
-            patch(
-                "app.routes.auth.password_reset.generate_reset_token", autospec=True
-            ) as generate_token,
-            patch(
-                "app.routes.auth.password_reset.store_reset_token_hash_cur", autospec=True
-            ) as store,
-            patch(
-                "app.routes.auth.password_reset.enqueue_outbound_email_cur", autospec=True
-            ) as enqueue,
-        ):
-            first = guest_client.post(
-                "/forgot-password",
-                data={"email": "alice@uzh.ch", "csrf_token": guest_client.csrf_token},
-            )
-            second = guest_client.post(
-                "/forgot-password",
-                data={"email": "nobody@uzh.ch", "csrf_token": guest_client.csrf_token},
-            )
-
+        """Check lookup failure produces the identical generic page for any address (HTTP 200)."""
+        with patch(
+            "app.routes.auth.password_reset.request_password_reset",
+            autospec=True,
+            side_effect=exception,
+        ) as issue:
+            responses = [
+                guest_client.post(
+                    "/forgot-password", data={"email": email, "csrf_token": guest_client.csrf_token}
+                )
+                for email in ("alice@example.org", "nobody@example.org")
+            ]
+        first, second = responses
         assert first.status_code == second.status_code == 200
         assert first.text == second.text
-        # X-Request-ID is a per-request correlation id, not part of the
-        # enumeration-neutral contract; every other header must match exactly.
-        headers_first = {k: v for k, v in first.headers.items() if k != "x-request-id"}
-        headers_second = {k: v for k, v in second.headers.items() if k != "x-request-id"}
-        assert headers_first == headers_second
-        assert lookup.await_count == 2
-        generate_token.assert_not_called()
-        store.assert_not_awaited()
-        enqueue.assert_not_awaited()
+        assert {k: v for k, v in first.headers.items() if k != "x-request-id"} == {
+            k: v for k, v in second.headers.items() if k != "x-request-id"
+        }
+        assert issue.await_count == 2
 
     def test_healthy_lookup_still_enqueues_for_the_known_address(self, guest_client):
-        """Positive control: absent the injected failure, an eligible address
-        does reach the outbox."""
-        user = make_sample_user(email="alice@uzh.ch")
-
-        @asynccontextmanager
-        async def fake_get_db_cursor(_pool):
-            yield sentinel.cursor
-
-        with (
-            patch(
-                "app.routes.auth.password_reset.get_user_by_email",
-                autospec=True,
-                return_value=user,
-            ),
-            patch(
-                "app.routes.auth.password_reset.get_db_cursor",
-                autospec=True,
-                side_effect=fake_get_db_cursor,
-            ),
-            patch("app.routes.auth.password_reset.store_reset_token_hash_cur", autospec=True),
-            patch(
-                "app.routes.auth.password_reset.enqueue_outbound_email_cur", autospec=True
-            ) as enqueue,
-        ):
+        """The HTTP boundary reaches the service; database tests prove actual enqueue."""
+        with patch("app.routes.auth.password_reset.request_password_reset", autospec=True) as issue:
             response = guest_client.post(
                 "/forgot-password",
-                data={"email": user.email, "csrf_token": guest_client.csrf_token},
+                data={"email": "alice@example.org", "csrf_token": guest_client.csrf_token},
             )
-
         assert response.status_code == 200
-        enqueue.assert_awaited_once()
+        issue.assert_awaited_once()
 
 
 class TestResetPasswordRoute:
-    """GET consults the token gate before rendering; POST commits once."""
+    """GET renders a generic identifier-only form; POST checks the capability and commits once."""
 
     def test_valid_token_renders_the_new_password_form(self, guest_client):
-        with (
-            patch(
-                "app.routes.auth.password_reset.validate_reset_token",
-                autospec=True,
-                return_value={"user_id": 7, "email": "alice@uzh.ch"},
-            ) as validate,
-            patch(
-                "app.routes.auth.password_reset.verify_reset_token_hash",
-                autospec=True,
-                return_value=True,
-            ),
-        ):
-            response = guest_client.get("/reset-password/a-live-reset-token")
-
+        """A non-secret identifier renders a generic form without resolving a token."""
+        token = "a-live-reset-token"
+        with patch(
+            "app.routes.auth.password_reset.validate_reset_token", autospec=True
+        ) as validate:
+            response = guest_client.get(f"/reset-password/{action_token_public_id(token)}")
         assert response.status_code == 200
-        assert 'name="password"' in response.text
-        validate.assert_called_once_with("a-live-reset-token")
+        assert 'name="password"' in response.text and 'name="public_id"' in response.text
+        assert 'name="totp_code"' in response.text
+        assert token not in response.text and "alice@example.org" not in response.text
+        validate.assert_not_called()
+        guest_client.mock_pool.connection.assert_not_called()
 
     def test_invalid_token_renders_the_error_page_instead(self, guest_client):
+        """Legacy secret-bearing paths are rejected rather than parsed as capabilities."""
         with patch(
-            "app.routes.auth.password_reset.validate_reset_token",
-            autospec=True,
-            return_value=None,
-        ):
+            "app.routes.auth.password_reset.validate_reset_token", autospec=True
+        ) as validate:
             response = guest_client.get("/reset-password/not-a-real-token")
-
-        assert response.status_code == 422
-        assert "invalid or has expired" in response.text
+        assert response.status_code == 404
         assert 'name="password"' not in response.text
+        validate.assert_not_called()
 
     def test_valid_submission_redirects_and_commits_exactly_once(self, guest_client):
+        """Check valid submission redirects and commits exactly once (HTTP 303)."""
         with (
             patch(
                 "app.routes.auth.password_reset.validate_reset_token",
                 autospec=True,
-                return_value={"user_id": 7, "email": "alice@uzh.ch"},
+                return_value={"user_id": 7, "email": "alice@example.org"},
             ),
             patch(
                 "app.routes.auth.password_reset.update_password_with_token", autospec=True
@@ -698,8 +628,10 @@ class TestResetPasswordRoute:
                 "/reset-password",
                 data={
                     "token": "a-live-reset-token",
+                    "public_id": action_token_public_id("a-live-reset-token"),
                     "password": "correct-horse-battery-staple-9",
                     "password_confirm": "correct-horse-battery-staple-9",
+                    "totp_code": "123456",
                     "csrf_token": guest_client.csrf_token,
                 },
                 follow_redirects=False,
@@ -707,7 +639,68 @@ class TestResetPasswordRoute:
 
         assert response.status_code == 303
         assert response.headers["location"] == "/login"
-        update.assert_awaited_once()
+        update.assert_awaited_once_with(
+            guest_client.mock_pool,
+            7,
+            "a-live-reset-token",
+            "correct-horse-battery-staple-9",
+            expected_email="alice@example.org",
+            totp_code="123456",
+        )
+
+    def test_missing_authenticator_code_never_calls_completion(self, guest_client):
+        """Check missing authenticator code never calls completion (HTTP 422)."""
+        with patch(
+            "app.routes.auth.password_reset.update_password_with_token", autospec=True
+        ) as update:
+            response = guest_client.post(
+                "/reset-password",
+                data={
+                    "token": "a-live-reset-token",
+                    "public_id": action_token_public_id("a-live-reset-token"),
+                    "password": "correct-horse-battery-staple-9",
+                    "password_confirm": "correct-horse-battery-staple-9",
+                    "csrf_token": guest_client.csrf_token,
+                },
+            )
+        assert response.status_code == 422
+        update.assert_not_awaited()
+
+    @pytest.mark.parametrize("unreadable", [False, True])
+    def test_failed_totp_never_echoes_authenticator_code(self, guest_client, unreadable):
+        """Check failed TOTP never echoes authenticator code."""
+        token = "a-live-reset-token"
+        code = "765432"
+        failure = TotpDecryptionError(7) if unreadable else InvalidResetTotp("Invalid code")
+        with (
+            patch(
+                "app.routes.auth.password_reset.validate_reset_token",
+                autospec=True,
+                return_value={"user_id": 7, "email": "alice@example.org"},
+            ),
+            patch(
+                "app.routes.auth.password_reset.update_password_with_token",
+                autospec=True,
+                side_effect=failure,
+            ),
+        ):
+            response = guest_client.post(
+                "/reset-password",
+                data={
+                    "token": token,
+                    "public_id": action_token_public_id(token),
+                    "password": "correct-horse-battery-staple-9",
+                    "password_confirm": "correct-horse-battery-staple-9",
+                    "totp_code": code,
+                    "csrf_token": guest_client.csrf_token,
+                },
+            )
+        assert response.status_code == (503 if unreadable else 422)
+        assert code not in response.text
+        if unreadable:
+            assert token not in response.text
+        else:
+            assert token in response.text
 
 
 class TestShibbolethCallbackAccess:
@@ -717,6 +710,7 @@ class TestShibbolethCallbackAccess:
     def test_disabled_federation_refuses_without_creating_a_session(
         self, guest_client, monkeypatch
     ):
+        """Check disabled federation refuses without creating a session (HTTP 303)."""
         monkeypatch.setattr(settings, "shibboleth_enabled", False)
         with patch("app.routes.auth.login.finalize_shibboleth_login", autospec=True) as finalize:
             response = guest_client.get("/auth/shibboleth/callback", follow_redirects=False)
@@ -729,15 +723,8 @@ class TestShibbolethCallbackAccess:
     def test_enabled_federation_with_the_trusted_internal_header_reaches_the_finalizer(
         self, guest_client, monkeypatch
     ):
-        """Positive control: nginx's internal secret and a trusted assertion
-        are enough to reach finalize_shibboleth_login exactly once.
-
-        The deployment-only "reached over TCP" guard (request.client is
-        always non-None inside TestClient, unlike the production Unix
-        socket) is neutralised here so this test isolates the header/secret
-        gate that this route itself owns; that guard's own behaviour is
-        pinned directly against the handler in
-        unit/test_shibboleth_callback.py.
+        """Require trusted federation headers to reach finalization with the TCP-deployment guard
+        patched.
         """
         monkeypatch.setattr(settings, "shibboleth_enabled", True)
         monkeypatch.setattr(

@@ -9,19 +9,24 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
 
 from app.credentials import normalize_email
 
-from .authentication import verify_dummy
+from .account_clock import database_now_cur
 from .credential_attempts import (
     SessionStepUpAttemptOutcome,
     reserve_session_step_up_attempt,
 )
-from .crypto import password_hasher
-from .db import get_db_cursor
-from .password_work import run_password_work
+from .db import Database, get_db_cursor
+from .password_verification import (
+    PasswordFailureReason,
+    PasswordVerified,
+    verify_dummy,
+    verify_password_hash,
+)
+from .security_notifications import queue_security_change_notice_cur
 from .session_revocation import (
     delete_user_sessions_cur,
     invalidate_pending_authentication_state_cur,
@@ -36,6 +41,7 @@ from .totp_recovery_codes import (
     consume_reserved_recovery_code_cur,
     has_unused_active_recovery_code_cur,
     normalize_recovery_code,
+    recovery_code_candidate_sql,
     reserve_recovery_code_password_attempt_cur,
 )
 from .users import guard_current_admin_session_cur
@@ -43,7 +49,7 @@ from .users import guard_current_admin_session_cur
 logger = logging.getLogger(__name__)
 
 TOTP_RECOVERY_AUTHORIZATION_MAX_AGE_SECONDS = 30 * 60
-TOTP_RECOVERY_SESSION_MAX_AGE_SECONDS = 15 * 60
+TOTP_RECOVERY_SESSION_MAX_AGE_SECONDS = 10 * 60
 _NO_MATCH_RECOVERY_CODE_HASH = "z" * 64
 TotpRecoveryRejectionReason = Literal[
     "self_recovery",
@@ -224,7 +230,7 @@ def _validate_locked_target(row: dict[str, Any] | None) -> bool:
 
 
 async def authorize_totp_recovery(
-    pool: AsyncConnectionPool,
+    pool: Database,
     *,
     actor_id: int,
     actor_session_id: str,
@@ -240,6 +246,8 @@ async def authorize_totp_recovery(
     recovery was already required. TotpRecoveryRejected/ AdminActionRejected
     identify policy failures; decryption/storage errors roll back authorization
     but not the attempt. No target code is created or exposed.
+
+    Use a pool or an idle connection so the attempt commits before proof work.
     """
     reservation = await reserve_session_step_up_attempt(
         pool,
@@ -283,8 +291,6 @@ async def authorize_totp_recovery(
         actor = await cur.fetchone()
         if actor is None or actor["auth_method"] != "local" or not actor["totp_configured"]:
             raise TotpRecoveryRejected("actor_ineligible")
-        if not actor["login_unlocked"]:
-            raise TotpRecoveryRejected("actor_account_locked")
 
         if not await verify_and_consume_totp_cur(
             cur,
@@ -350,6 +356,11 @@ async def authorize_totp_recovery(
             ),
         )
 
+        if not reissued:
+            await queue_security_change_notice_cur(
+                cur, user_id=target_user_id, change="totp_recovery_authorized"
+            )
+
     logger.info(
         "Administrator %d authorized TOTP recovery for user %d; reissued=%s; expires_at=%s",
         actor_id,
@@ -366,8 +377,8 @@ async def authorize_totp_recovery(
     )
 
 
-def _recovery_row_is_eligible(row: dict[str, Any] | None) -> bool:
-    """Return whether a snapshot can reserve public recovery password work."""
+def _recovery_row_is_eligible(row: dict[str, Any] | None, *, now: datetime) -> bool:
+    """Check recovery eligibility against an explicitly supplied database time."""
     return bool(
         row is not None
         and row["auth_method"] == "local"
@@ -377,7 +388,8 @@ def _recovery_row_is_eligible(row: dict[str, Any] | None) -> bool:
         and row["totp_recovery_required"]
         and row["totp_recovery_authorized_at"] is not None
         and row["totp_recovery_auth_revision"] == row["auth_revision"]
-        and row["recovery_unexpired"]
+        and row["totp_recovery_expires_at"] is not None
+        and row["totp_recovery_expires_at"] > now
         and row["totp_recovery_code_generation"] > 0
         and isinstance(row["password_hash"], str)
         and row["password_hash"]
@@ -385,7 +397,7 @@ def _recovery_row_is_eligible(row: dict[str, Any] | None) -> bool:
 
 
 async def _reserve_recovery_password_attempt(
-    pool: AsyncConnectionPool,
+    pool: Database,
     *,
     email: str,
     recovery_code: str,
@@ -405,7 +417,7 @@ async def _reserve_recovery_password_attempt(
         hash_token(canonical_code) if canonical_code is not None else _NO_MATCH_RECOVERY_CODE_HASH
     )
 
-    selection_sql = """
+    selection_sql = sql.SQL("""
         SELECT users.id,
                users.password_hash,
                users.auth_revision,
@@ -417,28 +429,24 @@ async def _reserve_recovery_password_attempt(
                users.totp_recovery_code_generation,
                users.totp_recovery_authorized_at,
                users.totp_recovery_auth_revision,
-               (
-                   users.totp_recovery_expires_at IS NOT NULL
-                   AND users.totp_recovery_expires_at > clock_timestamp()
-               ) AS recovery_unexpired,
+               users.totp_recovery_expires_at,
+               clock_timestamp() AS checked_at,
                matched_code.position AS recovery_code_position
         FROM users
         LEFT JOIN totp_recovery_codes AS matched_code
           ON matched_code.user_id = users.id
          AND matched_code.generation = users.totp_recovery_code_generation
-         AND matched_code.code_hash = %s
-         AND matched_code.used_at IS NULL
-         AND matched_code.password_attempt_count < %s
-    """
+         AND {candidate}
+    """).format(candidate=recovery_code_candidate_sql("matched_code"))
 
     # An impossible digest keeps malformed codes on the same nonlocking query.
     async with get_db_cursor(pool) as cur:
         await cur.execute(
             selection_sql
-            + """
+            + sql.SQL("""
               WHERE LOWER(email) = LOWER(%s)
                 AND auth_method = 'local'
-            """,
+            """),
             (
                 candidate_hash,
                 TOTP_RECOVERY_PASSWORD_ATTEMPT_LIMIT,
@@ -447,8 +455,8 @@ async def _reserve_recovery_password_attempt(
         )
         initial = await cur.fetchone()
         if (
-            not _recovery_row_is_eligible(initial)
-            or initial is None
+            initial is None
+            or not _recovery_row_is_eligible(initial, now=initial["checked_at"])
             or initial["recovery_code_position"] is None
         ):
             return None
@@ -473,10 +481,7 @@ async def _reserve_recovery_password_attempt(
                    totp_recovery_code_generation,
                    totp_recovery_authorized_at,
                    totp_recovery_auth_revision,
-                   (
-                       totp_recovery_expires_at IS NOT NULL
-                       AND totp_recovery_expires_at > clock_timestamp()
-                   ) AS recovery_unexpired
+                   totp_recovery_expires_at
             FROM users
             WHERE id = %s
             FOR UPDATE
@@ -484,11 +489,20 @@ async def _reserve_recovery_password_attempt(
             (candidate.user_id,),
         )
         locked = await cur.fetchone()
-        if (
-            not _recovery_row_is_eligible(locked)
-            or locked is None
-            or locked["totp_recovery_code_generation"] != candidate.generation
-        ):
+        if locked is None or locked["totp_recovery_code_generation"] != candidate.generation:
+            return None
+
+        # The reservation helper updates this code. Acquire its lock before
+        # sampling time so an expired authorization cannot spend an attempt.
+        await cur.execute(
+            """SELECT position FROM totp_recovery_codes
+               WHERE user_id = %s AND generation = %s AND position = %s
+               FOR UPDATE""",
+            (candidate.user_id, candidate.generation, candidate.position),
+        )
+        code = await cur.fetchone()
+        now = await database_now_cur(cur)
+        if not _recovery_row_is_eligible(locked, now=now) or code is None:
             return None
 
         reservation = await reserve_recovery_code_password_attempt_cur(
@@ -505,14 +519,14 @@ async def _reserve_recovery_password_attempt(
 
 
 async def redeem_totp_recovery(
-    pool: AsyncConnectionPool,
+    pool: Database,
     *,
     email: str,
     password: str,
     recovery_code: str,
     ip_address: str,
 ) -> TotpRecoveryRedemption:
-    """Consume a retained code/password and return a raw 15-minute recovery-session token.
+    """Consume a retained code/password and return a raw ten-minute recovery-session token.
 
     Require active/verified local recovery state and a current revision-bound
     admin authorization. Reserve a code's three-attempt password budget before
@@ -522,6 +536,8 @@ async def redeem_totp_recovery(
     existing login lock does not block recovery. TotpRecoveryRedemptionRejected
     carries internal reasons; callers must return one generic public response.
     Later failures roll back completion but preserve the reserved attempt.
+
+    Use a pool or an idle connection so the attempt commits before proof work.
     """
     attempt = await _reserve_recovery_password_attempt(
         pool,
@@ -533,24 +549,19 @@ async def redeem_totp_recovery(
         raise TotpRecoveryRedemptionRejected("invalid_credentials")
 
     user_id = attempt.reservation.user_id
-    try:
-        await run_password_work(
-            password_hasher.verify,
-            attempt.password_hash,
-            password,
-        )
-    except VerifyMismatchError as exc:
+    result = await verify_password_hash(
+        password_hash=attempt.password_hash,
+        password=password,
+        user_id=user_id,
+        operation="totp_recovery",
+    )
+    if not isinstance(result, PasswordVerified):
+        if result.reason is PasswordFailureReason.UNUSABLE_HASH:
+            await verify_dummy(password)
         raise TotpRecoveryRedemptionRejected(
             "invalid_credentials",
             user_id=user_id,
-        ) from exc
-    except (InvalidHashError, VerificationError) as exc:
-        logger.exception("Unverifiable password hash during TOTP recovery for user %d", user_id)
-        await verify_dummy(password)
-        raise TotpRecoveryRedemptionRejected(
-            "invalid_credentials",
-            user_id=user_id,
-        ) from exc
+        ) from result.cause
 
     async with get_db_cursor(pool) as cur:
         await cur.execute(
@@ -565,10 +576,7 @@ async def redeem_totp_recovery(
                    totp_recovery_code_generation,
                    totp_recovery_authorized_at,
                    totp_recovery_auth_revision,
-                   (
-                       totp_recovery_expires_at IS NOT NULL
-                       AND totp_recovery_expires_at > clock_timestamp()
-                   ) AS recovery_unexpired
+                   totp_recovery_expires_at
             FROM users
             WHERE id = %s
             FOR UPDATE
@@ -611,7 +619,17 @@ async def redeem_totp_recovery(
                 "recovery_not_authorized",
                 user_id=user_id,
             )
-        if not row["recovery_unexpired"]:
+        # Consumption can wait on the code row independently of the user row.
+        # Take that lock before the final authorization-expiry decision.
+        await cur.execute(
+            """SELECT position FROM totp_recovery_codes
+               WHERE user_id = %s AND generation = %s AND position = %s
+               FOR UPDATE""",
+            (user_id, attempt.reservation.generation, attempt.reservation.position),
+        )
+        await cur.fetchone()
+        now = await database_now_cur(cur)
+        if row["totp_recovery_expires_at"] is None or row["totp_recovery_expires_at"] <= now:
             raise TotpRecoveryRedemptionRejected(
                 "recovery_expired",
                 user_id=user_id,
@@ -647,6 +665,10 @@ async def redeem_totp_recovery(
             ip_address=ip_address,
             purpose="totp_recovery",
             max_age_seconds=TOTP_RECOVERY_SESSION_MAX_AGE_SECONDS,
+        )
+
+        await queue_security_change_notice_cur(
+            cur, user_id=user_id, change="totp_recovery_redeemed"
         )
 
     logger.info("TOTP recovery code redeemed for user %d", user_id)

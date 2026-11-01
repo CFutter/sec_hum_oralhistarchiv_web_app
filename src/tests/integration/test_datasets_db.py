@@ -1,34 +1,4 @@
-"""Tier-scoping and ordering of `app.services.datasets` queries.
-
-`get_facets` is the function that stops a below-tier user's search sidebar
-from enumerating keyword/language/access-level values that occur only in
-above-tier datasets. Before this module existed, it was only ever
-monkeypatched away (unit cache tests) or executed without content assertions
-(e2e page loads) — neutralising its tier filter shipped a fully green suite.
-
-Also pins the sibling oracles: `get_keyword_count` (the home-page stat
-carries its own copy of the tier CASE), the `?language=` exact-match filter
-in `search_datasets` (gated behind the visibility predicate on its own SQL
-line, separately deletable from the tested keyword twin), the public
-discovery search boundary (title and access level stay searchable on an
-above-tier row while the returned record stays redacted), the tier-redaction
-of the home page's recent list, the tier-scoping of the empty-page fallback
-COUNT(*), and the stable nulls-last ordering shared by search and recent
-listings.
-
-Every negative assertion ("below tier must NOT see X") is paired with a
-positive control ("at/above tier DOES see X") so a broken fixture or an
-over-eager filter cannot pass as a leak-free result.
-
-The three-tier data layout used throughout (keyword facets need TWO sharers
-to survive the HAVING COUNT(*) >= 2 gate; languages/access_levels keep
-singletons):
-
-    tier        keywords (x2 sharers)   language     access_level
-    public      pub-kw                  German       public
-    registered  reg-kw                  Italian      public
-    vetted      secret-kw               Rumantsch    restricted
-"""
+"""Tier-scoping and ordering of `app.services.datasets` queries."""
 
 from datetime import UTC, datetime
 
@@ -37,14 +7,19 @@ import pytest
 from app.services.datasets import (
     FACET_OPTION_LIMIT,
     get_facets,
-    get_keyword_count,
+    get_global_catalogue_stats,
+    get_last_full_rebuild_date,
     get_recent_datasets,
     get_total_dataset_count,
     search_datasets,
 )
+from tests.source_fixtures import legacy_source
+
+_SOURCES = (legacy_source(max_visibility="public"),)
 
 
 def _seed_three_tiers(dataset_factory):
+    """Insert two datasets per tier with distinct facet markers."""
     dataset_factory(
         visibility_tier="public",
         keywords=["pub-kw"],
@@ -68,6 +43,12 @@ def _seed_three_tiers(dataset_factory):
     dataset_factory(visibility_tier="vetted", keywords=["secret-kw"], access_level="restricted")
 
 
+@pytest.fixture(autouse=True)
+def _bound_catalogue_policy(bind_catalogue_policy):
+    """Bind the test's selected source policy before querying."""
+    bind_catalogue_policy(_SOURCES)
+
+
 class TestFacetTierScoping:
     """Facet content (keywords/languages/access levels) is tier-scoped on
     every channel `get_facets` exposes."""
@@ -78,7 +59,7 @@ class TestFacetTierScoping:
         registered- or vetted-tier datasets."""
         _seed_three_tiers(dataset_factory)
 
-        public = await get_facets(db_pool, "public")
+        public = await get_facets(db_pool, "public", configured_sources=_SOURCES)
 
         assert "secret-kw" not in public["keywords"]
         assert "reg-kw" not in public["keywords"]
@@ -96,7 +77,7 @@ class TestFacetTierScoping:
         while vetted-only values stay hidden."""
         _seed_three_tiers(dataset_factory)
 
-        registered = await get_facets(db_pool, "registered")
+        registered = await get_facets(db_pool, "registered", configured_sources=_SOURCES)
 
         assert "reg-kw" in registered["keywords"]
         assert "Italian" in registered["languages"]
@@ -111,7 +92,7 @@ class TestFacetTierScoping:
         the data and the public/registered tests weren't passing vacuously."""
         _seed_three_tiers(dataset_factory)
 
-        vetted = await get_facets(db_pool, "vetted")
+        vetted = await get_facets(db_pool, "vetted", configured_sources=_SOURCES)
 
         assert {"pub-kw", "reg-kw", "secret-kw"} <= set(vetted["keywords"])
         assert {"German", "Italian", "Rumantsch"} <= set(vetted["languages"])
@@ -124,7 +105,7 @@ class TestFacetTierScoping:
         the reason every keyword in this module needs two sharers."""
         dataset_factory(visibility_tier="public", keywords=["lonely-kw"], languages=["Vulcan"])
 
-        facets = await get_facets(db_pool, "vetted")
+        facets = await get_facets(db_pool, "vetted", configured_sources=_SOURCES)
 
         assert "lonely-kw" not in facets["keywords"]
         assert "Vulcan" in facets["languages"]
@@ -140,45 +121,9 @@ class TestFacetTierScoping:
         for i in range(2):
             dataset_factory(uuid=f"public:{i}", keywords=keywords)
             dataset_factory(uuid=f"hidden:{i}", keywords=["secret-facet"], visibility_tier="vetted")
-        guest = await get_facets(db_pool, "public")
+        guest = await get_facets(db_pool, "public", configured_sources=_SOURCES)
         assert len(guest["keywords"]) == FACET_OPTION_LIMIT
         assert "secret-facet" not in guest["keywords"]
-
-
-class TestKeywordCountTierScoping:
-    """The home-page keyword stat (`get_keyword_count`) is tier-scoped and
-    diverges deliberately from the facet keyword list."""
-
-    async def test_get_keyword_count_is_tier_scoped(self, db_pool, dataset_factory):
-        """get_keyword_count carries its own copy of the tier CASE; dropping
-        its WHERE clause makes a public user's home page count keywords
-        across ALL tiers — an aggregate oracle. Singletons count here (no
-        >=2 gate), so one dataset per tier suffices."""
-        dataset_factory(visibility_tier="public", keywords=["pub-kw"])
-        dataset_factory(visibility_tier="registered", keywords=["reg-kw"])
-        dataset_factory(visibility_tier="vetted", keywords=["hidden-1", "hidden-2"])
-
-        assert await get_keyword_count(db_pool, "public") == 1
-        assert await get_keyword_count(db_pool, "registered") == 2
-        assert await get_keyword_count(db_pool, "vetted") == 4  # positive control
-
-    async def test_singleton_keyword_counted_but_absent_from_facets(self, db_pool, dataset_factory):
-        """The keyword count is NOT derivable from the facet lists —
-        get_facets drops singletons (the HAVING COUNT(*) >= 2 de-noise gate)
-        while get_keyword_count counts every distinct keyword. The
-        shared-payload cache design rests on carrying BOTH per tier; a
-        'simplification' that recomputes the count as
-        len(facets['keywords']) silently undercounts, and this pins the
-        divergence at the service layer where it originates."""
-        dataset_factory(visibility_tier="public", keywords=["once-kw"])
-
-        facets = await get_facets(db_pool, "public")
-        assert "once-kw" not in facets["keywords"]
-
-        # POSITIVE CONTROL: the same tier's count DOES include the
-        # singleton — its absence above is the >=2 gate, not tier gating or
-        # a broken seed.
-        assert await get_keyword_count(db_pool, "public") == 1
 
 
 class TestLanguageFilterTierGating:
@@ -186,18 +131,18 @@ class TestLanguageFilterTierGating:
     behind the visibility predicate, separately from the keyword filter."""
 
     async def test_language_filter_is_tier_gated(self, db_pool, dataset_factory):
-        """The language filter line in search_datasets is gated behind the
-        visibility predicate SEPARATELY from the (already-tested) keyword
-        line. Deleting `AND {visible}` from the language line alone lets a
-        guest confirm a hidden dataset carries a guessed language — a
-        presence oracle this test closes in both directions."""
+        """Verify language filter is tier gated."""
         dataset_factory(visibility_tier="vetted", title="Hidden DS", languages=["Rumantsch"])
 
-        results, total = await search_datasets(db_pool, "public", language="Rumantsch")
+        results, total = await search_datasets(
+            db_pool, "public", language="Rumantsch", configured_sources=_SOURCES
+        )
         assert results == [] and total == 0
 
         # Positive control: the vetted actor gets the hit through the same filter.
-        results, total = await search_datasets(db_pool, "vetted", language="Rumantsch")
+        results, total = await search_datasets(
+            db_pool, "vetted", language="Rumantsch", configured_sources=_SOURCES
+        )
         assert total == 1
         assert results[0].title == "Hidden DS"
 
@@ -209,7 +154,9 @@ class TestLanguageFilterTierGating:
         public data would pass the leak test above but fail here)."""
         dataset_factory(visibility_tier="public", title="Open DS", languages=["German"])
 
-        results, total = await search_datasets(db_pool, "public", language="German")
+        results, total = await search_datasets(
+            db_pool, "public", language="German", configured_sources=_SOURCES
+        )
         assert total == 1
         assert results[0].title == "Open DS"
 
@@ -232,7 +179,9 @@ class TestPublicDiscoverySearchBoundary:
         )
 
         for search_text in ("CURATED-PUBLIC-DISCOVERY-TITLE", "restricted"):
-            results, total = await search_datasets(db_pool, "public", search_text=search_text)
+            results, total = await search_datasets(
+                db_pool, "public", search_text=search_text, configured_sources=_SOURCES
+            )
             assert total == 1
             assert len(results) == 1
             assert results[0].title == "CURATED-PUBLIC-DISCOVERY-TITLE"
@@ -263,13 +212,19 @@ class TestPublicDiscoverySearchBoundary:
 
         for field_name, marker in full_only_markers.items():
             public_results, public_total = await search_datasets(
-                db_pool, "public", search_text=marker
+                db_pool,
+                "public",
+                search_text=marker,
+                configured_sources=_SOURCES,
             )
             assert public_results == [], field_name
             assert public_total == 0, field_name
 
             vetted_results, vetted_total = await search_datasets(
-                db_pool, "vetted", search_text=marker
+                db_pool,
+                "vetted",
+                search_text=marker,
+                configured_sources=_SOURCES,
             )
             assert vetted_total == 1, field_name
             assert vetted_results[0].title == "Safe Public Title", field_name
@@ -280,13 +235,7 @@ class TestRecentDatasetsTierRedaction:
     below-tier metadata while still listing the row."""
 
     async def test_get_recent_datasets_redacts_below_tier(self, db_pool, dataset_factory):
-        """search_datasets and get_dataset_by_id have redaction pins;
-        get_recent_datasets is the only remaining filter_for_tier call site
-        without one. home.html renders description, authors, keywords and
-        languages directly, so dropping the call leaks restricted metadata
-        to anonymous visitors on the landing page. The existing e2e witness
-        asserts only a COUNT ('<span class="stat-number">3</span>'), which
-        is present whether or not redaction runs."""
+        """Verify get recent datasets redacts below tier."""
         dataset_factory(
             visibility_tier="vetted",
             title="Vetted Title",
@@ -296,7 +245,7 @@ class TestRecentDatasetsTierRedaction:
             authors=["Secret Author"],
         )
 
-        recent = await get_recent_datasets(db_pool, "public")
+        recent = await get_recent_datasets(db_pool, "public", configured_sources=_SOURCES)
         total = await get_total_dataset_count(db_pool)
 
         assert total == 1  # the row IS listed — catalogue browsable
@@ -308,7 +257,7 @@ class TestRecentDatasetsTierRedaction:
         assert ds.authors == []
 
         # POSITIVE CONTROL: an over-broad "redact everything" fix fails here.
-        recent_v = await get_recent_datasets(db_pool, "vetted")
+        recent_v = await get_recent_datasets(db_pool, "vetted", configured_sources=_SOURCES)
         assert recent_v[0].description == "SECRET-DESC"
         assert recent_v[0].keywords == ["secret-kw"]
 
@@ -322,57 +271,62 @@ class TestRecentDatasetsTierRedaction:
         dataset_factory(visibility_tier="registered", title="Reg", description="REG-DESC")
         dataset_factory(visibility_tier="vetted", title="Vet", description="VET-DESC")
 
-        recent = await get_recent_datasets(db_pool, "registered")
+        recent = await get_recent_datasets(db_pool, "registered", configured_sources=_SOURCES)
         by_title = {d.title: d for d in recent}
 
         assert by_title["Reg"].description == "REG-DESC"  # at tier -> full
         assert by_title["Vet"].description is None  # above tier -> redacted
 
 
-class TestSearchFallbackCountTierScoping:
-    """The empty-page fallback COUNT(*) query in `search_datasets` carries
-    the same tier WHERE as the main query."""
+class TestSearchExactCountTierScoping:
+    """The compatibility API's separate count keeps the page's exact field gates."""
 
-    async def test_search_fallback_count_is_tier_scoped(self, db_pool, dataset_factory):
-        """search_datasets issues a SECOND count query when a page past the
-        end returns no rows (COUNT(*) OVER() has no carrier). It must re-use
-        the same tier-gated WHERE; dropping it turns total_count into a
-        cross-tier counting oracle that reconstructs exactly the presence
-        oracle the main query's gating closes.
+    async def test_search_exact_count_is_tier_scoped(self, db_pool, dataset_factory):
+        """Empty pages retain the exact count of current, permitted matches.
 
-        A FILTERED query is REQUIRED: with no filter the WHERE collapses to
-        TRUE and the catalogue is browsable by design, so the mutation is
-        invisible. page>=2 is required too: offset==0 short-circuits to
-        ([], 0) before the fallback."""
+        The compatibility API fetches its page and count separately. A private
+        description must not affect the public count, even on an empty page.
+        """
         for i in range(3):
             dataset_factory(
                 visibility_tier="vetted", title=f"Hidden {i}", description="SECRET-DESC"
             )
         dataset_factory(visibility_tier="public", title="Open 1")
 
-        # Guest probes the tier-gated full blob on page 2 -> 0 rows -> fallback.
+        # Guest probes a protected field on an empty second page.
         results, total = await search_datasets(
-            db_pool, "public", search_text="SECRET-DESC", page=2, page_size=20
+            db_pool,
+            "public",
+            search_text="SECRET-DESC",
+            page=2,
+            page_size=20,
+            configured_sources=_SOURCES,
         )
         assert results == []
-        assert total == 0, f"fallback count leaked cross-tier rows: total={total}"
+        assert total == 0, f"exact count leaked cross-tier rows: total={total}"
 
-        # POSITIVE CONTROL 1: the vetted actor's fallback count sees the 3
+        # POSITIVE CONTROL 1: the vetted actor's exact count sees the 3
         # hits — proves the rows exist and the guest assertion is not
         # vacuous.
         results_v, total_v = await search_datasets(
-            db_pool, "vetted", search_text="SECRET-DESC", page=2, page_size=20
+            db_pool,
+            "vetted",
+            search_text="SECRET-DESC",
+            page=2,
+            page_size=20,
+            configured_sources=_SOURCES,
         )
         assert results_v == []
         assert total_v == 3
 
-        # POSITIVE CONTROL 2: page 1 really returns them — the fallback is
-        # the only thing under test; the main query must still work.
-        page1, t1 = await search_datasets(db_pool, "vetted", search_text="SECRET-DESC", page=1)
+        # POSITIVE CONTROL 2: page 1 returns the same three permitted matches.
+        page1, t1 = await search_datasets(
+            db_pool, "vetted", search_text="SECRET-DESC", page=1, configured_sources=_SOURCES
+        )
         assert len(page1) == 3
         assert t1 == 3
 
-    async def test_search_fallback_count_is_tier_scoped_on_keyword_channel(
+    async def test_search_exact_count_is_tier_scoped_on_keyword_channel(
         self, db_pool, dataset_factory
     ):
         """Same property on the ?keyword= channel — the keyword and
@@ -381,12 +335,22 @@ class TestSearchFallbackCountTierScoping:
             dataset_factory(visibility_tier="vetted", title=f"H{i}", keywords=["secret-kw"])
 
         results, total = await search_datasets(
-            db_pool, "public", keyword="secret-kw", page=2, page_size=20
+            db_pool,
+            "public",
+            keyword="secret-kw",
+            page=2,
+            page_size=20,
+            configured_sources=_SOURCES,
         )
         assert results == [] and total == 0
 
         results_v, total_v = await search_datasets(
-            db_pool, "vetted", keyword="secret-kw", page=2, page_size=20
+            db_pool,
+            "vetted",
+            keyword="secret-kw",
+            page=2,
+            page_size=20,
+            configured_sources=_SOURCES,
         )
         assert results_v == [] and total_v == 3  # positive control
 
@@ -398,6 +362,7 @@ class TestDatasetOrdering:
     async def test_search_recent_and_pagination_agree_on_missing_dates(
         self, db_pool, dataset_factory, tier
     ):
+        """Verify search recent and pagination agree on missing dates."""
         undated_first = dataset_factory(upstream_modified_at=None, keywords=["history"])
         older = dataset_factory(
             upstream_modified_at=datetime(2025, 1, 1, tzinfo=UTC),
@@ -413,7 +378,7 @@ class TestDatasetOrdering:
             keywords=["history"],
         )
         expected = [newer_last, newer_first, older, undated_last, undated_first]
-        recent = await get_recent_datasets(db_pool, tier, limit=5)
+        recent = await get_recent_datasets(db_pool, tier, limit=5, configured_sources=_SOURCES)
         assert [row.id for row in recent] == expected
         pages = []
         for page in (1, 2, 3):
@@ -423,10 +388,71 @@ class TestDatasetOrdering:
                 keyword="history",
                 page=page,
                 page_size=2,
+                configured_sources=_SOURCES,
             )
             assert count == 5
             pages.extend(row.id for row in rows)
         assert pages == expected
-        rows, count = await search_datasets(db_pool, tier, page=4, page_size=2)
+        rows, count = await search_datasets(
+            db_pool, tier, page=4, page_size=2, configured_sources=_SOURCES
+        )
         assert rows == []
         assert count == 5
+
+
+class TestConfiguredSourceRebuildFreshness:
+    """Global counts retain all rows; freshness covers every selected source."""
+
+    @pytest.mark.parametrize(
+        ("first_state", "second_state", "expected_state"),
+        [
+            ("older", "newer", "older"),
+            ("newer", "older", "older"),
+            ("missing", "newer", None),
+            ("newer", "missing", None),
+            ("never", "newer", None),
+            ("newer", "never", None),
+        ],
+        ids=[
+            "first-source-is-oldest",
+            "second-source-is-oldest",
+            "first-source-is-missing",
+            "second-source-is-missing",
+            "first-source-never-rebuilt",
+            "second-source-never-rebuilt",
+        ],
+    )
+    async def test_freshness_requires_all_selected_sources_and_ignores_unselected_state(
+        self, db_pool, sync_conn, dataset_factory, first_state, second_state, expected_state
+    ):
+        """Verify freshness requires all selected sources and ignores unselected state."""
+        source_names = ("archive_alpha", "archive_beta")
+        timestamps = {
+            "older": datetime(2026, 1, 2, tzinfo=UTC),
+            "newer": datetime(2026, 1, 3, tzinfo=UTC),
+            "never": None,
+        }
+        for name, state in zip(source_names, (first_state, second_state), strict=True):
+            if state != "missing":
+                sync_conn.execute(
+                    "INSERT INTO sync_status (source, last_full_rebuild_date) VALUES (%s, %s)",
+                    (name, timestamps[state]),
+                )
+        sync_conn.execute(
+            "INSERT INTO sync_status (source, last_full_rebuild_date) VALUES (%s, %s)",
+            ("unselected_archive", datetime(2020, 1, 1, tzinfo=UTC)),
+        )
+        sync_conn.commit()
+
+        # The default legacy row also remains unselected and never rebuilt.
+        # Retained dataset rows count even when their source is not selected.
+        for name in (*source_names, "unselected_archive"):
+            dataset_factory(source=name)
+
+        expected = None if expected_state is None else timestamps[expected_state]
+        for selected in (source_names, source_names[::-1]):
+            assert await get_global_catalogue_stats(db_pool, source_names=selected) == (
+                3,
+                expected,
+            )
+            assert await get_last_full_rebuild_date(db_pool, source_names=selected) == expected

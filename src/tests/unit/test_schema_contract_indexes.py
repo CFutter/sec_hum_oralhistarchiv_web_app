@@ -1,15 +1,4 @@
-"""Unit tests for the index half of the PostgreSQL schema contract.
-
-`app.services.db_schema_contract` declares, per application table, the exact
-application-managed indexes (method, keys, operator classes, ordering,
-included columns, predicate, and catalog flags) PostgreSQL must have.
-`app.services.db_drift` converts live `pg_index` catalog rows into the same
-dataclasses, excludes indexes owned by a PRIMARY KEY/UNIQUE/exclusion
-constraint (those are validated through `pg_constraint` instead), and
-compares the remainder for exact equality. These tests exercise catalog-row
-conversion and contract comparison without a database; PostgreSQL catalog
-behavior itself is covered by the integration companion module.
-"""
+"""Unit tests for the index half of the PostgreSQL schema contract."""
 
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -48,6 +37,7 @@ class TestIndexCatalogConversion:
     """`_index_spec_from_row` converts one `pg_index` row exactly."""
 
     def test_index_row_conversion_preserves_operator_class_and_ordering(self):
+        """Check index row conversion preserves operator class and ordering."""
         row = (
             "ix_modified",
             False,
@@ -83,6 +73,7 @@ class TestIndexCatalogConversion:
         )
 
     def test_index_row_conversion_preserves_expression_predicate_and_flags(self):
+        """Check index row conversion preserves expression predicate and flags."""
         row = (
             "idx_users_email_lower",
             True,
@@ -115,10 +106,12 @@ class TestIndexCatalogConversion:
         )
 
     def test_index_row_conversion_rejects_wrong_query_shape(self):
+        """Check index row conversion rejects wrong query shape (RuntimeError)."""
         with pytest.raises(RuntimeError, match="expected 12 values"):
             db_drift._index_spec_from_row(("too", "short"))
 
     def test_index_row_conversion_rejects_inconsistent_key_metadata(self):
+        """Check index row conversion rejects inconsistent key metadata (RuntimeError)."""
         row = (
             "broken_idx",
             False,
@@ -138,6 +131,7 @@ class TestIndexCatalogConversion:
             db_drift._index_spec_from_row(row)
 
     def test_index_row_conversion_rejects_unsupported_access_method(self):
+        """Check index row conversion rejects unsupported access method (RuntimeError)."""
         row = (
             "hash_idx",
             False,
@@ -157,6 +151,7 @@ class TestIndexCatalogConversion:
             db_drift._index_spec_from_row(row)
 
     def test_index_row_conversion_rejects_unknown_option_bits(self):
+        """Check index row conversion rejects unknown option bits (RuntimeError)."""
         row = (
             "broken_idx",
             False,
@@ -183,6 +178,7 @@ class TestIndexCatalogQuery:
         self,
         monkeypatch,
     ):
+        """Check index catalog query excludes constraint owned indexes."""
         row = (
             "probe_created_at_idx",
             False,
@@ -204,6 +200,7 @@ class TestIndexCatalogQuery:
 
         @asynccontextmanager
         async def _cursor_context(pool, *, row_factory):
+            """Yield the scripted cursor after checking the database boundary."""
             assert pool is _POOL
             assert row_factory is tuple_row
             yield cursor
@@ -227,6 +224,7 @@ class TestIndexContract:
     """`assert_table_index_contract` verifies exact index shape."""
 
     async def test_index_check_accepts_exact_contract(self, monkeypatch):
+        """Check index check accepts exact contract."""
         get_specs = _mock_get_table_index_specs(monkeypatch, dict(_INDEX_CONTRACT))
 
         await db_drift.assert_table_index_contract(
@@ -238,6 +236,7 @@ class TestIndexContract:
         get_specs.assert_awaited_once_with(_POOL, "probe")
 
     async def test_index_check_rejects_missing_index(self, monkeypatch):
+        """Check index check rejects missing index (RuntimeError)."""
         _mock_get_table_index_specs(monkeypatch, {})
 
         with pytest.raises(
@@ -251,6 +250,7 @@ class TestIndexContract:
             )
 
     async def test_index_check_rejects_unexpected_index(self, monkeypatch):
+        """Check index check rejects unexpected index (RuntimeError)."""
         actual = {
             **_INDEX_CONTRACT,
             "legacy_idx": _INDEX,
@@ -265,6 +265,7 @@ class TestIndexContract:
             )
 
     async def test_index_check_allows_explicit_transitional_index(self, monkeypatch):
+        """Check index check allows explicit transitional index."""
         actual = {
             **_INDEX_CONTRACT,
             "legacy_idx": _INDEX,
@@ -324,6 +325,7 @@ class TestIndexContract:
         monkeypatch,
         actual_index,
     ):
+        """Check index check rejects structural drift (RuntimeError)."""
         _mock_get_table_index_specs(monkeypatch, {"probe_created_at_idx": actual_index})
 
         with pytest.raises(RuntimeError, match=r"index 'probe_created_at_idx'"):

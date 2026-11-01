@@ -1,8 +1,8 @@
 """Collect routers with centrally validated access and mutation policies.
 
-Handlers expect initialized app.state resources and session middleware state;
-SecureAPIRouter supplies route authorization/content-type/CSRF dependencies.
-Unhandled service/database failures propagate to application error handling.
+Handlers require initialized app.state resources and session middleware
+state. SecureAPIRouter installs authorization, form-type and CSRF guards;
+unhandled service/database failures reach application error handling.
 """
 
 from .auth import routers as auth_routers

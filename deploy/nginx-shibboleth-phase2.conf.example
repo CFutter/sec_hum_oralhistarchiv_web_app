@@ -1,6 +1,7 @@
 # Phase-2 Shibboleth locations for the HTTPS server block.
-# These blocks have no edge rate/connection limits. Add and verify reviewed
-# admission controls before enabling them; location / limits do not carry over.
+# Public locations explicitly apply the shared SSO zones from nginx.conf.example
+# before SP work. They do not inherit limits from the sibling location /.
+# Defaults need SP-capacity and university-NAT acceptance before activation.
 #
 # This file is NOT used by deploy/nginx.conf.example. Install it only after the
 # SP, FastCGI services, issuer policy, REFEDS MFA assurance and every attribute
@@ -12,17 +13,43 @@
 # an empty required value makes the application reject the login.
 
 location /Shibboleth.sso/ {
+    limit_req zone=oralhistarchiv_sso_req burst=10 nodelay;
+    limit_req zone=oralhistarchiv_sso_global_req burst=20 nodelay;
+    limit_conn oralhistarchiv_sso_conn 8;
+    limit_conn oralhistarchiv_sso_global_conn 16;
+    client_max_body_size 64k;
+    client_body_timeout 10s;
+    send_timeout 10s;
     include fastcgi_params;
+    fastcgi_request_buffering on;
+    fastcgi_connect_timeout 1s;
+    fastcgi_send_timeout 5s;
+    fastcgi_read_timeout 5s;
+    fastcgi_next_upstream off;
     fastcgi_pass unix:/run/shibboleth/shibresponder.sock;
 }
 
 location = /shibauthorizer {
     internal;
     include fastcgi_params;
+    fastcgi_request_buffering on;
+    fastcgi_connect_timeout 1s;
+    fastcgi_send_timeout 5s;
+    fastcgi_read_timeout 5s;
+    fastcgi_next_upstream off;
     fastcgi_pass unix:/run/shibboleth/shibauthorizer.sock;
 }
 
 location = /auth/shibboleth/callback {
+    # nginx preaccess limits run before the access-phase shib_request below.
+    # Charge the public parent once; /shibauthorizer stays internal-only.
+    limit_req zone=oralhistarchiv_sso_req burst=10 nodelay;
+    limit_req zone=oralhistarchiv_sso_global_req burst=20 nodelay;
+    limit_conn oralhistarchiv_sso_conn 8;
+    limit_conn oralhistarchiv_sso_global_conn 16;
+    client_max_body_size 64k;
+    client_body_timeout 10s;
+    send_timeout 10s;
     # Do not inherit a broader `satisfy any` policy: every configured access
     # handler, including the Shibboleth authorizer, must succeed.
     satisfy all;
@@ -44,6 +71,8 @@ location = /auth/shibboleth/callback {
         $upstream_http_variable_displayname;
     shib_request_set $oha_shib_affiliation
         $upstream_http_variable_affiliation;
+    shib_request_set $oha_shib_entitlement
+        $upstream_http_variable_entitlement;
     shib_request_set $oha_shib_country
         $upstream_http_variable_schachomeorganizationcountry;
 
@@ -72,7 +101,9 @@ location = /auth/shibboleth/callback {
     proxy_set_header X-OHA-Shib-Authn-Context $oha_shib_authn_context;
     proxy_set_header X-OHA-Shib-Display-Name  $oha_shib_display_name;
     proxy_set_header X-OHA-Shib-Affiliation   $oha_shib_affiliation;
+    proxy_set_header X-OHA-Shib-Entitlement   $oha_shib_entitlement;
     proxy_set_header X-OHA-Shib-Country       $oha_shib_country;
+
 
     proxy_connect_timeout 10s;
     proxy_read_timeout    30s;

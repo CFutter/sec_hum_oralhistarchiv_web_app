@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, cite the development version and identify the exact
+  reviewed commit or release that you used. Review contributor attribution
+  before publishing a formal release citation.
+type: software
+title: Oral History Archive
+# Collective attribution is not a declaration of legal copyright ownership.
+authors:
+  - name: Oral History Archive contributors
+version: 0.1.0
+license: MIT
+abstract: >-
+  A server-rendered catalogue for oral-history metadata with configured source
+  adapters and field-aware access tiers. The application code uses the MIT
+  license; bundled third-party assets retain their separately documented terms.
+keywords:
+  - oral history
+  - metadata catalogue
+  - access control

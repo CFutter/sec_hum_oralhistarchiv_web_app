@@ -1,16 +1,5 @@
-"""Unit tests for `app.services.totp_maintenance`: the bounded, writers-stopped
-reads used by the TOTP key-rotation maintenance procedure (`scripts/reencrypt_totp.py`).
-
-`secret_pages` is an async generator that pages through users with a TOTP
-secret set, ordered by id, without holding a database connection open while
-the caller processes a batch — each page acquires and releases its own
-`get_db_cursor` context, so a long-running re-encryption pass never pins a
-pool connection between batches. `rotation_secret_pages` is the same
-contract for the session-bound replacement credentials in
-`pending_totp_rotations`, paged by `user_id` instead of `id`.
-
-Pure unit tests: no DB, `get_db_cursor` is patched with an async context
-manager over a mock cursor.
+"""Unit tests for `app.services.totp_maintenance`: the bounded, writers-stopped reads used by the TOTP
+key-rotation maintenance procedure (`scripts/reencrypt_totp.py`).
 """
 
 from contextlib import asynccontextmanager
@@ -31,17 +20,14 @@ class TestSecretPagesBatching:
     """`secret_pages` yields bounded pages and never holds a connection across batches."""
 
     async def test_pages_release_the_connection_and_advance_by_last_id_between_batches(self):
-        """Each page is read under its own `get_db_cursor` context (released
-        before the caller sees the page), and the next page's query starts
-        strictly after the last id already yielded — a rotation over a large
-        user table must not pin a connection for its whole duration nor
-        re-read rows it already processed."""
+        """Check pages release the connection and advance by last ID between batches."""
         cursor = make_async_cursor()
         cursor.fetchall.side_effect = [[{"id": 2}, {"id": 7}], [{"id": 11}], []]
         held = False
 
         @asynccontextmanager
         async def page_cursor(_pool):
+            """Require nonoverlapping page scopes and clear the held flag on every exit."""
             nonlocal held
             assert not held
             held = True
@@ -61,7 +47,7 @@ class TestSecretPagesBatching:
             ),
         ):
             async for rows in secret_pages(object(), 2):
-                assert not held  # No read connection is held while processing a batch.
+                assert not held
                 assert len(rows) <= 2
                 ids.extend(row["id"] for row in rows)
         assert ids == [2, 7, 11]
@@ -72,7 +58,7 @@ class TestSecretPagesBatching:
         ]
 
     async def test_no_matching_rows_yields_no_pages(self):
-        """Positive control above: rows do accumulate across pages when present."""
+        """Check no matching rows yields no pages."""
         cursor = make_async_cursor(fetchall=[])
         acquire = create_autospec(
             totp_maintenance_module.get_db_cursor,
@@ -93,6 +79,7 @@ class TestSecretPagesValidation:
         ids=["zero_is_too_small", "negative_is_too_small", "one_past_the_maximum"],
     )
     async def test_out_of_range_batch_size_is_rejected(self, batch_size):
+        """Check out of range batch size is rejected (ValueError)."""
         with pytest.raises(ValueError, match="batch_size must be between 1"):
             async for _ in secret_pages(object(), batch_size):
                 pass
@@ -101,7 +88,7 @@ class TestSecretPagesValidation:
         "batch_size", [1, _MAX_BATCH_SIZE], ids=["minimum_batch_size", "maximum_batch_size"]
     )
     async def test_boundary_batch_sizes_are_accepted(self, batch_size):
-        """Positive control above: the values immediately outside the range are rejected."""
+        """Check boundary batch sizes are accepted."""
         cursor = make_async_cursor(fetchall=[])
         acquire = create_autospec(
             totp_maintenance_module.get_db_cursor,
@@ -115,6 +102,7 @@ class TestSecretPagesValidation:
 
 @asynccontextmanager
 async def _single_use_cursor(cursor):
+    """Yield the scripted cursor without a real database connection."""
     yield cursor
 
 
@@ -127,12 +115,13 @@ class TestRotationSecretPagesValidation:
         ids=["zero_is_too_small", "negative_is_too_small", "one_past_the_maximum"],
     )
     async def test_out_of_range_batch_size_is_rejected(self, batch_size):
+        """Check out of range batch size is rejected (ValueError)."""
         with pytest.raises(ValueError, match="batch_size must be between 1"):
             async for _ in rotation_secret_pages(object(), batch_size):
                 pass
 
     async def test_in_range_batch_size_is_accepted(self):
-        """Positive control above: values outside the range are rejected before any query."""
+        """Check in range batch size is accepted."""
         cursor = make_async_cursor(fetchall=[])
         acquire = create_autospec(
             totp_maintenance_module.get_db_cursor,
@@ -150,6 +139,7 @@ class TestRotationSecretPagesBatching:
     """
 
     async def test_pages_release_the_connection_and_advance_by_last_user_id_between_batches(self):
+        """Check pages release the connection and advance by last user ID between batches."""
         cursor = make_async_cursor()
         cursor.fetchall.side_effect = [
             [
@@ -163,6 +153,7 @@ class TestRotationSecretPagesBatching:
 
         @asynccontextmanager
         async def page_cursor(_pool):
+            """Require nonoverlapping page scopes and clear the held flag on every exit."""
             nonlocal held
             assert not held
             held = True

@@ -1,31 +1,18 @@
-"""Route resolution and bucket aggregation for rate admission.
-
-Two properties are pinned here, both against the real
-``BoundedRateLimitMiddleware``/``Limiter`` objects with an in-process
-(memory) backend — these are resolution/aggregation properties, not
-storage properties, so no Redis is needed:
-
-- Every kind of unmatched traffic (unknown paths, percent-encoding,
-  trailing-slash variants, query strings, unsupported methods) resolves to
-  one stable sentinel handler and marks the request so session middleware
-  skips its database lookup; a genuine full route match does neither.
-- A decorated route's own limit is honoured, and two differently
-  parameterised paths of the same endpoint share one bucket because the
-  limiter's key style is ``"endpoint"`` (the qualified function name), not
-  the concrete URL.
-"""
+"""Route resolution and bucket aggregation for rate admission."""
 
 import httpx
 import pytest
 from fastapi import FastAPI, Request, Response
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
+from starlette.types import Scope
 
 import app.middleware.rate_limiting as rl
 from app.middleware.rate_limiting import BoundedRateLimitMiddleware
 
 
 def _unlimited_limiter() -> Limiter:
+    """Build a high-limit fixed-window limiter for middleware dispatch tests."""
     return Limiter(
         key_func=rl.get_rate_limit_client_id,
         default_limits=["1000/minute"],
@@ -34,7 +21,8 @@ def _unlimited_limiter() -> Limiter:
     )
 
 
-def _scope(*, method: str, path: str, query_string: bytes = b"", app: FastAPI) -> dict:
+def _scope(*, method: str, path: str, query_string: bytes = b"", app: FastAPI) -> Scope:
+    """Build an HTTP scope with the selected method, path, query, and application."""
     return {
         "type": "http",
         "method": method,
@@ -54,20 +42,24 @@ class TestUnmatchedTrafficSharesOneSentinelAndMarksTheRequest:
     route does neither."""
 
     def _app(self) -> FastAPI:
+        """Build an item application with a high-limit backend on app.state."""
         app = FastAPI()
         app.state.limiter = _unlimited_limiter()
 
         @app.get("/items/{item_id}")
         async def get_item(item_id: str):
+            """Echo the item identifier from the guarded route."""
             return Response(item_id)
 
         return app
 
     async def _dispatch(self, app: FastAPI, *, method: str, path: str, query: bytes = b""):
+        """Dispatch the middleware with a downstream stub and return the mutated request."""
         middleware = BoundedRateLimitMiddleware(app)
         request = Request(_scope(method=method, path=path, query_string=query, app=app))
 
         async def call_next(_request):
+            """Return a downstream marker response."""
             return Response("downstream")
 
         await middleware.dispatch(request, call_next)
@@ -97,6 +89,7 @@ class TestUnmatchedTrafficSharesOneSentinelAndMarksTheRequest:
     async def test_every_unmatched_variant_shares_one_sentinel_key_and_sets_the_marker(
         self, method, path, query
     ):
+        """Check every unmatched variant shares one sentinel key and sets the marker."""
         app = self._app()
         limiter: Limiter = app.state.limiter
         request = await self._dispatch(app, method=method, path=path, query=query)
@@ -119,8 +112,7 @@ class TestUnmatchedTrafficSharesOneSentinelAndMarksTheRequest:
         assert request.state.rate_limit_route_unmatched is True
 
     async def test_a_full_route_match_does_not_set_the_unmatched_marker(self):
-        """Positive control: a genuine, fully-matched route neither uses the
-        sentinel handler nor sets the session-skip marker."""
+        """Check a full route match does not set the unmatched marker."""
         app = self._app()
         request = await self._dispatch(app, method="GET", path="/items/1")
 
@@ -128,11 +120,10 @@ class TestUnmatchedTrafficSharesOneSentinelAndMarksTheRequest:
 
 
 class TestDecoratedRouteLimitsAggregateByEndpointNotByPath:
-    """`key_style="endpoint"` means SlowAPI's storage key is the qualified
-    view-function name, not the concrete URL: two differently parameterised
-    requests to the same endpoint consume the same bucket."""
+    """Cover decorated route limits aggregate by endpoint not by path."""
 
     def _app(self, limiter: Limiter) -> FastAPI:
+        """Build a middleware-enabled item route limited to two requests per minute."""
         app = FastAPI()
         app.state.limiter = limiter
         app.add_middleware(BoundedRateLimitMiddleware)
@@ -142,16 +133,19 @@ class TestDecoratedRouteLimitsAggregateByEndpointNotByPath:
         async def get_item(item_id: str, request: Request):
             # SlowAPI's decorator requires a "request"/"websocket" parameter
             # by name; it is not otherwise used by this endpoint.
+            """Echo the item identifier from the guarded route."""
             del request
             return Response(item_id)
 
         @app.exception_handler(RateLimitExceeded)
         async def exceeded(_request, _exc):
+            """Return the synthetic HTTP 429 response for RateLimitExceeded."""
             return Response("limited", status_code=429)
 
         return app
 
     async def test_two_different_paths_of_one_endpoint_share_one_bucket(self):
+        """Check two different paths of one endpoint share one bucket (HTTP 429)."""
         limiter = Limiter(
             key_func=lambda: "client",
             strategy="fixed-window",
@@ -171,9 +165,7 @@ class TestDecoratedRouteLimitsAggregateByEndpointNotByPath:
         assert third.status_code == 429
 
     async def test_within_the_registered_limit_every_distinct_path_is_admitted(self):
-        """Positive control: the decorated route's own limit (not some
-        stricter accident) is what's enforced — while under it, distinct
-        parameterised paths are all admitted."""
+        """Check within the registered limit every distinct path is admitted."""
         limiter = Limiter(
             key_func=lambda: "client",
             strategy="fixed-window",

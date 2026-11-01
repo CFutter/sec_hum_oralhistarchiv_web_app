@@ -1,16 +1,5 @@
-"""Integration tests: the scheduler ACTUALLY runs its coroutine jobs, plus
-the unverified-account reaper against a real PostgreSQL.
-
-create_scheduler must build an AsyncIOScheduler. A BackgroundScheduler
-would "run" the async jobs by calling the coroutine
-function in a thread, producing an un-awaited coroutine object that is
-silently discarded — the executed-event log line would still fire, so only
-an OBSERVABLE side effect (the expired-session DELETE landing in the real
-database) proves the coroutine was awaited.
-
-Reaper (app.services.users.reap_unverified_accounts): deletes only LOCAL,
-UNVERIFIED accounts older than the cutoff; audit-logs each deletion with a
-HASHED email (never the raw address).
+"""Integration tests: the scheduler ACTUALLY runs its coroutine jobs, plus the unverified-account
+reaper against a real PostgreSQL.
 """
 
 import asyncio
@@ -26,10 +15,9 @@ from app.services.scheduler import RunningJobTracker, create_scheduler
 from app.services.session_ids import hash_session_id
 from app.services.users import reap_unverified_accounts
 from tests.integration.conftest import TEST_DATABASE_URL
+from tests.source_fixtures import legacy_source
 
-# ---------------------------------------------------------------------------
 # helpers
-# ---------------------------------------------------------------------------
 
 
 def _session_exists(raw_session_id: str) -> bool:
@@ -54,26 +42,27 @@ def _age_user(user_id: int, days: int) -> None:
 
 
 def _user_exists(user_id: int) -> bool:
+    """Check whether the user row still exists through a separate connection."""
     with psycopg.connect(TEST_DATABASE_URL) as conn:
         row = conn.execute("SELECT 1 FROM users WHERE id = %s", (user_id,)).fetchone()
     return row is not None
 
 
 def _scheduler_pool_mock() -> MagicMock:
+    """Create a pool double with the scheduler's two-connection minimum."""
     pool = MagicMock(spec=AsyncConnectionPool)
     pool.max_size = 2
     return pool
 
 
-# ---------------------------------------------------------------------------
 # The scheduler executes its coroutine jobs for real
-# ---------------------------------------------------------------------------
 
 
 async def _wait_until_session_gone(raw_session_id: str, timeout: float = 5.0) -> None:
     """Bounded poll of the real database row instead of a fixed sleep budget."""
 
     async def _poll() -> None:
+        """Wait until the test session no longer exists."""
         while _session_exists(raw_session_id):
             await asyncio.sleep(0.05)
 
@@ -83,18 +72,11 @@ async def _wait_until_session_gone(raw_session_id: str, timeout: float = 5.0) ->
 async def test_scheduler_executes_session_cleanup_against_real_db(
     db_pool, user_factory, session_factory
 ):
-    """A started scheduler's session_cleanup job (next_run_time=now)
-    DELETEs the expired session row from the real database while leaving the
-    live one intact.
-
-    Guards the AsyncIOScheduler-vs-BackgroundScheduler silent-noop: with a
-    BackgroundScheduler the coroutine would be created but never awaited, the
-    EXECUTED event would still log, and the expired row would survive —
-    which is exactly what this test polls for.
-    """
+    """Verify scheduler executes session cleanup against real database."""
     user = user_factory()
     expired_raw = session_factory(user.id, expires_in_seconds=-60)
     live_raw = session_factory(user.id, expires_in_seconds=28800)
+    selected_source = legacy_source()
     assert _session_exists(expired_raw)
 
     # Patch the sync jobs BEFORE create_scheduler so add_job captures the
@@ -112,7 +94,7 @@ async def test_scheduler_executes_session_cleanup_against_real_db(
         ),
     ):
         running_jobs = RunningJobTracker()
-        sched = create_scheduler(db_pool, MagicMock(), running_jobs)
+        sched = create_scheduler(db_pool, MagicMock(), running_jobs, (selected_source,))
         sched.start()
         try:
             # Bounded poll for the observable DELETE, not a fixed iteration budget.
@@ -132,9 +114,7 @@ async def test_scheduler_executes_session_cleanup_against_real_db(
     assert _session_exists(live_raw), "live session must not be cleaned up"
 
 
-# ---------------------------------------------------------------------------
 # reap_unverified_accounts — direct service calls against the real DB
-# ---------------------------------------------------------------------------
 
 
 async def test_reap_deletes_old_local_unverified_account(db_pool, user_factory):
