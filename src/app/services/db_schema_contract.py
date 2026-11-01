@@ -7,14 +7,29 @@ fields shown in its SQL. Editing these string literals changes the
 runtime contract and requires a corresponding database migration.
 """
 
+import re
 from dataclasses import dataclass
 from typing import Literal
+
+from app import (
+    SEARCH_AUDIENCES,
+    SEARCH_FUNCTION_RESULTS,
+    SEARCH_FUNCTION_SOURCES,
+    SEARCH_STABLE_FUNCTIONS,
+)
+from app import search_mask_contract as search_masks
+from app.catalogue_sql import (
+    CATALOGUE_PAGE_IDS_SOURCE,
+    CATALOGUE_SCAN_CEILING_SOURCE,
+    CATALOGUE_SEARCH_CANDIDATES_DEFINITION,
+)
 
 IdentityMode = Literal["", "a", "d"]
 IndexMethod = Literal["btree", "gin"]
 TriggerEnabledMode = Literal["O", "D", "R", "A"]
 FunctionVolatility = Literal["i", "s", "v"]
 FunctionParallelMode = Literal["u", "r", "s"]
+PolicyCommand = Literal["r", "a", "w", "d", "*"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +110,43 @@ class TriggerSpec:
     definition: str
 
 
+@dataclass(frozen=True, slots=True)
+class RowSecuritySpec:
+    """Exact row-security enable/force flags on an application table."""
+
+    enabled: bool
+    forced: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PolicySpec:
+    """Exact row policy: command r/a/w/d/* means SELECT/INSERT/UPDATE/DELETE/ALL.
+
+    Roles are sorted names; PUBLIC represents PostgreSQL's zero role OID.
+    Absent USING/WITH CHECK expressions remain None.
+    """
+
+    command: PolicyCommand
+    permissive: bool
+    roles: tuple[str, ...]
+    using: str | None
+    with_check: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ViewSpec:
+    """Exact ordered view columns, definition, options and trusted ownership.
+
+    The owner must match the base catalogue table's owner. Hardened runtime
+    validation separately requires that owner to be the migration identity.
+    """
+
+    columns: tuple[tuple[str, str], ...]
+    definition: str
+    options: tuple[str, ...]
+    owner_matches_catalogue: bool = True
+
+
 _UPDATE_SEARCH_TEXT_SOURCE = (
     "\n"
     "        BEGIN\n"
@@ -117,13 +169,113 @@ _UPDATE_SEARCH_TEXT_SOURCE = (
     "                COALESCE(array_to_string(NEW.keywords, ' '), '') "
     "|| ' ' ||\n"
     "                COALESCE(array_to_string(NEW.authors, ' '), '');\n"
+    "            NEW.search_vector_public :=\n"
+    "                pg_catalog.to_tsvector('pg_catalog.simple'::regconfig, "
+    "NEW.search_text_public);\n"
+    "            NEW.search_vector_full :=\n"
+    "                pg_catalog.to_tsvector(\n"
+    "                    'pg_catalog.simple'::regconfig,\n"
+    "                    NEW.search_text_public || ' ' ||\n"
+    "                    COALESCE(NEW.description, '') || ' ' ||\n"
+    "                    COALESCE(NEW.project_title, '') || ' ' ||\n"
+    "                    COALESCE(NEW.project_description, '') || ' ' ||\n"
+    "                    COALESCE(array_to_string(NEW.keywords, ' '), '') || ' ' ||\n"
+    "                    COALESCE(array_to_string(NEW.authors, ' '), '')\n"
+    "                );\n"
     "            RETURN NEW;\n"
     "        END;\n"
     "        "
 )
 
 
+def _search_document_sql_tokens(sql: str) -> tuple[str, ...]:
+    """Ignore SQL comments/layout while preserving string literal contents.
+
+    This recognizes the current trigger's simple expressions, not arbitrary
+    PL/pgSQL. Unrecognized expression shapes must fail the contract check.
+    """
+    tokens = re.findall(r"'(?:''|[^'])*'|--[^\n]*|/\*.*?\*/|:=|[^\W\d]\w*|[^\s]", sql, re.S)
+    return tuple(
+        token if token.startswith("'") else token.lower()
+        for token in tokens
+        if not token.startswith(("--", "/*"))
+    )
+
+
+def _search_trigger_assignment(tokens: tuple[str, ...], column: str) -> tuple[str, ...]:
+    """Require one terminated NEW.column assignment or raise RuntimeError; return its expression."""
+    marker = ("new", ".", column, ":=")
+    starts = [
+        index + len(marker)
+        for index in range(len(tokens))
+        if tokens[index : index + len(marker)] == marker
+    ]
+    if len(starts) != 1:
+        raise RuntimeError(f"Search-document contract requires one assignment to NEW.{column}")
+    start = starts[0]
+    try:
+        end = tokens.index(";", start)
+    except ValueError as exc:
+        raise RuntimeError(f"Search-document assignment to NEW.{column} is unterminated") from exc
+    return tokens[start:end]
+
+
+def assert_search_document_contract() -> None:
+    """Raise RuntimeError unless trigger document expressions match the versioned field map.
+
+    Compare order, array conversion and the public prefix used by the full vector.
+    """
+    extra_document = " || ' ' || ".join(
+        # The frozen trigger spells array_to_string without qualification.
+        f"COALESCE({field.value_sql(table_alias='NEW').removeprefix('pg_catalog.')}, '')"
+        for field in search_masks.SEARCH_DOCUMENT_FIELDS
+    )
+    expected = {
+        "search_text_public": "COALESCE(NEW.title, '') || ' ' || COALESCE(NEW.access_level, '')",
+        "search_text_full": f"COALESCE(NEW.title, '') || ' ' || {extra_document}",
+        "search_vector_full": (
+            "pg_catalog.to_tsvector('pg_catalog.simple'::regconfig, "
+            f"NEW.search_text_public || ' ' || {extra_document})"
+        ),
+    }
+    tokens = _search_document_sql_tokens(FUNCTION_CONTRACTS["update_search_text()"].source)
+    for column, expression in expected.items():
+        if _search_trigger_assignment(tokens, column) != _search_document_sql_tokens(expression):
+            raise RuntimeError(
+                f"Search-document contract mismatch for NEW.{column}: "
+                "trigger expression must match SEARCH_DOCUMENT_FIELDS and its document prefix"
+            )
+
+
 FUNCTION_CONTRACTS: dict[str, FunctionSpec] = {
+    "catalogue_scan_ceiling()": FunctionSpec(
+        identity_arguments="",
+        result="integer",
+        language="sql",
+        volatility="s",
+        security_definer=True,
+        strict=False,
+        parallel="u",
+        configuration=("search_path=pg_catalog, public",),
+        source=CATALOGUE_SCAN_CEILING_SOURCE,
+    ),
+    (
+        "catalogue_page_ids(p_anchor integer, p_ceiling integer, p_backward boolean, "
+        "p_limit integer, p_offset integer, p_query jsonb)"
+    ): FunctionSpec(
+        identity_arguments=(
+            "p_anchor integer, p_ceiling integer, p_backward boolean, "
+            "p_limit integer, p_offset integer, p_query jsonb"
+        ),
+        result="SETOF integer",
+        language="plpgsql",
+        volatility="s",
+        security_definer=True,
+        strict=False,
+        parallel="u",
+        configuration=("search_path=pg_catalog, public",),
+        source=CATALOGUE_PAGE_IDS_SOURCE,
+    ),
     "update_search_text()": FunctionSpec(
         identity_arguments="",
         result="trigger",
@@ -153,8 +305,10 @@ TRIGGER_CONTRACTS: dict[str, dict[str, TriggerSpec]] = {
             ),
         ),
     },
+    "dataset_admin_state": {},
     "sync_status": {},
     "ingestion_failures": {},
+    "ingestion_quarantine": {},
     "users": {},
     "totp_recovery_codes": {},
     "admin_promotion_requests": {},
@@ -184,6 +338,9 @@ SESSION_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
     "expires_at": ColumnSpec(
         "timestamp with time zone",
         nullable=False,
+    ),
+    "last_activity_at": ColumnSpec(
+        "timestamp with time zone", nullable=False, default="CURRENT_TIMESTAMP"
     ),
     "ip_address": ColumnSpec("text", nullable=True),
 }
@@ -226,11 +383,7 @@ DATASET_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
     ),
     "uuid": ColumnSpec("text", nullable=False),
     "doi": ColumnSpec("text", nullable=True),
-    "source": ColumnSpec(
-        "text",
-        nullable=False,
-        default="'swissubase'::text",
-    ),
+    "source": ColumnSpec("text", nullable=False),
     "title": ColumnSpec("text", nullable=True),
     "project_title": ColumnSpec("text", nullable=True),
     "description": ColumnSpec("text", nullable=True),
@@ -289,6 +442,15 @@ DATASET_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
     ),
     "search_text_public": ColumnSpec("text", nullable=True),
     "search_text_full": ColumnSpec("text", nullable=True),
+    "search_vector_public": ColumnSpec("tsvector", nullable=False),
+    "search_vector_full": ColumnSpec("tsvector", nullable=False),
+}
+
+DATASET_ADMIN_STATE_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
+    "source": ColumnSpec("text", nullable=False),
+    "uuid": ColumnSpec("text", nullable=False),
+    "visibility_tier": ColumnSpec("text", nullable=True),
+    "hidden_at": ColumnSpec("timestamp with time zone", nullable=True),
 }
 
 SYNC_STATUS_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
@@ -296,10 +458,11 @@ SYNC_STATUS_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
     "incremental_started_at": ColumnSpec("timestamp with time zone", nullable=True),
     "incremental_position": ColumnSpec("integer", nullable=False, default="0"),
     "incremental_affected": ColumnSpec("integer", nullable=False, default="0"),
-    "incremental_failures": ColumnSpec("jsonb", nullable=False, default="'{}'::jsonb"),
     "source_cursor": ColumnSpec("timestamp with time zone", nullable=True),
     "source_fingerprint": ColumnSpec("text", nullable=True),
-    "id": ColumnSpec("integer", nullable=False),
+    "source_fetch_cursor": ColumnSpec("timestamp with time zone", nullable=True),
+    "source_fetch_fingerprint": ColumnSpec("text", nullable=True),
+    "source": ColumnSpec("text", nullable=False),
     "last_harvest_date": ColumnSpec(
         "timestamp with time zone",
         nullable=True,
@@ -329,6 +492,17 @@ INGESTION_FAILURE_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
         "timestamp with time zone",
         nullable=False,
         default="CURRENT_TIMESTAMP",
+    ),
+}
+
+INGESTION_QUARANTINE_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
+    "source": ColumnSpec("text", nullable=False),
+    "uuid": ColumnSpec("text", nullable=False),
+    "reason": ColumnSpec("text", nullable=False),
+    "failed_harvest_at": ColumnSpec("timestamp with time zone", nullable=False),
+    "failed_source_cursor": ColumnSpec("timestamp with time zone", nullable=False),
+    "quarantined_at": ColumnSpec(
+        "timestamp with time zone", nullable=False, default="CURRENT_TIMESTAMP"
     ),
 }
 
@@ -365,6 +539,7 @@ USER_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
         nullable=True,
     ),
     "pending_totp_secret": ColumnSpec("text", nullable=True),
+    "pending_totp_session_hash": ColumnSpec("text", nullable=True),
     "pending_totp_created_at": ColumnSpec(
         "timestamp with time zone",
         nullable=True,
@@ -383,6 +558,10 @@ USER_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
         "timestamp with time zone",
         nullable=True,
     ),
+    "password_reset_attempt_count": ColumnSpec("integer", nullable=False, default="0"),
+    "password_reset_attempt_window_started_at": ColumnSpec(
+        "timestamp with time zone", nullable=True
+    ),
     "auth_method": ColumnSpec(
         "text",
         nullable=False,
@@ -396,6 +575,9 @@ USER_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
         nullable=True,
     ),
     "federated_approved_by": ColumnSpec("integer", nullable=True),
+    "federated_review": ColumnSpec("jsonb", nullable=True),
+    "federated_review_revision": ColumnSpec("bigint", nullable=False, default="0"),
+    "federated_approved_proposal": ColumnSpec("jsonb", nullable=True),
     "access_tier": ColumnSpec(
         "text",
         nullable=False,
@@ -551,8 +733,10 @@ EMAIL_OUTBOX_COLUMN_CONTRACT: dict[str, ColumnSpec] = {
 
 TABLE_COLUMN_CONTRACTS: dict[str, dict[str, ColumnSpec]] = {
     "oral_history_datasets": DATASET_COLUMN_CONTRACT,
+    "dataset_admin_state": DATASET_ADMIN_STATE_COLUMN_CONTRACT,
     "sync_status": SYNC_STATUS_COLUMN_CONTRACT,
     "ingestion_failures": INGESTION_FAILURE_COLUMN_CONTRACT,
+    "ingestion_quarantine": INGESTION_QUARANTINE_COLUMN_CONTRACT,
     "users": USER_COLUMN_CONTRACT,
     "totp_recovery_codes": TOTP_RECOVERY_CODE_COLUMN_CONTRACT,
     "admin_promotion_requests": ADMIN_PROMOTION_REQUEST_COLUMN_CONTRACT,
@@ -606,6 +790,12 @@ DATASET_CONSTRAINT_CONTRACT: dict[str, ConstraintSpec] = {
         kind="primary_key",
         columns=("id",),
     ),
+    "datasets_source_check": ConstraintSpec(
+        kind="check",
+        check_definition=(
+            "CHECK ((source ~ '^[abcdefghijklmnopqrstuvwxyz0123456789_]{1,32}$'::text))"
+        ),
+    ),
     "datasets_source_uuid_key": ConstraintSpec(
         kind="unique",
         columns=("source", "uuid"),
@@ -623,11 +813,31 @@ DATASET_CONSTRAINT_CONTRACT: dict[str, ConstraintSpec] = {
     ),
 }
 
+DATASET_ADMIN_STATE_CONSTRAINT_CONTRACT: dict[str, ConstraintSpec] = {
+    "dataset_admin_state_pkey": ConstraintSpec(
+        kind="primary_key",
+        columns=("source", "uuid"),
+    ),
+    "dataset_admin_state_source_check": ConstraintSpec(
+        kind="check",
+        check_definition=(
+            "CHECK ((source ~ '^[abcdefghijklmnopqrstuvwxyz0123456789_]{1,32}$'::text))"
+        ),
+    ),
+    "dataset_admin_state_visibility_tier_check": ConstraintSpec(
+        kind="check",
+        check_definition=(
+            "CHECK ((visibility_tier = ANY (ARRAY['public'::text, "
+            "'registered'::text, 'vetted'::text])))"
+        ),
+    ),
+}
+
 
 SYNC_STATUS_CONSTRAINT_CONTRACT: dict[str, ConstraintSpec] = {
     "sync_status_pkey": ConstraintSpec(
         kind="primary_key",
-        columns=("id",),
+        columns=("source",),
     ),
     "sync_status_incremental_position_check": ConstraintSpec(
         kind="check",
@@ -659,8 +869,34 @@ INGESTION_FAILURE_CONSTRAINT_CONTRACT: dict[str, ConstraintSpec] = {
     ),
 }
 
+INGESTION_QUARANTINE_CONSTRAINT_CONTRACT: dict[str, ConstraintSpec] = {
+    "ingestion_quarantine_pkey": ConstraintSpec(kind="primary_key", columns=("source", "uuid")),
+    "ingestion_quarantine_reason_check": ConstraintSpec(
+        kind="check",
+        check_definition=(
+            "CHECK ((reason = ANY (ARRAY['record_rejected'::text, "
+            "'record_write_failed'::text, 'filter_mismatch'::text])))"
+        ),
+    ),
+}
+
 
 USER_CONSTRAINT_CONTRACT: dict[str, ConstraintSpec] = {
+    "users_password_reset_attempt_count_check": ConstraintSpec(
+        kind="check",
+        check_definition=(
+            "CHECK (((password_reset_attempt_count >= 0) AND (password_reset_attempt_count <= 5)))"
+        ),
+    ),
+    "users_password_reset_attempt_window_check": ConstraintSpec(
+        kind="check",
+        check_definition=(
+            "CHECK ((((password_reset_attempt_count = 0) AND "
+            "(password_reset_attempt_window_started_at IS NULL)) OR "
+            "((password_reset_attempt_count > 0) AND "
+            "(password_reset_attempt_window_started_at IS NOT NULL))))"
+        ),
+    ),
     "users_pkey": ConstraintSpec(
         kind="primary_key",
         columns=("id",),
@@ -672,13 +908,69 @@ USER_CONSTRAINT_CONTRACT: dict[str, ConstraintSpec] = {
     "users_local_password_required": ConstraintSpec(
         kind="check",
         check_definition=(
-            "CHECK (((auth_method <> 'local'::text) OR (password_hash IS NOT NULL)))"
+            "CHECK (((auth_method <> 'local'::text) OR (password_hash IS NOT NULL) OR "
+            "((NOT is_active) AND (NOT email_verified) AND (NOT is_admin))))"
         ),
     ),
     "users_lockout_notice_state_check": ConstraintSpec(
         kind="check",
         check_definition=(
             "CHECK (((failed_login_count > 0) OR (lockout_notice_enqueued_at IS NULL)))"
+        ),
+    ),
+    "users_federated_review_state_check": ConstraintSpec(
+        kind="check",
+        check_definition=(
+            "CHECK ((((federated_review_revision >= 0) AND (((federated_review IS NULL) AND"
+            " (federated_review_revision = 0)) OR ((auth_method = 'shibboleth'::text) AND "
+            "(federated_review_revision > 0) AND (jsonb_typeof(federated_review) = "
+            "'object'::text) AND (federated_review ?& ARRAY['issuer'::text, "
+            "'affiliation'::text, 'entitlement'::text, 'proposal'::text]) AND "
+            "((federated_review - ARRAY['issuer'::text, 'affiliation'::text, "
+            "'entitlement'::text, 'proposal'::text]) = '{}'::jsonb) AND "
+            "(jsonb_typeof((federated_review -> 'issuer'::text)) = 'string'::text) AND "
+            "((federated_review ->> 'issuer'::text) = shibboleth_issuer) AND "
+            "((length((federated_review ->> 'issuer'::text)) >= 1) AND "
+            "(length((federated_review ->> 'issuer'::text)) <= 2048)) AND "
+            "((jsonb_typeof((federated_review -> 'affiliation'::text)) = 'null'::text) OR "
+            "((jsonb_typeof((federated_review -> 'affiliation'::text)) = 'string'::text) "
+            "AND ((length((federated_review ->> 'affiliation'::text)) >= 1) AND "
+            "(length((federated_review ->> 'affiliation'::text)) <= 512)))) AND "
+            "((jsonb_typeof((federated_review -> 'entitlement'::text)) = 'null'::text) OR "
+            "((jsonb_typeof((federated_review -> 'entitlement'::text)) = 'string'::text) "
+            "AND ((length((federated_review ->> 'entitlement'::text)) >= 1) AND "
+            "(length((federated_review ->> 'entitlement'::text)) <= 4096)))) AND "
+            "(((federated_review -> 'proposal'::text) = 'null'::jsonb) OR "
+            "((jsonb_typeof((federated_review -> 'proposal'::text)) = 'object'::text) AND "
+            "((federated_review -> 'proposal'::text) ?& ARRAY['index'::text, 'match'::text,"
+            " 'tier'::text]) AND (((federated_review -> 'proposal'::text) - "
+            "ARRAY['index'::text, 'match'::text, 'tier'::text]) = '{}'::jsonb) AND "
+            "(jsonb_typeof((federated_review #> '{proposal,index}'::text[])) = "
+            "'number'::text) AND ((federated_review #>> '{proposal,index}'::text[]) ~ "
+            "'^[1-9][0-9]*$'::text) AND (jsonb_typeof((federated_review #> "
+            "'{proposal,match}'::text[])) = 'object'::text) AND ((federated_review #> "
+            "'{proposal,match}'::text[]) <> '{}'::jsonb) AND ((federated_review #>> "
+            "'{proposal,tier}'::text[]) = ANY (ARRAY['public'::text, 'registered'::text, "
+            "'vetted'::text])))))) AND ((federated_approved_proposal IS NULL) OR "
+            "((auth_method = 'shibboleth'::text) AND (federated_status = ANY "
+            "(ARRAY['approved'::text, 'disabled'::text])) AND (federated_review IS NOT "
+            "NULL) AND (jsonb_typeof(federated_approved_proposal) = 'object'::text) AND "
+            "(federated_approved_proposal ? 'proposal'::text) AND "
+            "((federated_approved_proposal - 'proposal'::text) = '{}'::jsonb) AND "
+            "(((federated_approved_proposal -> 'proposal'::text) = 'null'::jsonb) OR "
+            "((jsonb_typeof((federated_approved_proposal -> 'proposal'::text)) = "
+            "'object'::text) AND ((federated_approved_proposal -> 'proposal'::text) ?& "
+            "ARRAY['index'::text, 'match'::text, 'tier'::text]) AND "
+            "(((federated_approved_proposal -> 'proposal'::text) - ARRAY['index'::text, "
+            "'match'::text, 'tier'::text]) = '{}'::jsonb) AND "
+            "(jsonb_typeof((federated_approved_proposal #> '{proposal,index}'::text[])) = "
+            "'number'::text) AND ((federated_approved_proposal #>> "
+            "'{proposal,index}'::text[]) ~ '^[1-9][0-9]*$'::text) AND "
+            "(jsonb_typeof((federated_approved_proposal #> '{proposal,match}'::text[])) = "
+            "'object'::text) AND ((federated_approved_proposal #> "
+            "'{proposal,match}'::text[]) <> '{}'::jsonb) AND ((federated_approved_proposal "
+            "#>> '{proposal,tier}'::text[]) = ANY (ARRAY['public'::text, "
+            "'registered'::text, 'vetted'::text]))))))) IS TRUE))"
         ),
     ),
     "users_federated_state_check": ConstraintSpec(
@@ -704,11 +996,7 @@ USER_CONSTRAINT_CONTRACT: dict[str, ConstraintSpec] = {
             "(federated_approved_by IS NOT NULL)) OR "
             "((federated_status = 'disabled'::text) AND (NOT is_active) AND "
             "(federated_approved_at IS NOT NULL) AND "
-            "(federated_approved_by IS NOT NULL)) OR "
-            "((federated_status = 'legacy_quarantined'::text) AND "
-            "(NOT is_active) AND (access_tier = 'public'::text) AND "
-            "(NOT is_admin) AND (federated_approved_at IS NULL) AND "
-            "(federated_approved_by IS NULL))))))"
+            "(federated_approved_by IS NOT NULL))))))"
         ),
     ),
     "users_access_tier_check": ConstraintSpec(
@@ -903,7 +1191,11 @@ EMAIL_OUTBOX_CONSTRAINT_CONTRACT: dict[str, ConstraintSpec] = {
             "(ARRAY['duplicate_registration_notice'::text, "
             "'email_change_notice'::text, "
             "'account_credential_fault_notice'::text, "
-            "'account_locked_notice'::text])) "
+            "'account_locked_notice'::text, "
+            "'password_changed_notice'::text, 'totp_enrolled_notice'::text, "
+            "'totp_rotated_notice'::text, 'totp_recovery_authorized_notice'::text, "
+            "'totp_recovery_redeemed_notice'::text, 'totp_recovery_completed_notice'::text, "
+            "'admin_promotion_accepted_notice'::text])) "
             "AND (action_token_hash IS NULL) "
             "AND (expires_at IS NULL))))"
         ),
@@ -1005,8 +1297,10 @@ TABLE_CONSTRAINT_CONTRACTS: dict[
     dict[str, ConstraintSpec],
 ] = {
     "oral_history_datasets": DATASET_CONSTRAINT_CONTRACT,
+    "dataset_admin_state": DATASET_ADMIN_STATE_CONSTRAINT_CONTRACT,
     "sync_status": SYNC_STATUS_CONSTRAINT_CONTRACT,
     "ingestion_failures": INGESTION_FAILURE_CONSTRAINT_CONTRACT,
+    "ingestion_quarantine": INGESTION_QUARANTINE_CONSTRAINT_CONTRACT,
     "users": USER_CONSTRAINT_CONTRACT,
     "totp_recovery_codes": TOTP_RECOVERY_CODE_CONSTRAINT_CONTRACT,
     "admin_promotion_requests": ADMIN_PROMOTION_REQUEST_CONSTRAINT_CONTRACT,
@@ -1045,6 +1339,26 @@ DATASET_INDEX_CONTRACT: dict[str, IndexSpec] = {
             IndexKeySpec(
                 definition="search_text_full",
                 operator_class="gin_trgm_ops",
+            ),
+        ),
+    ),
+    "idx_search_vector_public": IndexSpec(
+        unique=False,
+        method="gin",
+        keys=(
+            IndexKeySpec(
+                definition="search_vector_public",
+                operator_class="tsvector_ops",
+            ),
+        ),
+    ),
+    "idx_search_vector_full": IndexSpec(
+        unique=False,
+        method="gin",
+        keys=(
+            IndexKeySpec(
+                definition="search_vector_full",
+                operator_class="tsvector_ops",
             ),
         ),
     ),
@@ -1243,8 +1557,10 @@ PENDING_TOTP_ROTATION_INDEX_CONTRACT: dict[str, IndexSpec] = {
 
 TABLE_INDEX_CONTRACTS: dict[str, dict[str, IndexSpec]] = {
     "oral_history_datasets": DATASET_INDEX_CONTRACT,
+    "dataset_admin_state": {},
     "sync_status": SYNC_STATUS_INDEX_CONTRACT,
     "ingestion_failures": INGESTION_FAILURE_INDEX_CONTRACT,
+    "ingestion_quarantine": {},
     "users": USER_INDEX_CONTRACT,
     "totp_recovery_codes": TOTP_RECOVERY_CODE_INDEX_CONTRACT,
     "admin_promotion_requests": ADMIN_PROMOTION_REQUEST_INDEX_CONTRACT,
@@ -1253,3 +1569,529 @@ TABLE_INDEX_CONTRACTS: dict[str, dict[str, IndexSpec]] = {
     "sessions": SESSION_INDEX_CONTRACT,
     "pending_totp_rotations": PENDING_TOTP_ROTATION_INDEX_CONTRACT,
 }
+
+
+# PostgreSQL 16 catalog rendering, captured from the initial schema with RLS.
+_CATALOGUE_DISCOVERY_DEFINITION = (
+    " SELECT stored.id,\n"
+    "    stored.uuid,\n"
+    "    stored.title,\n"
+    "    stored.access_level,\n"
+    "    stored.version,\n"
+    "    stored.source,\n"
+    "        CASE\n"
+    "            WHEN ((admin_state.visibility_tier IS NULL) OR (\n"
+    "            CASE stored.visibility_tier\n"
+    "                WHEN 'public'::text THEN 0\n"
+    "                WHEN 'registered'::text THEN 1\n"
+    "                WHEN 'vetted'::text THEN 2\n"
+    "                ELSE 99\n"
+    "            END >=\n"
+    "            CASE admin_state.visibility_tier\n"
+    "                WHEN 'public'::text THEN 0\n"
+    "                WHEN 'registered'::text THEN 1\n"
+    "                WHEN 'vetted'::text THEN 2\n"
+    "                ELSE 99\n"
+    "            END)) THEN stored.visibility_tier\n"
+    "            ELSE admin_state.visibility_tier\n"
+    "        END AS visibility_tier\n"
+    "   FROM (oral_history_datasets stored\n"
+    "     LEFT JOIN dataset_admin_state admin_state ON (((admin_state.sourc"
+    "e = stored.source) AND (admin_state.uuid = stored.uuid))))\n"
+    "  WHERE ((admin_state.hidden_at IS NULL) AND (NOT (EXISTS ( SELECT 1\n"
+    "           FROM ingestion_quarantine quarantine\n"
+    "          WHERE ((quarantine.source = stored.source) AND (quarantine.uuid = stored.uuid))))));"
+)
+
+
+_DATASET_ADMIN_CATALOGUE_DEFINITION = (
+    " SELECT stored.id,\n"
+    "    stored.source,\n"
+    "    stored.uuid,\n"
+    "    stored.visibility_tier AS stored_tier,\n"
+    "        CASE (stored.data -> 'visibility_tier'::text)\n"
+    "            WHEN '\"public\"'::jsonb THEN 'public'::text\n"
+    "            WHEN '\"registered\"'::jsonb THEN 'registered'::text\n"
+    "            WHEN '\"vetted\"'::jsonb THEN 'vetted'::text\n"
+    "            ELSE NULL::text\n"
+    "        END AS record_tier\n"
+    "   FROM (oral_history_datasets stored\n"
+    "     LEFT JOIN dataset_admin_state admin_state ON (((admin_state.sourc"
+    "e = stored.source) AND (admin_state.uuid = stored.uuid))));"
+)
+
+_CATALOGUE_WEB_POLICY_USING = (
+    "((CURRENT_USER = 'oralhistarchiv_web'::name) AND (\n"
+    "CASE visibility_tier\n"
+    "    WHEN 'public'::text THEN 0\n"
+    "    WHEN 'registered'::text THEN 1\n"
+    "    WHEN 'vetted'::text THEN 2\n"
+    "    ELSE 99\n"
+    "END <=\n"
+    "CASE current_setting('app.viewer_tier'::text, true)\n"
+    "    WHEN 'registered'::text THEN 1\n"
+    "    WHEN 'vetted'::text THEN 2\n"
+    "    ELSE 0\n"
+    "END) AND (NOT (EXISTS ( SELECT 1\n"
+    "   FROM dataset_admin_state admin_state\n"
+    "  WHERE ((admin_state.source = oral_history_datasets.source) AND (admi"
+    "n_state.uuid = oral_history_datasets.uuid) AND ((admin_state.hidden_at"
+    " IS NOT NULL) OR ((admin_state.visibility_tier IS NOT NULL) AND (\n"
+    "        CASE admin_state.visibility_tier\n"
+    "            WHEN 'public'::text THEN 0\n"
+    "            WHEN 'registered'::text THEN 1\n"
+    "            WHEN 'vetted'::text THEN 2\n"
+    "            ELSE 99\n"
+    "        END >\n"
+    "        CASE current_setting('app.viewer_tier'::text, true)\n"
+    "            WHEN 'registered'::text THEN 1\n"
+    "            WHEN 'vetted'::text THEN 2\n"
+    "            ELSE 0\n"
+    "        END))))))))"
+)
+
+# Only fixed schema-contract text is composed; no request data enters this expression.
+_CATALOGUE_WEB_POLICY_USING = _CATALOGUE_WEB_POLICY_USING[:-1] + (
+    " AND (NOT (EXISTS ( SELECT 1\n"  # nosec B608  # nosec B608
+    "   FROM ingestion_quarantine quarantine\n"
+    "  WHERE ((quarantine.source = oral_history_datasets.source) AND "
+    "(quarantine.uuid = oral_history_datasets.uuid))))))"
+)
+
+TABLE_ROW_SECURITY_CONTRACTS: dict[str, RowSecuritySpec] = {
+    table: RowSecuritySpec(enabled=table == "oral_history_datasets", forced=False)
+    for table in TABLE_COLUMN_CONTRACTS
+}
+
+TABLE_POLICY_CONTRACTS: dict[str, dict[str, PolicySpec]] = {
+    table: {} for table in TABLE_COLUMN_CONTRACTS
+}
+TABLE_POLICY_CONTRACTS["oral_history_datasets"] = {
+    "catalogue_web_select": PolicySpec(
+        command="r",
+        permissive=True,
+        roles=("PUBLIC",),
+        using=_CATALOGUE_WEB_POLICY_USING,
+        with_check=None,
+    ),
+    "catalogue_scheduler_all": PolicySpec(
+        command="*",
+        permissive=True,
+        roles=("PUBLIC",),
+        using="(CURRENT_USER = 'oralhistarchiv_scheduler'::name)",
+        with_check="(CURRENT_USER = 'oralhistarchiv_scheduler'::name)",
+    ),
+}
+
+VIEW_CONTRACTS: dict[str, ViewSpec] = {
+    "catalogue_discovery": ViewSpec(
+        columns=(
+            ("id", "integer"),
+            ("uuid", "text"),
+            ("title", "text"),
+            ("access_level", "text"),
+            ("version", "text"),
+            ("source", "text"),
+            ("visibility_tier", "text"),
+        ),
+        definition=_CATALOGUE_DISCOVERY_DEFINITION,
+        options=("security_barrier=true", "security_invoker=false"),
+    ),
+    "catalogue_search_candidates": ViewSpec(
+        columns=(("id", "integer"),),
+        definition=CATALOGUE_SEARCH_CANDIDATES_DEFINITION,
+        options=("security_barrier=true", "security_invoker=false"),
+    ),
+    "dataset_admin_catalogue": ViewSpec(
+        columns=(
+            ("id", "integer"),
+            ("source", "text"),
+            ("uuid", "text"),
+            ("stored_tier", "text"),
+            ("record_tier", "text"),
+        ),
+        definition=_DATASET_ADMIN_CATALOGUE_DEFINITION,
+        options=("security_barrier=true", "security_invoker=false"),
+    ),
+}
+
+
+# Three physical audience relations must not share term/filter indexes. Private
+# maintenance functions refresh them inside the source/admin/quarantine write.
+for _signature, _source in SEARCH_FUNCTION_SOURCES.items():
+    _name, _arguments = _signature.split("(", 1)
+    FUNCTION_CONTRACTS[_signature] = FunctionSpec(
+        identity_arguments=_arguments[:-1],
+        result=SEARCH_FUNCTION_RESULTS[_name],
+        language="plpgsql",
+        volatility="s" if _name in SEARCH_STABLE_FUNCTIONS else "v",
+        security_definer=True,
+        strict=False,
+        parallel="u",
+        configuration=("search_path=pg_catalog, public",),
+        source=_source,
+    )
+
+for _table in ("oral_history_datasets", "dataset_admin_state", "ingestion_quarantine"):
+    TRIGGER_CONTRACTS[_table].update(
+        {
+            "trg_search_projection_lock": TriggerSpec(
+                enabled="O",
+                internal=False,
+                trigger_type=30,
+                function_schema_is_application=True,
+                function_name="catalogue_projection_write_lock",
+                definition=(
+                    "CREATE TRIGGER trg_search_projection_lock BEFORE INSERT OR DELETE OR UPDATE "
+                    f"ON public.{_table} FOR EACH STATEMENT "
+                    "EXECUTE FUNCTION catalogue_projection_write_lock()"
+                ),
+            ),
+            "trg_search_projection_refresh": TriggerSpec(
+                enabled="O",
+                internal=False,
+                trigger_type=29,
+                function_schema_is_application=True,
+                function_name="catalogue_refresh_search_projection",
+                definition=(
+                    "CREATE TRIGGER trg_search_projection_refresh AFTER INSERT OR DELETE OR UPDATE "
+                    f"ON public.{_table} FOR EACH ROW "
+                    "EXECUTE FUNCTION catalogue_refresh_search_projection()"
+                ),
+            ),
+        }
+    )
+
+TABLE_COLUMN_CONTRACTS["catalogue_search_policy"] = {
+    "singleton": ColumnSpec("boolean", nullable=False, default="true"),
+    "fingerprint": ColumnSpec("text", nullable=False),
+    "masks": ColumnSpec("jsonb", nullable=False),
+}
+TABLE_CONSTRAINT_CONTRACTS["catalogue_search_policy"] = {
+    "catalogue_search_policy_pkey": ConstraintSpec(kind="primary_key", columns=("singleton",)),
+    "catalogue_search_policy_singleton_check": ConstraintSpec(
+        kind="check", check_definition="CHECK (singleton)"
+    ),
+    "catalogue_search_policy_fingerprint_check": ConstraintSpec(
+        kind="check", check_definition="CHECK ((fingerprint ~ '^[0-9a-f]{64}$'::text))"
+    ),
+}
+TABLE_INDEX_CONTRACTS["catalogue_search_policy"] = {}
+for _audience in SEARCH_AUDIENCES:
+    _table = "catalogue_search_" + _audience
+    TABLE_COLUMN_CONTRACTS[_table] = {
+        "id": ColumnSpec("integer", nullable=False),
+        "upstream_modified_at": ColumnSpec("timestamp with time zone", nullable=True),
+        "public_document": ColumnSpec("text", nullable=False),
+        "literal_document": ColumnSpec("text", nullable=False),
+        "search_vector": ColumnSpec("tsvector", nullable=False),
+        "keywords": ColumnSpec("text[]", nullable=False),
+        "languages": ColumnSpec("text[]", nullable=False),
+        "access_level": ColumnSpec("text", nullable=True),
+    }
+    TABLE_CONSTRAINT_CONTRACTS[_table] = {
+        _table + "_pkey": ConstraintSpec(kind="primary_key", columns=("id",)),
+        _table + "_id_fkey": ConstraintSpec(
+            kind="foreign_key",
+            columns=("id",),
+            referenced_table="oral_history_datasets",
+            referenced_columns=("id",),
+            on_update="NO ACTION",
+            on_delete="CASCADE",
+            references_application_schema=True,
+        ),
+    }
+    TABLE_INDEX_CONTRACTS[_table] = {
+        f"idx_{_table}_{suffix}": IndexSpec(
+            unique=False,
+            method="gin",
+            keys=(IndexKeySpec(column, operator),),
+        )
+        for suffix, column, operator in (
+            ("vector", "search_vector", "tsvector_ops"),
+            ("public_trgm", "public_document", "gin_trgm_ops"),
+            ("literal_trgm", "literal_document", "gin_trgm_ops"),
+            ("keywords", "keywords", "array_ops"),
+            ("languages", "languages", "array_ops"),
+        )
+    }
+    TABLE_INDEX_CONTRACTS[_table][f"idx_{_table}_order"] = IndexSpec(
+        unique=False,
+        method="btree",
+        keys=(
+            IndexKeySpec("upstream_modified_at", "timestamptz_ops", descending=True),
+            IndexKeySpec("id", "int4_ops", descending=True, nulls_first=True),
+        ),
+    )
+for _table in (
+    "catalogue_search_policy",
+    *("catalogue_search_" + item for item in SEARCH_AUDIENCES),
+):
+    TRIGGER_CONTRACTS[_table] = {}
+    TABLE_ROW_SECURITY_CONTRACTS[_table] = RowSecuritySpec(enabled=False, forced=False)
+    TABLE_POLICY_CONTRACTS[_table] = {}
+
+
+# Persistent security state and delivery receipts have no account/catalogue cascade.
+_PRESERVE_SOURCE_SECURITY_STATE_SOURCE = (
+    "\n"
+    "        DECLARE\n"
+    "            retained_tier text;\n"
+    "            asserted_tier text := NEW.data->>'visibility_tier';\n"
+    "        BEGIN\n"
+    "            IF asserted_tier IN ('public', 'registered', 'vetted') AND\n"
+    "                array_position(ARRAY['public', 'registered', 'vetted'], asserted_tier)\n"
+    "                > array_position(ARRAY['public', 'registered', 'vetted'], "
+    "NEW.visibility_tier)\n"
+    "            THEN\n"
+    "                NEW.visibility_tier := asserted_tier;\n"
+    "            END IF;\n"
+    "            INSERT INTO public.source_security_state AS existing (source, "
+    "uuid, visibility_tier)\n"
+    "            VALUES (NEW.source, NEW.uuid, NEW.visibility_tier)\n"
+    "            ON CONFLICT (source, uuid) DO UPDATE SET visibility_tier = CASE\n"
+    "                WHEN asserted_tier IN ('public', 'registered', 'vetted')\n"
+    "                THEN EXCLUDED.visibility_tier\n"
+    "                WHEN array_position(ARRAY['public', 'registered', 'vetted'],\n"
+    "                                    existing.visibility_tier)\n"
+    "                   > array_position(ARRAY['public', 'registered', 'vetted'],\n"
+    "                                    EXCLUDED.visibility_tier)\n"
+    "                THEN existing.visibility_tier ELSE EXCLUDED.visibility_tier END\n"
+    "            RETURNING visibility_tier INTO retained_tier;\n"
+    "            NEW.visibility_tier := retained_tier;\n"
+    "            RETURN NEW;\n"
+    "        END;\n"
+    "        "
+)
+_AUDIT_RESTRICTION_STATE_SOURCE = (
+    "\n"
+    "        DECLARE\n"
+    "            event_name text;\n"
+    "            event_payload jsonb;\n"
+    "        BEGIN\n"
+    "            IF TG_TABLE_NAME = 'ingestion_quarantine' THEN\n"
+    "                IF TG_OP = 'DELETE' THEN\n"
+    "                    event_name := 'ingestion_restored';\n"
+    "                    event_payload := jsonb_build_object(\n"
+    "                        'source', OLD.source, 'uuid', OLD.uuid, 'reason', OLD.reason);\n"
+    "                ELSE\n"
+    "                    event_name := 'ingestion_quarantined';\n"
+    "                    event_payload := jsonb_build_object(\n"
+    "                        'source', NEW.source, 'uuid', NEW.uuid, 'reason', NEW.reason);\n"
+    "                END IF;\n"
+    "            ELSE\n"
+    "                IF TG_OP = 'DELETE' THEN\n"
+    "                    event_name := 'source_restriction_removed';\n"
+    "                    event_payload := jsonb_build_object(\n"
+    "                        'source', OLD.source, 'uuid', OLD.uuid, 'old_tier', "
+    "OLD.visibility_tier);\n"
+    "                ELSE\n"
+    "                    IF TG_OP = 'INSERT' AND NEW.visibility_tier = 'public' THEN\n"
+    "                        RETURN NULL;\n"
+    "                    END IF;\n"
+    "                    IF TG_OP = 'UPDATE' AND NEW.visibility_tier = "
+    "OLD.visibility_tier THEN\n"
+    "                        RETURN NULL;\n"
+    "                    END IF;\n"
+    "                    IF TG_OP = 'UPDATE' AND\n"
+    "                        array_position(ARRAY['public', 'registered', "
+    "'vetted'], NEW.visibility_tier)\n"
+    "                        < array_position(\n"
+    "                            ARRAY['public', 'registered', 'vetted'], OLD.visibility_tier)\n"
+    "                    THEN\n"
+    "                        event_name := 'source_restriction_lowered';\n"
+    "                        event_payload := jsonb_build_object(\n"
+    "                            'source', NEW.source, 'uuid', NEW.uuid,\n"
+    "                            'old_tier', OLD.visibility_tier, 'tier', "
+    "NEW.visibility_tier);\n"
+    "                    ELSE\n"
+    "                        event_name := 'source_restriction_retained';\n"
+    "                        event_payload := jsonb_build_object(\n"
+    "                            'source', NEW.source, 'uuid', NEW.uuid, 'tier', "
+    "NEW.visibility_tier);\n"
+    "                    END IF;\n"
+    "                END IF;\n"
+    "            END IF;\n"
+    "            INSERT INTO public.security_audit_events (event_id, event_type, payload)\n"
+    "            VALUES (gen_random_uuid(), event_name, event_payload);\n"
+    "            RETURN NULL;\n"
+    "        END;\n"
+    "        "
+)
+
+TABLE_COLUMN_CONTRACTS.update(
+    {
+        "source_security_state": {
+            "source": ColumnSpec("text", nullable=False),
+            "uuid": ColumnSpec("text", nullable=False),
+            "visibility_tier": ColumnSpec("text", nullable=False),
+        },
+        "source_binding_acknowledgements": {
+            "source": ColumnSpec("text", nullable=False),
+            "previous_fingerprint": ColumnSpec("text", nullable=False),
+            "source_fingerprint": ColumnSpec("text", nullable=False),
+            "acknowledged_at": ColumnSpec(
+                "timestamp with time zone", nullable=False, default="clock_timestamp()"
+            ),
+        },
+        "security_audit_events": {
+            "event_id": ColumnSpec("uuid", nullable=False),
+            "created_at": ColumnSpec(
+                "timestamp with time zone", nullable=False, default="clock_timestamp()"
+            ),
+            "event_type": ColumnSpec("text", nullable=False),
+            "payload": ColumnSpec("jsonb", nullable=False),
+        },
+        "security_audit_receipts": {
+            "event_id": ColumnSpec("uuid", nullable=False),
+            "delivered_at": ColumnSpec(
+                "timestamp with time zone", nullable=False, default="clock_timestamp()"
+            ),
+        },
+    }
+)
+TABLE_CONSTRAINT_CONTRACTS.update(
+    {
+        "source_security_state": {
+            "source_security_state_pkey": ConstraintSpec(
+                kind="primary_key", columns=("source", "uuid")
+            ),
+            "source_security_state_tier_check": ConstraintSpec(
+                kind="check",
+                check_definition=(
+                    "CHECK ((visibility_tier = ANY (ARRAY['public'::text, "
+                    "'registered'::text, 'vetted'::text])))"
+                ),
+            ),
+        },
+        "source_binding_acknowledgements": {
+            "source_binding_acknowledgements_pkey": ConstraintSpec(
+                kind="primary_key", columns=("source",)
+            ),
+            "source_binding_acknowledgements_previous_check": ConstraintSpec(
+                kind="check",
+                check_definition="CHECK ((previous_fingerprint ~ '^[0-9a-f]{64}$'::text))",
+            ),
+            "source_binding_acknowledgements_target_check": ConstraintSpec(
+                kind="check",
+                check_definition="CHECK ((source_fingerprint ~ '^[0-9a-f]{64}$'::text))",
+            ),
+        },
+        "security_audit_events": {
+            "security_audit_events_pkey": ConstraintSpec(kind="primary_key", columns=("event_id",)),
+            "security_audit_events_payload_check": ConstraintSpec(
+                kind="check",
+                check_definition=(
+                    "CHECK (((jsonb_typeof(payload) = 'object'::text) AND "
+                    "(octet_length((payload)::text) <= 16384)))"
+                ),
+            ),
+        },
+        "security_audit_receipts": {
+            "security_audit_receipts_pkey": ConstraintSpec(
+                kind="primary_key", columns=("event_id",)
+            ),
+            "security_audit_receipts_event_id_fkey": ConstraintSpec(
+                kind="foreign_key",
+                columns=("event_id",),
+                referenced_table="security_audit_events",
+                referenced_columns=("event_id",),
+                on_update="NO ACTION",
+                on_delete="RESTRICT",
+                references_application_schema=True,
+            ),
+        },
+    }
+)
+for _table in (
+    "source_security_state",
+    "source_binding_acknowledgements",
+    "security_audit_events",
+    "security_audit_receipts",
+):
+    TABLE_INDEX_CONTRACTS[_table] = {}
+    TABLE_ROW_SECURITY_CONTRACTS[_table] = RowSecuritySpec(enabled=False, forced=False)
+    TABLE_POLICY_CONTRACTS[_table] = {}
+    TRIGGER_CONTRACTS[_table] = {}
+TABLE_INDEX_CONTRACTS["security_audit_events"]["idx_security_audit_events_created"] = IndexSpec(
+    unique=False,
+    method="btree",
+    keys=(IndexKeySpec("created_at", "timestamptz_ops"), IndexKeySpec("event_id", "uuid_ops")),
+)
+
+for _name, _body in (
+    ("catalogue_preserve_source_security_state", _PRESERVE_SOURCE_SECURITY_STATE_SOURCE),
+    ("catalogue_audit_restriction_state", _AUDIT_RESTRICTION_STATE_SOURCE),
+):
+    FUNCTION_CONTRACTS[_name + "()"] = FunctionSpec(
+        identity_arguments="",
+        result="trigger",
+        language="plpgsql",
+        volatility="v",
+        security_definer=True,
+        strict=False,
+        parallel="u",
+        configuration=("search_path=pg_catalog, public",),
+        source=_body,
+    )
+TRIGGER_CONTRACTS["oral_history_datasets"]["oral_history_datasets_security_state"] = TriggerSpec(
+    enabled="O",
+    internal=False,
+    trigger_type=23,
+    function_schema_is_application=True,
+    function_name="catalogue_preserve_source_security_state",
+    definition=(
+        "CREATE TRIGGER oral_history_datasets_security_state BEFORE INSERT OR UPDATE "
+        "ON public.oral_history_datasets FOR EACH ROW EXECUTE FUNCTION "
+        "catalogue_preserve_source_security_state()"
+    ),
+)
+for _table, _trigger in (
+    ("source_security_state", "source_security_state_audit"),
+    ("ingestion_quarantine", "ingestion_quarantine_audit"),
+):
+    TRIGGER_CONTRACTS[_table][_trigger] = TriggerSpec(
+        enabled="O",
+        internal=False,
+        trigger_type=29,
+        function_schema_is_application=True,
+        function_name="catalogue_audit_restriction_state",
+        definition=(
+            f"CREATE TRIGGER {_trigger} AFTER INSERT OR DELETE OR UPDATE ON "
+            f"public.{_table} FOR EACH ROW EXECUTE FUNCTION "
+            "catalogue_audit_restriction_state()"
+        ),
+    )
+
+
+TABLE_COLUMN_CONTRACTS["anonymous_mail_issuance"] = {
+    "id": ColumnSpec("uuid", nullable=False),
+    "recipient_key": ColumnSpec("text", nullable=False),
+    "created_at": ColumnSpec(
+        "timestamp with time zone", nullable=False, default="clock_timestamp()"
+    ),
+}
+TABLE_CONSTRAINT_CONTRACTS["anonymous_mail_issuance"] = {
+    "anonymous_mail_issuance_pkey": ConstraintSpec(kind="primary_key", columns=("id",)),
+    "anonymous_mail_issuance_recipient_check": ConstraintSpec(
+        kind="check", check_definition="CHECK ((recipient_key ~ '^[0-9a-f]{64}$'::text))"
+    ),
+}
+TABLE_INDEX_CONTRACTS["anonymous_mail_issuance"] = {
+    "idx_anonymous_mail_issuance_created": IndexSpec(
+        unique=False, method="btree", keys=(IndexKeySpec("created_at", "timestamptz_ops"),)
+    ),
+    "idx_anonymous_mail_issuance_recipient": IndexSpec(
+        unique=False,
+        method="btree",
+        keys=(
+            IndexKeySpec("recipient_key", "text_ops"),
+            IndexKeySpec("created_at", "timestamptz_ops"),
+        ),
+    ),
+}
+TRIGGER_CONTRACTS["anonymous_mail_issuance"] = {}
+TABLE_ROW_SECURITY_CONTRACTS["anonymous_mail_issuance"] = RowSecuritySpec(
+    enabled=False, forced=False
+)
+TABLE_POLICY_CONTRACTS["anonymous_mail_issuance"] = {}

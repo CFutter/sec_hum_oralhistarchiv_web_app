@@ -18,11 +18,12 @@ from psycopg.rows import tuple_row
 from psycopg.sql import Composable
 from psycopg_pool import AsyncConnectionPool
 
-from app.credentials import normalize_email
+from app.duration_contract import validate_unverified_reap_after_days
+from app.service_errors import UserInputRejected, UserNotFound
+from app.sources import AccessTier
 from config import settings
 
-from ..federation_contract import valid_federated_identity
-from .access_tiers import AccessTier
+from ..federation_contract import REVIEW_REVISION_MAX, valid_federated_identity
 from .crypto import audit_email_hash
 from .db import get_db_cursor
 from .db_constraints import is_users_email_collision
@@ -43,27 +44,13 @@ _ADMIN_ACTION_LOCK = 0x4F484141
 DISPLAY_NAME_MAX_LENGTH = 200
 
 AuthMethod = Literal["local", "shibboleth"]
-FederatedStatus = Literal[
-    "pending",
-    "approved",
-    "disabled",
-    "legacy_quarantined",
-]
+FederatedStatus = Literal["pending", "approved", "disabled"]
 
 _FEDERATED_ADMIN_MUTATION_ALLOWED = frozenset({"approved", "disabled"})
 _ACCESS_TIERS: tuple[AccessTier, ...] = ("public", "registered", "vetted")
 
 
-class UserAlreadyExistsError(ValueError):
-    """Local registration collided with an existing case-insensitive email address."""
-
-    def __init__(self, email: str):
-        """Store the conflicting email and include it in the exception message."""
-        self.email = email
-        super().__init__(f"User already exists [{email}]")
-
-
-class AdminActionRejected(ValueError):
+class AdminActionRejected(UserInputRejected):
     """The acting administrator or the requested membership change is invalid."""
 
 
@@ -106,6 +93,19 @@ class User:
     federated_status: FederatedStatus | None = None
     federated_approved_at: datetime | None = None
     federated_approved_by: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FederatedApproval:
+    """Committed user and the exact proposal reviewed during approval.
+
+    Audit callers use these locked transaction values, never posted proposal
+    attributes or a later read that could observe another assertion.
+    """
+
+    user: User
+    proposed_tier: AccessTier | None
+    proposed_rule: dict[str, Any] | None
 
 
 _ASCII_PRINTABLE_START = 0x20
@@ -193,11 +193,11 @@ async def _guard_admin_membership_change_cur(
     new_is_active: bool | None = None,
     new_is_admin: bool | None = None,
 ) -> dict[str, Any]:
-    """Guard the actor, lock the target, and return its membership snapshot.
+    """Guard the actor, lock the target and return its membership snapshot.
 
-    None proposed values mean no change to that property. Reject self-demotion,
-    self-deactivation, or removal of the last active admin with
-    AdminActionRejected; raise ValueError for a missing target.
+    None leaves a proposed property unchanged. Raise AdminActionRejected for
+    self-demotion/deactivation, last-active-admin removal or activating a
+    passwordless local account; raise UserNotFound for a missing target.
     """
     await guard_current_admin_session_cur(
         cur,
@@ -205,13 +205,20 @@ async def _guard_admin_membership_change_cur(
         actor_session_id=actor_session_id,
     )
     await cur.execute(
-        """SELECT is_active, is_admin, auth_method, federated_status
+        """SELECT is_active, is_admin, auth_method, federated_status,
+                  (password_hash IS NOT NULL) AS password_configured
            FROM users WHERE id = %s FOR UPDATE""",
         (user_id,),
     )
     target: dict[str, Any] | None = await cur.fetchone()
     if target is None:
-        raise ValueError(f"User {user_id} not found")
+        raise UserNotFound(f"User {user_id} not found")
+    if (
+        new_is_active is True
+        and target.get("auth_method") == "local"
+        and not target["password_configured"]
+    ):
+        raise AdminActionRejected("This account must complete email setup before activation.")
     if actor_id == user_id and new_is_active is False:
         raise AdminActionRejected("You cannot deactivate your own account.")
     if actor_id == user_id and new_is_admin is False:
@@ -242,17 +249,16 @@ def _reject_unapproved_federated_admin_change(target: dict[str, Any]) -> None:
 
 
 def normalize_display_name(raw: str) -> str:
-    """Strip whitespace; require 1..200 characters without ASCII controls or DEL.
-
-    Raise ValueError on failure; other Unicode controls are not rejected.
-    """
+    """Strip to 1..200 chars without ASCII controls/DEL, or raise UserInputRejected."""
     name = raw.strip()
     if not name:
-        raise ValueError("Display name cannot be empty.")
+        raise UserInputRejected("Display name cannot be empty.")
     if len(name) > DISPLAY_NAME_MAX_LENGTH:
-        raise ValueError(f"Display name must be at most {DISPLAY_NAME_MAX_LENGTH} characters.")
+        raise UserInputRejected(
+            f"Display name must be at most {DISPLAY_NAME_MAX_LENGTH} characters."
+        )
     if any(ord(c) < _ASCII_PRINTABLE_START or ord(c) == _ASCII_DELETE for c in name):
-        raise ValueError("Display name cannot contain control characters.")
+        raise UserInputRejected("Display name cannot contain control characters.")
     return name
 
 
@@ -407,38 +413,6 @@ async def list_users(
     return [parse_user(r) for r in rows], rows[0]["total_count"]
 
 
-async def insert_unverified_local_user_cur(
-    cur: AsyncCursor[Any],
-    *,
-    email: str,
-    display_name: str,
-    password_hash: str,
-    affiliation: str | None = None,
-    country: str | None = None,
-) -> User:
-    """Insert and return a public local account in the caller's transaction.
-
-    Normalize email/display_name; raise ValueError for invalid values.
-    password_hash must already be hashed; profile metadata is passed through.
-    Database defaults supply active/unverified state. UniqueViolation propagates
-    on collisions; a missing RETURNING row raises RuntimeError.
-    """
-    normalized = normalize_email(email)
-    if normalized is None:
-        raise ValueError("Please enter a valid email address.")
-    await cur.execute(
-        sql.SQL("""INSERT INTO users (email, display_name, affiliation, country,
-            password_hash, auth_method, access_tier)
-            VALUES (%s, %s, %s, %s, %s, 'local', 'public')
-            RETURNING {}""").format(USER_COLUMNS_SQL),
-        (normalized, normalize_display_name(display_name), affiliation, country, password_hash),
-    )
-    row = await cur.fetchone()
-    if not row:
-        raise RuntimeError(f"Failed to create user: {email}")
-    return parse_user(row)
-
-
 async def create_shibboleth_user_cur(
     cur: AsyncCursor[Any],
     *,
@@ -578,17 +552,19 @@ async def approve_federated_user(
     *,
     expected_issuer: str,
     expected_subject_id: str,
+    expected_review_revision: int,
     access_tier: AccessTier,
     actor_id: int,
     actor_session_id: str,
-) -> User:
+) -> FederatedApproval:
     """Approve an exact pending identity/tier under current federation and admin policy.
 
-    Match the review's case-sensitive issuer/subject and an enabled trusted
-    issuer; set active/approved, retain nonadmin/unverified status, clear lockout,
-    advance auth_revision, record approver/time, and revoke sessions atomically.
-    Return the updated User. Raise AdminActionRejected for invalid/stale policy,
-    actor, or review state; ValueError for a missing target.
+    Match the review's case-sensitive issuer/subject, revision and an enabled
+    trusted issuer; set active/approved, retain nonadmin/unverified status, clear
+    lockout, advance auth_revision, record approver/time and proposal baseline,
+    and revoke sessions atomically. Return the updated User and reviewed proposal
+    for audit. Raise AdminActionRejected for invalid/stale policy, actor or review
+    state; UserNotFound for a missing target. Unobserved rows cannot be approved.
     """
     identity_values_are_exact = valid_federated_identity(expected_issuer, expected_subject_id)
     federation_is_currently_trusted = (
@@ -596,6 +572,8 @@ async def approve_federated_user(
     )
     if (
         not identity_values_are_exact
+        or type(expected_review_revision) is not int
+        or not 1 <= expected_review_revision <= REVIEW_REVISION_MAX
         or access_tier not in _ACCESS_TIERS
         or not federation_is_currently_trusted
     ):
@@ -624,7 +602,9 @@ async def approve_federated_user(
                           auth_revision = auth_revision + 1,
                           federated_status = 'approved',
                           federated_approved_at = clock_timestamp(),
-                          federated_approved_by = %(actor_id)s
+                          federated_approved_by = %(actor_id)s,
+                          federated_approved_proposal =
+                              jsonb_build_object('proposal', federated_review -> 'proposal')
                     WHERE id = %(user_id)s
                       AND auth_method = 'shibboleth'
                       AND federated_status = 'pending'
@@ -633,12 +613,15 @@ async def approve_federated_user(
                       AND NOT email_verified
                       AND shibboleth_issuer = %(expected_issuer)s
                       AND shibboleth_subject_id = %(expected_subject_id)s
-                RETURNING {}"""
+                      AND federated_review_revision = %(expected_review_revision)s
+                      AND federated_review IS NOT NULL
+                RETURNING {}, federated_review -> 'proposal' AS reviewed_proposal"""
             ).format(USER_COLUMNS_SQL),
             {
                 "user_id": user_id,
                 "expected_issuer": expected_issuer,
                 "expected_subject_id": expected_subject_id,
+                "expected_review_revision": expected_review_revision,
                 "access_tier": access_tier,
                 "actor_id": actor_id,
             },
@@ -649,7 +632,12 @@ async def approve_federated_user(
             # that predates approval in the same transaction, so only a later,
             # freshly validated assertion can create an authenticated session.
             await delete_user_sessions_cur(cur, user_id)
-            return parse_user(row)
+            proposal = row["reviewed_proposal"]
+            return FederatedApproval(
+                user=parse_user(row),
+                proposed_tier=proposal["tier"] if proposal is not None else None,
+                proposed_rule=proposal,
+            )
 
         # Distinguish a stale/mismatched review from a deleted target without
         # exposing either case outside the administrator-only route.  The
@@ -660,9 +648,9 @@ async def approve_federated_user(
             (user_id,),
         )
         if await cur.fetchone() is None:
-            raise ValueError(f"User {user_id} not found")
+            raise UserNotFound(f"User {user_id} not found")
         raise AdminActionRejected(
-            "The federated identity changed or is no longer pending approval."
+            "The federated identity or review changed, or is no longer pending approval."
         )
 
 
@@ -676,8 +664,8 @@ async def update_access_tier(
 ) -> tuple[AccessTier, AccessTier]:
     """Guard the admin, lock the target, and commit its (old, new) access tiers.
 
-    Reject unapproved/quarantined federation states with AdminActionRejected;
-    the actor guard uses the same error. A missing target raises ValueError.
+    Reject federated states other than approved/disabled with AdminActionRejected;
+    the actor guard uses the same error. A missing target raises UserNotFound.
     new_tier is passed to the database without runtime validation; schema
     constraints reject invalid values. Existing sessions are retained.
     """
@@ -694,7 +682,7 @@ async def update_access_tier(
         )
         target = await cur.fetchone()
         if target is None:
-            raise ValueError(f"User {user_id} not found")
+            raise UserNotFound(f"User {user_id} not found")
         _reject_unapproved_federated_admin_change(target)
 
         await cur.execute(
@@ -708,12 +696,14 @@ async def update_access_tier(
         )
         row = await cur.fetchone()
         if not row:
-            raise ValueError(f"User {user_id} not found")
+            raise UserNotFound(f"User {user_id} not found")
         return (target["access_tier"], row["new_value"])
 
 
 async def update_display_name(pool: AsyncConnectionPool, user_id: int, new_name: str) -> None:
-    """Commit normalize_display_name(new_name); raise ValueError for invalid/missing user.
+    """Commit the normalized name; reject invalid input or a missing user.
+
+    Raise UserInputRejected for validation and UserNotFound for a missing target.
 
     The caller must authorize self-service; this helper does not check a session.
     """
@@ -725,7 +715,7 @@ async def update_display_name(pool: AsyncConnectionPool, user_id: int, new_name:
             (normalized, user_id),
         )
         if not await cur.fetchone():
-            raise ValueError(f"User {user_id} not found")
+            raise UserNotFound(f"User {user_id} not found")
 
     logger.info("Display name updated for user %d", user_id)
 
@@ -738,15 +728,15 @@ async def set_user_active(
     actor_id: int,
     actor_session_id: str,
 ) -> SetActiveResult:
-    """Commit active state under admin/self-change/last-active-admin guards.
+    """Commit active state under administrator and membership guards.
 
-    Every request advances auth_revision. Activation clears failures/lockout and
-    pending email changes but retains sessions; pending/quarantined federated
-    users cannot activate here. Deactivation preserves lockout, revokes sessions
-    and pending capabilities, and changes approved federation state to disabled;
-    reactivation restores approved. Return old/new and whether failures or a
-    lock timestamp were cleared. AdminActionRejected signals policy rejection;
-    ValueError signals a missing target. All writes roll back together.
+    Every call advances auth_revision. Activation requires credentials for local
+    users or approved/disabled federation state; it clears failures, lockout and
+    pending email changes while retaining sessions. Deactivation preserves
+    lockout, revokes sessions/pending capabilities and disables approved federation
+    state. Reactivation restores approved. Return old/new values and whether
+    failure counters or lockout were cleared. AdminActionRejected signals policy
+    rejection; UserNotFound signals a missing target. All writes roll back together.
     """
     if is_active:
         sql_text = """
@@ -814,7 +804,7 @@ async def set_user_active(
         row = await cur.fetchone()
 
         if row is None:
-            raise ValueError(f"User {user_id} not found")
+            raise UserNotFound(f"User {user_id} not found")
 
         if is_active:
             await invalidate_pending_email_change_cur(cur, user_id)
@@ -841,8 +831,8 @@ async def set_user_admin(
 
     is_admin=True raises AdminActionRejected: use the promotion workflow. The
     admin guard also rejects unauthorized actors, self-demotion, last-admin
-    removal, and pending/quarantined federation state. Missing target raises
-    ValueError. Target row locking makes the returned old value authoritative.
+    removal, and federated states other than approved/disabled. Missing target raises
+    UserNotFound. Target row locking makes the returned old value authoritative.
     """
     if is_admin:
         raise AdminActionRejected(
@@ -869,7 +859,7 @@ async def set_user_admin(
         )
         row = await cur.fetchone()
         if not row:
-            raise ValueError(f"User {user_id} not found")
+            raise UserNotFound(f"User {user_id} not found")
         return (target["is_admin"], row["new_value"])
 
 
@@ -883,12 +873,15 @@ async def reap_unverified_accounts(
 ) -> int:
     """Delete at most 1,000 stale unverified local nonadmin users and return the count.
 
-    None age uses UNVERIFIED_REAP_AFTER_DAYS; explicit ages are not validated.
+    None age uses UNVERIFIED_REAP_AFTER_DAYS. Require an integer age of 1..3650
+    days before acquiring a connection; invalid ages raise ValueError.
     Commit independent batches of 100, skip locked rows, and audit deleted IDs
     with email hashes. Each batch has 250ms lock/5s statement limits; errors
     propagate after earlier batches have committed.
     """
-    max_age_days = settings.unverified_reap_after_days if max_age_days is None else max_age_days
+    max_age_days = validate_unverified_reap_after_days(
+        settings.unverified_reap_after_days if max_age_days is None else max_age_days
+    )
     total = 0
     for _ in range(_REAP_MAX_BATCHES):
         async with get_db_cursor(pool) as cur:

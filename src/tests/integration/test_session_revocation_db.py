@@ -1,13 +1,4 @@
-"""Integration tests for revocation cascades against real PostgreSQL.
-
-Sensitive account actions — confirming an email change, resetting a
-password, an admin deactivating an account, or a bulk force-logout — must
-invalidate every other in-flight pending capability (a different pending
-email change, a pending password reset, a pending TOTP enrollment) and mark
-any queued mail for those capabilities as dead, alongside killing sessions.
-Session lifecycle itself (creation, lookup, flash, cleanup) lives in
-test_sessions_db.py.
-"""
+"""Integration tests for revocation cascades against real PostgreSQL."""
 
 import asyncio
 from datetime import UTC, datetime, timedelta
@@ -19,9 +10,10 @@ import pyotp
 import pytest
 
 from app.services import email_change, password_reset, session_revocation, sessions, totp, users
-from app.services.crypto import encrypt_outbox_body, encrypt_value
+from app.services.crypto import encrypt_outbox_body
 from app.services.session_ids import hash_session_id
 from app.services.tokens import hash_token
+from app.services.totp_crypto import encrypt_value
 from tests.integration.conftest import DEFAULT_PASSWORD
 
 _TOTP_TIME = 1_800_000_000
@@ -36,6 +28,7 @@ ACTION_TYPES = (
 
 
 def _revision(sync_conn, user_id: int) -> int:
+    """Read the user's current authentication revision."""
     return sync_conn.execute(
         "SELECT auth_revision FROM users WHERE id = %s",
         (user_id,),
@@ -43,6 +36,7 @@ def _revision(sync_conn, user_id: int) -> int:
 
 
 def _pending_state(sync_conn, user_id: int):
+    """Read all pending enrollment and account-action credential fields."""
     return sync_conn.execute(
         """SELECT pending_totp_secret, pending_totp_created_at,
                   pending_email, pending_email_token_hash,
@@ -62,6 +56,7 @@ def _seed_all_pending_state(
     email_change_hash: str,
     reset_hash: str,
 ) -> None:
+    """Populate pending account credentials and action emails for revocation assertions."""
     verification_hash = "v" * 64
     sync_conn.execute(
         """UPDATE users
@@ -116,6 +111,7 @@ def _seed_all_pending_state(
 
 
 def _assert_cleared(sync_conn, user_id: int) -> None:
+    """Check pending credentials and action emails were invalidated."""
     assert _pending_state(sync_conn, user_id) == (None,) * 9
     rows = sync_conn.execute(
         """SELECT message_type, status, last_error
@@ -152,6 +148,7 @@ class TestSensitiveActionsClearPendingCapabilities:
         session_factory,
         sync_conn,
     ):
+        """Verify email confirmation clears other capabilities and mail."""
         user = user_factory(email="user@example.test")
         session_factory(user.id, purpose="full")
         revision = _revision(sync_conn, user.id)
@@ -171,7 +168,7 @@ class TestSensitiveActionsClearPendingCapabilities:
             db_pool,
             user.id,
             NEW_EMAIL,
-            hash_token(email_token),
+            email_token,
             expected_auth_revision=revision,
         )
 
@@ -192,7 +189,9 @@ class TestSensitiveActionsClearPendingCapabilities:
         session_factory,
         sync_conn,
     ):
-        user = user_factory(email="user@example.test")
+        """Verify password reset kills older email change and pending state."""
+        secret = pyotp.random_base32()
+        user = user_factory(email="user@example.test", totp_secret=encrypt_value(secret))
         session_factory(user.id, purpose="full")
         revision = _revision(sync_conn, user.id)
         email_token = email_change.generate_email_change_token(
@@ -211,9 +210,10 @@ class TestSensitiveActionsClearPendingCapabilities:
         await password_reset.update_password_with_token(
             db_pool,
             user.id,
-            hash_token(reset_token),
+            reset_token,
             NEW_PASSWORD,
             expected_email=user.email,
+            totp_code=pyotp.TOTP(secret).now(),
         )
 
         assert _revision(sync_conn, user.id) == revision + 1
@@ -222,7 +222,7 @@ class TestSensitiveActionsClearPendingCapabilities:
             db_pool,
             user.id,
             NEW_EMAIL,
-            hash_token(email_token),
+            email_token,
             expected_auth_revision=revision,
         )
 
@@ -233,6 +233,7 @@ class TestSensitiveActionsClearPendingCapabilities:
         session_factory,
         sync_conn,
     ):
+        """Verify revoking all sessions clears capabilities and mail."""
         user = user_factory(email="user@example.test")
         session_factory(user.id, purpose="full")
         revision = _revision(sync_conn, user.id)
@@ -260,6 +261,7 @@ class TestSensitiveActionsClearPendingCapabilities:
         session_factory,
         sync_conn,
     ):
+        """Verify deactivation clears capabilities and mail."""
         admin = user_factory(is_admin=True)
         admin_session = session_factory(admin.id, purpose="full")
         target = user_factory(email="user@example.test")
@@ -300,6 +302,7 @@ class TestEmailChangeConfirmationRejectsRevisionMismatch:
         user_factory,
         sync_conn,
     ):
+        """Verify rejects revision mismatch even if cleanup is bypassed."""
         user = user_factory()
         revision = _revision(sync_conn, user.id)
         token = email_change.generate_email_change_token(
@@ -324,7 +327,7 @@ class TestEmailChangeConfirmationRejectsRevisionMismatch:
             db_pool,
             user.id,
             NEW_EMAIL,
-            hash_token(token),
+            token,
             expected_auth_revision=revision,
         )
         assert (
@@ -354,6 +357,7 @@ class TestSelfEmailChangeRequiresLiveExactSession:
         user_factory,
         session_factory,
     ):
+        """Verify requires a live exact full session."""
         user = user_factory()
         raw_session = session_factory(user.id, purpose=purpose)
         if purpose == "full":
@@ -373,6 +377,7 @@ class TestSelfEmailChangeRequiresLiveExactSession:
                 session_id=raw_session,
                 current_password=DEFAULT_PASSWORD,
                 new_email=NEW_EMAIL,
+                totp_code="111111",
             )
         assert exc_info.value.reason == "invalid_session"
 
@@ -390,7 +395,9 @@ class TestConcurrentSessionRevocationDuringEmailChangeStaging:
         sync_conn,
         monkeypatch,
     ):
-        user = user_factory(email="user@example.test")
+        """Verify revoke all serializes after staging and removes its result."""
+        secret = pyotp.random_base32()
+        user = user_factory(email="user@example.test", totp_secret=encrypt_value(secret))
         raw_session = session_factory(user.id, purpose="full")
         revision = _revision(sync_conn, user.id)
         entered_enqueue = asyncio.Event()
@@ -399,6 +406,7 @@ class TestConcurrentSessionRevocationDuringEmailChangeStaging:
         calls = 0
 
         async def pause_first_enqueue(cur, *, user_id, email, action):
+            """Pause the first enqueue to expose the transaction race."""
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -425,6 +433,7 @@ class TestConcurrentSessionRevocationDuringEmailChangeStaging:
                 session_id=raw_session,
                 current_password=DEFAULT_PASSWORD,
                 new_email=NEW_EMAIL,
+                totp_code=pyotp.TOTP(secret).now(),
             )
         )
         await asyncio.wait_for(entered_enqueue.wait(), timeout=5)
@@ -459,6 +468,7 @@ class TestConcurrentSessionRevocationDuringEmailChangeStaging:
 
 
 def _seed_rotation_challenge(sync_conn, user_id, raw_session, revision, replacement_secret):
+    """Insert and commit a session-bound pending rotation challenge."""
     sync_conn.execute(
         """INSERT INTO pending_totp_rotations
                (user_id, session_id, auth_revision, encrypted_secret, expires_at)
@@ -469,6 +479,7 @@ def _seed_rotation_challenge(sync_conn, user_id, raw_session, revision, replacem
 
 
 def _counts(sync_conn, user_id):
+    """Return the user's stored session and pending-rotation counts."""
     sessions_left = sync_conn.execute(
         "SELECT count(*) FROM sessions WHERE user_id = %s", (user_id,)
     ).fetchone()[0]
@@ -496,6 +507,7 @@ class TestConcurrentRevocationDuringPendingTotpRotation:
         sync_conn,
         monkeypatch,
     ):
+        """Verify bulk revocation and rotation confirmation never deadlock."""
         active_secret = pyotp.random_base32()
         replacement_secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(active_secret))
@@ -510,6 +522,7 @@ class TestConcurrentRevocationDuringPendingTotpRotation:
         real_delete = session_revocation.delete_user_sessions_cur
 
         async def paused_delete(cur, user_id):
+            """Delete sessions with the real helper, then hold the transaction at the gate."""
             await real_delete(cur, user_id)
             entered.set()
             await release.wait()
@@ -592,12 +605,7 @@ class TestConcurrentRevocationDuringPendingTotpRotation:
         sync_conn,
         monkeypatch,
     ):
-        """The other paired trigger the brief calls out: logging out the
-        exact session races the same confirmation. `delete_session` deletes
-        a single session row directly (no lock-order helper to gate), so
-        this races the two real coroutines on independent connections
-        without forcing a specific interleaving; either winner still leaves
-        a coherent, deadlock-free result."""
+        """Verify logout and rotation confirmation never deadlock."""
         active_secret = pyotp.random_base32()
         replacement_secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(active_secret))
@@ -626,6 +634,7 @@ class TestConcurrentRevocationDuringPendingTotpRotation:
 
 
 def _challenge_exists(sync_conn, user_id) -> bool:
+    """Check whether a pending rotation row exists for the user."""
     return (
         sync_conn.execute(
             "SELECT 1 FROM pending_totp_rotations WHERE user_id = %s", (user_id,)
@@ -642,6 +651,7 @@ class TestSessionLifecycleCascadesExactChallenge:
     and never a different user's still-live challenge."""
 
     def _seed_two_users_with_challenges(self, sync_conn, user_factory, session_factory, **kwargs):
+        """Create two users with independent pending rotations and sessions."""
         target = user_factory(totp_secret=encrypt_value(pyotp.random_base32()))
         target_session = session_factory(target.id, purpose="full", **kwargs)
         bystander = user_factory(totp_secret=encrypt_value(pyotp.random_base32()))
@@ -665,6 +675,7 @@ class TestSessionLifecycleCascadesExactChallenge:
     async def test_logout_cascades_exactly_the_challenge_bound_to_that_session(
         self, db_pool, user_factory, session_factory, sync_conn
     ):
+        """Verify logout cascades exactly the challenge bound to that session."""
         target, target_session, bystander = self._seed_two_users_with_challenges(
             sync_conn, user_factory, session_factory
         )
@@ -677,6 +688,7 @@ class TestSessionLifecycleCascadesExactChallenge:
     async def test_expiry_cleanup_cascades_exactly_the_challenge_bound_to_that_session(
         self, db_pool, user_factory, session_factory, sync_conn
     ):
+        """Verify expiry cleanup cascades exactly the challenge bound to that session."""
         target, _target_session, bystander = self._seed_two_users_with_challenges(
             sync_conn, user_factory, session_factory, expires_in_seconds=-10
         )
@@ -690,6 +702,7 @@ class TestSessionLifecycleCascadesExactChallenge:
     async def test_direct_revocation_cascades_exactly_the_challenge_bound_to_that_session(
         self, db_pool, user_factory, session_factory, sync_conn
     ):
+        """Verify direct revocation cascades exactly the challenge bound to that session."""
         target, _target_session, bystander = self._seed_two_users_with_challenges(
             sync_conn, user_factory, session_factory
         )
@@ -708,6 +721,7 @@ class TestUserDeletionCascadesItsChallenges:
     async def test_deleting_the_user_row_removes_its_challenge_and_leaves_no_ciphertext(
         self, user_factory, session_factory, sync_conn
     ):
+        """Verify deleting the user row removes its challenge and leaves no ciphertext."""
         target = user_factory(totp_secret=encrypt_value(pyotp.random_base32()))
         target_session = session_factory(target.id, purpose="full")
         bystander = user_factory(totp_secret=encrypt_value(pyotp.random_base32()))

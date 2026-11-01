@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% set active_page = "account" %}
-{% block title %}Administrator Invitation — Oral History Archive{% endblock %}
+{% block title %}Administrator Invitation — {{ site_name }}{% endblock %}
 
 {% block content %}
 <section class="container auth-page">
@@ -69,7 +69,7 @@
           id="current_password"
           name="current_password"
           required
-          maxlength="200"
+          maxlength="{{ local_password_max_chars }}"
           autocomplete="current-password"
         >
       </div>
@@ -80,8 +80,8 @@
           id="totp_code"
           name="totp_code"
           required
-          maxlength="6"
-          pattern="[0-9]{6}"
+          maxlength="{{ totp_code_raw_max_chars }}"
+          pattern="[0-9\s]{6,{{ totp_code_raw_max_chars }}}"
           inputmode="numeric"
           autocomplete="one-time-code"
         >

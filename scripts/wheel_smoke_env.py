@@ -6,7 +6,27 @@ These public fixture values must never be used as production credentials.
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Mapping
 from typing import Final
+
+_SMOKE_HOST_ENV_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "USERPROFILE",
+    }
+)
 
 _REQUIRED_SETTINGS: Final[frozenset[str]] = frozenset(
     {
@@ -24,9 +44,8 @@ _REQUIRED_SETTINGS: Final[frozenset[str]] = frozenset(
         "SHIBBOLETH_ENABLED",
         "COOKIES_SECURE",
         "FASTAPI_DEBUG",
-        "SEED_MOCK_DATA",
-        "OAI_INSTITUTION_FILTER",
-        "SWISSUBASE_OAI_PMH_URL",
+        "SOURCES_CONFIG_FILE",
+        "ALLOW_FIXTURE_SOURCE",
     }
 )
 
@@ -42,8 +61,6 @@ _WHEEL_SMOKE_ENV: Final[dict[str, str]] = {
     "OUTBOX_ENCRYPTION_KEYS": '["pQ8vN2rL6xB9mD4sF7hJ1kC5wY0zA3eR6tU9iO2gH5bV8nM4"]',
     "HEALTH_DETAIL_TOKEN": "hT7dK2mQ9wX4vB8zN1cR5jF0aG3sL6eY9uP2iO5tM8kW3qE7",
     "ALLOWED_HOSTS": '["localhost", "127.0.0.1", "testserver"]',
-    "OAI_INSTITUTION_FILTER": "Universität Kassel",
-    "SWISSUBASE_OAI_PMH_URL": "https://www.swissubase.ch/oai-pmh/v1/oai",
     "RATE_LIMIT_ENABLED": "true",
     "RATE_LIMIT_PER_MINUTE": "30",
     "RATE_LIMIT_PER_HOUR": "1000",
@@ -56,9 +73,10 @@ _WHEEL_SMOKE_ENV: Final[dict[str, str]] = {
     "CORS_ENABLED": "false",
     "COOKIES_SECURE": "false",
     "FASTAPI_DEBUG": "false",
-    "SEED_MOCK_DATA": "false",
     "LOG_LEVEL": "INFO",
     "LOG_FORMAT": "json",
+    "SOURCES_CONFIG_FILE": "",
+    "ALLOW_FIXTURE_SOURCE": "false",
 }
 
 
@@ -81,9 +99,23 @@ def smoke_environment() -> dict[str, str]:
     return _WHEEL_SMOKE_ENV.copy()
 
 
+def smoke_process_environment(host_environment: Mapping[str, str]) -> dict[str, str]:
+    """Return allowed host variables plus fixed settings for offline runtime probes.
+
+    Unknown variables are excluded even when future application settings are
+    added. Build/download commands must continue using their own environment.
+    Neither the supplied mapping nor the smoke defaults are mutated.
+    """
+    environment = {
+        key: value for key, value in host_environment.items() if key.upper() in _SMOKE_HOST_ENV_KEYS
+    }
+    environment.update(smoke_environment())
+    return environment
+
+
 def main() -> None:
-    """Print smoke settings as sorted JSON to stdout."""
-    print(json.dumps(smoke_environment(), sort_keys=True))
+    """Print a complete offline smoke-process environment as sorted JSON."""
+    print(json.dumps(smoke_process_environment(os.environ), sort_keys=True))
 
 
 if __name__ == "__main__":

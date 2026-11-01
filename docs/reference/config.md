@@ -4,7 +4,7 @@ Generated configuration and logging APIs. Operator references: [Settings](../con
 
 ## `config.settings`
 
-`Settings` loads the environment at construction. The OS-level `ENV_STATE` selects whether the repository `.env` is read: unset/`dev` enables it; staging/production require real environment configuration. Invalid settings raise Pydantic validation errors. Cross-field checks cover hardened URLs, cookies, SMTP/TLS, health credentials, host/CORS policy, independent Redis credentials, and federation activation. Secret fields use `SecretStr`; masking is not permission to log credentials.
+`Settings` requires the exact uppercase OS key `ENV_STATE` with value `dev`, `staging` or `production`. Only `dev` loads the repository `.env`; OS values take precedence. Missing, conflicting or invalid mode selections fail before settings load. Other invalid settings raise Pydantic validation errors. Secret fields use `SecretStr`; callers must still avoid logging credentials.
 
 ::: config.settings
 

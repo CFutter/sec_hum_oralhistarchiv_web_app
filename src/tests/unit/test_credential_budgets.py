@@ -1,18 +1,11 @@
-"""Durable, exact-session budgets for credential step-up (app.services.credential_attempts).
+"""Exact-session attempt budgets and reservation-before-verification ordering."""
 
-reserve_session_step_up_attempt() is the shared serialization point every
-protected route calls before doing expensive credential verification. These
-tests cover the budget's own accounting, storage, and refusal behaviour, and
-then prove that every call site spends a reservation before it starts
-expensive verification work (password checks, TOTP checks, recovery-code
-checks) and never runs that work when the reservation is refused.
-"""
-
+from datetime import UTC, datetime, timedelta
 from unittest.mock import create_autospec, patch, sentinel
 
 import pytest
 
-from app.services import credential_attempts, email_change, totp
+from app.services import credential_attempts, email_change, password_verification, totp
 from app.services.credential_attempts import SessionStepUpAttemptOutcome
 from app.services.session_ids import hash_session_id
 from config import settings
@@ -21,6 +14,29 @@ from tests.fixtures import FakeCursorCtx, make_async_cursor, make_mock_pool
 USER_ID = 41
 RAW_SESSION_ID = "raw-session-secret-never-log-or-store"
 SESSION_HASH = hash_session_id(RAW_SESSION_ID)
+NOW = datetime(2026, 10, 26, 18, tzinfo=UTC)
+
+
+def _session_row(count, *, login_unlocked=True, **changes):
+    """Return an unexpired step-up session row with explicit field overrides."""
+    row = {
+        "step_up_attempt_count": count,
+        "login_unlocked": login_unlocked,
+        "expires_at": NOW + timedelta(hours=1),
+        "last_activity_at": NOW,
+    }
+    row.update(changes)
+    return row
+
+
+@pytest.fixture(autouse=True)
+def _fixed_reservation_clock(monkeypatch):
+    """Fix reservation database time at NOW for the test."""
+    monkeypatch.setattr(
+        credential_attempts,
+        "database_now_cur",
+        create_autospec(credential_attempts.database_now_cur, return_value=NOW),
+    )
 
 
 async def _reserve(*, fetchone, execute_side_effect=None):
@@ -49,11 +65,12 @@ class TestSessionStepUpReservation:
     """The reservation query is scoped to one live, active, full session and records its own count."""
 
     async def test_reservation_increments_exact_session_attempt_count(self, monkeypatch):
+        """Reservation increments exact session attempt count."""
         monkeypatch.setattr(settings, "session_step_up_attempt_limit", 5)
 
         outcome, cur = await _reserve(
             fetchone=[
-                {"step_up_attempt_count": 2, "login_unlocked": True},
+                _session_row(2, login_unlocked=True),
                 {"step_up_attempt_count": 3},
             ]
         )
@@ -67,6 +84,7 @@ class TestSessionStepUpReservation:
         assert "RETURNING step_up_attempt_count" in update.args[0]
 
     async def test_lookup_is_scoped_to_the_exact_live_active_full_session(self):
+        """Lookup is scoped to the exact live active full session."""
         outcome, cur = await _reserve(fetchone=None)
 
         assert outcome is SessionStepUpAttemptOutcome.INVALID_SESSION
@@ -85,7 +103,7 @@ class TestSessionStepUpReservation:
 
 
 class TestBudgetRefusals:
-    """Refusals at the account lock and the attempt limit, each contrasted with the passing case."""
+    """Attempt exhaustion and independence from username-triggered login locks."""
 
     async def test_reservation_allowed_up_to_the_limit_then_refused_on_the_next_request(
         self,
@@ -97,13 +115,11 @@ class TestBudgetRefusals:
 
         allowed, allowed_cur = await _reserve(
             fetchone=[
-                {"step_up_attempt_count": 2, "login_unlocked": True},
+                _session_row(2, login_unlocked=True),
                 {"step_up_attempt_count": 3},
             ]
         )
-        exhausted, exhausted_cur = await _reserve(
-            fetchone={"step_up_attempt_count": 3, "login_unlocked": True}
-        )
+        exhausted, exhausted_cur = await _reserve(fetchone=_session_row(3, login_unlocked=True))
 
         assert allowed is SessionStepUpAttemptOutcome.RESERVED
         assert allowed_cur.execute.await_count == 2
@@ -118,21 +134,25 @@ class TestBudgetRefusals:
         assert RAW_SESSION_ID not in caplog.text
         assert SESSION_HASH[:8] in caplog.text
 
-    async def test_locked_account_is_refused_without_mutating_the_session(self):
-        """An account-wide lock refuses the reservation without touching the session row."""
+    async def test_login_lock_does_not_block_an_existing_full_sessions_proof_budget(self):
+        """Username-only abuse cannot deny separately bounded authenticated proof."""
         outcome, cur = await _reserve(
-            fetchone={"step_up_attempt_count": 1, "login_unlocked": False}
+            fetchone=[
+                _session_row(1, login_unlocked=False),
+                {"step_up_attempt_count": 2},
+            ]
         )
-
-        assert outcome is SessionStepUpAttemptOutcome.ACCOUNT_LOCKED
-        assert cur.execute.await_count == 1
+        assert outcome is SessionStepUpAttemptOutcome.RESERVED
+        assert cur.execute.await_count == 2
+        assert "locked_until" not in str(cur.execute.await_args_list[0].args[0])
 
 
 class TestReservationFailureHandling:
     """Storage failures and disappearing rows fail closed instead of reporting a reservation."""
 
     async def test_storage_error_propagates_without_reporting_a_reservation(self):
-        cur = make_async_cursor(fetchone={"step_up_attempt_count": 0, "login_unlocked": True})
+        """Storage error propagates without reporting a reservation."""
+        cur = make_async_cursor(fetchone=_session_row(0, login_unlocked=True))
         storage_error = RuntimeError("database unavailable")
         cur.execute.side_effect = [None, storage_error]
 
@@ -157,7 +177,8 @@ class TestReservationFailureHandling:
         assert cur.execute.await_count == 2
 
     async def test_disappearing_locked_session_fails_closed(self):
-        outcome_row = {"step_up_attempt_count": 0, "login_unlocked": True}
+        """Disappearing locked session fails closed."""
+        outcome_row = _session_row(0, login_unlocked=True)
         cur = make_async_cursor(fetchone=[outcome_row, None])
 
         with (
@@ -193,15 +214,7 @@ class _CredentialBoundaryReached(RuntimeError):
 
 
 def _reservation_mock(result):
-    """An autospecced double of reserve_session_step_up_attempt.
-
-    Every caller-module binding (here: totp, email_change; the administrator
-    flows in test_admin_authority_credential_budgets.py use the identical
-    helper against admin_promotion and totp_recover) imports the exact same
-    function object from credential_attempts, so autospeccing against the
-    defining module's reference enforces the real signature regardless of
-    which binding a test patches.
-    """
+    """Return a signature-checked reservation double with the requested outcome."""
     if isinstance(result, Exception):
         return create_autospec(
             credential_attempts.reserve_session_step_up_attempt,
@@ -240,16 +253,17 @@ class TestTotpRotationSpendsReservationBeforePasswordWork:
         reservation,
         expected_outcome,
     ):
+        """Rejected reservation stops before password work."""
         reserve = _reservation_mock(reservation)
         password_work = create_autospec(
-            totp._verify_rotation_password_snapshot,
+            totp.verify_password_snapshot,
             side_effect=AssertionError("password work must not run"),
             spec_set=True,
         )
 
         with (
             patch.object(totp, "reserve_session_step_up_attempt", reserve),
-            patch.object(totp, "_verify_rotation_password_snapshot", password_work),
+            patch.object(totp, "verify_password_snapshot", password_work),
         ):
             result = await totp.begin_totp_rotation(
                 sentinel.pool,
@@ -268,17 +282,18 @@ class TestTotpRotationSpendsReservationBeforePasswordWork:
         password_work.assert_not_awaited()
 
     async def test_reservation_storage_error_stops_before_password_work(self):
+        """Reservation storage error stops before password work."""
         storage_error = _ReservationStorageError("reservation unavailable")
         reserve = _reservation_mock(storage_error)
         password_work = create_autospec(
-            totp._verify_rotation_password_snapshot,
+            totp.verify_password_snapshot,
             side_effect=AssertionError("password work must not run"),
             spec_set=True,
         )
 
         with (
             patch.object(totp, "reserve_session_step_up_attempt", reserve),
-            patch.object(totp, "_verify_rotation_password_snapshot", password_work),
+            patch.object(totp, "verify_password_snapshot", password_work),
             pytest.raises(_ReservationStorageError) as caught,
         ):
             await totp.begin_totp_rotation(
@@ -293,14 +308,16 @@ class TestTotpRotationSpendsReservationBeforePasswordWork:
         password_work.assert_not_awaited()
 
     async def test_reservation_succeeds_before_password_work_runs(self):
-        """Positive control: a granted reservation runs before password work, in that order."""
+        """A granted reservation runs before password work, in that order."""
         events: list[str] = []
 
         async def reserve(*_args, **_kwargs):
+            """Record reservation and return RESERVED before credential verification."""
             events.append("reserve")
             return SessionStepUpAttemptOutcome.RESERVED
 
         async def verify_password(*_args, **_kwargs):
+            """Record password verification and raise the boundary sentinel."""
             events.append("password")
             raise _CredentialBoundaryReached
 
@@ -316,9 +333,9 @@ class TestTotpRotationSpendsReservationBeforePasswordWork:
             ) as reserve_attempt,
             patch.object(
                 totp,
-                "_verify_rotation_password_snapshot",
+                "verify_password_snapshot",
                 new=create_autospec(
-                    totp._verify_rotation_password_snapshot,
+                    totp.verify_password_snapshot,
                     side_effect=verify_password,
                     spec_set=True,
                 ),
@@ -357,6 +374,7 @@ class TestEmailChangeSpendsReservationBeforePasswordWork:
         reservation,
         expected_reason,
     ):
+        """Rejected reservation stops before password work."""
         reserve = _reservation_mock(reservation)
         acquire_cursor = create_autospec(
             email_change.get_db_cursor,
@@ -375,12 +393,14 @@ class TestEmailChangeSpendsReservationBeforePasswordWork:
                 session_id=SESSION_ID,
                 current_password="candidate password",
                 new_email="new-address@example.edu",
+                totp_code="111111",
             )
 
         assert caught.value.reason == expected_reason
         acquire_cursor.assert_not_called()
 
     async def test_reservation_storage_error_stops_before_password_work(self):
+        """Reservation storage error stops before password work."""
         storage_error = _ReservationStorageError("reservation unavailable")
         acquire_cursor = create_autospec(
             email_change.get_db_cursor,
@@ -403,13 +423,14 @@ class TestEmailChangeSpendsReservationBeforePasswordWork:
                 session_id=SESSION_ID,
                 current_password="candidate password",
                 new_email="new-address@example.edu",
+                totp_code="111111",
             )
 
         assert caught.value is storage_error
         acquire_cursor.assert_not_called()
 
     async def test_reservation_succeeds_before_argon2_work_runs(self):
-        """Positive control: a granted reservation runs before the argon2 password check, in that order."""
+        """A granted reservation runs before the argon2 password check, in that order."""
         events: list[str] = []
         cursor = make_async_cursor(
             fetchone={
@@ -422,10 +443,12 @@ class TestEmailChangeSpendsReservationBeforePasswordWork:
         )
 
         async def reserve(*_args, **_kwargs):
+            """Record reservation and return RESERVED before credential verification."""
             events.append("reserve")
             return SessionStepUpAttemptOutcome.RESERVED
 
         async def password_work(*_args, **_kwargs):
+            """Record password verification and raise the boundary sentinel."""
             events.append("password")
             raise _CredentialBoundaryReached
 
@@ -449,10 +472,10 @@ class TestEmailChangeSpendsReservationBeforePasswordWork:
                 ),
             ),
             patch.object(
-                email_change,
+                password_verification,
                 "run_password_work",
                 new=create_autospec(
-                    email_change.run_password_work,
+                    password_verification.run_password_work,
                     side_effect=password_work,
                     spec_set=True,
                 ),
@@ -465,6 +488,7 @@ class TestEmailChangeSpendsReservationBeforePasswordWork:
                 session_id=SESSION_ID,
                 current_password="candidate password",
                 new_email="new-address@example.edu",
+                totp_code="111111",
             )
 
         assert events == ["reserve", "password"]
@@ -473,3 +497,25 @@ class TestEmailChangeSpendsReservationBeforePasswordWork:
             user_id=USER_ID,
             session_id=SESSION_ID,
         )
+
+
+@pytest.mark.parametrize(
+    "absolute_expired,idle_age_seconds",
+    [
+        (True, 0),
+        (False, settings.session_idle_timeout_seconds),
+        (False, settings.session_idle_timeout_seconds + 30),
+    ],
+)
+async def test_expired_session_is_rejected_before_spending_or_exhausting_budget(
+    absolute_expired, idle_age_seconds
+):
+    """Expired session is rejected before spending or exhausting budget."""
+    row = _session_row(
+        settings.session_step_up_attempt_limit,
+        expires_at=NOW if absolute_expired else NOW + timedelta(hours=1),
+        last_activity_at=NOW - timedelta(seconds=idle_age_seconds),
+    )
+    outcome, cur = await _reserve(fetchone=row)
+    assert outcome is SessionStepUpAttemptOutcome.INVALID_SESSION
+    assert cur.execute.await_count == 1

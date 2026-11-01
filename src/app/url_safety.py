@@ -2,13 +2,25 @@
 
 from urllib.parse import SplitResult, urlsplit
 
+_URL_CONTROLS = frozenset(map(chr, (*range(32), 127)))
+
 
 def parse_http_url(
     value: str,
     *,
     require_https: bool = False,
 ) -> SplitResult:
-    """Parse an absolute HTTP(S) URL with a host and no userinfo."""
+    """Parse a stripped absolute HTTP(S) URL; raise ValueError if structurally invalid.
+
+    Reject ASCII controls, missing hosts, malformed ports and userinfo.
+    require_https restricts the scheme to HTTPS. This performs no network or
+    reachability check.
+    """
+    # urlsplit discards some controls, including embedded CR, LF and TAB.
+    # Refuse them before trimming or parsing so the original value stays safe
+    # for both an HTML link and a redirect header.
+    if any(character in _URL_CONTROLS for character in value):
+        raise ValueError("HTTP(S) URL must not contain control characters")
     candidate = value.strip()
     allowed_schemes = {"https"} if require_https else {"http", "https"}
 

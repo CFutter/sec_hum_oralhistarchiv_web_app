@@ -1,17 +1,4 @@
-"""Unit tests for the table-shape half of the PostgreSQL schema contract.
-
-`app.services.db_schema_contract` declares, per application table, the exact
-columns (type, nullability, default, identity) and constraints (primary key,
-unique, check, foreign key) PostgreSQL must have. `app.services.db_drift`
-converts live `pg_attribute`/`pg_constraint` catalog rows into the same
-dataclasses and compares them for exact equality, so any live-schema table
-whose columns or constraints do not match the declared contract exactly is
-reported before the application starts trusting it. Extra columns or
-constraints are only tolerated when a caller explicitly allowlists them
-during a migration window. These tests exercise catalog-row conversion and
-contract comparison without a database; PostgreSQL catalog behavior itself is
-covered by the integration companion module.
-"""
+"""Unit tests for the table-shape half of the PostgreSQL schema contract."""
 
 from dataclasses import replace
 from unittest.mock import create_autospec
@@ -25,7 +12,10 @@ from app.services.db_schema_contract import (
     TABLE_COLUMN_CONTRACTS,
     TABLE_CONSTRAINT_CONTRACTS,
     TABLE_INDEX_CONTRACTS,
+    TABLE_POLICY_CONTRACTS,
+    TABLE_ROW_SECURITY_CONTRACTS,
     TRIGGER_CONTRACTS,
+    VIEW_CONTRACTS,
     ColumnSpec,
     ConstraintSpec,
 )
@@ -63,13 +53,25 @@ def _mock_get_table_constraint_specs(monkeypatch, return_value):
 
 
 class TestContractTableCoverage:
-    """The four table-keyed contract maps declare the same table names."""
+    """All six table-keyed maps agree; views have their own explicit contract."""
 
     def test_contract_maps_cover_the_same_tables(self):
+        """Check contract maps cover the same tables."""
         expected_tables = {
             "oral_history_datasets",
+            "catalogue_search_policy",
+            "catalogue_search_public",
+            "catalogue_search_registered",
+            "catalogue_search_vetted",
+            "dataset_admin_state",
             "sync_status",
             "ingestion_failures",
+            "ingestion_quarantine",
+            "source_security_state",
+            "source_binding_acknowledgements",
+            "security_audit_events",
+            "security_audit_receipts",
+            "anonymous_mail_issuance",
             "users",
             "totp_recovery_codes",
             "admin_promotion_requests",
@@ -83,13 +85,67 @@ class TestContractTableCoverage:
         assert set(TABLE_CONSTRAINT_CONTRACTS) == expected_tables
         assert set(TABLE_INDEX_CONTRACTS) == expected_tables
         assert set(TRIGGER_CONTRACTS) == expected_tables
-        assert set(FUNCTION_CONTRACTS) == {"update_search_text()"}
+        assert set(TABLE_ROW_SECURITY_CONTRACTS) == expected_tables
+        assert set(TABLE_POLICY_CONTRACTS) == expected_tables
+        assert set(VIEW_CONTRACTS) == {
+            "catalogue_discovery",
+            "catalogue_search_candidates",
+            "dataset_admin_catalogue",
+        }
+        assert VIEW_CONTRACTS["catalogue_search_candidates"].columns == (("id", "integer"),)
+        assert set(FUNCTION_CONTRACTS) == {
+            "catalogue_preserve_source_security_state()",
+            "catalogue_audit_restriction_state()",
+            "update_search_text()",
+            "catalogue_projection_write_lock()",
+            "catalogue_refresh_search_record(p_id integer)",
+            "catalogue_refresh_search_projection()",
+            "catalogue_replace_search_policy(p_expected text, p_fingerprint text, p_masks jsonb)",
+            "catalogue_initialize_search_policy(p_fingerprint text, p_masks jsonb)",
+            "catalogue_guard_search_policy(p_fingerprint text)",
+            "catalogue_search_relation(p_query jsonb)",
+            "catalogue_match_ids(p_query jsonb)",
+            "catalogue_search_candidates()",
+            "catalogue_scan_ceiling()",
+            "catalogue_page_ids(p_anchor integer, p_ceiling integer, p_backward boolean, "
+            "p_limit integer, p_offset integer, p_query jsonb)",
+        }
+        assert VIEW_CONTRACTS["catalogue_discovery"].columns == (
+            ("id", "integer"),
+            ("uuid", "text"),
+            ("title", "text"),
+            ("access_level", "text"),
+            ("version", "text"),
+            ("source", "text"),
+            ("visibility_tier", "text"),
+        )
+        columns = TABLE_COLUMN_CONTRACTS["oral_history_datasets"]
+        assert columns["search_vector_public"] == ColumnSpec("tsvector", nullable=False)
+        assert columns["search_vector_full"] == ColumnSpec("tsvector", nullable=False)
+        indexes = TABLE_INDEX_CONTRACTS["oral_history_datasets"]
+        assert set(indexes) == {
+            "idx_datasets_source",
+            "idx_search_text_public_trgm",
+            "idx_search_text_full_trgm",
+            "idx_search_vector_public",
+            "idx_search_vector_full",
+            "ix_datasets_upstream_modified_at",
+            "ix_datasets_keywords_gin",
+            "ix_datasets_languages_gin",
+        }
+        for name in ("public", "full"):
+            vector_index = indexes[f"idx_search_vector_{name}"]
+            assert vector_index.method == "gin"
+            assert len(vector_index.keys) == 1
+            assert vector_index.keys[0].definition == f"search_vector_{name}"
+            assert vector_index.keys[0].operator_class == "tsvector_ops"
 
 
 class TestColumnContract:
     """`assert_table_column_contract` verifies exact column shape."""
 
     async def test_column_check_accepts_exact_contract(self, monkeypatch):
+        """Check column check accepts exact contract."""
         get_specs = _mock_get_table_column_specs(monkeypatch, dict(_COLUMN_CONTRACT))
 
         await db_drift.assert_table_column_contract(
@@ -101,6 +157,7 @@ class TestColumnContract:
         get_specs.assert_awaited_once_with(_POOL, "probe")
 
     async def test_column_check_rejects_missing_columns(self, monkeypatch):
+        """Check column check rejects missing columns (RuntimeError)."""
         _mock_get_table_column_specs(monkeypatch, {})
 
         with pytest.raises(
@@ -114,6 +171,7 @@ class TestColumnContract:
             )
 
     async def test_column_check_rejects_unexpected_columns(self, monkeypatch):
+        """Check column check rejects unexpected columns (RuntimeError)."""
         actual = {
             **_COLUMN_CONTRACT,
             "legacy_value": ColumnSpec("text", nullable=True),
@@ -131,6 +189,7 @@ class TestColumnContract:
             )
 
     async def test_column_check_allows_explicit_transitional_column(self, monkeypatch):
+        """Check column check allows explicit transitional column."""
         actual = {
             **_COLUMN_CONTRACT,
             "legacy_value": ColumnSpec("text", nullable=True),
@@ -159,6 +218,7 @@ class TestColumnContract:
         monkeypatch,
         actual_column,
     ):
+        """Check column check rejects structural drift (RuntimeError)."""
         _mock_get_table_column_specs(monkeypatch, {"id": actual_column})
 
         with pytest.raises(RuntimeError, match=r"column 'id'"):
@@ -173,6 +233,7 @@ class TestConstraintCatalogConversion:
     """`_constraint_spec_from_row` converts one `pg_constraint` row exactly."""
 
     def test_constraint_row_conversion_preserves_primary_key_columns(self):
+        """Check constraint row conversion preserves primary key columns."""
         row = (
             "probe_pkey",
             "p",
@@ -192,6 +253,7 @@ class TestConstraintCatalogConversion:
         assert db_drift._constraint_spec_from_row(row) == _PRIMARY_KEY
 
     def test_constraint_row_conversion_preserves_canonical_check_definition(self):
+        """Check constraint row conversion preserves canonical check definition."""
         definition = "CHECK ((attempt_count >= 0))"
         row = (
             "attempt_count_check",
@@ -215,6 +277,7 @@ class TestConstraintCatalogConversion:
         )
 
     def test_constraint_row_conversion_preserves_foreign_key_behavior(self):
+        """Check constraint row conversion preserves foreign key behavior."""
         row = (
             "sessions_user_id_fkey",
             "f",
@@ -242,10 +305,12 @@ class TestConstraintCatalogConversion:
         )
 
     def test_constraint_row_conversion_rejects_wrong_query_shape(self):
+        """Check constraint row conversion rejects wrong query shape (RuntimeError)."""
         with pytest.raises(RuntimeError, match="expected 13 values"):
             db_drift._constraint_spec_from_row(("too", "short"))
 
     def test_constraint_row_conversion_rejects_unknown_kind(self):
+        """Check constraint row conversion rejects unknown kind (RuntimeError)."""
         row = (
             "probe_unknown",
             "x",
@@ -266,6 +331,7 @@ class TestConstraintCatalogConversion:
             db_drift._constraint_spec_from_row(row)
 
     def test_constraint_row_conversion_rejects_unknown_foreign_key_action(self):
+        """Check constraint row conversion rejects unknown foreign key action (RuntimeError)."""
         row = (
             "probe_fkey",
             "f",
@@ -290,6 +356,7 @@ class TestConstraintContract:
     """`assert_table_constraint_contract` verifies exact constraint shape."""
 
     async def test_constraint_check_accepts_exact_contract(self, monkeypatch):
+        """Check constraint check accepts exact contract."""
         get_specs = _mock_get_table_constraint_specs(monkeypatch, dict(_CONSTRAINT_CONTRACT))
 
         await db_drift.assert_table_constraint_contract(
@@ -301,6 +368,7 @@ class TestConstraintContract:
         get_specs.assert_awaited_once_with(_POOL, "probe")
 
     async def test_constraint_check_rejects_missing_constraint(self, monkeypatch):
+        """Check constraint check rejects missing constraint (RuntimeError)."""
         _mock_get_table_constraint_specs(monkeypatch, {})
 
         with pytest.raises(
@@ -314,6 +382,7 @@ class TestConstraintContract:
             )
 
     async def test_constraint_check_rejects_unexpected_constraint(self, monkeypatch):
+        """Check constraint check rejects unexpected constraint (RuntimeError)."""
         actual = {
             **_CONSTRAINT_CONTRACT,
             "legacy_check": ConstraintSpec(
@@ -334,6 +403,7 @@ class TestConstraintContract:
         self,
         monkeypatch,
     ):
+        """Check constraint check allows explicit transitional constraint."""
         actual = {
             **_CONSTRAINT_CONTRACT,
             "legacy_check": ConstraintSpec(
@@ -366,6 +436,7 @@ class TestConstraintContract:
         monkeypatch,
         actual_constraint,
     ):
+        """Check constraint check rejects structural drift (RuntimeError)."""
         _mock_get_table_constraint_specs(monkeypatch, {"probe_pkey": actual_constraint})
 
         with pytest.raises(RuntimeError, match=r"constraint 'probe_pkey'"):
@@ -376,6 +447,7 @@ class TestConstraintContract:
             )
 
     async def test_constraint_check_rejects_changed_check_definition(self, monkeypatch):
+        """Check constraint check rejects changed check definition (RuntimeError)."""
         expected = {
             "state_check": ConstraintSpec(
                 kind="check",
@@ -399,6 +471,7 @@ class TestConstraintContract:
 
     @pytest.mark.parametrize("name", ["sessions_purpose_check", "sessions_flash_category_check"])
     async def test_constraint_check_accepts_dump_restore_casts(self, monkeypatch, name):
+        """Check constraint check accepts dump restore casts."""
         expected = TABLE_CONSTRAINT_CONTRACTS["sessions"][name]
         restored = db_drift._canonical_check_constraint(expected)
         assert restored != expected
@@ -419,6 +492,7 @@ class TestConstraintContract:
     async def test_dump_restore_normalization_preserves_real_drift(
         self, monkeypatch, before, after
     ):
+        """Check dump restore normalization preserves real drift (RuntimeError)."""
         name = "sessions_purpose_check"
         expected = TABLE_CONSTRAINT_CONTRACTS["sessions"][name]
         restored = db_drift._canonical_check_constraint(expected)
@@ -430,6 +504,7 @@ class TestConstraintContract:
             await db_drift.assert_table_constraint_contract(_POOL, "sessions", {name: expected})
 
     async def test_constraint_check_rejects_changed_foreign_key_action(self, monkeypatch):
+        """Check constraint check rejects changed foreign key action (RuntimeError)."""
         expected_fk = ConstraintSpec(
             kind="foreign_key",
             columns=("user_id",),
@@ -451,11 +526,10 @@ class TestConstraintContract:
 
 
 class TestSyncStatusProgressContractCoverage:
-    """`SYNC_STATUS_CONSTRAINT_CONTRACT` mirrors every bound the migration
-    places on resumable incremental-sync progress, so a fresh database and
-    the declared contract fail closed the same way."""
+    """Cover sync status progress contract coverage."""
 
     def test_contract_bounds_incremental_progress_and_ties_it_to_a_staged_harvest(self):
+        """Check contract bounds incremental progress and ties it to a staged harvest."""
         check_definitions = {
             spec.check_definition
             for spec in SYNC_STATUS_CONSTRAINT_CONTRACT.values()

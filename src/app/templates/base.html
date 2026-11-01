@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="{% block meta_description %}Digital Oral History Archive{% endblock %}">
+  <meta name="description" content="{% block meta_description %}{{ about_summary }}{% endblock %}">
   {% if not is_production %}
     <meta name="robots" content="noindex, nofollow">
   {% endif %}
     
-  <title>{% block title %}Digital Oral History Archive{% endblock %}</title>
+  <title>{% block title %}{{ site_name }}{% endblock %}</title>
 
   <link rel="icon" href="{{ path_for(request, 'static', path='favicon.svg') }}" type="image/svg+xml">
   <link rel="stylesheet" href="{{ path_for(request, 'static', path='css/style.css') }}">
@@ -33,13 +33,14 @@
             <line x1="12" y1="19" x2="12" y2="22"/>
           </svg>
         </span>
-        <span class="logo-text">Oral History Archive</span>
+        <span class="logo-text">{{ site_name }}</span>
       </a>
       {% set active_page = active_page | default("") %}
       <nav class="header-nav" aria-label="Main navigation">
         <a href="{{ path_for(request, 'home') }}" class="nav-link {% if active_page == 'home' %}active{% endif %}">Home</a>
         <a href="{{ path_for(request, 'search_page') }}" class="nav-link {% if active_page == 'search' %}active{% endif %}">Search</a>
         <a href="{{ path_for(request, 'about') }}" class="nav-link {% if active_page == 'about' %}active{% endif %}">About</a>
+        {% if show_auth_navigation | default(true) %}
         {% if user %}
           {% if user.is_admin %}
             <a href="{{ path_for(request, 'admin_dashboard') }}" class="nav-link {% if active_page == 'admin' %}active{% endif %}">Admin</a>
@@ -51,6 +52,7 @@
           </form>
         {% else %}
           <a href="{{ path_for(request, 'login_page') }}" class="nav-link nav-auth">Login</a>
+        {% endif %}
         {% endif %}
               </nav>
     </div>
@@ -68,8 +70,8 @@
   <footer class="site-footer">
     <div class="footer-inner">
       <div class="footer-left">
-        <strong>Digital Oral History Archive</strong>
-        <span>University of Zurich — Phase 1 Prototype</span>
+        <strong>{{ site_name }}</strong>
+        <span>{{ institution_name }}</span>
       </div>
       <div class="footer-right">
         <a href="{{ path_for(request, 'about') }}">About</a>

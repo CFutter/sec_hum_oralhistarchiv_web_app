@@ -6,11 +6,11 @@ Example: a registered user with a full session requests a dataset whose `visibil
 
 ```http
 GET /dataset/4711 HTTP/1.1
-Host: archive.example.uzh.ch
-Cookie: oha_session=<signed-session-id>
+Host: archive.example.org
+Cookie: __Host-oha_session=<signed-session-id>
 ```
 
-`oha_session` is the default configurable cookie name. The signed raw token identifies a hashed PostgreSQL session row. A full local session must also satisfy current account, verification, TOTP, and recovery-state checks.
+The default cookie is `__Host-oha_session` in staging/production and `oha_session` in development. Its signed token identifies a hashed PostgreSQL session row. Full local sessions also require current account, verification, TOTP and recovery-state checks.
 
 ## Step 1 — nginx
 
@@ -34,6 +34,16 @@ Audit assigns a 16-character request ID before admission and session lookup. It 
 
 Inside it, `BoundedRateLimitMiddleware` evaluates policies before session lookup using bounded, serialized worker capacity. An exceeded limit returns 429; unavailable storage or admission capacity returns retryable 503. Hardened environments require `RATE_LIMIT_REDIS_URL`; development may use general Redis or process-local memory. Unmatched routes are marked to skip session lookup; read-only static requests bypass rate admission.
 
+`GET /search` also passes a shared start budget before session lookup. This
+budget remains active when ordinary rate limiting is disabled. The handler
+then uses its own one-connection pool, an immediate local permit and a
+nonblocking PostgreSQL transaction advisory lock shared by web workers. Results
+and facet work share that lock and the operation deadline. SQL statements have
+a separate positive timeout. Busy, timed-out or failed searches return a
+non-cacheable, retryable 503; they never borrow the ordinary session/request
+pool or retry through a different query mode. All search modes and pagination
+paths use this boundary.
+
 `get_client_ip()` trusts forwarded IP headers only when enabled and received from a configured trusted peer or recognized Unix-socket connection. The socket's permissions and proxy configuration are part of that trust boundary.
 
 ## Step 6 — Session resolution
@@ -48,7 +58,13 @@ Recovery-purpose sessions may reach only their exact enrollment/logout method/pa
 
 On return from the inner application, `set_secure_headers` applies the CSP, frame/content-type/referrer protections, and disabled browser-feature policy from `build_secure_headers`. Production adds one-year HSTS with `includeSubDomains; preload`.
 
-Paths outside `/static/` receive `Cache-Control: no-store`, including anonymous responses. Reset, verification, and email-confirmation paths also receive `Referrer-Policy: no-referrer`. Early admission refusals apply their own security headers.
+Paths outside `/static/` receive `Cache-Control: no-store`, including anonymous responses. Reset, verification, and email-confirmation paths also receive `Referrer-Policy: strict-origin`. Early admission refusals apply their own security headers.
+
+Sensitive form responses retain origin-only referrers when the common security
+headers are applied. Their source path and query are never forwarded as a
+referrer, while same-origin HTML POSTs retain the browser origin needed by the
+CSRF dependency. An explicit `no-referrer` policy on such a form would instead
+produce `Origin: null` and prevent submission.
 
 ## Step 8 — CSRF cookies
 
@@ -58,11 +74,11 @@ For GETs or requests whose session resolution completed, middleware maintains a 
 
 `GET /dataset/{dataset_id}` uses the public policy: guests may browse, but a presented authenticated user must satisfy full-session checks. Setup sessions redirect to enrollment. Our registered full-session user proceeds.
 
-`SecureAPIRouter` installs policy dependencies and mutation Content-Type/CSRF checks. Startup rejects unclassified routes and deviations from reviewed route inventories; only the two signed email-confirmation POSTs omit CSRF.
+`SecureAPIRouter` installs access, mutation Content-Type and CSRF dependencies. Startup rejects unclassified routes and inventory drift. Only exact `POST /account/confirm-email` omits CSRF.
 
 ## Step 10 — The route handler
 
-`routes.pages.detail` reads the pool and viewer tier, then calls `get_dataset_by_id`. Missing rows render 404. Existing rows are redacted in the service before return according to the viewer tier; this registered viewer receives the registered dataset in full.
+`routes.pages.detail` calls `get_dataset_by_id` with the pool, viewer tier and catalogue policy. Missing or hidden rows render 404. Other rows are redacted before return: each field requires the strictest record, code and source tier, so a registered viewer may still lack fields.
 
 Non-public datasets emit `dataset_access` with dataset identifiers, required/viewer tiers, and the full-access decision. `detail.html` then renders the returned record. A guest still sees the public discovery envelope and record existence; see [Access Control](access-control.md).
 
@@ -82,6 +98,7 @@ The inner response receives cookie and privacy headers, session redirect-flash h
 | Invalid/expired session | Guest state |
 | Rate limit exceeded | 429 |
 | Rate storage/admission unavailable or database pool exhausted | Retryable 503 |
+| Search start/concurrency capacity exhausted, or search deadline reached | Retryable 503; no ordinary-pool fallback |
 | Session fails the route policy | Policy-specific redirect, 403, or cloaked 404 |
 | Missing dataset | 404 |
 | Viewer below dataset tier | Redacted detail page |

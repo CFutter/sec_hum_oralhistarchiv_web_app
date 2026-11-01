@@ -1,11 +1,4 @@
-"""Executable contract for the deployed systemd units and gunicorn runtime.
-
-Covers the Gunicorn/Uvicorn worker boundary, the Unix-socket hardening of the
-web and scheduler services, the scheduler's stop/drain policy, and how the
-audit log is shipped off the units via journald and rsyslog. The nginx
-configuration and the SQL grants are separate deployment artifacts and are
-covered elsewhere.
-"""
+"""Shipped systemd, Gunicorn worker/socket and audit-shipping contracts."""
 
 import ast
 import configparser
@@ -28,6 +21,7 @@ import pytest
 from gunicorn.workers.base import Worker
 from uvicorn_worker import UvicornWorker  # type: ignore[import-untyped]
 
+from app.middleware.bounded_rate_limit_storage import bounded_redis_uri
 from app.middleware.rate_limiting import _build_limiter
 from app.paths import PROJECT_ROOT
 from config import settings
@@ -99,6 +93,7 @@ async def gunicorn_scope_probe(
 
 
 def _literal_config_assignment(name: str) -> object:
+    """Return the unique literal Gunicorn assignment, failing on missing or duplicate names."""
     tree = ast.parse(GUNICORN_CONFIG.read_text(), filename=str(GUNICORN_CONFIG))
     values = []
     for node in tree.body:
@@ -111,6 +106,7 @@ def _literal_config_assignment(name: str) -> object:
 
 
 def _declared_pin(group: str, package: str) -> str:
+    """Return the unique exact project dependency pin in the selected group."""
     project = tomllib.loads(PYPROJECT.read_text())
     if group == "runtime":
         requirements = project["project"]["dependencies"]
@@ -123,6 +119,7 @@ def _declared_pin(group: str, package: str) -> str:
 
 
 def _locked_version(package: str) -> str:
+    """Return the unique locked distribution version, failing on missing or duplicate entries."""
     lock = tomllib.loads(LOCKFILE.read_text())
     matches = [entry["version"] for entry in lock["package"] if entry["name"] == package]
     assert len(matches) == 1, f"expected exactly one locked {package} distribution"
@@ -130,6 +127,7 @@ def _locked_version(package: str) -> str:
 
 
 def _stop(process: subprocess.Popen[str]) -> tuple[str, str]:
+    """Terminate a live child, kill after five seconds if needed, and collect stdout/stderr."""
     if process.poll() is None:
         process.terminate()
         try:
@@ -141,6 +139,7 @@ def _stop(process: subprocess.Popen[str]) -> tuple[str, str]:
 
 
 def _wait_for_socket(process: subprocess.Popen[str], socket_path: Path) -> None:
+    """Wait up to 15 seconds for the socket, failing earlier if Gunicorn exits."""
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         if socket_path.is_socket():
@@ -156,6 +155,7 @@ def _wait_for_socket(process: subprocess.Popen[str], socket_path: Path) -> None:
 
 
 def _request_probe(socket_path: Path) -> dict[str, object]:
+    """Probe the Unix socket with forwarded headers and return its HTTP-200 JSON body."""
     request = (
         b"GET / HTTP/1.1\r\n"
         b"Host: localhost\r\n"
@@ -194,6 +194,7 @@ class TestGunicornRuntime:
     """The Gunicorn/Uvicorn worker boundary matches the reviewed stack."""
 
     def test_declared_and_locked_gunicorn_stack_is_the_reviewed_stack(self) -> None:
+        """Declared and locked Gunicorn stack is the reviewed stack."""
         assert _declared_pin("runtime", "gunicorn") == EXPECTED_GUNICORN
         assert _declared_pin("runtime", "uvicorn") == EXPECTED_UVICORN
         assert _declared_pin("runtime", "uvicorn-worker") == EXPECTED_UVICORN_WORKER
@@ -205,6 +206,7 @@ class TestGunicornRuntime:
         assert _locked_version("types-gunicorn") == EXPECTED_GUNICORN_STUBS
 
     def test_installed_gunicorn_stack_matches_the_reviewed_lock(self) -> None:
+        """Installed Gunicorn stack matches the reviewed lock."""
         assert version("gunicorn") == EXPECTED_GUNICORN
         assert version("uvicorn") == EXPECTED_UVICORN
         assert version("uvicorn-worker") == EXPECTED_UVICORN_WORKER
@@ -214,8 +216,9 @@ class TestGunicornRuntime:
     def test_production_config_preserves_unix_socket_and_forwarded_header_boundary(
         self, tmp_path: Path
     ) -> None:
+        """Production config preserves unix socket and forwarded header boundary."""
         assert _literal_config_assignment("bind") == "unix:/run/oralhistarchiv/gunicorn.sock"
-        assert _literal_config_assignment("worker_class") == "uvicorn_worker.UvicornWorker"
+        assert _literal_config_assignment("worker_class") == "app.server_worker.SafeUvicornWorker"
         assert _literal_config_assignment("umask") == EXPECTED_SOCKET_UMASK
         assert _literal_config_assignment("forwarded_allow_ips") == ""
 
@@ -259,6 +262,7 @@ class TestServiceSocketHardening:
     """Unix-socket and unit hardening keeps the proxy, web and scheduler apart."""
 
     def test_web_runtime_directory_is_limited_to_the_nginx_proxy_group(self) -> None:
+        """Web runtime directory is limited to the nginx proxy group."""
         assert unit_directives(WEB_SERVICE, "User") == ["oralhistarchiv"]
         assert unit_directives(WEB_SERVICE, "Group") == ["oralhistarchiv-proxy"]
         assert unit_directives(WEB_SERVICE, "UMask") == ["0077"]
@@ -266,6 +270,7 @@ class TestServiceSocketHardening:
         assert unit_directives(WEB_SERVICE, "RuntimeDirectoryMode") == ["0750"]
 
     def test_shibboleth_secret_environment_is_web_only(self) -> None:
+        """Shibboleth secret environment is web only."""
         common = "/etc/oralhistarchiv/common.env"
         web = "/etc/oralhistarchiv/web.env"
         scheduler = "/etc/oralhistarchiv/scheduler.env"
@@ -283,14 +288,18 @@ class TestServiceSocketHardening:
         assert shibboleth not in unit_directives(SCHEDULER_SERVICE, "EnvironmentFile")
 
     def test_gunicorn_uses_only_the_unix_socket_with_mode_0660(self) -> None:
+        """Gunicorn uses only the unix socket with mode 0660."""
         assert _literal_config_assignment("bind") == "unix:/run/oralhistarchiv/gunicorn.sock"
         # Gunicorn creates a Unix socket from 0777 while temporarily applying this
         # setting: 0777 & ~0117 == 0660.
-        assert _literal_config_assignment("umask") == 0o117
-        assert 0o777 & ~_literal_config_assignment("umask") == 0o660
+        umask = _literal_config_assignment("umask")
+        assert isinstance(umask, int)
+        assert umask == 0o117
+        assert 0o777 & ~umask == 0o660
         assert _literal_config_assignment("forwarded_allow_ips") == ""
 
     def test_scheduler_has_a_distinct_uid_and_cannot_reach_the_web_socket_path(self) -> None:
+        """Scheduler has a distinct uid and cannot reach the web socket path."""
         web_user = unit_directives(WEB_SERVICE, "User")
         scheduler_user = unit_directives(SCHEDULER_SERVICE, "User")
 
@@ -305,6 +314,7 @@ class TestServiceSocketHardening:
         )
 
     def test_only_web_service_declares_the_socket_runtime_directory(self) -> None:
+        """Only web service declares the socket runtime directory."""
         assert unit_directives(WEB_SERVICE, "RuntimeDirectory") == ["oralhistarchiv"]
         assert unit_directives(SCHEDULER_SERVICE, "RuntimeDirectory") == []
 
@@ -312,17 +322,27 @@ class TestServiceSocketHardening:
         """Outer shell quotes keep inner JSON quotes after EnvironmentFile parsing."""
         runbook = DEPLOYMENT_RUNBOOK.read_text()
         expected_assignments = {
-            "ALLOWED_HOSTS": "'[\"archive.example.uzh.ch\"]'",
+            "ALLOWED_HOSTS": "'[\"archive.example.org\"]'",
             "TOTP_ENCRYPTION_KEYS": "'[\"GENERATE_INDEPENDENT_TOKEN_URLSAFE_64\"]'",
             "OUTBOX_ENCRYPTION_KEYS": "'[\"GENERATE_INDEPENDENT_TOKEN_URLSAFE_64\"]'",
-            "SHIBBOLETH_TRUSTED_ISSUERS": ("'[\"https://eduid.ch/idp/shibboleth\"]'"),
+            "SHIBBOLETH_TRUSTED_ISSUERS": "'[]'",
         }
 
         for name, value in expected_assignments.items():
             assert f"{name}={value}" in runbook
             assert re.search(rf"(?m)^{name}=\[", runbook) is None
 
+        federation_runbook = (PROJECT_ROOT / "docs/runbooks/federation-integration.md").read_text(
+            encoding="utf-8"
+        )
+        assert (
+            "SHIBBOLETH_TRUSTED_ISSUERS='[\"https://idp.example.org/idp/shibboleth\"]'"
+            in federation_runbook
+        )
+        assert re.search(r"(?m)^SHIBBOLETH_TRUSTED_ISSUERS=\[", federation_runbook) is None
+
     def test_runbook_requires_live_inventory_of_every_proxy_uid_process(self) -> None:
+        """Runbook requires live inventory of every proxy uid process."""
         runbook = DEPLOYMENT_RUNBOOK.read_text()
 
         # Resolve the actual nginx worker identity, fail closed, and use the same
@@ -348,6 +368,7 @@ class TestServiceSocketHardening:
         assert "dedicated worker UID" in runbook
 
     def test_runbook_uses_raw_unix_connect_positive_and_negative_controls(self) -> None:
+        """Runbook uses raw unix connect positive and negative controls."""
         runbook = DEPLOYMENT_RUNBOOK.read_text()
 
         assert "stat -Lc 'type=%F owner=%U group=%G mode=%a path=%n'" in runbook
@@ -363,6 +384,7 @@ class TestSchedulerStopPolicy:
     """Systemd's stop policy stays aligned with Python and SMTP subprocess draining."""
 
     def test_scheduler_stop_budget_and_child_signal_policy(self) -> None:
+        """Scheduler stop budget and child signal policy."""
         tree = ast.parse((PROJECT_ROOT / "run_scheduler.py").read_text())
         constants = {
             target.id: ast.literal_eval(node.value)
@@ -390,6 +412,7 @@ class TestAuditLogShipping:
     """The audit log is shipped off the units via journald and a bounded RELP queue."""
 
     def test_runtime_units_have_explicit_stable_journal_identifiers(self) -> None:
+        """Runtime units have explicit stable journal identifiers."""
         assert unit_directives(WEB_SERVICE, "StandardOutput") == ["journal"]
         assert unit_directives(WEB_SERVICE, "StandardError") == ["journal"]
         assert unit_directives(WEB_SERVICE, "SyslogIdentifier") == ["oralhistarchiv"]
@@ -409,6 +432,7 @@ class TestAuditLogShipping:
         assert unit_directives(MIGRATION_UNIT, "SyslogIdentifier") == ["oralhistarchiv-migrate"]
 
     def test_rsyslog_selects_trusted_systemd_unit_metadata(self) -> None:
+        """Rsyslog selects trusted systemd unit metadata."""
         active_config = _active_rsyslog_config()
         shipping_conditional = _shipping_conditional(active_config)
 
@@ -424,6 +448,7 @@ class TestAuditLogShipping:
         assert "$syslogtag" not in active_config
 
     def test_remote_action_is_named_reliable_bounded_and_observable(self) -> None:
+        """Remote action is named reliable bounded and observable."""
         active_config = _active_rsyslog_config()
         shipping_conditional = _shipping_conditional(active_config)
 
@@ -460,53 +485,51 @@ def _declares_key(path: Path, key: str) -> bool:
 
 
 class TestPerProcessLimiterCredentialIsolation:
-    """The rate-limit Redis credential is a web-only concern: only the web
-    process overlay supplies it, so a scheduler or migration deployment
-    (neither of which serves rate-limited requests) cannot be handed a
-    credential it has no use for."""
+    """Supply the dedicated limiter credential only to the web process."""
 
     def test_scheduler_and_migration_environment_do_not_declare_the_limiter_credential(
         self,
     ) -> None:
+        """Scheduler and migration environment do not declare the limiter credential."""
         assert not _declares_key(SCHEDULER_ENV_EXAMPLE, "RATE_LIMIT_REDIS_URL")
         assert not _declares_key(MIGRATION_ENV_EXAMPLE, "RATE_LIMIT_REDIS_URL")
 
     def test_web_environment_declares_its_own_limiter_credential(self) -> None:
+        """Web environment declares its own limiter credential."""
         assert _declares_key(WEB_ENV_EXAMPLE, "RATE_LIMIT_REDIS_URL")
 
 
 class TestGunicornRecyclingAndLimiterExternality:
-    """Worker recycling is bounded (never unlimited, never disabled) and the
-    limiter's own construction never enables an in-process fallback that
-    would let counters diverge per Gunicorn worker."""
+    """Bound worker recycling and keep rate-limit state outside Gunicorn workers."""
 
     def test_worker_recycling_is_present_and_bounded(self) -> None:
+        """Worker recycling is present and bounded."""
         max_requests = _literal_config_assignment("max_requests")
         jitter = _literal_config_assignment("max_requests_jitter")
         assert isinstance(max_requests, int) and 0 < max_requests <= 100_000
         assert isinstance(jitter, int) and 0 <= jitter < max_requests
 
     def test_constructed_limiter_never_falls_back_to_in_process_state(self) -> None:
+        """Constructed limiter never falls back to in process state."""
         constructed = _build_limiter()
         assert constructed._in_memory_fallback_enabled is False
-        assert constructed._storage_uri == (settings.rate_limit_storage_uri or "memory://")
+        expected_uri = (
+            bounded_redis_uri(settings.rate_limit_storage_uri)
+            if settings.rate_limit_storage_uri
+            else "memory://"
+        )
+        assert constructed._storage_uri == expected_uri
 
 
 PRODUCTION_MODE_UNITS = (WEB_SERVICE, SCHEDULER_SERVICE, MIGRATION_UNIT)
 
 
 class TestProductionModeStartGuard:
-    """The reference production units refuse to start unless the environment
-    they are actually given selects production mode.
-
-    Loading an environment file is not enough on its own: with ENV_STATE
-    simply missing, the application falls back to its development default and
-    several production-only checks become advisory. The guard has to be an
-    executed, unsuppressed check on the effective value.
-    """
+    """Refuse reference-unit startup unless the effective environment selects production."""
 
     @pytest.mark.parametrize("unit", PRODUCTION_MODE_UNITS, ids=lambda unit: unit.name)
     def test_the_unit_checks_its_mode_before_starting_its_process(self, unit: Path) -> None:
+        """The unit checks its mode before starting its process."""
         guards = unit_directives(unit, "ExecStartPre")
         assert guards, f"{unit.name} starts its process with no mode check in front of it"
 
@@ -543,9 +566,7 @@ class TestProductionModeStartGuard:
 
     @pytest.mark.parametrize("unit", (WEB_SERVICE, SCHEDULER_SERVICE), ids=lambda unit: unit.name)
     def test_a_later_environment_file_can_take_production_mode_away(self, unit: Path) -> None:
-        """Environment files are layered and the last one wins. A unit that
-        merely had 'production' written somewhere in its first file would pass
-        a weaker check while its processes ran in development mode."""
+        """Honor the last environment-file value when checking production mode."""
         paths = environment_file_paths(unit)
         assert len(paths) >= 2, (
             f"{unit.name} no longer layers environment files, so this test cannot "
@@ -563,6 +584,8 @@ class TestProductionModeStartGuard:
         all, so the shipped files are checked with systemd's own verifier."""
         verifier = shutil.which("systemd-analyze")
         if verifier is None:
+            if os.environ.get("REQUIRE_SYSTEMD") == "1":
+                pytest.fail("systemd-analyze is required by REQUIRE_SYSTEMD=1")
             pytest.skip("systemd-analyze is not installed in this development environment")
 
         completed = subprocess.run(

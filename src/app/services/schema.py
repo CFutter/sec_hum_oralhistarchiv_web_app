@@ -8,12 +8,11 @@ from typing import Any
 from psycopg import sql
 
 from app.doi import canonicalize_doi
+from app.sources import AccessTier
 
-from .access_tiers import AccessTier
 from .parsed_record import FACET_LABEL_MAX_CHARS, validate_parsed_record
 
 logger = logging.getLogger(__name__)
-# Source and application fields written before raw data and sync time.
 DATASET_COLUMNS = [
     "uuid",
     "title",
@@ -39,8 +38,7 @@ DATASET_COLUMNS = [
     "upstream_modified_at",
 ]
 
-# Columns used in SELECT queries (no institutions/main_disciplines
-# since they're not on the Dataset dataclass)
+# Match the Dataset projection; institutions/main_disciplines remain stored-only.
 DATASET_SELECT_COLUMNS = [
     "id",
     "uuid",
@@ -66,18 +64,19 @@ DATASET_SELECT_COLUMNS = [
 
 DATASET_SELECT_SQL = sql.SQL(", ").join(map(sql.Identifier, DATASET_SELECT_COLUMNS))
 
-# Trigger-maintained columns (trg_search_text). Referenced only in raw SQL
-# (search_datasets) — never SELECTed into Dataset, never written by the app.
-# Listed here so validate_application_column_contracts fails loudly if a migration
-# renames one, instead of every search 500-ing at runtime.
-DATASET_TRIGGER_COLUMNS = ["search_text_public", "search_text_full"]
+# Include trigger-owned columns in startup drift checks, outside Dataset/app writes.
+DATASET_TRIGGER_COLUMNS = [
+    "search_text_public",
+    "search_text_full",
+    "search_vector_public",
+    "search_vector_full",
+]
 
 DATASET_INSERT_COLUMNS = [*DATASET_COLUMNS, "data", "synced_at"]
 DATASET_INSERT_SQL = sql.SQL(", ").join(map(sql.Identifier, DATASET_INSERT_COLUMNS))
 DATASET_INSERT_PLACEHOLDERS = sql.SQL(", ").join([sql.Placeholder()] * len(DATASET_INSERT_COLUMNS))
 
-# Fields on Dataset that are computed in _parse_dataset(),
-# not read directly from a database column.
+# Derived URLs belong to Dataset but have no stored columns.
 DATASET_COMPUTED_FIELDS = {"resource_access_url", "landing_page_url"}
 
 PARSER_OWNED = set(DATASET_COLUMNS) - {"access_level", "source", "visibility_tier"}
@@ -102,11 +101,11 @@ def _json_default(value: Any) -> str:
 def _canonicalize_doi(raw: str) -> str | None:
     """Canonicalize DOI names/URIs, preserving safe non-resolver HTTP(S) URLs.
 
-    Return None and log up to 80 input characters when canonicalize_doi rejects it.
+    Return None and log a fixed warning without the input when canonicalize_doi rejects it.
     """
     value = canonicalize_doi(raw)
     if value is None:
-        logger.warning("Unrecognized DOI format from upstream: %s", raw[:80])
+        logger.warning("Unrecognized DOI format from upstream")
     return value
 
 
@@ -117,7 +116,8 @@ def build_record_params(
 
     Require all PARSER_OWNED keys, then validate ParsedRecord without
     coercion. Serialize raw data and proxies as JSON, canonicalize DOI, use
-    empty arrays for absent array content, and stamp synced_at with UTC now.
+    empty arrays for absent array content, and propose synced_at as UTC now.
+    The writer uses that stamp only for inserted or changed catalogue content.
     access_level must contain 1-256 characters. source and visibility_tier
     are caller-owned overrides; this function does not validate their policy.
 
@@ -153,7 +153,6 @@ def build_record_params(
             continue
         values[col] = (record.get(col) or []) if col in _ARRAY_COLUMNS else record.get(col)
 
-    # Fail if an insert-only column was added without a value.
     missing = [c for c in DATASET_INSERT_COLUMNS if c not in values]
     if missing:
         raise AssertionError(f"build_record_params has no value for columns: {missing}")

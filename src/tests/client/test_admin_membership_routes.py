@@ -1,13 +1,4 @@
-"""Admin membership routes at the client tier — the DB-less tier's admin coverage.
-
-Before this file the unit/client tier had ZERO admin coverage, so a developer running
-`pytest -m "not integration"` stayed green after regressing require_admin —
-the only admin authz tests lived in the integration tier, which can be
-skipped. These tests pin the 404 cloak, the admin-unlock UI contract,
-the CSRF rejection on the highest-privilege mutation, the framework-level
-422 for a garbage tier value, and the not-found/rejection flash contract that
-every mutation route on this router shares — none of which need a database.
-"""
+"""Admin membership routes at the client tier — the DB-less tier's admin coverage."""
 
 from contextlib import ExitStack
 from datetime import UTC, datetime
@@ -17,24 +8,39 @@ import pytest
 from lxml import html
 from psycopg.errors import DivisionByZero
 
+from app.service_errors import UserNotFound
 from app.services.admin_promotion import AdminPromotionRejected, AdminPromotionRequestResult
 from app.services.email_change import AdminEmailChangeRejected
-from app.services.users import AdminActionRejected, SetActiveResult
+from app.services.federated_review import FederatedReview
+from app.services.users import AdminActionRejected, FederatedApproval, SetActiveResult
 from tests.fixtures import RAW_SESSION_ID, make_sample_user
 
 
 def _patch(name, **kw):
+    """Patch the route collaborator with its real signature."""
     return patch(f"app.routes.auth.admin.{name}", autospec=True, **kw)
 
 
 @pytest.fixture(autouse=True)
 def _no_pending_admin_promotions():
-    """admin_dashboard (admin.py) awaits list_admin_promotion_states for the
-    rendered page's user ids on every GET /admin. Default to 'nothing
-    pending' so every dashboard test in this module stays focused on what it
-    actually asserts; a test exercising invitation display overrides this
-    patch itself."""
-    with _patch("list_admin_promotion_states", return_value={}):
+    """Default dashboard collaborators to no invitations and one observed federated review."""
+    with (
+        _patch("list_admin_promotion_states", return_value={}),
+        _patch(
+            "list_federated_reviews",
+            return_value={
+                7: FederatedReview(
+                    revision=1,
+                    issuer="https://idp.example.org/idp/shibboleth",
+                    affiliation=None,
+                    entitlement=None,
+                    proposed_tier=None,
+                    proposed_rule=None,
+                    mismatch=False,
+                )
+            },
+        ),
+    ):
         yield
 
 
@@ -68,8 +74,7 @@ class TestAdminDashboardAccess:
             assert "Page not found" in resp.text
 
     def test_admin_dashboard_renders_for_admin(self, admin_client):
-        """Positive control (and the admin_client fixture's first consumer): an
-        is_admin session gets the real dashboard, with the user list fetched."""
+        """Check admin dashboard renders for admin (HTTP 200)."""
         with _patch("list_users", return_value=([], 0)) as users:
             resp = admin_client.get("/admin")
         assert resp.status_code == 200
@@ -105,11 +110,7 @@ class TestFederatedIdentityDisplay:
     account status permits, so a stale login page can't confirm the tier."""
 
     def test_admin_dashboard_exposes_issuer_scoped_identity_for_review(self, admin_client):
-        """A federation account awaiting review shows both immutable identity components.
-
-        Email and display name are mutable claims, so an administrator must see
-        the issuer/subject binding before activating the account or raising tier.
-        """
+        """A federation account awaiting review shows both immutable identity components."""
         target = make_sample_user(
             id=7,
             auth_method="shibboleth",
@@ -133,6 +134,7 @@ class TestFederatedIdentityDisplay:
         ]
 
     def test_pending_federated_identity_has_only_exact_approval_action(self, admin_client):
+        """Check pending federated identity has only exact approval action."""
         target = make_sample_user(
             id=7,
             auth_method="shibboleth",
@@ -153,25 +155,32 @@ class TestFederatedIdentityDisplay:
         }
         assert fields["expected_issuer"] == target.shibboleth_issuer
         assert fields["expected_subject_id"] == target.shibboleth_subject_id
+        assert fields["expected_review_revision"] == "1"
         assert fields["csrf_token"]
         assert document.xpath('//form[@action="/admin/users/7/set-active"]') == []
         assert document.xpath('//form[@action="/admin/users/7/set-tier"]') == []
         assert document.xpath('//form[@action="/admin/users/7/set-admin"]') == []
 
-    def test_legacy_federated_identity_has_no_generic_membership_action(self, admin_client):
+    def test_invalid_federated_identity_has_no_generic_membership_action(self, admin_client):
+        # Unknown status must remain denied even for an active account double.
+        """Check invalid federated identity has no generic membership action (HTTP 200)."""
         target = make_sample_user(
             id=7,
             auth_method="shibboleth",
-            federated_status="legacy_quarantined",
+            is_active=True,
+            federated_status="unsupported",
         )
         with _patch("list_users", return_value=([target], 1)):
             response = admin_client.get("/admin")
 
+        assert response.status_code == 200
         document = html.fromstring(response.text)
+        assert "invalid federation state" in response.text
         assert "Manual identity reconciliation required." in response.text
         assert document.xpath('//form[starts-with(@action, "/admin/users/7/")]') == []
 
     def test_disabled_approved_federated_identity_has_reactivation_state_action(self, admin_client):
+        """Check disabled approved federated identity has reactivation state action."""
         target = make_sample_user(
             id=7,
             auth_method="shibboleth",
@@ -251,7 +260,10 @@ class TestSetAdminCsrfProtection:
 
 
 class TestApproveFederatedMutation:
+    """Cover approve federated mutation."""
+
     def test_approve_federated_without_csrf_is_403_and_writes_nothing(self, admin_client):
+        """Check approve federated without CSRF is 403 and writes nothing."""
         with _patch("approve_federated_user") as approve:
             response = admin_client.post(
                 "/admin/users/7/approve-federated",
@@ -269,6 +281,7 @@ class TestApproveFederatedMutation:
     def test_approve_federated_delegates_exact_identity_and_audits_without_subject(
         self, admin_client
     ):
+        """Check approve federated delegates exact identity and audits without subject (HTTP 303)."""
         approved = make_sample_user(
             id=7,
             auth_method="shibboleth",
@@ -278,7 +291,18 @@ class TestApproveFederatedMutation:
         issuer = "https://idp.example.org/idp/shibboleth"
         subject = "stable-subject-7"
         with (
-            _patch("approve_federated_user", return_value=approved) as approve,
+            _patch(
+                "approve_federated_user",
+                return_value=FederatedApproval(
+                    user=approved,
+                    proposed_tier="registered",
+                    proposed_rule={
+                        "index": 1,
+                        "match": {"affiliation": "member"},
+                        "tier": "registered",
+                    },
+                ),
+            ) as approve,
             _patch("set_flash_if_exists") as flash,
             _patch("audit_admin_action") as audit,
         ):
@@ -287,6 +311,7 @@ class TestApproveFederatedMutation:
                 data={
                     "expected_issuer": issuer,
                     "expected_subject_id": subject,
+                    "expected_review_revision": "3",
                     "access_tier": "vetted",
                     "csrf_token": admin_client.csrf_token,
                 },
@@ -299,6 +324,7 @@ class TestApproveFederatedMutation:
             7,
             expected_issuer=issuer,
             expected_subject_id=subject,
+            expected_review_revision=3,
             access_tier="vetted",
             actor_id=99,
             actor_session_id=RAW_SESSION_ID,
@@ -310,6 +336,12 @@ class TestApproveFederatedMutation:
         assert audit_fields["old_value"] == "pending"
         assert audit_fields["new_value"] == "approved"
         assert audit_fields["access_tier"] == "vetted"
+        assert audit_fields["proposed_tier"] == "registered"
+        assert audit_fields["proposed_rule"] == {
+            "index": 1,
+            "match": {"affiliation": "member"},
+            "tier": "registered",
+        }
         assert "subject" not in " ".join(audit_fields)
         assert issuer not in repr(audit.call_args)
         assert subject not in repr(audit.call_args)
@@ -319,6 +351,7 @@ class TestApproveFederatedMutation:
         )
 
     def test_approve_federated_rejects_unknown_tier_before_service(self, admin_client):
+        """Check approve federated rejects unknown tier before service (HTTP 422)."""
         with _patch("approve_federated_user") as approve:
             response = admin_client.post(
                 "/admin/users/7/approve-federated",
@@ -336,11 +369,10 @@ class TestApproveFederatedMutation:
 
 
 class TestSetTierMutation:
+    """Cover set tier mutation."""
+
     def test_set_tier_with_unknown_tier_value_is_422_before_any_db_work(self, admin_client):
-        """access_tier is typed as the AccessTier Literal, so 'root' must die in
-        framework validation (422 branded page) before any UPDATE runs.
-        Loosening the annotation to str would turn this into an uncaught CHECK-
-        constraint 500 on every mistyped submission."""
+        """Reject an unknown tier with a branded 422 before calling the write service."""
         with _patch("update_access_tier") as write:
             resp = admin_client.post(
                 "/admin/users/7/set-tier",
@@ -348,13 +380,11 @@ class TestSetTierMutation:
                 follow_redirects=False,
             )
         assert resp.status_code == 422
-        assert "Invalid request" in resp.text  # branded 422, not JSON
+        assert "Invalid request" in resp.text
         write.assert_not_awaited()
 
     def test_no_op_tier_change_flashes_info_and_skips_audit(self, admin_client):
-        """A no-op write (old == new from the locked-CTE return) must flash the
-        info copy and emit NO audit event — an unchanged row is not an admin
-        action worth an audit line (admin.py admin_set_tier no-op arm)."""
+        """Flash information without auditing an unchanged tier."""
         with (
             _patch("update_access_tier", return_value=("registered", "registered")) as write,
             _patch("set_flash_if_exists") as flash,
@@ -379,13 +409,10 @@ class TestSetTierMutation:
 
 
 class TestSetAdminMutation:
+    """Cover set admin mutation."""
+
     def test_admin_change_audits_old_and_new_from_service_return(self, admin_client):
-        """Granting admin access is a two-person control: POST is-admin=true
-        creates an acceptance invitation (request_admin_promotion) rather than
-        writing is_admin directly (admin.py admin_set_admin, docstring "Invite a
-        non-admin to accept authority"; set_user_admin itself now rejects
-        is_admin=True). The audit payload must be the invitation the service
-        returned atomically — not a value recomputed by the route."""
+        """Audit the invitation returned by the promotion service without granting authority directly."""
         expires_at = datetime(2026, 4, 1, tzinfo=UTC)
         invitation = AdminPromotionRequestResult(user_id=7, expires_at=expires_at, reissued=False)
         with (
@@ -415,12 +442,10 @@ class TestSetAdminMutation:
 
 
 class TestSetActiveMutation:
+    """Cover set active mutation."""
+
     def test_set_active_no_op_with_lock_cleared_is_the_unlock_path(self, admin_client):
-        """SetActiveResult(True, True, lock_cleared=True) — activating an
-        already-active user whose row held lockout state — is the documented
-        admin-unlock path: recovery success flash + a dedicated
-        admin_user_unlocked audit event. The database tests check that unlock
-        preserves existing sessions."""
+        """Report an active account unlock with recovery feedback and the dedicated audit event."""
         with (
             _patch(
                 "set_user_active",
@@ -468,12 +493,7 @@ class TestSetActiveMutation:
         assert flash.await_args.args[3] == "success"
 
     def test_deactivation_revokes_sessions_and_audits_lock_cleared(self, admin_client):
-        """The route delegates deactivation once and audits its returned state.
-
-        Session deletion is now owned by set_user_active(), and is verified in
-        test_account_deactivation_db.py. An extra route-level database operation
-        is rejected by the client fixture's database guard.
-        """
+        """The route delegates deactivation once and audits its returned state."""
         with (
             _patch(
                 "set_user_active",
@@ -627,12 +647,7 @@ class TestSelfProtectionGuards:
 
 
 class TestMutationRouteContracts:
-    """Contracts every /admin/users/{id}/<mutation> route shares, including
-    the email-change route: a stale form for a deleted user always flashes
-    'User not found.' instead of a 500, and a mid-request authority or
-    session change always flashes the rejection message without a success
-    audit. Grouped here (rather than split by production surface) because the
-    invariant, not the destination service, is what each case proves."""
+    """Require missing-target and changed-authority admin mutations to fail without success audits."""
 
     @pytest.mark.parametrize(
         ("path", "form", "service"),
@@ -642,6 +657,7 @@ class TestMutationRouteContracts:
                 {
                     "expected_issuer": "https://idp.example.org/idp/shibboleth",
                     "expected_subject_id": "stable-subject-999999",
+                    "expected_review_revision": "1",
                     "access_tier": "public",
                 },
                 "approve_federated_user",
@@ -655,7 +671,7 @@ class TestMutationRouteContracts:
             ("/admin/users/999999/set-admin", {"is_admin": "true"}, "request_admin_promotion"),
             (
                 "/admin/users/999999/change-email",
-                {"new_email": "x@uzh.ch"},
+                {"new_email": "x@example.org"},
                 "stage_admin_email_change",
             ),
         ],
@@ -670,14 +686,7 @@ class TestMutationRouteContracts:
     def test_mutation_on_nonexistent_user_flashes_not_found(
         self, admin_client, path, form, service
     ):
-        """A stale admin form (user deleted between page load and submit) must
-        land back on /admin with the 'User not found.' flash — never a 500.
-
-        The locked-CTE write service itself raises ValueError for a
-        missing user and admin.py catches it. Email staging uses its typed
-        policy rejection so an internal ValueError is not mistaken for a stale
-        form.
-        """
+        """Redirect a missing target to the dashboard with the not-found flash."""
         with ExitStack() as stack:
             flash = stack.enter_context(_patch("set_flash_if_exists"))
             if service == "stage_admin_email_change":
@@ -690,7 +699,7 @@ class TestMutationRouteContracts:
                 )
             else:
                 writer = stack.enter_context(
-                    _patch(service, side_effect=ValueError("User 999999 not found"))
+                    _patch(service, side_effect=UserNotFound("User 999999 not found"))
                 )
 
             resp = admin_client.post(
@@ -704,7 +713,7 @@ class TestMutationRouteContracts:
         flash.assert_awaited_once()
         assert flash.await_args.args[2] == "User not found."
         assert flash.await_args.args[3] == "error"
-        writer.assert_awaited_once()  # the write was attempted and failed cleanly
+        writer.assert_awaited_once()
 
     @pytest.mark.parametrize(
         ("path", "form", "service"),
@@ -714,6 +723,7 @@ class TestMutationRouteContracts:
                 {
                     "expected_issuer": "https://idp.example.org/idp/shibboleth",
                     "expected_subject_id": "stable-subject-7",
+                    "expected_review_revision": "1",
                     "access_tier": "registered",
                 },
                 "approve_federated_user",
@@ -721,7 +731,7 @@ class TestMutationRouteContracts:
             ("set-active", {"is_active": "false"}, "set_user_active"),
             ("set-tier", {"access_tier": "vetted"}, "update_access_tier"),
             ("set-admin", {"is_admin": "false"}, "set_user_admin"),
-            ("change-email", {"new_email": "new@uzh.ch"}, "stage_admin_email_change"),
+            ("change-email", {"new_email": "new@example.org"}, "stage_admin_email_change"),
         ],
         ids=(
             "approve_federated",
@@ -734,6 +744,7 @@ class TestMutationRouteContracts:
     def test_membership_rejection_is_error_flash_without_success_audit(
         self, admin_client, path, form, service
     ):
+        """Check membership rejection is error flash without success audit (HTTP 303)."""
         message = "Your administrator access changed. Please log in again."
         with (
             _patch(service, side_effect=AdminActionRejected(message)) as write,

@@ -1,16 +1,4 @@
-"""``app.services.credential_attempts`` against the real PostgreSQL schema.
-
-``reserve_session_step_up_attempt`` binds a small, shared attempt budget to
-the exact full session that is proving a password, TOTP code, or other
-sensitive credential during a step-up flow (admin promotion, email change,
-TOTP setup and recovery all reserve through it). These tests pin the durable
-serialization point which cannot be proved with mock cursors: one quota per
-exact active full session, and the deliberate lock order — session row
-before challenge/session cascade deletes — that keeps exhaustion and
-account-wide revocation from deadlocking each other. The integration
-conftest applies the application's Alembic migration and skips this module
-when the configured test database is unavailable.
-"""
+"""``app.services.credential_attempts`` against the real PostgreSQL schema."""
 
 import asyncio
 from unittest.mock import create_autospec
@@ -25,7 +13,6 @@ from app.services.credential_attempts import (
     SessionStepUpAttemptOutcome,
     reserve_session_step_up_attempt,
 )
-from app.services.crypto import encrypt_value
 from app.services.db import get_db_cursor
 from app.services.email_change import SelfEmailChangeRejected, stage_self_email_change
 from app.services.session_ids import hash_session_id
@@ -34,6 +21,7 @@ from app.services.session_revocation import (
     invalidate_pending_authentication_state_cur,
 )
 from app.services.totp import TotpRotationStartOutcome, begin_totp_rotation
+from app.services.totp_crypto import encrypt_value
 from app.services.totp_recover import TotpRecoveryRejected, authorize_totp_recovery
 from config import settings
 from tests.integration.conftest import TEST_DATABASE_URL
@@ -42,6 +30,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
 
 def _session_state(sync_conn, raw_session_id: str) -> tuple[int, bool] | None:
+    """Read the session attempt count and database-time expiry state, or None."""
     return sync_conn.execute(
         """
         SELECT step_up_attempt_count,
@@ -69,6 +58,7 @@ def _credential_snapshot(sync_conn, user_id: int):
 
 
 def _user_login_lock_state(sync_conn, user_id: int):
+    """Read failed-login count and lock deadline."""
     return sync_conn.execute(
         "SELECT failed_login_count, locked_until FROM users WHERE id = %s",
         (user_id,),
@@ -76,6 +66,7 @@ def _user_login_lock_state(sync_conn, user_id: int):
 
 
 async def _backend_pid(conn: psycopg.AsyncConnection) -> int:
+    """Read the PostgreSQL backend PID and commit the observer transaction."""
     cursor = await conn.execute("SELECT pg_backend_pid()")
     row = await cursor.fetchone()
     await conn.commit()
@@ -89,11 +80,12 @@ async def _reserve_session_on_independent_connection(
     session_id: str,
     barrier: asyncio.Barrier,
 ):
+    """Reserve a step-up attempt on an independent connection after a barrier."""
     async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn:
         backend_pid = await _backend_pid(conn)
         await barrier.wait()
         outcome = await reserve_session_step_up_attempt(
-            conn,  # type: ignore[arg-type] - exercises the supported direct-connection path
+            conn,
             user_id=user_id,
             session_id=session_id,
         )
@@ -102,6 +94,53 @@ async def _reserve_session_on_independent_connection(
 
 class TestSessionStepUpReservation:
     """One shared budget per exact active full session, serialized on its row."""
+
+    async def test_fresh_full_session_reservation_spends_one_attempt(
+        self, db_pool, user_factory, session_factory, sync_conn
+    ):
+        """A live full session remains eligible and spends exactly one attempt."""
+        user = user_factory()
+        raw_session = session_factory(user.id, purpose="full")
+        before_credentials = _credential_snapshot(sync_conn, user.id)
+        assert _session_state(sync_conn, raw_session) == (0, True)
+
+        outcome = await reserve_session_step_up_attempt(
+            db_pool, user_id=user.id, session_id=raw_session
+        )
+
+        assert outcome is SessionStepUpAttemptOutcome.RESERVED
+        assert _session_state(sync_conn, raw_session) == (1, True)
+        assert _credential_snapshot(sync_conn, user.id) == before_credentials
+
+    @pytest.mark.known_defect
+    async def test_idle_expired_full_session_cannot_reserve_a_step_up_attempt(
+        self, db_pool, user_factory, session_factory, sync_conn
+    ):
+        """An idle-expired bearer must not spend proof budget or regain authority."""
+        user = user_factory()
+        raw_session = session_factory(user.id, purpose="full")
+        sync_conn.execute(
+            """UPDATE sessions
+               SET last_activity_at = clock_timestamp() - %s * INTERVAL '1 second'
+               WHERE id = %s""",
+            (settings.session_idle_timeout_seconds + 30, hash_session_id(raw_session)),
+        )
+        sync_conn.commit()
+        before_credentials = _credential_snapshot(sync_conn, user.id)
+        assert _session_state(sync_conn, raw_session) == (0, True)
+        assert sync_conn.execute(
+            """SELECT last_activity_at <= clock_timestamp() - %s * INTERVAL '1 second'
+               FROM sessions WHERE id = %s""",
+            (settings.session_idle_timeout_seconds, hash_session_id(raw_session)),
+        ).fetchone() == (True,)
+
+        outcome = await reserve_session_step_up_attempt(
+            db_pool, user_id=user.id, session_id=raw_session
+        )
+
+        assert outcome is SessionStepUpAttemptOutcome.INVALID_SESSION
+        assert _session_state(sync_conn, raw_session) == (0, True)
+        assert _credential_snapshot(sync_conn, user.id) == before_credentials
 
     async def test_exhausting_the_session_budget_expires_only_that_session(
         self,
@@ -223,6 +262,7 @@ class TestSessionStepUpRevocationLockOrder:
         challenge_deleted = asyncio.Event()
 
         async def exhaust_exact_session():
+            """Exhaust the presented session's durable step-up budget."""
             async with (
                 await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn,
                 conn.transaction(),
@@ -235,12 +275,13 @@ class TestSessionStepUpRevocationLockOrder:
                 session_locked.set()
                 await challenge_deleted.wait()
                 return await reserve_session_step_up_attempt(
-                    conn,  # type: ignore[arg-type] - supported direct-connection path
+                    conn,
                     user_id=user.id,
                     session_id=raw_session,
                 )
 
         async def revoke_user_state():
+            """Revoke the user's authority while the step-up attempt is waiting."""
             await session_locked.wait()
             async with (
                 await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn,
@@ -293,6 +334,7 @@ class TestSessionStepUpRevocationLockOrder:
         real_delete = session_revocation.delete_user_sessions_cur
 
         async def observed_delete(cur, user_id):
+            """Signal session-deletion readiness, then delegate to the real deletion."""
             revocation_reached_session_delete.set()
             await real_delete(cur, user_id)
 
@@ -307,6 +349,7 @@ class TestSessionStepUpRevocationLockOrder:
         monkeypatch.setattr(session_revocation, "delete_user_sessions_cur", autospecced_delete)
 
         async def logout_exact_session():
+            """Lock and delete the presented session after revocation reaches session deletion."""
             async with (
                 await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn,
                 conn.transaction(),
@@ -321,6 +364,7 @@ class TestSessionStepUpRevocationLockOrder:
                 await conn.execute("DELETE FROM sessions WHERE id = %s", (session_hash,))
 
         async def revoke_every_session():
+            """Wait for the competing logout lock, then revoke all user sessions."""
             await logout_locked_session.wait()
             await session_revocation.delete_user_sessions(db_pool, user.id)
 
@@ -404,6 +448,7 @@ class TestSharedBudgetAcrossProtectedStepUpServices:
         monkeypatch,
         admin_actor,
     ):
+        """Verify alternating submissions across services share one counter."""
         limit = 4
         monkeypatch.setattr(settings, "session_step_up_attempt_limit", limit)
         secret = pyotp.random_base32()
@@ -412,6 +457,7 @@ class TestSharedBudgetAcrossProtectedStepUpServices:
         sibling_session = session_factory(user.id, purpose="full")
 
         async def submit_rotation_start():
+            """Assert an invalid password produces the invalid-credentials rotation outcome."""
             result = await begin_totp_rotation(
                 db_pool,
                 user.id,
@@ -422,6 +468,7 @@ class TestSharedBudgetAcrossProtectedStepUpServices:
             assert result.outcome is TotpRotationStartOutcome.INVALID_CREDENTIALS
 
         async def submit_email_change():
+            """Assert an invalid password rejects the email-change attempt."""
             with pytest.raises(SelfEmailChangeRejected):
                 await stage_self_email_change(
                     db_pool,
@@ -429,9 +476,11 @@ class TestSharedBudgetAcrossProtectedStepUpServices:
                     session_id=raw_session,
                     current_password="wrong-password",
                     new_email="someone-else@example.org",
+                    totp_code="111111",
                 )
 
         async def submit_promotion_prepare():
+            """Assert an invalid TOTP proof rejects promotion preparation."""
             with pytest.raises(AdminPromotionRejected) as excinfo:
                 await prepare_admin_promotion(
                     db_pool,
@@ -443,6 +492,7 @@ class TestSharedBudgetAcrossProtectedStepUpServices:
             assert excinfo.value.args[0] == "invalid_totp"
 
         async def submit_admin_recovery_authorization():
+            """Assert an invalid admin TOTP proof rejects recovery authorization."""
             with pytest.raises(TotpRecoveryRejected):
                 await authorize_totp_recovery(
                     db_pool,

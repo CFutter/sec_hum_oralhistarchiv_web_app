@@ -1,0 +1,16 @@
+[Unit]
+Description=Oral History Archive — Feed Parser Socket
+
+[Socket]
+ListenStream=/run/oralhistarchiv-parser.sock
+SocketUser=root
+SocketGroup=oralhistarchiv-scheduler
+SocketMode=0660
+Accept=yes
+Service=oralhistarchiv-parser@.service
+MaxConnections=2
+Backlog=8
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

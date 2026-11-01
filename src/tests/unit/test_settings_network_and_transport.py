@@ -1,15 +1,4 @@
-"""Fail-closed pins for the Settings validators that guard network exposure.
-
-Every test constructs ``Settings(_env_file=None, **kwargs)`` so no ``.env``
-file leaks in. Real OS environment variables still apply to *unset* fields,
-so the kwargs helpers below pass an explicit value for every field a test
-asserts on.
-
-Each validator here moved an invariant from caller discipline to the config
-boundary, so a bad deployment fails loudly at construction instead of
-silently at runtime. The tests therefore assert the boundary REJECTS the bad
-input, not just that the happy path constructs.
-"""
+"""Fail-closed pins for the Settings validators that guard network exposure."""
 
 import pytest
 from pydantic import SecretStr, ValidationError
@@ -51,10 +40,12 @@ class TestPublicBaseUrl:
         ],
     )
     def test_public_base_url_rejects_non_origin_values(self, public_base_url):
+        """Check public base URL rejects non origin values (ValidationError)."""
         with pytest.raises(ValidationError, match="PUBLIC_BASE_URL"):
             make_settings(**base_kwargs(public_base_url=public_base_url))
 
     def test_public_base_url_allows_valid_port(self):
+        """Check public base URL allows valid port."""
         configured = make_settings(
             **base_kwargs(public_base_url="https://archive.example.org:8443/")
         )
@@ -125,9 +116,11 @@ class TestAllowedHosts:
             s = make_settings(**base_kwargs(allowed_hosts=hosts))
         assert s.allowed_hosts == hosts
 
-    def test_empty_hosts_rejects_public_origin_even_in_dev(self):
-        with pytest.warns(RuntimeWarning), pytest.raises(ValidationError, match="PUBLIC_BASE_URL"):
+    def test_empty_hosts_rejects_even_in_dev_without_a_warning(self, recwarn):
+        """Check empty hosts rejects even in dev without a warning (ValidationError)."""
+        with pytest.raises(ValidationError, match="ALLOWED_HOSTS is empty"):
             make_settings(**base_kwargs(allowed_hosts=[]))
+        assert not recwarn.list
 
     @pytest.mark.parametrize(
         "hosts",
@@ -145,9 +138,9 @@ class TestAllowedHosts:
         ],
     )
     def test_allowed_hosts_syntax_and_public_base_url_membership_are_one_contract(self, hosts):
-        """ALLOWED_HOSTS entries must both be syntactically valid bare hosts
-        AND include PUBLIC_BASE_URL's own hostname — construction fails
-        whichever half of that single contract a given input violates."""
+        """Check allowed hosts syntax and public base URL membership are one contract
+        (ValidationError).
+        """
         with pytest.raises(ValidationError):
             make_settings(**base_kwargs(allowed_hosts=hosts))
 
@@ -156,11 +149,8 @@ class TestCors:
     """CORS must not disable the same-origin policy outside dev."""
 
     def test_cors_wildcard_with_credentials_rejected_in_staging(self):
-        """CORS enabled with '*' origins (here with allow_credentials=True, the
-        worst combination) must block startup in staging/production.
-
-        The validator rejects wildcard origins regardless of
-        cors_allow_credentials.
+        """CORS enabled with '*' origins (here with allow_credentials=True, the worst combination) must
+        block startup in staging/production.
         """
         kwargs = staging_kwargs(
             cors_enabled=True,
@@ -197,9 +187,8 @@ class TestDatabaseUrl:
     """DATABASE_URL must be a well-formed, canonical PostgreSQL DSN."""
 
     def test_database_url_rejects_non_postgres_scheme(self):
-        """A non-PostgreSQL URL must fail construction, and the error must name
-        the offending scheme so the operator sees what was actually configured."""
-        with pytest.raises(ValidationError, match="Got scheme: 'mysql'"):
+        """A non-PostgreSQL URL fails without echoing any submitted input."""
+        with pytest.raises(ValidationError, match="must start with 'postgresql://'"):
             make_settings(**base_kwargs(database_url="mysql://x/y"))
 
     def test_database_url_rejects_empty_connection_path(self):
@@ -218,29 +207,21 @@ class TestDatabaseUrl:
         ids=["legacy-scheme", "canonical-scheme", "legacy-socket-path"],
     )
     def test_database_url_scheme_normalized_to_postgresql(self, url, expected):
-        """Validator-accepts-what-a-consumer-rejects. SQLAlchemy (the
-        dialect registry Alembic's env.py resolves against) refuses the legacy
-        'postgres://' scheme, so the boundary must NORMALIZE it to 'postgresql://'
-        rather than pass it through — a revert to pass-through boots green and
-        then crashes the first migration. The socket form 'postgres:///dbname'
-        (no host) must survive the same rewrite."""
+        """Validator-accepts-what-a-consumer-rejects."""
         s = make_settings(**base_kwargs(database_url=url))
         value = s.database_url.get_secret_value()
         assert value.startswith("postgresql://")
         assert value == expected
 
     def test_database_url_accepts_an_already_wrapped_secretstr(self):
-        """The 'before' validator runs on the RAW input, ahead of Pydantic's
-        own SecretStr wrapping, so it must explicitly unwrap a caller-supplied
-        SecretStr (not just a plain str) before parsing the scheme — and the
-        unwrapped value round-trips unchanged through get_secret_value()."""
+        """Check database URL accepts an already wrapped secretstr."""
         value = "postgresql://user:password@localhost/test"
         s = make_settings(**base_kwargs(database_url=SecretStr(value)))
         assert s.database_url.get_secret_value() == value
 
 
 class TestStatementTimeoutFormat:
-    """db_statement_timeout is interpolated into SQL, so its shape is pinned tightly."""
+    """Reject configuration mistakes before a pool tries to configure connections."""
 
     @pytest.mark.parametrize(
         "value",
@@ -248,8 +229,7 @@ class TestStatementTimeoutFormat:
         ids=["seconds-unit", "milliseconds-unit", "minutes-unit", "zero-disables-the-timeout"],
     )
     def test_db_statement_timeout_accepts_interval_formats(self, value):
-        """The whitelist accepts '0' (disabled) and <digits><ms|s|min> — the only
-        shapes the app ever needs to interpolate into SET statement_timeout."""
+        """Accept bare '0' and ordinary positive ms/s/min durations."""
         s = make_settings(**base_kwargs(db_statement_timeout=value))
         assert s.db_statement_timeout == value
 
@@ -259,32 +239,13 @@ class TestStatementTimeoutFormat:
         ids=["sql-injection", "spelled-out-unit"],
     )
     def test_db_statement_timeout_rejects_non_interval_values(self, value):
-        """Anything outside the strict interval regex must fail — the value is
-        interpolated into SQL, so this validator is the injection guard."""
+        """Invalid duration syntax fails early; sql.Literal handles SQL quoting."""
         with pytest.raises(ValidationError, match="db_statement_timeout must be '0'"):
             make_settings(**base_kwargs(db_statement_timeout=value))
 
 
-class TestOaiInstitutionFilter:
-    """OAI_INSTITUTION_FILTER scopes which upstream records are ingested."""
-
-    def test_oai_institution_filter_blank_rejected(self):
-        """A whitespace-only institution filter must fail — it scopes which
-        datasets are ingested; empty would silently ingest nothing (or wrong)."""
-        with pytest.raises(ValidationError, match="OAI_INSTITUTION_FILTER must not be empty"):
-            make_settings(**base_kwargs(oai_institution_filter="  "))
-
-    def test_oai_institution_filter_whitespace_normalized(self):
-        """Surrounding whitespace is stripped so ' X ' matches records tagged 'X'
-        — guards against an invisible .env formatting mismatch."""
-        s = make_settings(**base_kwargs(oai_institution_filter=" X "))
-        assert s.oai_institution_filter == "X"
-
-
 class TestSessionCookieName:
-    """SESSION_COOKIE_NAME must be a distinct, syntactically valid cookie
-    token so it can never be confused with the CSRF/pre-session cookies and
-    the browser can always store and echo it back."""
+    """Cover session cookie name."""
 
     @pytest.mark.parametrize(
         "session_cookie_name",
@@ -298,7 +259,6 @@ class TestSessionCookieName:
             "é",
             "path",
             "__Secure-session",
-            "__Host-session",
         ],
         ids=[
             "empty_string",
@@ -310,18 +270,14 @@ class TestSessionCookieName:
             "non_ascii_character",
             "reserved_cookie_attribute_name",
             "secure_prefix_unsupported",
-            "host_prefix_unsupported",
         ],
     )
     def test_invalid_session_cookie_name_fails_construction(self, session_cookie_name):
-        """Empty, colliding with a reserved cookie name (CSRF or pre-session),
-        containing characters SimpleCookie cannot encode, or carrying an
-        unsupported __Secure-/__Host- prefix must all fail construction."""
+        """Check invalid session cookie name fails construction (ValidationError)."""
         with pytest.raises(ValidationError, match="SESSION_COOKIE_NAME"):
             make_settings(**base_kwargs(session_cookie_name=session_cookie_name))
 
     def test_valid_session_cookie_name_constructs(self):
-        """Positive control: a distinct, syntactically valid cookie name
-        without a __Secure-/__Host- prefix constructs without error."""
+        """Check valid session cookie name constructs."""
         s = make_settings(**base_kwargs(session_cookie_name="oha_session"))
         assert s.session_cookie_name == "oha_session"

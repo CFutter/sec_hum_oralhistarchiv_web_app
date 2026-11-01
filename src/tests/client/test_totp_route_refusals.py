@@ -1,9 +1,4 @@
-"""TOTP enrollment and rotation outcomes that overflowed the two capped
-sibling modules (test_totp_enrollment_routes.py, test_totp_rotation_routes.py
-are both near the 800-line cap): the non-recovery twin of each recovery-purpose
-branch already pinned there, and the best-effort session-revocation exception
-paths of both restart helpers.
-"""
+"""Contract tests for TOTP route refusals."""
 
 from unittest.mock import patch
 
@@ -22,10 +17,12 @@ RECOVERY_CODE = "AAAAA-BBBBB-CCCCC-DDDDD"
 
 
 def _patch(name, **kw):
+    """Patch the route collaborator with its real signature."""
     return patch(f"app.routes.auth.totp.{name}", autospec=True, **kw)
 
 
 def _assert_auth_cookies_cleared(response):
+    """Require deletion headers for the authentication cookies."""
     set_cookie_headers = response.headers.get_list("set-cookie")
     for cookie_name in (settings.session_cookie_name, CSRF_COOKIE_NAME):
         assert any(
@@ -35,6 +32,7 @@ def _assert_auth_cookies_cleared(response):
 
 
 def _post_setup(client, totp_code="123456", recovery_code_confirmation=RECOVERY_CODE, **extra):
+    """Submit the valid CSRF-protected form without following redirects."""
     data = {
         "totp_code": totp_code,
         "recovery_code_confirmation": recovery_code_confirmation,
@@ -45,11 +43,13 @@ def _post_setup(client, totp_code="123456", recovery_code_confirmation=RECOVERY_
 
 
 def _recovery_client(client_builder, **user_overrides):
+    """Build a recovery-only client for a user with no configured authenticator."""
     user = make_sample_user(totp_configured=False, totp_recovery_required=True, **user_overrides)
     return client_builder(session_user=user, session_purpose="totp_recovery")
 
 
 def _post_reset_confirm(client, new_totp_code="222222"):
+    """Submit the replacement TOTP code with CSRF without following redirects."""
     return client.post(
         "/account/reset-totp/confirm",
         data={"new_totp_code": new_totp_code, "csrf_token": client.csrf_token},
@@ -57,19 +57,11 @@ def _post_reset_confirm(client, new_totp_code="222222"):
     )
 
 
-# ---------------------------------------------------------------------------
-# GET /setup-totp — the totp_setup-purpose twin of the recovery-purpose
-# SESSION_EXPIRED case pinned in test_totp_enrollment_routes.py
-# ---------------------------------------------------------------------------
-
-
 class TestSetupTotpPageSessionExpiredNonRecovery:
+    """Cover setup TOTP page session expired non recovery."""
+
     def test_expired_totp_setup_session_restarts_at_a_fresh_login(self, totp_setup_client):
-        """A totp_setup-purpose session (not a recovery capability) whose
-        pending-secret authority expired is sent to a fresh /login, not back
-        to /recover-totp — that destination is reserved for a recovery
-        session's own expiry, pinned in
-        TestSetupTotpRecoveryPurposeGet.test_expired_recovery_session_is_sent_back_to_the_recovery_entry_point."""
+        """Check expired TOTP setup session restarts at a fresh login (HTTP 303)."""
         with (
             _patch(
                 "get_or_create_pending_totp_secret",
@@ -80,7 +72,7 @@ class TestSetupTotpPageSessionExpiredNonRecovery:
             resp = totp_setup_client.get("/setup-totp", follow_redirects=False)
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == "/login?error=totp_setup_completed"
+        assert resp.headers["location"] == "/login?error=session_expired"
         pending.assert_awaited_once_with(
             totp_setup_client.mock_pool,
             1,
@@ -91,18 +83,11 @@ class TestSetupTotpPageSessionExpiredNonRecovery:
         _assert_auth_cookies_cleared(resp)
 
 
-# ---------------------------------------------------------------------------
-# POST /setup-totp — the totp_setup-purpose twin of the recovery-purpose
-# INELIGIBLE case pinned in test_totp_enrollment_routes.py
-# ---------------------------------------------------------------------------
-
-
 class TestSetupTotpSubmitIneligibleNonRecovery:
+    """Cover setup TOTP submit ineligible non recovery."""
+
     def test_ineligible_account_gets_the_branded_unavailable_page(self, totp_setup_client):
-        """A totp_setup-purpose session found ineligible during submission
-        gets the branded unavailable page and stays on that session (unlike
-        the recovery-purpose twin, which restarts at /recover-totp — pinned
-        in TestSetupTotpSubmitRecoveryPurpose.test_ineligible_account_returns_to_the_recovery_entry_point)."""
+        """Check ineligible account gets the branded unavailable page (HTTP 403)."""
         with _patch(
             "verify_and_enroll_totp",
             return_value=TotpEnrollmentOutcome.INELIGIBLE,
@@ -114,16 +99,11 @@ class TestSetupTotpSubmitIneligibleNonRecovery:
         enroll.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# Best-effort session revocation tolerates a failed delete in BOTH restart
-# helpers — the totp_setup-restart half is pinned in
-# test_totp_enrollment_routes.py::TestCompletedSetupSessionEscapesLoop; this
-# is the recovery-restart half.
-# ---------------------------------------------------------------------------
-
-
 class TestRecoveryRestartToleratesRevocationFailure:
+    """Cover recovery restart tolerates revocation failure."""
+
     def test_recovery_session_still_restarts_even_if_revocation_itself_raises(self, client_builder):
+        """Check recovery session still restarts even if revocation itself raises (HTTP 303)."""
         client = _recovery_client(client_builder)
         with (
             _patch(
@@ -146,9 +126,7 @@ class TestRecoveryRestartToleratesRevocationFailure:
     def test_positive_control_recovery_restart_revokes_the_session_when_it_succeeds(
         self, client_builder
     ):
-        """Positive control: the same race with a healthy delete_session call
-        (pinned throughout TestSetupTotpSubmitRecoveryPurpose) revokes the
-        session rather than merely tolerating a failure to."""
+        """Check positive control recovery restart revokes the session when it succeeds (HTTP 303)."""
         client = _recovery_client(client_builder)
         with (
             _patch(
@@ -164,12 +142,10 @@ class TestRecoveryRestartToleratesRevocationFailure:
 
 
 class TestRecoveryRestartSkipsRevocationWithNoDerivableSessionId:
-    """The `71->80` branch: when the session id cannot be re-derived from the
-    cookie at all, the recovery restart skips the revocation attempt
-    entirely, exactly like the totp_setup restart does (pinned in
-    test_totp_enrollment_routes.py::TestSetupTotpBestEffortRevocation)."""
+    """Cover recovery restart skips revocation with no derivable session ID."""
 
-    def test_skips_revocation_when_no_session_id_is_derivable_from_the_cookie(self, client_builder):
+    def test_skips_revocation_when_no_session_id_was_resolved(self, client_builder):
+        """Check skips revocation when no session ID was resolved (HTTP 303)."""
         client = _recovery_client(client_builder)
         with (
             _patch(
@@ -178,7 +154,7 @@ class TestRecoveryRestartSkipsRevocationWithNoDerivableSessionId:
             ),
             _patch("delete_session") as delete,
             patch(
-                "app.routes.auth.totp.get_session_id_from_cookie",
+                "app.routes.auth.totp.get_resolved_session_id",
                 autospec=True,
                 return_value=None,
             ),
@@ -192,12 +168,10 @@ class TestRecoveryRestartSkipsRevocationWithNoDerivableSessionId:
 
 
 class TestResetTotpConfirmAttemptsExhausted:
-    """The confirmation step's own attempts-exhausted outcome (distinct from
-    the rotation-start step's ATTEMPTS_EXHAUSTED, which restarts at login):
-    too many wrong new-code guesses restarts at fresh authentication instead,
-    the same destination as a missing pending secret."""
+    """Cover reset TOTP confirm attempts exhausted."""
 
     def test_too_many_confirmation_attempts_restarts_the_flow(self, authenticated_client):
+        """Check too many confirmation attempts restarts the flow (HTTP 303)."""
         with (
             _patch(
                 "confirm_totp_rotation",

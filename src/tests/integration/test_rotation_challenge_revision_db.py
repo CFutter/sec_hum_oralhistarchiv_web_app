@@ -1,14 +1,4 @@
-"""A pending TOTP-rotation challenge is fenced to the exact `auth_revision`
-it was created under.
-
-`begin_totp_rotation` stamps the challenge it creates with the user's
-current `auth_revision`. `confirm_totp_rotation` re-reads that revision at
-confirmation time and refuses to promote the replacement secret when it no
-longer matches -- whatever changed the revision in between (a password
-change, an email-address change, an administrator membership write, or any
-other revision-bumping writer) removes the stale challenge instead of
-silently promoting it.
-"""
+"""A pending TOTP-rotation challenge is fenced to the exact `auth_revision` it was created under."""
 
 from types import SimpleNamespace
 
@@ -16,9 +6,9 @@ import pyotp
 import pytest
 
 from app.services import email_change, password_reset, totp, users
-from app.services.crypto import decrypt_value, encrypt_value
 from app.services.session_ids import hash_session_id
 from app.services.tokens import hash_token
+from app.services.totp_crypto import decrypt_value, encrypt_value
 
 pytestmark = pytest.mark.integration
 
@@ -28,6 +18,7 @@ NEW_PASSWORD = "A-different-strong-password-90210!"
 
 
 def _revision(sync_conn, user_id: int) -> int:
+    """Read the user's current authentication revision."""
     return sync_conn.execute(
         "SELECT auth_revision FROM users WHERE id = %s",
         (user_id,),
@@ -35,6 +26,7 @@ def _revision(sync_conn, user_id: int) -> int:
 
 
 def _seed_rotation_challenge(sync_conn, user_id, raw_session, revision, replacement_secret):
+    """Insert and commit a session-bound pending rotation challenge."""
     sync_conn.execute(
         """INSERT INTO pending_totp_rotations
                (user_id, session_id, auth_revision, encrypted_secret, expires_at)
@@ -45,6 +37,7 @@ def _seed_rotation_challenge(sync_conn, user_id, raw_session, revision, replacem
 
 
 def _challenge_row(sync_conn, user_id):
+    """Read the pending rotation's authentication revision, or None."""
     return sync_conn.execute(
         "SELECT auth_revision FROM pending_totp_rotations WHERE user_id = %s",
         (user_id,),
@@ -52,6 +45,7 @@ def _challenge_row(sync_conn, user_id):
 
 
 def _active_totp_secret(sync_conn, user_id) -> str:
+    """Read the user's encrypted active TOTP secret."""
     return sync_conn.execute("SELECT totp_secret FROM users WHERE id = %s", (user_id,)).fetchone()[
         0
     ]
@@ -119,6 +113,7 @@ class TestRevisionChangeInvalidatesAPendingRotation:
         sync_conn,
         monkeypatch,
     ):
+        """Verify password change invalidates the challenge."""
         active_secret = pyotp.random_base32()
         replacement_secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(active_secret))
@@ -135,9 +130,10 @@ class TestRevisionChangeInvalidatesAPendingRotation:
         await password_reset.update_password_with_token(
             db_pool,
             user.id,
-            hash_token(reset_token),
+            reset_token,
             NEW_PASSWORD,
             expected_email=user.email,
+            totp_code=pyotp.TOTP(active_secret).at(_TOTP_TIME),
         )
         assert _revision(sync_conn, user.id) == revision + 1
 
@@ -154,6 +150,7 @@ class TestRevisionChangeInvalidatesAPendingRotation:
         sync_conn,
         monkeypatch,
     ):
+        """Verify email change invalidates the challenge."""
         active_secret = pyotp.random_base32()
         replacement_secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(active_secret))
@@ -177,7 +174,7 @@ class TestRevisionChangeInvalidatesAPendingRotation:
             db_pool,
             user.id,
             NEW_EMAIL,
-            hash_token(email_token),
+            email_token,
             expected_auth_revision=revision,
         )
         assert _revision(sync_conn, user.id) == revision + 1

@@ -1,14 +1,13 @@
 """Rank access tiers and enforce source-specific minimum restrictions."""
 
-from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Literal, TypeGuard, get_args
+from typing import TypeGuard, get_args
 
 from psycopg import sql
 
-AccessTier = Literal["public", "registered", "vetted"]
+from app.ingestion_contracts import ACCESS_TIER_RANK
+from app.sources import AccessTier, SourcePolicy
 
-_TIER_RANK = {"public": 0, "registered": 1, "vetted": 2}
+_TIER_RANK = ACCESS_TIER_RANK
 
 
 class SourceVisibilityTierError(ValueError):
@@ -50,19 +49,6 @@ def assert_tier_rank_complete() -> None:
             f"AccessTier/_TIER_RANK drift — unranked: {sorted(declared - ranked)}; "
             f"ranked but not declared: {sorted(ranked - declared)}"
         )
-
-
-@dataclass(frozen=True)
-class SourcePolicy:
-    """Source restriction and classifier for raw access labels.
-
-    max_visibility is the least restrictive permitted tier; classify_access
-    maps a raw label or None to an access classification.
-    """
-
-    name: str
-    max_visibility: AccessTier
-    classify_access: Callable[[str | None], str]
 
 
 def can_access(user_tier: AccessTier, required_tier: AccessTier) -> bool:

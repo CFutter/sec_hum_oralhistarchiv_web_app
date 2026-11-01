@@ -15,9 +15,7 @@ STATIC_DIR = BASE_DIR / "static"
 
 
 def _migration_paths() -> tuple[Path, Path]:
-    """Return (INI path, script directory), preferring bundled assets;
-    raise RuntimeError if missing.
-    """
+    """Return bundled/source (INI, script directory); raise RuntimeError if incomplete."""
     bundled = files("app").joinpath("_migration_assets")
     if isinstance(bundled, Path) and bundled.is_dir():
         ini = bundled / "alembic.ini"

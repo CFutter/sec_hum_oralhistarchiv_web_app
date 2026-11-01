@@ -1,10 +1,4 @@
-"""Real-PostgreSQL tests for issuer-scoped Shibboleth provisioning.
-
-The security identity is the exact ``(issuer, subject)`` pair. Email and
-profile attributes are mutable claims and may never select or merge accounts.
-New identities are deliberately quarantined pending administrator review:
-public tier, inactive, and not locally email-verified.
-"""
+"""Real-PostgreSQL tests for issuer-scoped Shibboleth provisioning."""
 
 import pytest
 from psycopg.errors import CheckViolation
@@ -31,6 +25,7 @@ def _fetch_user_row(sync_conn, email_lower: str):
 
 
 def _count_users(sync_conn) -> int:
+    """Count all stored user rows."""
     return sync_conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
 
@@ -84,6 +79,7 @@ def _seed_email_bound_state(sync_conn, user_id: int) -> None:
 
 
 async def _provision(db_pool, **overrides):
+    """Create a federated user with the supplied field overrides."""
     values = {
         "issuer": ISSUER_A,
         "subject_id": "urn:sub:jane",
@@ -95,16 +91,17 @@ async def _provision(db_pool, **overrides):
 
 
 async def test_first_assertion_creates_only_a_pending_public_identity(db_pool, sync_conn):
+    """Verify first assertion creates only a pending public identity."""
     user = await _provision(
         db_pool,
-        affiliation="UZH",
+        affiliation="Example University",
         country="CH",
     )
 
     assert user is not None
     assert user.email == "jane@x.org"
     assert user.display_name == "Jane"
-    assert user.affiliation == "UZH"
+    assert user.affiliation == "Example University"
     assert user.country == "CH"
     assert user.auth_method == "shibboleth"
     assert user.access_tier == "public"
@@ -127,6 +124,7 @@ async def test_first_assertion_creates_only_a_pending_public_identity(db_pool, s
 
 
 async def test_returning_identity_updates_profile_but_preserves_authorization(db_pool, sync_conn):
+    """Verify returning identity updates profile but preserves authorization."""
     first = await _provision(db_pool)
     assert first is not None
 
@@ -166,6 +164,7 @@ async def test_returning_identity_updates_profile_but_preserves_authorization(db
 
 
 async def test_same_subject_from_different_issuers_is_a_different_identity(db_pool, sync_conn):
+    """Verify same subject from different issuers is a different identity."""
     first = await _provision(db_pool, email="a@example.org")
     second = await _provision(db_pool, issuer=ISSUER_B, email="b@example.org")
 
@@ -176,6 +175,7 @@ async def test_same_subject_from_different_issuers_is_a_different_identity(db_po
 
 
 async def test_same_issuer_and_subject_is_case_sensitive(db_pool, sync_conn):
+    """Verify same issuer and subject is case sensitive."""
     first = await _provision(db_pool, subject_id="Opaque-Subject", email="a@example.org")
     second = await _provision(db_pool, subject_id="opaque-subject", email="b@example.org")
 
@@ -186,7 +186,8 @@ async def test_same_issuer_and_subject_is_case_sensitive(db_pool, sync_conn):
 
 
 async def test_coalesce_keeps_profile_values_when_active_idp_omits_them(db_pool, sync_conn):
-    first = await _provision(db_pool, affiliation="UZH", country="CH")
+    """Verify coalesce keeps profile values when active idp omits them."""
+    first = await _provision(db_pool, affiliation="Example University", country="CH")
     assert first is not None
     _approve_federated_user(sync_conn, first.id)
 
@@ -200,11 +201,12 @@ async def test_coalesce_keeps_profile_values_when_active_idp_omits_them(db_pool,
     assert second is not None
     assert second.id == first.id
     assert second.display_name == "Jane"
-    assert second.affiliation == "UZH"
+    assert second.affiliation == "Example University"
     assert second.country == "CH"
 
 
 async def test_mixed_case_email_is_normalized_on_insert_and_update(db_pool, sync_conn):
+    """Verify mixed case email is normalized on insert and update."""
     first = await _provision(db_pool, email=" MiXed@Case.Org ")
     assert first is not None
     assert first.email == "mixed@case.org"
@@ -218,6 +220,7 @@ async def test_mixed_case_email_is_normalized_on_insert_and_update(db_pool, sync
 
 
 async def test_same_normalized_email_preserves_email_bound_state(db_pool, sync_conn):
+    """Verify same normalized email preserves email bound state."""
     first = await _provision(db_pool)
     assert first is not None
     _approve_federated_user(sync_conn, first.id)
@@ -236,6 +239,7 @@ async def test_same_normalized_email_preserves_email_bound_state(db_pool, sync_c
 
 
 async def test_changed_email_clears_every_old_email_credential(db_pool, sync_conn):
+    """Verify changed email clears every old email credential."""
     first = await _provision(db_pool)
     assert first is not None
     _approve_federated_user(sync_conn, first.id)
@@ -261,27 +265,29 @@ async def test_changed_email_clears_every_old_email_credential(db_pool, sync_con
 async def test_local_email_collision_returns_none_and_leaves_row_untouched(
     db_pool, sync_conn, user_factory
 ):
-    user_factory(email="owned@uzh.ch")
-    before = _fetch_user_row(sync_conn, "owned@uzh.ch")
+    """Verify local email collision returns none and leaves row untouched."""
+    user_factory(email="owned@example.org")
+    before = _fetch_user_row(sync_conn, "owned@example.org")
     assert before is not None
 
     result = await _provision(
         db_pool,
-        email="OWNED@uzh.ch",
+        email="OWNED@example.org",
         display_name="Attacker",
         affiliation="Untrusted",
     )
 
     assert result is None
-    assert _fetch_user_row(sync_conn, "owned@uzh.ch") == before
+    assert _fetch_user_row(sync_conn, "owned@example.org") == before
     assert _count_users(sync_conn) == 1
 
 
 async def test_recycled_federated_email_does_not_transfer_account(db_pool, sync_conn):
+    """Verify recycled federated email does not transfer account."""
     original = await _provision(
         db_pool,
         subject_id="urn:sub:alice",
-        email="shared@uzh.ch",
+        email="shared@example.org",
         display_name="Alice",
     )
     assert original is not None
@@ -289,13 +295,13 @@ async def test_recycled_federated_email_does_not_transfer_account(db_pool, sync_
     newcomer = await _provision(
         db_pool,
         subject_id="urn:sub:bob",
-        email="shared@uzh.ch",
+        email="shared@example.org",
         display_name="Bob",
     )
 
     assert newcomer is None
     assert _count_users(sync_conn) == 1
-    row = _fetch_user_row(sync_conn, "shared@uzh.ch")
+    row = _fetch_user_row(sync_conn, "shared@example.org")
     assert row["id"] == original.id
     assert row["display_name"] == "Alice"
 
@@ -310,29 +316,27 @@ def _grant_reviewed_authority(sync_conn, user_id: int) -> None:
 
 
 def _session_owner_ids(sync_conn) -> list[int]:
+    """Read session owner IDs in stored session order."""
     return [row[0] for row in sync_conn.execute("SELECT user_id FROM sessions ORDER BY id")]
 
 
 async def test_an_email_one_subject_gave_up_never_carries_its_account_to_another(
     db_pool, sync_conn, session_factory
 ):
-    """The reassignment case. One subject's asserted address changes, so the
-    old address is free; a different subject then presents it. The newcomer
-    must be provisioned as the stranger it is — its own quarantined row — and
-    must inherit none of the first subject's tier, administrator standing, or
-    live sessions.
-    """
-    original = await _provision(db_pool, subject_id="urn:sub:alice", email="shared@uzh.ch")
+    """Verify an email one subject gave up never carries its account to another."""
+    original = await _provision(db_pool, subject_id="urn:sub:alice", email="shared@example.org")
     assert original is not None
     _approve_federated_user(sync_conn, original.id)
     _grant_reviewed_authority(sync_conn, original.id)
     session_factory(original.id, purpose="full")
 
-    moved = await _provision(db_pool, subject_id="urn:sub:alice", email="alice-elsewhere@uzh.ch")
+    moved = await _provision(
+        db_pool, subject_id="urn:sub:alice", email="alice-elsewhere@example.org"
+    )
     assert moved is not None
     assert moved.id == original.id, "an email change must not split the identity in two"
 
-    newcomer = await _provision(db_pool, subject_id="urn:sub:bob", email="shared@uzh.ch")
+    newcomer = await _provision(db_pool, subject_id="urn:sub:bob", email="shared@example.org")
 
     assert newcomer is not None
     assert newcomer.id != original.id
@@ -341,7 +345,7 @@ async def test_an_email_one_subject_gave_up_never_carries_its_account_to_another
     assert newcomer.is_admin is False
     assert newcomer.federated_status == "pending"
 
-    retained = _fetch_user_row(sync_conn, "alice-elsewhere@uzh.ch")
+    retained = _fetch_user_row(sync_conn, "alice-elsewhere@example.org")
     assert retained["id"] == original.id
     assert retained["access_tier"] == "vetted"
     assert retained["is_admin"] is True
@@ -357,37 +361,38 @@ async def test_a_subject_cannot_take_over_another_row_by_asserting_its_email(
     merging the two identities — and neither row may be touched on the way
     out.
     """
-    incumbent = await _provision(db_pool, subject_id="urn:sub:bob", email="bob@uzh.ch")
+    incumbent = await _provision(db_pool, subject_id="urn:sub:bob", email="bob@example.org")
     assert incumbent is not None
     _approve_federated_user(sync_conn, incumbent.id)
     _grant_reviewed_authority(sync_conn, incumbent.id)
     session_factory(incumbent.id, purpose="full")
 
-    claimant = await _provision(db_pool, subject_id="urn:sub:alice", email="alice@uzh.ch")
+    claimant = await _provision(db_pool, subject_id="urn:sub:alice", email="alice@example.org")
     assert claimant is not None
     _approve_federated_user(sync_conn, claimant.id)
 
-    incumbent_before = _fetch_user_row(sync_conn, "bob@uzh.ch")
-    claimant_before = _fetch_user_row(sync_conn, "alice@uzh.ch")
+    incumbent_before = _fetch_user_row(sync_conn, "bob@example.org")
+    claimant_before = _fetch_user_row(sync_conn, "alice@example.org")
 
-    result = await _provision(db_pool, subject_id="urn:sub:alice", email="bob@uzh.ch")
+    result = await _provision(db_pool, subject_id="urn:sub:alice", email="bob@example.org")
 
     assert result is None
-    assert _fetch_user_row(sync_conn, "bob@uzh.ch") == incumbent_before
-    assert _fetch_user_row(sync_conn, "alice@uzh.ch") == claimant_before
+    assert _fetch_user_row(sync_conn, "bob@example.org") == incumbent_before
+    assert _fetch_user_row(sync_conn, "alice@example.org") == claimant_before
     assert _count_users(sync_conn) == 2
     assert _session_owner_ids(sync_conn) == [incumbent.id]
 
 
 async def test_cross_issuer_email_collision_does_not_transfer_account(db_pool, sync_conn):
-    original = await _provision(db_pool, email="shared@uzh.ch")
+    """Verify cross issuer email collision does not transfer account."""
+    original = await _provision(db_pool, email="shared@example.org")
     assert original is not None
 
-    newcomer = await _provision(db_pool, issuer=ISSUER_B, email="shared@uzh.ch")
+    newcomer = await _provision(db_pool, issuer=ISSUER_B, email="shared@example.org")
 
     assert newcomer is None
     assert _count_users(sync_conn) == 1
-    row = _fetch_user_row(sync_conn, "shared@uzh.ch")
+    row = _fetch_user_row(sync_conn, "shared@example.org")
     assert row["id"] == original.id
     assert row["shibboleth_issuer"] == ISSUER_A
 
@@ -410,7 +415,11 @@ async def test_cross_issuer_email_collision_does_not_transfer_account(db_pool, s
 async def test_blank_identity_component_is_refused_without_write(
     db_pool, sync_conn, issuer, subject_id
 ):
-    assert await _provision(db_pool, issuer=issuer, subject_id=subject_id, email="x@uzh.ch") is None
+    """Verify blank identity component is refused without write."""
+    assert (
+        await _provision(db_pool, issuer=issuer, subject_id=subject_id, email="x@example.org")
+        is None
+    )
     assert _count_users(sync_conn) == 0
 
 
@@ -427,6 +436,7 @@ def _insert_federated_row(
     approved_at=None,
     approved_by=None,
 ):
+    """Insert a federated identity with the supplied authority fields."""
     return sync_conn.execute(
         """INSERT INTO users (
                email, auth_method, shibboleth_issuer, shibboleth_subject_id,
@@ -465,6 +475,7 @@ def _insert_federated_row(
     ],
 )
 def test_database_rejects_missing_blank_or_noncanonical_identity(sync_conn, issuer, subject_id):
+    """Verify database rejects missing blank or noncanonical identity."""
     with pytest.raises(CheckViolation, match="users_federated_state_check"):
         _insert_federated_row(sync_conn, issuer=issuer, subject_id=subject_id)
     sync_conn.rollback()
@@ -482,10 +493,7 @@ def test_database_rejects_missing_blank_or_noncanonical_identity(sync_conn, issu
         ("approved", True, "registered", False, "2026-01-01T00:00:00Z", None),
         ("disabled", True, "registered", False, "2026-01-01T00:00:00Z", 7),
         ("disabled", False, "registered", False, None, None),
-        ("legacy_quarantined", True, "public", False, None, None),
-        ("legacy_quarantined", False, "vetted", False, None, None),
-        ("legacy_quarantined", False, "public", True, None, None),
-        ("unknown", False, "public", False, None, None),
+        ("unsupported", False, "public", False, None, None),
         (None, False, "public", False, None, None),
     ],
 )
@@ -498,6 +506,7 @@ def test_database_rejects_incoherent_federated_state(
     approved_at,
     approved_by,
 ):
+    """Verify database rejects incoherent federated state."""
     with pytest.raises(CheckViolation, match="users_federated_state_check"):
         _insert_federated_row(
             sync_conn,
@@ -512,6 +521,7 @@ def test_database_rejects_incoherent_federated_state(
 
 
 def test_database_rejects_verified_federated_identity(sync_conn):
+    """Verify database rejects verified federated identity."""
     with pytest.raises(CheckViolation, match="users_federated_state_check"):
         _insert_federated_row(sync_conn, email_verified=True)
     sync_conn.rollback()
@@ -523,7 +533,6 @@ def test_database_rejects_verified_federated_identity(sync_conn):
         ("pending", False, "public", False, None, None),
         ("approved", True, "vetted", True, "2026-01-01T00:00:00Z", 7),
         ("disabled", False, "vetted", True, "2026-01-01T00:00:00Z", 7),
-        ("legacy_quarantined", False, "public", False, None, None),
     ],
 )
 def test_database_accepts_each_coherent_federated_state(
@@ -535,6 +544,7 @@ def test_database_accepts_each_coherent_federated_state(
     approved_at,
     approved_by,
 ):
+    """Verify database accepts each coherent federated state."""
     _insert_federated_row(
         sync_conn,
         status=status,
@@ -561,6 +571,7 @@ def test_database_accepts_each_coherent_federated_state(
 def test_database_rejects_federation_state_on_local_account(
     sync_conn, issuer, subject_id, status, approved_at, approved_by
 ):
+    """Verify database rejects federation state on local account."""
     with pytest.raises(CheckViolation, match="users_federated_state_check"):
         sync_conn.execute(
             """INSERT INTO users (

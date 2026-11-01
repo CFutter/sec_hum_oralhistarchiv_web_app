@@ -6,6 +6,8 @@ from pathlib import Path
 
 from psycopg.conninfo import conninfo_to_dict
 
+from app import resolve_environment
+
 _DATABASE_NAME = "oralhistarchiv"
 
 _DEPLOYED_ENV_STATES = frozenset({"staging", "production"})
@@ -17,7 +19,11 @@ def _migration_database_url() -> str:
     Raises RuntimeError unless ENV_STATE is staging/production and
     MIGRATION_DATABASE_URL names that database; psycopg parse errors propagate.
     """
-    if os.environ.get("ENV_STATE") not in _DEPLOYED_ENV_STATES:
+    try:
+        environment = resolve_environment()
+    except ValueError:
+        raise RuntimeError("migrate_release requires one canonical uppercase ENV_STATE") from None
+    if environment not in _DEPLOYED_ENV_STATES:
         raise RuntimeError("migrate_release must run with ENV_STATE set to staging or production")
 
     migration_url = os.environ.get("MIGRATION_DATABASE_URL", "")

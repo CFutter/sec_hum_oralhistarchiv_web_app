@@ -1,20 +1,4 @@
-"""Admin-flow integration tests — real PostgreSQL, real routes, real middleware.
-
-Covers the administrator surface of src/app/routes/auth/admin.py end to end:
-admin-initiated email change to a fresh address, the taken-address and
-federated-account refusals, the transactional email-outbox boundary and its
-delivery metadata, admin action flash messages (set-tier, set-active,
-set-admin and their no-ops), set-active session revocation and the
-asymmetric lockout clear, set-admin grant-as-invitation and revoke, the
-self-action refusals, and require_admin's 404 cloak for non-admins and
-anonymous visitors. Membership invariants enforced by app.services.users
-(one active admin surviving crossed concurrent changes, stale-actor
-rejection, self-removal refusal, and the unverified-administrator reaper)
-are covered against the same database in TestMembershipInvariants.
-
-Every route test drives the REAL login form (password + TOTP) so the
-session, CSRF token, and flash storage are all the production paths.
-"""
+"""Admin-flow integration tests — real PostgreSQL, real routes, real middleware."""
 
 import asyncio
 import logging
@@ -27,7 +11,7 @@ from fastapi import status
 
 from app.middleware.csrf import _compute_csrf_token
 from app.services import users
-from app.services.crypto import decrypt_outbox_body, encrypt_value
+from app.services.crypto import decrypt_outbox_body
 from app.services.email import DeliveryResult
 from app.services.email_change import (
     email_change_token_email_metadata,
@@ -35,18 +19,19 @@ from app.services.email_change import (
 )
 from app.services.email_delivery import deliver_email_outbox_batch
 from app.services.email_outbox import enqueue_outbound_email_cur
+from app.services.totp_crypto import encrypt_value
 from config import settings
+from tests.action_links import token_from_action_email
 from tests.fixtures import sign_session_id
 from tests.integration.conftest import login_admin
 
 _EMAIL_CHANGE_MESSAGE_COUNT = 2
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _user_row(sync_conn, user_id, columns):
+    """Read the requested user columns as a row tuple."""
     return sync_conn.execute(f"SELECT {columns} FROM users WHERE id = %s", (user_id,)).fetchone()
 
 
@@ -78,6 +63,7 @@ def _decrypt_body(message):
 
 
 def _audit_records(caplog, event_type):
+    """Select the requested audit event from captured log records."""
     return [
         rec
         for rec in caplog.records
@@ -100,14 +86,14 @@ class TestAdminEmailChange:
         with caplog.at_level(logging.INFO, logger="audit"):
             resp = e2e_client.post(
                 f"/admin/users/{target.id}/change-email",
-                data={"new_email": "fresh@uzh.ch", "csrf_token": csrf},
+                data={"new_email": "fresh@example.org", "csrf_token": csrf},
                 follow_redirects=False,
             )
         assert resp.status_code == status.HTTP_303_SEE_OTHER
         assert resp.headers["location"] == "/admin"
 
         row = _user_row(sync_conn, target.id, "pending_email, pending_email_token_hash")
-        assert row[0] == "fresh@uzh.ch"
+        assert row[0] == "fresh@example.org"
         assert row[1] is not None
 
         # Capability link → the NEW address; heads-up notice → the
@@ -121,13 +107,13 @@ class TestAdminEmailChange:
         }
 
         verification = by_type["email_change_verification"]
-        assert verification["recipient"] == "fresh@uzh.ch"
+        assert verification["recipient"] == "fresh@example.org"
         verification_body = _decrypt_body(verification)
         assert f"{settings.public_base_url}/account/confirm-email/" in verification_body
 
         notice = by_type["email_change_notice"]
         assert notice["recipient"] == target.email
-        assert "fresh@uzh.ch" in _decrypt_body(notice)
+        assert "fresh@example.org" in _decrypt_body(notice)
         assert all(message["status"] == "pending" for message in messages)
 
         # The admin-initiated request leaves an audit trail.
@@ -153,6 +139,7 @@ class TestAdminEmailChange:
         enqueue_count = 0
 
         async def enqueue_then_fail(cur, *, user_id, email, action):
+            """Raise on the second enqueue and delegate earlier messages to the real writer."""
             nonlocal enqueue_count
             enqueue_count += 1
 
@@ -176,7 +163,7 @@ class TestAdminEmailChange:
         ):
             resp = e2e_client.post(
                 f"/admin/users/{target.id}/change-email",
-                data={"new_email": "fresh@uzh.ch", "csrf_token": csrf},
+                data={"new_email": "fresh@example.org", "csrf_token": csrf},
                 follow_redirects=False,
             )
 
@@ -197,11 +184,11 @@ class TestAdminEmailChange:
         'already in use' flash and nothing is staged on the target."""
         _, csrf = login_admin(e2e_client, user_factory)
         target = user_factory()
-        user_factory(email="taken@uzh.ch")  # the address's rightful owner
+        user_factory(email="taken@example.org")  # the address's rightful owner
 
         resp = e2e_client.post(
             f"/admin/users/{target.id}/change-email",
-            data={"new_email": "taken@uzh.ch", "csrf_token": csrf},
+            data={"new_email": "taken@example.org", "csrf_token": csrf},
             follow_redirects=False,
         )
         assert resp.status_code == status.HTTP_303_SEE_OTHER
@@ -222,7 +209,7 @@ class TestAdminEmailChange:
 
         resp = e2e_client.post(
             f"/admin/users/{target.id}/change-email",
-            data={"new_email": "fresh@uzh.ch", "csrf_token": csrf},
+            data={"new_email": "fresh@example.org", "csrf_token": csrf},
             follow_redirects=False,
         )
         assert resp.status_code == status.HTTP_303_SEE_OTHER
@@ -282,7 +269,7 @@ class TestAdminEmailChange:
         links = [word for word in body.split() if word.startswith(prefix)]
         assert len(links) == 1
 
-        token = links[0].removeprefix(prefix)
+        token = token_from_action_email(body, links[0])
         payload = validate_email_change_token(token)
 
         assert payload is not None
@@ -438,17 +425,7 @@ class TestAdminSetActive:
     def test_admin_unlock_active_locked_out_user(
         self, e2e_client, user_factory, session_factory, sync_conn, caplog
     ):
-        """An ACTIVE user who is currently locked out (failed_login_count > 0
-        and locked_until in the future) gets is_active=true posted, which is
-        a no-op on is_active itself (old_value == new_value == True) but the
-        SQL in set_user_active unconditionally clears failed_login_count and
-        locked_until on every is_active=true write, so
-        SetActiveResult.lock_cleared is True. That combination is
-        special-cased away from the generic 'No change' info branch into
-        'Account unlocked.' (success) plus a dedicated admin_user_unlocked
-        audit event — and unlike deactivation, it must NOT revoke the user's
-        live sessions (they were never logged out; only the lockout counters
-        are reset)."""
+        """Verify admin unlock active locked out user."""
         admin, csrf = login_admin(e2e_client, user_factory)
         target = user_factory(is_active=True)
         session_factory(target.id)  # must survive — this is not a revocation path
@@ -514,17 +491,7 @@ class TestAdminSetAdmin:
     def test_admin_grant_creates_an_accepted_invitation_not_an_immediate_grant(
         self, e2e_client, user_factory, sync_conn, caplog
     ):
-        """set-admin with is_admin=true never flips is_admin directly.
-
-        admin_set_admin (via request_admin_promotion) only creates an
-        expiring, target-accepted invitation row in
-        admin_promotion_requests: the target must reauthenticate and confirm
-        a fresh recovery code themselves before authority activates. The
-        grant direction therefore audits admin_promotion_requested, not a
-        completed status change, and the target's is_admin stays False until
-        they accept. The target must already be an eligible local, active,
-        verified account with TOTP configured for the invitation to be
-        created at all."""
+        """Verify admin grant creates an accepted invitation not an immediate grant."""
         admin, csrf = login_admin(e2e_client, user_factory)
         target = user_factory(totp_secret=encrypt_value(pyotp.random_base32()))
 
@@ -704,6 +671,7 @@ class TestMembershipInvariants:
         ready = asyncio.Event()
 
         async def change(name, actor, target):
+            """Wait for the race barrier and apply the requested administrator change."""
             await ready.wait()
             return await getattr(users, name)(
                 db_pool,

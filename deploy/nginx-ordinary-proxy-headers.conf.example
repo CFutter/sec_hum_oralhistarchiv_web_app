@@ -19,6 +19,7 @@ proxy_set_header X-OHA-Shib-Mail          "";
 proxy_set_header X-OHA-Shib-Authn-Context "";
 proxy_set_header X-OHA-Shib-Display-Name  "";
 proxy_set_header X-OHA-Shib-Affiliation   "";
+proxy_set_header X-OHA-Shib-Entitlement   "";
 proxy_set_header X-OHA-Shib-Country       "";
 
 # Legacy/raw names are cleared as defense in depth and during upgrades. The
@@ -29,6 +30,8 @@ proxy_set_header eduPersonUniqueId            "";
 proxy_set_header mail                         "";
 proxy_set_header displayName                  "";
 proxy_set_header affiliation                  "";
+proxy_set_header entitlement                  "";
+proxy_set_header eduPersonEntitlement         "";
 proxy_set_header schacHomeOrganizationCountry "";
 proxy_set_header Shib-Identity-Provider       "";
 proxy_set_header Shib-AuthnContext-Class      "";

@@ -8,14 +8,16 @@ operate on any existing row, including expired sessions.
 
 import logging
 import secrets
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any, Literal, NamedTuple, TypeGuard
 
 from psycopg import AsyncCursor, InterfaceError, OperationalError, sql
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
+from app.duration_contract import validate_session_max_age_seconds
 from config import settings
 
+from .account_clock import database_now_cur
 from .db import get_db_cursor
 from .session_ids import hash_session_id
 from .users import User, parse_user, user_columns_sql
@@ -31,6 +33,8 @@ _SESSION_PURPOSES: tuple[SessionPurpose, ...] = (
 
 _CLEANUP_MAX_BATCH_SIZE = 5_000
 _CLEANUP_MAX_BATCHES = 100
+_SETUP_SESSION_MAX_AGE_SECONDS = 600
+_HARDENED_SESSION_MAX_AGE_SECONDS = 8 * 60 * 60
 
 
 def _is_session_purpose(value: object) -> TypeGuard[SessionPurpose]:
@@ -50,6 +54,58 @@ class SessionLookup(NamedTuple):
     flash_present: bool
 
 
+def _session_lifetime(value: int, purpose: SessionPurpose) -> int:
+    """Validate lifetime; cap setup/recovery at 600s and reject hardened full values over 8h."""
+    lifetime = validate_session_max_age_seconds(value)
+    if purpose not in _SESSION_PURPOSES:
+        raise ValueError(f"Invalid session purpose: {purpose!r}")
+    if purpose != "full":
+        return min(lifetime, _SETUP_SESSION_MAX_AGE_SECONDS)
+    if settings.is_hardened and lifetime > _HARDENED_SESSION_MAX_AGE_SECONDS:
+        raise ValueError("Hardened sessions cannot exceed eight hours")
+    return lifetime
+
+
+async def _refresh_session_activity_cur(
+    cur: AsyncCursor[Any], session_hash: str, purpose: SessionPurpose
+) -> bool:
+    """Refresh due activity only after locking and checking database wall time.
+
+    Recent activity takes a read-only path. A due row may wait for another
+    transaction, so recheck both deadlines after that lock, before any write.
+    A competing refresh can make the row no longer due; the final read still
+    requires a live row with the same authority.
+    """
+    await cur.execute(
+        """SELECT expires_at, last_activity_at FROM sessions
+           WHERE id = %s AND purpose = %s
+             AND last_activity_at <= clock_timestamp() - %s * INTERVAL '1 second'
+           FOR UPDATE""",
+        (session_hash, purpose, settings.session_activity_update_interval_seconds),
+    )
+    due = await cur.fetchone()
+    if due is not None:
+        now = await database_now_cur(cur)
+        idle_cutoff = now - timedelta(seconds=settings.session_idle_timeout_seconds)
+        if due["expires_at"] <= now or due["last_activity_at"] <= idle_cutoff:
+            return False
+        await cur.execute(
+            """UPDATE sessions SET last_activity_at = clock_timestamp()
+               WHERE id = %s AND purpose = %s AND expires_at > clock_timestamp()
+                 AND last_activity_at > clock_timestamp() - %s * INTERVAL '1 second'
+               RETURNING id""",
+            (session_hash, purpose, settings.session_idle_timeout_seconds),
+        )
+        return await cur.fetchone() is not None
+    await cur.execute(
+        """SELECT id FROM sessions WHERE id = %s AND purpose = %s
+             AND expires_at > clock_timestamp()
+             AND last_activity_at > clock_timestamp() - %s * INTERVAL '1 second'""",
+        (session_hash, purpose, settings.session_idle_timeout_seconds),
+    )
+    return await cur.fetchone() is not None
+
+
 async def create_session_cur(
     cur: AsyncCursor[Any],
     *,
@@ -58,27 +114,34 @@ async def create_session_cur(
     purpose: SessionPurpose,
     max_age_seconds: int,
 ) -> str:
-    """Insert a hashed token; return its raw value before the caller commits.
+    """Insert a token hash and return the raw token before the caller commits.
 
-    The caller must check account eligibility and commit before exposing the
-    token. max_age_seconds is added to current UTC time without range checks.
-    Raise ValueError for an unknown purpose; database failures propagate.
+    Callers check eligibility and commit before exposing it. Require an integer
+    lifetime of 60..31536000 seconds; setup/recovery is capped at 600 seconds and
+    hardened full sessions cannot exceed eight hours. Invalid lifetime/purpose
+    raises ValueError before token generation or I/O; database failures propagate.
     """
     if purpose not in _SESSION_PURPOSES:
         raise ValueError(f"Invalid session purpose: {purpose!r}")
 
+    max_age_seconds = _session_lifetime(max_age_seconds, purpose)
     session_id = secrets.token_urlsafe(32)
     session_hash = hash_session_id(session_id)
-    expires_at = datetime.now(UTC) + timedelta(seconds=max_age_seconds)
 
     await cur.execute(
         """
         INSERT INTO sessions (
             id, user_id, expires_at, ip_address, purpose
         )
-        VALUES (%s, %s, %s, %s, %s)
+        VALUES (
+            %s,
+            %s,
+            clock_timestamp() + %s * INTERVAL '1 second',
+            %s,
+            %s
+        )
         """,
-        (session_hash, user_id, expires_at, ip_address, purpose),
+        (session_hash, user_id, max_age_seconds, ip_address, purpose),
     )
 
     return session_id
@@ -91,16 +154,21 @@ async def create_session(
     max_age_seconds: int | None = None,
     purpose: SessionPurpose = "totp_setup",
 ) -> str:
-    """Commit a session and return its raw token for the caller's cookie.
+    """Commit a session and return its raw cookie token.
 
-    None lifetime uses SESSION_MAX_AGE_SECONDS; account eligibility is the
-    caller's responsibility. Raise ValueError for an unknown or totp_recovery
-    purpose; recovery tokens require redeem_totp_recovery's atomic workflow.
+    None lifetime uses SESSION_MAX_AGE_SECONDS; setup is capped at 600 seconds.
+    Before acquiring a connection, reject lifetimes outside integer
+    60..31536000 seconds, hardened full lifetimes over eight hours, and unknown
+    or totp_recovery purposes with ValueError. Recovery requires atomic redemption;
+    account eligibility is the caller's responsibility.
     """
     if purpose == "totp_recovery":
         raise ValueError("TOTP recovery sessions require atomic code redemption")
 
-    lifetime = settings.session_max_age_seconds if max_age_seconds is None else max_age_seconds
+    lifetime = _session_lifetime(
+        settings.session_max_age_seconds if max_age_seconds is None else max_age_seconds,
+        purpose,
+    )
 
     async with get_db_cursor(pool) as cur:
         session_id = await create_session_cur(
@@ -124,7 +192,9 @@ async def create_session(
 async def get_session_user(pool: AsyncConnectionPool, session_id: str) -> SessionLookup:
     """Return the eligible session's user, purpose, and pending-flash flag.
 
-    Missing/expired/ineligible sessions yield (None, None, False). Local users
+    Missing, absolute/idle-expired or ineligible sessions yield (None, None, False).
+    Eligible application requests refresh activity at a bounded write cadence;
+    neither the touch nor a concurrent request can revive an expired row. Local users
     must be active and recovery state must match the purpose. Shibboleth users
     must be active, approved, enabled, from a trusted issuer, and use full
     purpose. Delete invalid-purpose, recovery-mismatch, or disallowed federated
@@ -143,10 +213,11 @@ async def get_session_user(pool: AsyncConnectionPool, session_id: str) -> Sessio
                    FROM sessions s
                    JOIN users u ON s.user_id = u.id
                    WHERE s.id = %s
-                     AND s.expires_at > CURRENT_TIMESTAMP
+                     AND s.expires_at > clock_timestamp()
+                     AND s.last_activity_at > clock_timestamp() - %s * INTERVAL '1 second'
                      AND (u.is_active OR u.auth_method = 'shibboleth')"""
             ).format(user_columns_sql("u")),
-            (session_hash,),
+            (session_hash, settings.session_idle_timeout_seconds),
         )
         row = await cur.fetchone()
         if not row:
@@ -181,6 +252,8 @@ async def get_session_user(pool: AsyncConnectionPool, session_id: str) -> Sessio
             await cur.execute("DELETE FROM sessions WHERE id = %s", (session_hash,))
             return SessionLookup(None, None, False)
 
+        if not await _refresh_session_activity_cur(cur, session_hash, raw_purpose):
+            return SessionLookup(None, None, False)
         return SessionLookup(parse_user(row), raw_purpose, row["flash_present"])
 
 
@@ -313,7 +386,7 @@ async def cleanup_expired_sessions(
     batch_size: int = 1_000,
     max_batches: int = 20,
 ) -> int:
-    """Commit batches deleting sessions expired before transaction start; return count.
+    """Commit bounded batches deleting absolute- or idle-expired sessions; return count.
 
     Skip rows locked elsewhere; stop on a short batch. Earlier batches remain
     committed if a later one fails. Raise ValueError unless batch_size is
@@ -333,7 +406,8 @@ async def cleanup_expired_sessions(
                 WITH expired AS (
                     SELECT id
                     FROM sessions
-                    WHERE expires_at < CURRENT_TIMESTAMP
+                    WHERE expires_at <= clock_timestamp()
+                       OR last_activity_at <= clock_timestamp() - %s * INTERVAL '1 second'
                     ORDER BY expires_at
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
@@ -342,7 +416,7 @@ async def cleanup_expired_sessions(
                 USING expired
                 WHERE session.id = expired.id
                 """,
-                (batch_size,),
+                (settings.session_idle_timeout_seconds, batch_size),
             )
             deleted = cur.rowcount
 

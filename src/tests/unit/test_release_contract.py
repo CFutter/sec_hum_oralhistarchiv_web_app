@@ -1,11 +1,4 @@
-"""Executable contract for the reviewed, hash-locked production release path.
-
-Covers `scripts/build_release.py` (constrained, hash-verified build of the
-sdist/wheel and the release manifest) and `deploy/install_release.py` (safe
-extraction, manifest verification and the atomic host install), plus the
-deployment artifacts (systemd units, nginx config, the deployment runbook)
-that the release is installed against.
-"""
+"""Executable contract for the reviewed, hash-locked production release path."""
 
 from __future__ import annotations
 
@@ -18,9 +11,10 @@ import re
 import subprocess
 import tarfile
 import tomllib
+from importlib import metadata
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 
@@ -34,12 +28,29 @@ NGINX_CONFIG = PROJECT_ROOT / "deploy/nginx.conf.example"
 INSTALLER_PATH = PROJECT_ROOT / "deploy/install_release.py"
 BUILD_REQUIREMENTS = PROJECT_ROOT / "build-requirements.txt"
 BUILD_RELEASE_PATH = PROJECT_ROOT / "scripts/build_release.py"
+_LICENSE_PATHS = (
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "src/app/static/fonts/OFL.txt",
+    "src/app/services/data/SECLISTS-LICENSE.txt",
+)
+_PARSER_AND_MAINTENANCE_PATHS = (
+    "oralhistarchiv-parser.socket",
+    "oralhistarchiv-parser@.service",
+    "run_parser.py",
+    "scripts/rebuild_search_policy.py",
+    "scripts/bootstrap_admin.py",
+    "scripts/acknowledge_source_binding.py",
+    "scripts/export_security_audit.py",
+    "deploy/invalidate-action-email-capabilities.sql",
+)
 
 _REMOTE_ACTION = re.compile(r"(?m)^\s*-?\s*uses:\s*(?P<reference>[^#\s]+)")
 _FULL_ACTION_SHA = re.compile(r"[^@\s]+@[0-9a-f]{40}\Z")
 
 
 def _load_module(name: str, path: Path):
+    """Load and execute the selected repository script in an isolated module."""
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -49,13 +60,107 @@ def _load_module(name: str, path: Path):
 
 build_release = _load_module("build_release", BUILD_RELEASE_PATH)
 install_release = _load_module("install_release", INSTALLER_PATH)
+smoke_installed_wheel = _load_module(
+    "smoke_installed_wheel", PROJECT_ROOT / "scripts/smoke_installed_wheel.py"
+)
 
 
 def _sha256(path: Path) -> str:
+    """Return the SHA-256 hexadecimal digest of file bytes."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+@pytest.fixture
+def installed_licenses(tmp_path, monkeypatch):
+    """Write a synthetic installed distribution and redirect license discovery to it."""
+    installed = tmp_path / "site-packages"
+    dist_info = installed / "oral_history_archive-0.1.0.dist-info"
+    dist_info.mkdir(parents=True)
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.4\n"
+        "Name: Oral-History-Archive\n"
+        "Version: 0.1.0\n"
+        "License-Expression: MIT AND OFL-1.1\n"
+        + "".join(f"License-File: {relative}\n" for relative in _LICENSE_PATHS),
+        encoding="utf-8",
+    )
+    (dist_info / "RECORD").write_text(
+        "".join(f"{dist_info.name}/licenses/{relative},,\n" for relative in _LICENSE_PATHS),
+        encoding="utf-8",
+    )
+    for relative in _LICENSE_PATHS:
+        notice = dist_info / "licenses" / relative
+        notice.parent.mkdir(parents=True, exist_ok=True)
+        notice.write_text(f"License text for {relative}\n", encoding="utf-8")
+    for relative in ("static/fonts/OFL.txt", "services/data/SECLISTS-LICENSE.txt"):
+        notice = installed / "app" / relative
+        notice.parent.mkdir(parents=True, exist_ok=True)
+        notice.write_text(f"Packaged notice for {relative}\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        smoke_installed_wheel.metadata,
+        "distribution",
+        lambda _name: metadata.PathDistribution(dist_info),
+    )
+    monkeypatch.setattr(smoke_installed_wheel.resources, "files", lambda _name: installed / "app")
+    return installed, dist_info
+
+
+class TestInstalledWheelLicenses:
+    """Installed license metadata must identify complete, readable shipped notices."""
+
+    def test_complete_installed_licenses_pass(self, installed_licenses):
+        """Check complete installed licenses pass."""
+        installed, _ = installed_licenses
+        smoke_installed_wheel._validate_installed_licenses(installed)
+
+    @pytest.mark.parametrize(
+        ("failure", "message"),
+        [
+            ("expression", "License-Expression must be MIT AND OFL-1.1"),
+            ("metadata-record", "unexpected distribution License-File records"),
+            ("wheel-record", "distribution license file is not recorded: LICENSE"),
+            ("missing-license", "distribution license file is missing: LICENSE"),
+            ("empty-license", "distribution license file is empty: LICENSE"),
+            ("missing-notice", "packaged license notice is missing: static/fonts/OFL.txt"),
+            ("empty-notice", "packaged license notice is empty: static/fonts/OFL.txt"),
+        ],
+    )
+    def test_incomplete_installed_licenses_fail(self, installed_licenses, failure, message):
+        """Check incomplete installed licenses fail (RuntimeError)."""
+        installed, dist_info = installed_licenses
+        if failure in {"expression", "metadata-record"}:
+            path = dist_info / "METADATA"
+            content = path.read_text(encoding="utf-8")
+            if failure == "expression":
+                content = content.replace("MIT AND OFL-1.1", "MIT")
+            else:
+                content = content.replace("License-File: LICENSE\n", "")
+            path.write_text(content, encoding="utf-8")
+        elif failure == "wheel-record":
+            path = dist_info / "RECORD"
+            content = path.read_text(encoding="utf-8")
+            path.write_text(
+                content.replace(f"{dist_info.name}/licenses/LICENSE,,\n", ""),
+                encoding="utf-8",
+            )
+        else:
+            path = (
+                installed / "app/static/fonts/OFL.txt"
+                if failure.endswith("notice")
+                else dist_info / "licenses/LICENSE"
+            )
+            if failure.startswith("missing"):
+                path.unlink()
+            else:
+                path.write_text(" \n", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match=re.escape(message)):
+            smoke_installed_wheel._validate_installed_licenses(installed)
+
+
 def _write_valid_payload(parent: Path, commit: str = "a" * 40) -> tuple[Path, dict[str, Any]]:
+    """Write a complete synthetic release payload and manifest; return both."""
     root = parent / f"oralhistarchiv-release-{commit}"
     required = set(install_release._REQUIRED_PAYLOAD_FILES)
     required.add("wheels/oral_history_archive-0.1.0-py3-none-any.whl")
@@ -91,6 +196,7 @@ class TestReleaseBuildContract:
     """`scripts/build_release.py` builds a constrained, hash-verified sdist/wheel."""
 
     def test_build_backend_is_exactly_pinned_and_hash_constrained(self):
+        """Check build backend is exactly pinned and hash constrained."""
         project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         assert project["build-system"] == {
             "requires": ["hatchling==1.32.0"],
@@ -108,7 +214,19 @@ class TestReleaseBuildContract:
             re.search(r"--hash=sha256:[0-9a-f]{64}\b", block) for block in requirement_blocks
         )
 
+    def test_wheel_smoke_environment_overrides_ambient_source_selection(self, monkeypatch):
+        """Check wheel smoke environment overrides ambient source selection."""
+        monkeypatch.setenv("SOURCES_CONFIG_FILE", "/ambient/production-sources.toml")
+        monkeypatch.setenv("ALLOW_FIXTURE_SOURCE", "true")
+        smoke_env = _load_module(
+            "wheel_smoke_env", PROJECT_ROOT / "scripts/wheel_smoke_env.py"
+        ).smoke_environment()
+
+        assert smoke_env["SOURCES_CONFIG_FILE"] == ""
+        assert smoke_env["ALLOW_FIXTURE_SOURCE"] == "false"
+
     def test_runtime_export_validator_rejects_unhashed_editable_and_dev_inputs(self):
+        """Check runtime export validator rejects unhashed editable and dev inputs (RuntimeError)."""
         digest = "1" * 64
         build_release._validate_runtime_export(f"requests==2.33.0 \\\n    --hash=sha256:{digest}\n")
 
@@ -124,6 +242,7 @@ class TestReleaseBuildContract:
             )
 
     def test_release_builder_requires_the_reviewed_uv_version(self, monkeypatch):
+        """Check release builder requires the reviewed uv version (RuntimeError)."""
         monkeypatch.setattr(build_release, "_output", lambda *_args, **_kwargs: "uv 0.12.11")
         build_release._assert_uv_version({})
 
@@ -134,9 +253,13 @@ class TestReleaseBuildContract:
     def test_distribution_build_constrains_and_hash_verifies_both_builds(
         self, tmp_path, monkeypatch
     ):
+        """Check distribution build constrains and hash verifies both builds."""
         calls: list[list[str]] = []
 
         def fake_run(args, **_kwargs):
+            """Capture build arguments and write a stand-in sdist or wheel into the requested output
+            directory.
+            """
             calls.append(args)
             output = Path(args[args.index("--out-dir") + 1])
             if "--sdist" in args:
@@ -159,6 +282,7 @@ class TestReleaseBuildContract:
         assert str(sdist) == calls[1][-1]
 
     def test_manifest_hashes_every_payload_file(self, tmp_path, monkeypatch):
+        """Check manifest hashes every payload file."""
         project_root = tmp_path / "project"
         project_root.mkdir()
         (project_root / "pyproject.toml").write_text(
@@ -189,19 +313,76 @@ class TestReleaseBuildContract:
         assert manifest["uv_lock_sha256"] == _sha256(lock)
         assert manifest["build_requirements_sha256"] == _sha256(build)
 
+    @pytest.mark.parametrize("uppercase", [True, False], ids=["uppercase", "lowercase"])
+    def test_wheel_smoke_probes_exclude_retired_source_settings(
+        self, tmp_path: Path, uppercase: bool
+    ) -> None:
+        """Check wheel smoke probes exclude retired source settings."""
+        source_keys = (
+            "SWISSUBASE_OAI_PMH_URL",
+            "OAI_INSTITUTION_FILTER",
+            "SWISSUBASE_MAX_VISIBILITY",
+            "SYNC_INTERVAL_SECONDS",
+            "FULL_REBUILD_INTERVAL_SECONDS",
+            "OAI_MAX_PAGES",
+            "SYNC_WRITE_TIMEOUT_SECONDS",
+        )
+        retired_keys = {"SEED_MOCK_DATA", *source_keys}
+        smoke_defaults = _load_module(
+            "wheel_smoke_env_retired_source_settings",
+            PROJECT_ROOT / "scripts/wheel_smoke_env.py",
+        ).smoke_environment()
+        assert not {name.upper() for name in smoke_defaults} & retired_keys
+
+        inherited = {
+            (name if uppercase else name.lower()): "retired-source-canary" for name in source_keys
+        }
+        inherited.update(
+            {
+                "SOURCES_CONFIG_FILE": "/ambient/production-sources.toml",
+                "ALLOW_FIXTURE_SOURCE": "true",
+                "SMOKE_ENV_SENTINEL": "excluded",
+            }
+        )
+        original = inherited.copy()
+        work = tmp_path / "work"
+        work.mkdir()
+        wheel = tmp_path / "application.whl"
+        wheel.write_bytes(b"dummy wheel")
+        requirements = tmp_path / "requirements-runtime.txt"
+        requirements.write_text("", encoding="utf-8")
+
+        with (
+            patch.object(
+                build_release,
+                "_output",
+                autospec=True,
+                return_value=json.dumps(smoke_defaults),
+            ),
+            patch.object(build_release, "_run", autospec=True) as run,
+        ):
+            build_release._smoke_test_wheel(wheel, requirements, work, inherited)
+
+        probes = [call for call in run.call_args_list if call.args[0][1:2] == ["-I"]]
+        assert [call.args[0][1:] for call in probes] == [
+            ["-I", str(work / "smoke_installed_wheel.py")],
+            ["-I", "-m", "app.migrate", "heads"],
+            ["-I", "-m", "app.migrate", "upgrade", "head", "--sql"],
+        ]
+        for call in probes:
+            child_env = call.kwargs["env"]
+            assert not {name.upper() for name in child_env} & retired_keys
+            assert child_env["SOURCES_CONFIG_FILE"] == ""
+            assert child_env["ALLOW_FIXTURE_SOURCE"] == "false"
+            assert "SMOKE_ENV_SENTINEL" not in child_env
+        assert inherited == original
+
 
 class TestWheelPackagingIncludesRotationAssets:
-    """The wheel's packaging configuration cannot silently drop the TOTP
-    rotation templates or the initial migration: `packages` names the whole
-    `src/app` tree with no `exclude`, and hatchling's default wheel file
-    selection is git-tracked-file based, so anything the repository tracks
-    under a packaged directory ships. Actually building and installing the
-    wheel to render the pages is out of scope for the unit tier (`hatchling`
-    is a build-time-only dependency, not installed in this environment) —
-    covered instead by `scripts/smoke_installed_wheel.py` in CI.
-    """
+    """Cover wheel packaging includes rotation assets."""
 
     def test_wheel_target_declares_no_excludes_that_could_drop_a_template(self):
+        """Check wheel target declares no excludes that could drop a template."""
         project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         wheel_target = project["tool"]["hatch"]["build"]["targets"]["wheel"]
         assert wheel_target["packages"] == ["src/app", "src/config"]
@@ -209,6 +390,7 @@ class TestWheelPackagingIncludesRotationAssets:
         assert "exclude" not in project["tool"]["hatch"]["build"]
 
     def test_rotation_templates_are_tracked_under_the_packaged_app_directory(self):
+        """Check rotation templates are tracked under the packaged app directory."""
         for name in ("reset_totp.html", "reset_totp_confirm.html"):
             template = PROJECT_ROOT / "src" / "app" / "templates" / name
             assert template.is_file(), f"{name} is missing from the source tree"
@@ -229,6 +411,7 @@ class TestReleaseInstallContract:
     """`deploy/install_release.py` only ever installs a verified, unmodified payload."""
 
     def test_installer_rejects_archive_traversal_and_links(self, tmp_path):
+        """Check installer rejects archive traversal and links (ValueError)."""
         traversal = tmp_path / "traversal.tar.gz"
         with tarfile.open(traversal, "w:gz") as bundle:
             member = tarfile.TarInfo(f"oralhistarchiv-release-{'c' * 40}/../../escaped")
@@ -247,22 +430,106 @@ class TestReleaseInstallContract:
             install_release._extract_safely(linked, tmp_path / "link-output")
 
     def test_installer_manifest_detects_changed_and_unexpected_files(self, tmp_path):
+        """Check installer manifest detects changed and unexpected files (ValueError)."""
         root, manifest = _write_valid_payload(tmp_path)
-        assert install_release._verify_payload(root) == manifest
+        assert install_release.verify_payload(root) == manifest
 
         target = root / "run_scheduler.py"
         target.write_text("tampered\n", encoding="utf-8")
         with pytest.raises(ValueError, match=r"changed=\['run_scheduler.py'\]"):
-            install_release._verify_payload(root)
+            install_release.verify_payload(root)
 
         target.write_text("payload:run_scheduler.py\n", encoding="utf-8")
         (root / "unexpected.py").write_text("unexpected\n", encoding="utf-8")
         with pytest.raises(ValueError, match=r"unexpected=\['unexpected.py'\]"):
-            install_release._verify_payload(root)
+            install_release.verify_payload(root)
+
+    @pytest.mark.parametrize("nested", [False, True], ids=["root", "nested"])
+    @pytest.mark.parametrize("directory", [False, True], ids=["file", "directory"])
+    def test_incoming_archives_cannot_supply_virtual_environment_content(
+        self, tmp_path, nested, directory
+    ):
+        """Check incoming archives cannot supply virtual environment content (ValueError)."""
+        archive = tmp_path / "environment.tar.gz"
+        prefix = "support/" if nested else ""
+        suffix = "" if directory else "/lib/python3.11/site-packages/startup.pth"
+        with tarfile.open(archive, "w:gz") as bundle:
+            member = tarfile.TarInfo(f"oralhistarchiv-release-{'c' * 40}/{prefix}.venv{suffix}")
+            if directory:
+                member.type = tarfile.DIRTYPE
+                bundle.addfile(member)
+            else:
+                member.size = 1
+                bundle.addfile(member, io.BytesIO(b"x"))
+        with pytest.raises(ValueError, match="must not contain virtual environments"):
+            install_release._extract_safely(archive, tmp_path / "output")
+        assert not (tmp_path / "output").exists()
+
+    @pytest.mark.parametrize("relative", [".venv/startup.pth", "support/.venv/startup.pth"])
+    @pytest.mark.parametrize("manifested", [False, True])
+    def test_incoming_payload_rejects_environment_content_even_when_manifested(
+        self, tmp_path, relative, manifested
+    ):
+        """Check incoming payload rejects environment content even when manifested (ValueError)."""
+        root, manifest = _write_valid_payload(tmp_path)
+        target = root / relative
+        target.parent.mkdir(parents=True)
+        target.write_text("startup contamination", encoding="utf-8")
+        if manifested:
+            manifest["files"][relative] = _sha256(target)
+            (root / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match="virtual environment"):
+            install_release.verify_payload(root)
+
+    def test_completed_release_exempts_only_its_generated_root_environment(self, tmp_path):
+        """Check completed release exempts only its generated root environment (ValueError)."""
+        root, manifest = _write_valid_payload(tmp_path)
+        generated = root / ".venv/bin/python"
+        generated.parent.mkdir(parents=True)
+        generated.write_text("installer-owned interpreter", encoding="utf-8")
+        assert install_release.verify_payload(root, generated_environment=True) == manifest
+        nested = root / "support/.venv"
+        nested.mkdir(parents=True)
+        with pytest.raises(ValueError, match="unexpected virtual environment"):
+            install_release.verify_payload(root, generated_environment=True)
+
+    @pytest.mark.parametrize("symlink", [False, True], ids=["existing", "broken-symlink"])
+    def test_environment_creation_refuses_preexisting_paths_before_running_python(
+        self, tmp_path, monkeypatch, symlink
+    ):
+        """Check environment creation refuses preexisting paths before running python (ValueError)."""
+        root, manifest = _write_valid_payload(tmp_path)
+        environment = root / ".venv"
+        if symlink:
+            environment.symlink_to(tmp_path / "missing-environment")
+        else:
+            environment.mkdir()
+            (environment / "startup.pth").write_text("must not execute", encoding="utf-8")
+        run = create_autospec(install_release._run)
+        monkeypatch.setattr(install_release, "_run", run)
+        with pytest.raises(ValueError, match="absent virtual environment"):
+            install_release._install_python_environment(root, manifest)
+        run.assert_not_called()
+
+    @pytest.mark.parametrize("relative", _PARSER_AND_MAINTENANCE_PATHS)
+    def test_installer_requires_parser_and_maintenance_assets_even_if_manifest_omits_them(
+        self, tmp_path, relative
+    ):
+        """Check installer requires parser and maintenance assets even if manifest omits them
+        (ValueError).
+        """
+        root, manifest = _write_valid_payload(tmp_path)
+        (root / relative).unlink()
+        del manifest["files"][relative]
+        (root / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="release payload is incomplete"):
+            install_release.verify_payload(root)
 
     def test_host_install_uses_only_hashed_binary_runtime_and_manifested_wheel(
         self, tmp_path, monkeypatch
     ):
+        """Check host install uses only hashed binary runtime and manifested wheel."""
         root, manifest = _write_valid_payload(tmp_path)
         calls: list[list[str]] = []
         monkeypatch.setattr(install_release, "_run", lambda args, **_kwargs: calls.append(args))
@@ -284,6 +551,7 @@ class TestReleaseInstallContract:
         assert calls[4][1:3] == ["-I", "-c"]
 
     def test_installer_builds_the_venv_at_its_final_absolute_path_before_switching(self):
+        """Check installer builds the venv at its final absolute path before switching."""
         source = INSTALLER_PATH.read_text(encoding="utf-8")
         move = source.index("extracted.replace(final)")
         install = source.index("_install_python_environment(final, manifest)")
@@ -305,10 +573,7 @@ class TestReleaseInstallContract:
         ],
     )
     def test_installer_neutralizes_inherited_install_destinations(self, monkeypatch, name):
-        """A host-environment variable that could redirect pip's install
-        destination (inherited from whatever shell invoked the installer)
-        must never survive into the environment the installer builds for
-        its own pip invocations."""
+        """Check installer neutralizes inherited install destinations."""
         monkeypatch.setenv(name, "/unexpected/location")
         assert name not in install_release._clean_pip_environment()
 
@@ -330,10 +595,7 @@ class TestReleaseInstallContract:
     def test_installer_fails_closed_on_unknown_or_running_service_state(
         self, monkeypatch, returncode, output
     ):
-        """Any service state the installer cannot positively confirm as
-        stopped — a failed systemctl call, unparseable output, or a service
-        still activating/erroring — refuses the install rather than risking
-        an in-place upgrade of a running process."""
+        """Check installer fails closed on unknown or running service state (RuntimeError)."""
         monkeypatch.setattr(
             install_release.subprocess,
             "run",
@@ -343,9 +605,7 @@ class TestReleaseInstallContract:
             install_release._require_services_stopped()
 
     def test_installer_cannot_enter_while_shared_runtime_lock_is_held(self, tmp_path, monkeypatch):
-        """A concurrent installer already holding the deployment lock (even
-        just a shared read lock) blocks a second install from starting, so
-        two installs can never race over the same release directory."""
+        """Check installer cannot enter while shared runtime lock is held (RuntimeError)."""
         lock_path = tmp_path / "deploy.lock"
         lock_path.touch()
         archive = tmp_path / "artifact.tar.gz"
@@ -360,10 +620,7 @@ class TestReleaseInstallContract:
     def test_interrupted_install_is_retryable_without_changing_current_release(
         self, tmp_path, monkeypatch
     ):
-        """An install interrupted (e.g. KeyboardInterrupt) while staging the
-        final release directory leaves the currently-live release symlink
-        untouched and removes the half-built directory, so the operator can
-        simply retry."""
+        """An install interrupted (e.g."""
         install_root = tmp_path / "releases"
         install_root.mkdir()
         incoming = tmp_path / "incoming"
@@ -386,10 +643,7 @@ class TestReleaseInstallContract:
         assert not (install_root / extracted.name).exists()
 
     def test_stale_partial_release_is_quarantined_then_replaced(self, tmp_path, monkeypatch):
-        """A half-built release directory left behind by a previous
-        interrupted install (no completion marker) is moved aside into a
-        quarantine directory rather than reused, and the retry builds a
-        fresh, complete release in its place."""
+        """Check stale partial release is quarantined then replaced."""
         install_root = tmp_path / "releases"
         install_root.mkdir()
         incoming = tmp_path / "incoming"
@@ -406,11 +660,7 @@ class TestReleaseInstallContract:
         assert len(list(install_root.glob(".incomplete-*/**/interrupted"))) == 1
 
     def test_real_release_staging_contains_the_installer_inventory(self, tmp_path):
-        """A release staged by the real `build_release._stage_payload` (not a
-        hand-written fixture) passes the installer's own manifest
-        verification and includes the systemd unit the installer inventory
-        requires — the build and install sides of the contract agree on the
-        payload shape end to end."""
+        """Check real release staging contains the installer inventory."""
         wheel = tmp_path / "oral_history_archive-0.1.0-py3-none-any.whl"
         sdist = tmp_path / "oral_history_archive-0.1.0.tar.gz"
         requirements = tmp_path / "requirements.txt"
@@ -420,21 +670,40 @@ class TestReleaseInstallContract:
         payload = build_release._stage_payload(
             tmp_path, commit="a" * 40, sdist=sdist, wheel=wheel, runtime_requirements=requirements
         )
-        install_release._verify_payload(payload)
+        manifest = install_release.verify_payload(payload)
         assert (payload / "oralhistarchiv-migrate.service").is_file()
+        for relative in (*_LICENSE_PATHS, *_PARSER_AND_MAINTENANCE_PATHS):
+            assert (payload / relative).read_bytes() == (PROJECT_ROOT / relative).read_bytes()
+            assert manifest["files"][relative] == _sha256(PROJECT_ROOT / relative)
 
 
 class TestReleaseDeploymentArtifacts:
     """The published artifacts (CI gate, systemd units, nginx, runbook) match the install path."""
 
-    def test_ci_release_is_main_only_gate_complete_and_digest_published(self):
+    def test_ci_release_is_main_only_gate_complete_and_digest_published(self) -> None:
+        """Check ci release is main only gate complete and digest published."""
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         assert (
             "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"
             in workflow
         )
         assert (
-            "needs: [lint, opaque-references, typecheck, security, wheel-smoke, tests]" in workflow
+            "needs: [lint, opaque-references, site-references, typecheck, security, wheel-smoke, tests]"
+            in workflow
+        )
+        site_references = re.search(
+            r"(?ms)^  site-references:\n(?P<job>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow
+        )
+        assert site_references is not None, "the required site-reference job is missing"
+        site_job = site_references.group("job")
+        assert re.search(r"(?m)^    name: no site references$", site_job)
+        assert re.search(r"(?m)^        run: bash scripts/check-no-site-refs.sh$", site_job)
+        assert (
+            "- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1" in site_job
+        )
+        assert "          persist-credentials: false" in site_job
+        assert not re.search(r"(?m)^[ \t]*(?:-[ \t]*)?(?:continue-on-error|if)[ \t]*:", site_job), (
+            "the site-reference job and its steps must be unconditional and blocking"
         )
         assert "python scripts/build_release.py" in workflow
         assert '--commit-sha "$GITHUB_SHA"' in workflow
@@ -446,7 +715,58 @@ class TestReleaseDeploymentArtifacts:
         assert references
         assert all(_FULL_ACTION_SHA.fullmatch(reference) for reference in references)
 
+        expected_paths = {
+            "oralhistarchiv.service",
+            "oralhistarchiv-scheduler.service",
+            "oralhistarchiv-migrate.service",
+            "deploy/migrate_release.py",
+            "deploy/oralhistarchiv-tmpfiles.conf",
+            "deploy/bootstrap-database-roles.sql",
+            "deploy/database-runtime-grants.sql",
+            "deploy/verify-runtime-database-access.sql",
+            "deploy/nginx.conf.example",
+            "deploy/nginx-ordinary-proxy-headers.conf.example",
+            "deploy/nginx-shibboleth-phase2.conf.example",
+            "deploy/nginx-shibboleth-secret.conf.example",
+            "deploy/redis-security.conf.example",
+            "deploy/oralhistarchiv-rate-limit-redis.service",
+            *_PARSER_AND_MAINTENANCE_PATHS,
+        }
+        check = re.search(
+            r"(?ms)^      - name: Verify required deployment assets are in the release\n"
+            r"(?P<step>.*?)(?=^      - |\Z)",
+            workflow,
+        )
+        assert check is not None, "the CI deployment-asset check is missing"
+        step = check.group("step")
+        ci_paths = re.search(
+            r"(?ms)^          required_paths=\(\n(?P<paths>.*?)^          \)$",
+            step,
+        )
+        assert ci_paths is not None, "the CI deployment-asset array is missing"
+        assert sorted(ci_paths.group("paths").split()) == sorted(
+            expected_paths | set(_LICENSE_PATHS)
+        )
+        assert (
+            '          for relative_path in "${required_paths[@]}"; do\n'
+            '            tar -tzf "$release_archive" \\\n'
+            '              "${release_root}/${relative_path}" >/dev/null\n'
+            "          done"
+        ) in step
+
+        runbook = DEPLOYMENT_RUNBOOK.read_text(encoding="utf-8")
+        documented_paths = re.search(
+            r"(?ms)^required_release_paths=\(\n(?P<paths>.*?)^\)$",
+            runbook,
+        )
+        assert documented_paths is not None, "the runbook deployment-asset array is missing"
+        assert sorted(documented_paths.group("paths").split()) == sorted(expected_paths)
+        assert expected_paths <= install_release._REQUIRED_PAYLOAD_FILES
+        for relative_path in expected_paths:
+            assert (PROJECT_ROOT / relative_path).is_file(), relative_path
+
     def test_production_units_import_only_from_the_release_venv(self):
+        """Check production units import only from the release venv."""
         web = WEB_UNIT.read_text(encoding="utf-8")
         scheduler = SCHEDULER_UNIT.read_text(encoding="utf-8")
         for unit in (web, scheduler):
@@ -464,6 +784,7 @@ class TestReleaseDeploymentArtifacts:
         )
 
     def test_runbook_has_no_source_or_editable_production_install_path(self):
+        """Check runbook has no source or editable production install path."""
         runbook = DEPLOYMENT_RUNBOOK.read_text(encoding="utf-8")
         forbidden = ("git clone", "git pull", "pip install -e", ".[dev]")
         assert all(value not in runbook for value in forbidden)
@@ -477,3 +798,36 @@ class TestReleaseDeploymentArtifacts:
             "root:root 755",
         ):
             assert required in runbook
+
+
+@pytest.mark.parametrize("retired_key", ["SEED_MOCK_DATA", "seed_mock_data"])
+def test_installed_wheel_probes_exclude_the_retired_key(tmp_path, monkeypatch, retired_key):
+    """Check installed wheel probes exclude the retired key."""
+    defaults = _load_module(
+        "wheel_smoke_env", PROJECT_ROOT / "scripts/wheel_smoke_env.py"
+    ).smoke_environment()
+    assert "SEED_MOCK_DATA" not in defaults
+    runner = create_autospec(build_release._run)
+    output = create_autospec(build_release._output, return_value=json.dumps(defaults))
+    monkeypatch.setattr(build_release, "_run", runner)
+    monkeypatch.setattr(build_release, "_output", output)
+    inherited = {
+        retired_key: "true",
+        "SOURCES_CONFIG_FILE": "/ambient/operator-sources.toml",
+        "ALLOW_FIXTURE_SOURCE": "true",
+    }
+
+    build_release._smoke_test_wheel(
+        tmp_path / "application.whl",
+        tmp_path / "runtime-requirements.txt",
+        tmp_path,
+        inherited,
+    )
+
+    probes = [entry.kwargs["env"] for entry in runner.call_args_list if "-I" in entry.args[0]]
+    assert len(probes) == 3
+    for probe in probes:
+        assert all(key.upper() != "SEED_MOCK_DATA" for key in probe)
+        assert probe["SOURCES_CONFIG_FILE"] == ""
+        assert probe["ALLOW_FIXTURE_SOURCE"] == "false"
+    assert inherited[retired_key] == "true"

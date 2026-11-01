@@ -1,0 +1,589 @@
+# Publication policy v1. Exceptions are exact path/rule/line digest/count records.
+version = 1
+
+[[rules]]
+id = "institution"
+pattern = '(?i:(?<![a-z0-9])uzh(?![a-z0-9])|university\s+of\s+zurich|universität\s+zürich|\bleomed\b|\beduid\b)'
+reason = "Remove deployment-specific institutional names and domains."
+
+[[rules]]
+id = "former-site"
+pattern = '(?i:\bkassel\b)'
+reason = "Remove former staging-site assumptions from generic examples."
+
+[[rules]]
+id = "organisation"
+pattern = '\bSWITCH(?:aai)?\b|(?i:\bswitch(?:aai)?\.ch\b|\bswitch\s+edu.?id\b)'
+reason = "Identify named federation organisation references, while ordinary English verbs remain allowed."
+
+[[rules]]
+id = "upstream-name"
+pattern = '(?i:swissubase)'
+reason = "Review vendor namespaces and retired configuration identifiers individually."
+
+[[rules]]
+id = "obsolete-proxy"
+pattern = '(?i:\bcaddy\b)'
+reason = "Remove the old site-specific proxy assumption; preserve exact security wordlist data."
+
+[[rules]]
+id = "site-operations"
+pattern = '(?i:\bcentral\s+it\b)'
+reason = "Describe operator responsibilities without assuming an institutional unit."
+
+[[rules]]
+id = "private-repository"
+pattern = '(?i:github(?:usercontent)?\.com/CFutter(?:/|\b)|sec_hum_oralhistarchiv_web_app)'
+reason = "Keep the current private repository identity out of generic publication material."
+
+[[exceptions]]
+path = "scripts/site-reference-policy.toml"
+rule = "institution"
+line_sha256 = "1991de6fc9a490c171894fb202d45319daf396164de5218fad5c37271c409f03"
+count = 1
+kind = "policy"
+reason = "The exact deny-pattern declaration is policy data, not deployment content."
+
+[[exceptions]]
+path = "scripts/site-reference-policy.toml"
+rule = "upstream-name"
+line_sha256 = "8ef612c3c51eda45a5c22b8cb13ece435918d637e0be02778d3ad853774de35a"
+count = 1
+kind = "policy"
+reason = "The exact deny-pattern declaration is policy data, not deployment content."
+
+[[exceptions]]
+path = "scripts/site-reference-policy.toml"
+rule = "private-repository"
+line_sha256 = "e6c9c200e53bb7a34f99ddfce287d9d226c3ab1d4d3f099b916df221dbb781f3"
+count = 1
+kind = "policy"
+reason = "The exact deny-pattern declaration is policy data, not deployment content."
+
+[[exceptions]]
+path = "docs/configuration/settings.md"
+rule = "upstream-name"
+line_sha256 = "9ca3798c4d2fa26a3d03b67fb1d01962f271cdff7b34bb64e881b3d6eede7597"
+count = 1
+kind = "compatibility"
+reason = "Retain deliberately rejected retired settings and migration guidance; no active setting is introduced."
+
+[[exceptions]]
+path = "docs/configuration/settings.md"
+rule = "upstream-name"
+line_sha256 = "06a5f5dcf06d3dd019b59b74bbb080ee3d27f76cf004c2bc1965171b8dde1c52"
+count = 1
+kind = "compatibility"
+reason = "Retain deliberately rejected retired settings and migration guidance; no active setting is introduced."
+
+[[exceptions]]
+path = "docs/configuration/settings.md"
+rule = "upstream-name"
+line_sha256 = "066c6f671ee0ff0841ee2d9e6b63438e3a0412b37ef3786d1f26a13e33bd5728"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/app/services/data/common_passwords.txt"
+rule = "obsolete-proxy"
+line_sha256 = "d6e0ff2b7a534a9750d13545971476557164f72cb92ad74be7f145491ec4acf4"
+count = 1
+kind = "security-data"
+reason = "Preserve the reviewed upstream password-blocklist entry byte for byte."
+
+[[exceptions]]
+path = "src/config/settings.py"
+rule = "upstream-name"
+line_sha256 = "c0aff5668c1837b3320ee4cd27106113caea1a7b02da5a6f62bc728298113ec9"
+count = 1
+kind = "compatibility"
+reason = "Retain deliberately rejected retired settings and migration guidance; no active setting is introduced."
+
+[[exceptions]]
+path = "src/config/settings.py"
+rule = "upstream-name"
+line_sha256 = "ff62673f6ee380edd4661277a40653a84ebf7668f90be73ed52a53fa788b3741"
+count = 1
+kind = "compatibility"
+reason = "Retain deliberately rejected retired settings and migration guidance; no active setting is introduced."
+
+[[exceptions]]
+path = "src/tests/client/test_page_routes.py"
+rule = "upstream-name"
+line_sha256 = "d037faf5c842fda5db846ccdcc2674973d9e5f7cc600b1e4b8625526a2c22051"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_pages_e2e.py"
+rule = "upstream-name"
+line_sha256 = "7d03f5b631e8ba168d577189cdaccc072e074fe121f2e194cd82378aff4feb8e"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_pages_e2e.py"
+rule = "upstream-name"
+line_sha256 = "a00904cda8ca77affa80b6fc29e4b8aafd4cf319e1d0e495c71beef2dca6611e"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_pages_e2e.py"
+rule = "upstream-name"
+line_sha256 = "8cc6b7d5b9c6a4674a43dc434d32e5210063d687b358607cf11bd0524521820d"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_pages_e2e.py"
+rule = "upstream-name"
+line_sha256 = "0496736146178b63023522d9a20ab31798c740f818ae901fd0e99d1ee6bae086"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_pages_e2e.py"
+rule = "upstream-name"
+line_sha256 = "2755d0db886cd5b40b2475f7961ecad0f01cfa04417814dea13de1078190225d"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_pages_e2e.py"
+rule = "upstream-name"
+line_sha256 = "c3ac661c5dc9cc037cf0ad4811064531b2b6fd357ab0298526870578b120c52d"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_pages_e2e.py"
+rule = "upstream-name"
+line_sha256 = "6ae09b49605477b4c19e557136ba12df0f001aa608139630812ef7aa0b2eafde"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_pages_e2e.py"
+rule = "upstream-name"
+line_sha256 = "0af57a03c35007e3cbb7330ac99da0c17794a7bc9411310dd16744f165705190"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_pages_e2e.py"
+rule = "upstream-name"
+line_sha256 = "d49be31ec1f885aa9d0aa322d024178c1a96b578bdbe348e2373652ca7928ffb"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_pages_e2e.py"
+rule = "upstream-name"
+line_sha256 = "09e291454aab7fb921093d9375b204214499b8ba5c6e5bc6e12f998f34c7e138"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_schema_constraints_db.py"
+rule = "upstream-name"
+line_sha256 = "61b83c39a3cfdd2a6cc58e4d52d4123a026bc8075ddbf51cc649e821ac592dd1"
+count = 2
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_schema_constraints_db.py"
+rule = "upstream-name"
+line_sha256 = "f4067cbf74e514aa9e6fbd161ca32ea226907b191374bedeac9a24b5b1011c90"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_schema_constraints_db.py"
+rule = "upstream-name"
+line_sha256 = "a9a3f493cbac4066af3ad2c48ce32f43b5668a8ebb6f0287d9cc74ecea17024a"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_schema_constraints_db.py"
+rule = "upstream-name"
+line_sha256 = "39d4b279703b9c3c441193cae938c23fef8d10c465aa710077a64d3a4b3786d5"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_schema_constraints_db.py"
+rule = "upstream-name"
+line_sha256 = "cd0f78f201ece39588c6fec6e4af30826f0ede8d344c12a6f68a3ef341fb0e7c"
+count = 2
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_sync_incremental_db.py"
+rule = "upstream-name"
+line_sha256 = "cac92570c7b6c9e22c0137228f08cbaafdbc0c64e057761f58df57a7befec0e6"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_sync_incremental_db.py"
+rule = "upstream-name"
+line_sha256 = "ad3d97b35d74ff8ebc60a711f6514dc54b3ccce541d64b714ae728d3e872d21c"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_sync_incremental_db.py"
+rule = "upstream-name"
+line_sha256 = "c26aa72de9dbe37c0fbf999e1c3dc5b7ffd682c0c949543c30a19eb91174389c"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_sync_incremental_db.py"
+rule = "upstream-name"
+line_sha256 = "3fa25d02a37b4d9dc63f32fd0d167602e1db79bc6c40604adf6b095b9343ff1d"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_sync_incremental_db.py"
+rule = "upstream-name"
+line_sha256 = "995a3f2262a57bd251d4fcbd54c4ba386c11f7cbe6d0d393f7cf1c2476eebaee"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_sync_rebuild_db.py"
+rule = "upstream-name"
+line_sha256 = "4bd6ba6b18fefc1668b68e1553ff504cb6308b00e516cca8ce5439b57991f2a7"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/oai_fixtures.py"
+rule = "upstream-name"
+line_sha256 = "3d9a755db39340055af9473752e6802802d19fa56e3f241521eafd2643670433"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/oai_fixtures.py"
+rule = "upstream-name"
+line_sha256 = "1f8d6c9a8f50a648f8c825501d0e17ea75403d6d16bcce10a36670e482b5bbb3"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/oai_fixtures.py"
+rule = "upstream-name"
+line_sha256 = "e33f75a2f60df51cf8a9509d93ffa91858a940cd4cc38f7588107cb003c7390d"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/source_fixtures.py"
+rule = "upstream-name"
+line_sha256 = "a24c93ebb1748de02321e914af84fb38fcc24191aaf45fdd9a84a10fad519554"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/source_fixtures.py"
+rule = "upstream-name"
+line_sha256 = "d299366f2de8f4ed1bd7c20bb4b9cce028b46f6366abdda2eccce7a85723b336"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/source_fixtures.py"
+rule = "upstream-name"
+line_sha256 = "403be969e9d36d48963522fa358c72f2aaf5153f530b291d4516f693f0a55d2b"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/source_fixtures.py"
+rule = "upstream-name"
+line_sha256 = "e37dc83237aaf74bce21907ec8e9d531224acc5c8c01e2face0a4c531cccd17c"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/source_fixtures.py"
+rule = "upstream-name"
+line_sha256 = "c1a7d90d2c4d0ec9e17cc7e25cd87665fe9bde94911293f879a9fb43d1ef5ce7"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/sources.toml"
+rule = "upstream-name"
+line_sha256 = "f4c118c0bc45df89de04858f0ff642d0439207f8f714d4296c253331eb361a84"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/sources.toml"
+rule = "upstream-name"
+line_sha256 = "ea659e00d460827766d982855c5ec0bca93499408186e28559ff7ca6101192a9"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/sources.toml"
+rule = "upstream-name"
+line_sha256 = "3e51e26fb599207623bcd539d03955be323f0539138659c495e48eb37f22f262"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/sources.toml"
+rule = "upstream-name"
+line_sha256 = "706595e2ae63d3d829e55fcdebddcc08a6338a0b79d4a1bc1f99be812cfeaf69"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/sources.toml"
+rule = "upstream-name"
+line_sha256 = "900f355c6fd40ffac57fdbfa07b54663700a0ca0865bbf25393b8ae6a418036d"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/sources/cases/oai_pmh_cmdi.py"
+rule = "upstream-name"
+line_sha256 = "7ddd5ca87308bd80d047a5bf83ad00db816872220c1fe9a5c7cd6bd4a7e3adc1"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/sources/cases/oai_pmh_cmdi.py"
+rule = "upstream-name"
+line_sha256 = "900f355c6fd40ffac57fdbfa07b54663700a0ca0865bbf25393b8ae6a418036d"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_access_tiers.py"
+rule = "upstream-name"
+line_sha256 = "e839d516f2b1f510d436a3805c798edb75e2ae80708f49c8de589290b4e5e87b"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_access_tiers.py"
+rule = "upstream-name"
+line_sha256 = "0d562cd7ce1df357a5c66b39ff4408cbf2ef47f87839bc216aab57ded4372368"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_access_tiers.py"
+rule = "upstream-name"
+line_sha256 = "7f9f515f0538756e2fd6a2c4605b6dca829f3862e532a99bd0197c67d792966e"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_federation_runbook.py"
+rule = "institution"
+line_sha256 = "4f0214392944337c0a06981cffa26fef8951f6aeffe5144f9e4e1df9c867835b"
+count = 3
+kind = "negative-test"
+reason = "This exact assertion rejects institutional dependencies in the generic runbook."
+
+[[exceptions]]
+path = "src/tests/unit/test_federation_runbook.py"
+rule = "former-site"
+line_sha256 = "4f0214392944337c0a06981cffa26fef8951f6aeffe5144f9e4e1df9c867835b"
+count = 1
+kind = "negative-test"
+reason = "This exact assertion rejects institutional dependencies in the generic runbook."
+
+[[exceptions]]
+path = "src/tests/unit/test_federation_runbook.py"
+rule = "upstream-name"
+line_sha256 = "4f0214392944337c0a06981cffa26fef8951f6aeffe5144f9e4e1df9c867835b"
+count = 1
+kind = "negative-test"
+reason = "This exact assertion rejects institutional dependencies in the generic runbook."
+
+[[exceptions]]
+path = "src/tests/unit/test_oai_client_fetch.py"
+rule = "upstream-name"
+line_sha256 = "8d3b1c5da424f4cef1c71c5c79116d425a841d1d0cff698d4e76a05e6f9e55e4"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_oai_client_parsing.py"
+rule = "upstream-name"
+line_sha256 = "8d3b1c5da424f4cef1c71c5c79116d425a841d1d0cff698d4e76a05e6f9e55e4"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_oai_worker_success.py"
+rule = "upstream-name"
+line_sha256 = "027e2b41d32426ce987f55a2c3341d1f496eb9c14d85dde957137836344d065e"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_record_parsing.py"
+rule = "upstream-name"
+line_sha256 = "1508c1e71cd9aa449e4b25f4f87f3dfc8a21b9a41f42b5d2a128dffbd608aa73"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_record_parsing.py"
+rule = "upstream-name"
+line_sha256 = "9b49c5d976efe60e28fee3d8fb3274bae31e1eab798dd584ff3bfcb48d87e015"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_record_parsing.py"
+rule = "upstream-name"
+line_sha256 = "da6fa3268debee52ced7c85ae5027c32deb694fad54c158e4b4af0ebe4512b2f"
+count = 2
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_release_contract.py"
+rule = "upstream-name"
+line_sha256 = "cda70849498fafec46b2fecf53e6a039666db020580062fe10b5ac561739a932"
+count = 1
+kind = "compatibility"
+reason = "Retain deliberately rejected retired settings and migration guidance; no active setting is introduced."
+
+[[exceptions]]
+path = "src/tests/unit/test_release_contract.py"
+rule = "upstream-name"
+line_sha256 = "908b79a9c6ab787334b461645dd2d7f292f82d2ec4b399b5ef4f51fd2f186428"
+count = 1
+kind = "compatibility"
+reason = "Retain deliberately rejected retired settings and migration guidance; no active setting is introduced."
+
+[[exceptions]]
+path = "src/tests/unit/test_security_validators.py"
+rule = "upstream-name"
+line_sha256 = "eba4367e15076d4e75696b57d91cbf294c5c294ca1d6af38a3e3f92b4d70850e"
+count = 1
+kind = "compatibility"
+reason = "Retain deliberately rejected retired settings and migration guidance; no active setting is introduced."
+
+[[exceptions]]
+path = "src/tests/unit/test_sync_rebuild.py"
+rule = "upstream-name"
+line_sha256 = "5df6c2ed75af2136169cac6f3f244bdc3dc8456f5e887763290e20826dc8115b"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/integration/test_oai_envelope_db.py"
+rule = "upstream-name"
+line_sha256 = "58ca0d38fa964ad895fd6252c9b2428764f538bec1cd5ad2f46e2b2bbfef8905"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_sync_incremental.py"
+rule = "upstream-name"
+line_sha256 = "325692172e519b7801fbe83a2cc221406193505c14e5a3917208a5b593d86e5e"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_sync_rebuild.py"
+rule = "upstream-name"
+line_sha256 = "17dd5da6677c28b2cd97f4ecc5fe923c59a03aba59ced1a1c6866bc9eadce71c"
+count = 2
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_sync_rebuild.py"
+rule = "upstream-name"
+line_sha256 = "7967e9e93fe1e2e4fff0f9e58bd541c5ceacce850ddba8f722a1b431040b17dd"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_sync_rebuild.py"
+rule = "upstream-name"
+line_sha256 = "8d1bfc942d4658f5a088615de1c3b95ea6798f48f5a8d104d25a731860837477"
+count = 3
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_sync_rebuild.py"
+rule = "upstream-name"
+line_sha256 = "975de9442779a5384ee57f7ac2e8d0cb9c15e87dbf5d5228ff0cd9d3daf1fd50"
+count = 1
+kind = "vendor"
+reason = "Reviewed public upstream protocol, namespace, API or fixture reference; no deployment identity or credential."
+
+[[exceptions]]
+path = "src/tests/unit/test_wheel_smoke_environment.py"
+rule = "upstream-name"
+line_sha256 = "de762e81fd43749f0418f46840df4aabfddfd1cc8729bd9607502a385884163a"
+count = 1
+kind = "compatibility"
+reason = "Retain deliberately rejected retired settings and migration guidance; no active setting is introduced."

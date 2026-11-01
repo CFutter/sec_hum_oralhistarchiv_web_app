@@ -20,6 +20,10 @@ Password policy enforces a 12-character minimum, a common-password blocklist, an
 
 ::: app.services.password_reset
 
+## `app.services.password_change`
+
+::: app.services.password_change
+
 ## `app.services.password_work`
 
 ::: app.services.password_work

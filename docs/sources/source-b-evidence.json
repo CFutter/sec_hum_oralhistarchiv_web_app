@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "evidence_limit": "References cover every collected parameter case of each base node. Collection and docstring checks do not establish passing behavior; run the full required serial and randomized parallel suites. Synthetic evidence does not authorize a real source.",
+  "operational_evidence": {
+    "source_owner_approval": "Record owner-approved public values, curated mappings and representative samples, including their combination, existence, enumeration, ordering, counts and detail-response channels. Tests cannot certify human-language disclosure safety.",
+    "real_feed_acceptance": "Validate the actual private feed schema, signed request/response integration, configured identity and credentials, and correction/withdrawal procedure before activation.",
+    "representative_encrypted_restore": "Perform and record an isolated encrypted restore of representative real-source state with deployed backup/recovery roles, grants, any enabled RLS, key custody and off-host recovery access. The synthetic CI round trip does not establish these operational facts."
+  },
+  "requirements": {
+    "SB-DISC-001": {
+      "tests": [
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_native_records_release_exact_public_fields_or_all_full_fields"
+      ],
+      "operational_evidence": []
+    },
+    "SB-DISC-002": {
+      "tests": [
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_native_records_release_exact_public_fields_or_all_full_fields",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_public_discovery_and_private_full_text_search",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_private_filters_facets_counts_and_pagination"
+      ],
+      "operational_evidence": [
+        "source_owner_approval"
+      ]
+    },
+    "SB-DISC-003": {
+      "tests": [
+        "src/tests/unit/test_json_feed_records.py::test_discovery_and_list_labels_are_trimmed_bounded_and_control_free",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_native_records_release_exact_public_fields_or_all_full_fields"
+      ],
+      "operational_evidence": [
+        "source_owner_approval"
+      ]
+    },
+    "SB-DISC-004": {
+      "tests": [
+        "src/tests/unit/test_json_feed_pages.py::test_record_identity_must_be_single_unambiguous_public_uuid4",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_native_records_release_exact_public_fields_or_all_full_fields"
+      ],
+      "operational_evidence": [
+        "source_owner_approval"
+      ]
+    },
+    "SB-DISC-005": {
+      "tests": [
+        "src/tests/unit/test_json_feed_records.py::test_material_access_label_uses_only_the_reviewed_mapping",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_native_records_release_exact_public_fields_or_all_full_fields"
+      ],
+      "operational_evidence": [
+        "source_owner_approval"
+      ]
+    },
+    "SB-DISC-006": {
+      "tests": [
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_native_records_release_exact_public_fields_or_all_full_fields",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_public_discovery_and_private_full_text_search",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_private_filters_facets_counts_and_pagination"
+      ],
+      "operational_evidence": []
+    },
+    "SB-DISC-007": {
+      "tests": [
+        "src/tests/unit/test_json_feed_records.py::test_every_metadata_field_is_required_even_when_nullable",
+        "src/tests/integration/test_sensitive_source_sync_db.py::test_identifiable_bad_records_preserve_last_good_and_quarantine_new_records"
+      ],
+      "operational_evidence": []
+    },
+    "SB-DISC-008": {
+      "tests": [
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_native_corrections_and_withdrawals_refresh_raw_search_and_warm_caches",
+        "src/tests/integration/test_sensitive_source_sync_db.py::test_durable_hide_and_admin_floor_survive_native_withdrawal_and_reintroduction",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_real_admin_hide_removes_every_surface_and_preserves_another_source"
+      ],
+      "operational_evidence": []
+    },
+    "SB-DISC-009": {
+      "tests": [
+        "src/tests/unit/test_source_b_evidence.py::test_structural_record_validation_does_not_certify_public_disclosure"
+      ],
+      "operational_evidence": [
+        "source_owner_approval"
+      ]
+    },
+    "SB-VIS-001": {
+      "tests": [
+        "src/tests/unit/test_json_feed_pages.py::test_duplicate_nonidentity_keys_quarantine_only_the_identified_record",
+        "src/tests/integration/test_sensitive_source_sync_db.py::test_identifiable_bad_records_preserve_last_good_and_quarantine_new_records"
+      ],
+      "operational_evidence": []
+    },
+    "SB-VIS-002": {
+      "tests": [
+        "src/tests/unit/test_json_feed_records.py::test_source_tier_is_exact_and_never_defaulted",
+        "src/tests/integration/test_sensitive_source_sync_db.py::test_identifiable_bad_records_preserve_last_good_and_quarantine_new_records"
+      ],
+      "operational_evidence": []
+    },
+    "SB-VIS-003": {
+      "tests": [
+        "src/tests/integration/test_sensitive_source_sync_db.py::test_two_page_update_applies_tier_corrections_and_withdraws_only_this_source",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_native_corrections_and_withdrawals_refresh_raw_search_and_warm_caches"
+      ],
+      "operational_evidence": []
+    },
+    "SB-VIS-004": {
+      "tests": [
+        "src/tests/integration/test_sensitive_source_sync_db.py::test_two_page_update_applies_tier_corrections_and_withdraws_only_this_source",
+        "src/tests/integration/test_sensitive_source_sync_db.py::test_durable_hide_and_admin_floor_survive_native_withdrawal_and_reintroduction",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_native_corrections_and_withdrawals_refresh_raw_search_and_warm_caches"
+      ],
+      "operational_evidence": []
+    },
+    "SB-VIS-005": {
+      "tests": [
+        "src/tests/unit/test_json_feed_fetch.py::test_spawned_verified_tls_chain_returns_all_tiers_withdrawal_and_fixed_quarantine",
+        "src/tests/unit/test_json_feed_transport.py::test_signature_is_exactly_one_canonical_matching_mac"
+      ],
+      "operational_evidence": [
+        "real_feed_acceptance"
+      ]
+    },
+    "SB-VIS-006": {
+      "tests": [
+        "src/tests/integration/test_sensitive_source_audit_db.py::test_only_effective_committed_tier_changes_emit_once_and_are_source_scoped",
+        "src/tests/integration/test_sensitive_source_audit_db.py::test_only_actual_explicit_withdrawals_emit_even_for_a_zero_match_rebuild",
+        "src/tests/integration/test_sensitive_source_audit_db.py::test_doi_group_rollback_discards_its_events_and_database_detail_remains_private",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_native_corrections_and_withdrawals_refresh_raw_search_and_warm_caches"
+      ],
+      "operational_evidence": []
+    },
+    "SB-VIS-007": {
+      "tests": [
+        "src/tests/integration/test_sensitive_source_sync_db.py::test_two_page_update_applies_tier_corrections_and_withdraws_only_this_source",
+        "src/tests/integration/test_sensitive_source_sync_db.py::test_durable_hide_and_admin_floor_survive_native_withdrawal_and_reintroduction",
+        "src/tests/integration/test_sensitive_source_failure_db.py::test_fatal_native_fetch_preserves_all_committed_state_except_its_error"
+      ],
+      "operational_evidence": []
+    },
+    "SB-VIS-008": {
+      "tests": [
+        "src/tests/integration/test_sensitive_source_sync_db.py::test_two_page_update_applies_tier_corrections_and_withdraws_only_this_source",
+        "src/tests/integration/test_sensitive_source_pages_db.py::test_native_records_release_exact_public_fields_or_all_full_fields"
+      ],
+      "operational_evidence": [
+        "real_feed_acceptance"
+      ]
+    },
+    "SB-VIS-009": {
+      "tests": [
+        "src/tests/unit/test_runtime_preflight.py::TestBackupExecutionBehavior::test_schema_preflight_fails_closed_before_dumping",
+        "src/tests/integration/test_source_b_backup_db.py::test_encrypted_native_feed_backup_restores_state_and_resumes_staging",
+        "src/tests/integration/test_deployed_preflight_db.py::test_runtime_preflight_with_actual_deployed_role_login_defaults"
+      ],
+      "operational_evidence": [
+        "representative_encrypted_restore"
+      ]
+    },
+    "SB-TRANS-001": {
+      "tests": [
+        "src/tests/unit/test_json_feed_transport.py::test_non200_status_is_not_followed_retried_or_returned_as_empty_success",
+        "src/tests/integration/test_sensitive_source_failure_db.py::test_fatal_native_fetch_preserves_all_committed_state_except_its_error"
+      ],
+      "operational_evidence": [
+        "real_feed_acceptance"
+      ]
+    },
+    "SB-TRANS-002": {
+      "tests": [
+        "src/tests/unit/test_json_feed_fetch.py::test_every_configured_size_count_budget_encloses_the_full_pipeline",
+        "src/tests/integration/test_sensitive_source_failure_db.py::test_fatal_native_fetch_preserves_all_committed_state_except_its_error"
+      ],
+      "operational_evidence": []
+    },
+    "SB-TRANS-003": {
+      "tests": [
+        "src/tests/unit/test_json_feed_fetch.py::test_untrusted_processing_and_serialization_stalls_are_killed_inside_the_same_worker",
+        "src/tests/integration/test_sensitive_source_failure_db.py::test_fatal_native_fetch_preserves_all_committed_state_except_its_error"
+      ],
+      "operational_evidence": []
+    },
+    "SB-TRANS-004": {
+      "tests": [
+        "src/tests/unit/test_json_feed_fetch.py::test_signed_or_untrusted_chain_failures_return_no_harvest_or_body_details",
+        "src/tests/integration/test_sensitive_source_failure_db.py::test_fatal_native_fetch_preserves_all_committed_state_except_its_error"
+      ],
+      "operational_evidence": []
+    }
+  }
+}

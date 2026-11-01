@@ -1,9 +1,10 @@
 """Enroll, verify, and rotate encrypted local TOTP credentials.
 
-Enrollment/recovery secrets live for ten minutes; each setup-page request
-replaces pending recovery codes. Rotation uses a separate five-minute
-challenge bound to the authorizing session/revision after password and fresh
-TOTP proof. Consume codes through locked helpers, not get_totp_secret.
+Enrollment/recovery secrets live for ten minutes and belong to their creating
+session; each owner-session setup-page request replaces pending recovery codes.
+Rotation uses a separate five-minute challenge bound to the authorizing
+session/revision after password and fresh TOTP proof. Consume codes through
+locked helpers, not get_totp_secret.
 """
 
 import logging
@@ -14,24 +15,25 @@ from enum import StrEnum
 from typing import Any
 
 import pyotp
-from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from psycopg import AsyncCursor
 from psycopg_pool import AsyncConnectionPool
 
 from config import settings
 
+from .account_clock import database_now_cur
 from .credential_attempts import (
     SessionStepUpAttemptOutcome,
     reserve_session_step_up_attempt,
 )
-from .crypto import decrypt_value, encrypt_value, password_hasher
-from .db import get_db_cursor
-from .password_work import run_password_work
+from .db import Database, get_db_cursor
+from .password_verification import VerifiedPasswordSnapshot, verify_password_snapshot
+from .security_notifications import queue_security_change_notice_cur
 from .session_ids import hash_session_id
 from .session_revocation import (
     delete_user_sessions_cur,
     invalidate_pending_authentication_state_cur,
 )
+from .totp_crypto import decrypt_value, encrypt_value
 from .totp_recovery_codes import (
     activate_pending_recovery_code_set_cur,
     generate_recovery_codes,
@@ -160,28 +162,56 @@ async def _lock_authorizing_session_cur(
     user_id: int,
     session_id: str,
     pending_purpose: PendingTotpPurpose,
-) -> bool:
-    """Lock the user's unexpired raw-token session and test its pending purpose.
+) -> datetime | None:
+    """Lock the session, then return database wall time if it authorizes setup.
 
-    The caller owns the transaction and must lock the user first. Return False
-    for absent or wrong-purpose sessions; unsupported purposes raise ValueError
-    when a matching session exists.
+    The caller owns the transaction and must lock the user first. Return None
+    for absent, expired or wrong-purpose sessions; unsupported purposes raise
+    ValueError when a matching session exists. Read time only after both locks
+    so callers can use the same clock for their pending-secret age check.
     """
     await cur.execute(
         """
-        SELECT purpose
+        SELECT purpose, expires_at, last_activity_at
         FROM sessions
         WHERE id = %s
           AND user_id = %s
-          AND expires_at > clock_timestamp()
         FOR UPDATE
         """,
         (hash_session_id(session_id), user_id),
     )
     session = await cur.fetchone()
-    return session is not None and _session_purpose_matches(
-        session["purpose"],
-        pending_purpose,
+    if session is None or not _session_purpose_matches(session["purpose"], pending_purpose):
+        return None
+    now = await database_now_cur(cur)
+    idle_cutoff = now - timedelta(seconds=settings.session_idle_timeout_seconds)
+    return (
+        now if session["expires_at"] > now and session["last_activity_at"] > idle_cutoff else None
+    )
+
+
+async def _pending_owner_is_live_cur(
+    cur: AsyncCursor[Any],
+    *,
+    owner_hash: str | None,
+    user_id: int,
+    purpose: PendingTotpPurpose,
+) -> bool:
+    """Lock a different creator before deciding that its authority has expired."""
+    await cur.execute(
+        """SELECT purpose, expires_at, last_activity_at FROM sessions
+           WHERE id = %s AND user_id = %s FOR UPDATE""",
+        (owner_hash, user_id),
+    )
+    owner = await cur.fetchone()
+    if owner is None:
+        return False
+    now = await database_now_cur(cur)
+    return (
+        _session_purpose_matches(owner["purpose"], purpose)
+        and owner["expires_at"] > now
+        and owner["last_activity_at"]
+        > now - timedelta(seconds=settings.session_idle_timeout_seconds)
     )
 
 
@@ -265,15 +295,13 @@ async def get_or_create_pending_totp_secret(
                 totp_secret,
                 totp_recovery_required,
                 pending_totp_secret,
-                (
-                    pending_totp_created_at >
-                    CURRENT_TIMESTAMP - %s * INTERVAL '1 second'
-                ) AS pending_is_current
+                pending_totp_created_at,
+                pending_totp_session_hash
             FROM users
             WHERE id = %s
             FOR UPDATE
             """,
-            (_PENDING_TOTP_MAX_AGE_SECONDS, user_id),
+            (user_id,),
         )
         row = await cur.fetchone()
 
@@ -297,17 +325,30 @@ async def get_or_create_pending_totp_secret(
         else:
             raise ValueError(f"Unhandled pending TOTP purpose: {purpose!r}")
 
-        if not await _lock_authorizing_session_cur(
+        authorized_at = await _lock_authorizing_session_cur(
             cur,
             user_id=user_id,
             session_id=session_id,
             pending_purpose=purpose,
-        ):
+        )
+        if authorized_at is None:
             return PendingTotpResult(PendingTotpOutcome.SESSION_EXPIRED)
 
         pending_ciphertext = row["pending_totp_secret"]
-        if pending_ciphertext and row["pending_is_current"]:
-            secret = decrypt_value(pending_ciphertext)
+        created_at = row["pending_totp_created_at"]
+        cutoff = authorized_at - timedelta(seconds=_PENDING_TOTP_MAX_AGE_SECONDS)
+        if pending_ciphertext and created_at is not None and created_at > cutoff:
+            if row["pending_totp_session_hash"] != hash_session_id(session_id):
+                if await _pending_owner_is_live_cur(
+                    cur,
+                    owner_hash=row["pending_totp_session_hash"],
+                    user_id=user_id,
+                    purpose=purpose,
+                ):
+                    return PendingTotpResult(PendingTotpOutcome.INELIGIBLE)
+                # Never transfer the old secret after its creator loses authority.
+                pending_ciphertext = None
+            secret = decrypt_value(pending_ciphertext) if pending_ciphertext else None
             if secret is not None:
                 recovery_codes: tuple[str, ...] = ()
                 if staged_plaintext_codes:
@@ -330,10 +371,11 @@ async def get_or_create_pending_totp_secret(
             """
             UPDATE users
             SET pending_totp_secret = %s,
-                pending_totp_created_at = CURRENT_TIMESTAMP
+                pending_totp_created_at = clock_timestamp(),
+                pending_totp_session_hash = %s
             WHERE id = %s
             """,
-            (encrypted, user_id),
+            (encrypted, hash_session_id(session_id), user_id),
         )
 
         recovery_codes = ()
@@ -444,9 +486,9 @@ async def verify_and_enroll_totp(
     unexpired raw-token session, and a decryptable secret younger than ten
     minutes. Return TotpEnrollmentOutcome for expected rejections. Success
     activates recovery codes, consumes the TOTP step, increments auth_revision,
-    and clears pending capabilities. Initial setup upgrades only the supplied
-    session to full; recovery clears recovery/lockout state and deletes all
-    sessions. Database/invariant errors roll back the transaction.
+    and clears pending capabilities. Both initial setup and recovery revoke all
+    sessions and require a fresh login; recovery also clears lockout state.
+    Database/invariant errors roll back the transaction.
     """
     normalized_code = normalize_totp_code(code)
     async with get_db_cursor(pool) as cur:
@@ -454,7 +496,7 @@ async def verify_and_enroll_totp(
             """
             SELECT is_active, auth_method, email_verified,
                    totp_secret, pending_totp_secret,
-                   pending_totp_created_at,
+                   pending_totp_created_at, pending_totp_session_hash,
                    totp_recovery_required
             FROM users
             WHERE id = %s
@@ -481,19 +523,25 @@ async def verify_and_enroll_totp(
         pending_purpose = (
             PendingTotpPurpose.RECOVERY if recovering else PendingTotpPurpose.ENROLLMENT
         )
-        if not await _lock_authorizing_session_cur(
+        authorized_at = await _lock_authorizing_session_cur(
             cur,
             user_id=user_id,
             session_id=session_id,
             pending_purpose=pending_purpose,
-        ):
+        )
+        if authorized_at is None:
             return TotpEnrollmentOutcome.SESSION_EXPIRED
 
         ciphertext = row["pending_totp_secret"]
         created_at = row["pending_totp_created_at"]
-        cutoff = datetime.now(UTC) - timedelta(seconds=_PENDING_TOTP_MAX_AGE_SECONDS)
+        cutoff = authorized_at - timedelta(seconds=_PENDING_TOTP_MAX_AGE_SECONDS)
 
-        if not ciphertext or created_at is None or created_at <= cutoff:
+        if (
+            not ciphertext
+            or created_at is None
+            or created_at <= cutoff
+            or row["pending_totp_session_hash"] != hash_session_id(session_id)
+        ):
             return TotpEnrollmentOutcome.PENDING_SECRET_MISSING
 
         secret = decrypt_value(ciphertext)
@@ -523,6 +571,7 @@ async def verify_and_enroll_totp(
                     auth_revision = auth_revision + 1,
                     pending_totp_secret = NULL,
                     pending_totp_created_at = NULL,
+                    pending_totp_session_hash = NULL,
                     totp_recovery_required = false,
                     totp_recovery_expires_at = NULL,
                     totp_recovery_authorized_at = NULL,
@@ -545,62 +594,28 @@ async def verify_and_enroll_totp(
                     last_totp_step = %s,
                     auth_revision = auth_revision + 1,
                     pending_totp_secret = NULL,
-                    pending_totp_created_at = NULL
+                    pending_totp_created_at = NULL,
+                    pending_totp_session_hash = NULL
                 WHERE id = %s
                 """,
                 (ciphertext, step, user_id),
             )
+            await delete_user_sessions_cur(cur, user_id)
             await invalidate_pending_authentication_state_cur(cur, user_id)
-            await cur.execute(
-                "UPDATE sessions SET purpose = 'full' WHERE id = %s",
-                (hash_session_id(session_id),),
-            )
             outcome = TotpEnrollmentOutcome.ENROLLED
+
+        await queue_security_change_notice_cur(
+            cur,
+            user_id=user_id,
+            change="totp_recovery_completed" if recovering else "totp_enrolled",
+        )
 
     logger.info("TOTP %s completed for user %d", outcome.value, user_id)
     return outcome
 
 
-async def _verify_rotation_password_snapshot(
-    pool: AsyncConnectionPool,
-    *,
-    user_id: int,
-    password: str,
-) -> tuple[str, int] | None:
-    """Verify off-connection; return (password_hash, auth_revision), or None on rejection.
-
-    Missing/bad hashes also run dummy work. Callers recheck the snapshot and
-    account eligibility under lock before using it.
-    """
-    # Imported lazily because authentication imports TOTP consumption helpers.
-    from .authentication import verify_dummy  # noqa: PLC0415 - avoid import cycle
-
-    async with get_db_cursor(pool) as cur:
-        await cur.execute(
-            "SELECT password_hash, auth_revision FROM users WHERE id = %s",
-            (user_id,),
-        )
-        row = await cur.fetchone()
-
-    if row is None or not isinstance(row["password_hash"], str) or not row["password_hash"]:
-        await verify_dummy(password)
-        return None
-
-    password_hash = row["password_hash"]
-    try:
-        await run_password_work(password_hasher.verify, password_hash, password)
-    except VerifyMismatchError:
-        return None
-    except (InvalidHashError, VerificationError):
-        logger.exception("Unverifiable password hash during TOTP rotation for user %d", user_id)
-        await verify_dummy(password)
-        return None
-
-    return password_hash, row["auth_revision"]
-
-
 async def begin_totp_rotation(
-    pool: AsyncConnectionPool,
+    pool: Database,
     user_id: int,
     password: str,
     current_code: str,
@@ -609,14 +624,15 @@ async def begin_totp_rotation(
     valid_window: int = 1,
     period: int = 30,
 ) -> TotpRotationStartResult:
-    """Commit a five-minute replacement challenge after password and fresh TOTP proof.
+    """Commit a five-minute replacement challenge after password/fresh TOTP proof.
 
-    session_id is a raw full-session token. Spend a durable step-up attempt,
-    verify password off-connection, then lock user/session and recheck
-    eligibility, credentials/revision, lockout, and replay state. READY returns
-    the sole plaintext replacement seed and replaces any earlier challenge;
-    other outcomes reject without issuing a seed. Decryption errors propagate.
-    Raise ValueError for a negative step window or nonpositive period in seconds.
+    session_id is a raw full-session token. Spend a separately committed step-up
+    attempt, verify the password off-connection, then lock/recheck account, hash,
+    revision, session expiry and replay state. Login lockout is not checked. READY
+    returns a plaintext seed and replaces the earlier challenge; other outcomes
+    reject without a seed. Decryption errors propagate. Negative valid_window or
+    nonpositive period (seconds) raises ValueError. Use a pool or idle connection
+    so the attempt commits before proof work.
     """
     if valid_window < 0:
         raise ValueError("valid_window must be non-negative")
@@ -642,15 +658,15 @@ async def begin_totp_rotation(
             raise RuntimeError(f"Unhandled step-up reservation outcome: {reservation!r}") from exc
 
     normalized_code = normalize_totp_code(current_code)
-    password_snapshot = await _verify_rotation_password_snapshot(
+    password_snapshot = await verify_password_snapshot(
         pool,
         user_id=user_id,
         password=password,
+        operation="totp_rotation",
     )
-    if password_snapshot is None or normalized_code is None:
+    if not isinstance(password_snapshot, VerifiedPasswordSnapshot) or normalized_code is None:
         return TotpRotationStartResult(TotpRotationStartOutcome.INVALID_CREDENTIALS)
 
-    verified_hash, verified_revision = password_snapshot
     session_hash = hash_session_id(session_id)
 
     async with get_db_cursor(pool) as cur:
@@ -664,8 +680,7 @@ async def begin_totp_rotation(
                    totp_secret,
                    totp_recovery_required,
                    last_totp_step,
-                   (locked_until IS NULL OR locked_until <= clock_timestamp())
-                       AS login_unlocked
+                   locked_until
             FROM users
             WHERE id = %s
             FOR UPDATE
@@ -680,26 +695,36 @@ async def begin_totp_rotation(
             or not row["email_verified"]
             or row["auth_method"] != "local"
             or row["totp_recovery_required"]
-            or not row["login_unlocked"]
         ):
             return TotpRotationStartResult(TotpRotationStartOutcome.INELIGIBLE)
 
-        if row["password_hash"] != verified_hash or row["auth_revision"] != verified_revision:
-            return TotpRotationStartResult(TotpRotationStartOutcome.SESSION_EXPIRED)
-
         await cur.execute(
             """
-            SELECT 1
+            SELECT expires_at
             FROM sessions
             WHERE id = %s
               AND user_id = %s
               AND purpose = 'full'
-              AND expires_at > clock_timestamp()
             FOR UPDATE
             """,
             (session_hash, user_id),
         )
-        if await cur.fetchone() is None:
+        session = await cur.fetchone()
+
+        # Lock an existing challenge before checking time: its replacement
+        # below must not introduce another challenge-row wait after the check.
+        await cur.execute(
+            "SELECT user_id FROM pending_totp_rotations WHERE user_id = %s FOR UPDATE",
+            (user_id,),
+        )
+        await cur.fetchone()
+        now = await database_now_cur(cur)
+        if (
+            session is None
+            or session["expires_at"] <= now
+            or row["password_hash"] != password_snapshot.password_hash
+            or row["auth_revision"] != password_snapshot.auth_revision
+        ):
             return TotpRotationStartResult(TotpRotationStartOutcome.SESSION_EXPIRED)
 
         active_ciphertext = row["totp_secret"]
@@ -775,7 +800,7 @@ async def begin_totp_rotation(
 
 
 async def confirm_totp_rotation(
-    pool: AsyncConnectionPool,
+    pool: Database,
     user_id: int,
     new_code: str,
     *,
@@ -810,8 +835,7 @@ async def confirm_totp_rotation(
                    auth_method,
                    totp_secret,
                    totp_recovery_required,
-                   (locked_until IS NULL OR locked_until <= clock_timestamp())
-                       AS login_unlocked
+                   locked_until
             FROM users
             WHERE id = %s
             FOR UPDATE
@@ -828,34 +852,25 @@ async def confirm_totp_rotation(
             or row["totp_recovery_required"]
         ):
             return TotpRotationOutcome.INELIGIBLE
-        if not row["login_unlocked"]:
-            return TotpRotationOutcome.ACCOUNT_LOCKED
-
-        active_ciphertext = row["totp_secret"]
-        if not active_ciphertext or decrypt_value(active_ciphertext) is None:
-            raise TotpDecryptionError(user_id)
-
         await cur.execute(
             """
-            SELECT 1
+            SELECT expires_at
             FROM sessions
             WHERE id = %s
               AND user_id = %s
               AND purpose = 'full'
-              AND expires_at > clock_timestamp()
             FOR UPDATE
             """,
             (session_hash, user_id),
         )
-        if await cur.fetchone() is None:
-            return TotpRotationOutcome.SESSION_EXPIRED
+        session = await cur.fetchone()
 
         await cur.execute(
             """
             SELECT encrypted_secret,
                    auth_revision,
                    confirmation_attempt_count,
-                   expires_at > clock_timestamp() AS unexpired
+                   expires_at
             FROM pending_totp_rotations
             WHERE user_id = %s
               AND session_id = %s
@@ -864,10 +879,19 @@ async def confirm_totp_rotation(
             (user_id, session_hash),
         )
         challenge = await cur.fetchone()
+        # Both expiry decisions must be made after the final row-lock wait.
+        now = await database_now_cur(cur)
+        if session is None or session["expires_at"] <= now:
+            return TotpRotationOutcome.SESSION_EXPIRED
+
+        active_ciphertext = row["totp_secret"]
+        if not active_ciphertext or decrypt_value(active_ciphertext) is None:
+            raise TotpDecryptionError(user_id)
+
         if challenge is None:
             return TotpRotationOutcome.PENDING_SECRET_MISSING
 
-        if not challenge["unexpired"] or challenge["auth_revision"] != row["auth_revision"]:
+        if challenge["expires_at"] <= now or challenge["auth_revision"] != row["auth_revision"]:
             await cur.execute(
                 """DELETE FROM pending_totp_rotations
                    WHERE user_id = %s AND session_id = %s""",
@@ -936,6 +960,7 @@ async def confirm_totp_rotation(
         )
         await delete_user_sessions_cur(cur, user_id)
         await invalidate_pending_authentication_state_cur(cur, user_id)
+        await queue_security_change_notice_cur(cur, user_id=user_id, change="totp_rotated")
 
     logger.info(
         "TOTP rotation completed and sessions revoked for user %d",
@@ -967,16 +992,13 @@ async def get_pending_totp_secret(
                    totp_secret,
                    totp_recovery_required,
                    pending_totp_secret,
-                   (
-                       pending_totp_created_at IS NOT NULL
-                       AND pending_totp_created_at >
-                           clock_timestamp() - %s * INTERVAL '1 second'
-                   ) AS pending_is_current
+                   pending_totp_created_at,
+                   pending_totp_session_hash
             FROM users
             WHERE id = %s
             FOR UPDATE
             """,
-            (_PENDING_TOTP_MAX_AGE_SECONDS, user_id),
+            (user_id,),
         )
         row = await cur.fetchone()
         if (
@@ -985,7 +1007,7 @@ async def get_pending_totp_secret(
             or row["auth_method"] != "local"
             or not row["email_verified"]
             or not row["pending_totp_secret"]
-            or not row["pending_is_current"]
+            or row["pending_totp_created_at"] is None
         ):
             return None
 
@@ -996,12 +1018,20 @@ async def get_pending_totp_secret(
         else:
             raise ValueError(f"Unhandled pending TOTP purpose: {purpose!r}")
 
-        if not state_matches or not await _lock_authorizing_session_cur(
+        if not state_matches:
+            return None
+        authorized_at = await _lock_authorizing_session_cur(
             cur,
             user_id=user_id,
             session_id=session_id,
             pending_purpose=purpose,
-        ):
+        )
+        if authorized_at is None:
+            return None
+        cutoff = authorized_at - timedelta(seconds=_PENDING_TOTP_MAX_AGE_SECONDS)
+        if row["pending_totp_created_at"] <= cutoff or row[
+            "pending_totp_session_hash"
+        ] != hash_session_id(session_id):
             return None
 
         return decrypt_value(row["pending_totp_secret"])

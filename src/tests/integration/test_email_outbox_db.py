@@ -1,36 +1,31 @@
-"""Integration tests for transactional email outbox leases and delivery
-against PostgreSQL.
-
-These tests pin the PostgreSQL-dependent behavior that mocks cannot verify:
-transactional enqueue, encrypted storage, competing-worker claims, abandoned
-lease recovery, lease-token ownership, lease renewal, retries, terminal
-failure, delivery outcomes, row-contention deferral, and the development
-mailbox end-to-end delivery path, implemented in
-``app.services.email_outbox`` and ``app.services.email_delivery``. Retention,
-maintenance and metrics coverage for ``app.services.outbox_maintenance``
-lives in ``test_email_outbox_retention_db.py``.
-"""
+"""Integration tests for transactional email outbox leases and delivery against PostgreSQL."""
 
 import asyncio
-import re
+import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from email import policy
 from email.parser import BytesParser
 from typing import Any
 from unittest.mock import create_autospec, patch
+from uuid import UUID
 
+import pyotp
 import pytest
+import time_machine
+from lxml import html
 
-from app.services import email_change
+from app.services import begin_local_registration, email_change, get_user_by_email
 from app.services.db import get_db_cursor
 from app.services.email import DeliveryResult
-from app.services.email_delivery import deliver_email_outbox_batch, send_claimed_email
+from app.services.email_delivery import deliver_email_outbox_batch
 from app.services.email_outbox import (
     OutboundEmail,
     OutboxBodyDecryptionError,
     OutboxLeaseLostError,
     claim_due_emails,
     decrypt_claimed_email_body,
+    defer_contended_email,
     enqueue_email_cur,
     enqueue_outbound_email_cur,
     mark_email_dead,
@@ -38,8 +33,11 @@ from app.services.email_outbox import (
     prepare_email_delivery,
     retry_email_later,
 )
-from app.services.registration import queue_verification_email_cur
-from app.services.users import get_user_by_id
+from app.services.outbox_maintenance import get_outbox_metrics_cur, outbox_is_degraded
+from app.services.smtp_process import send_claimed_email
+from app.services.tokens import action_token_public_id
+from tests.action_links import action_path, token_from_action_email
+from tests.integration.conftest import do_login
 
 _BODY = """Use this one-time link:
 
@@ -56,10 +54,12 @@ _STATE_COLUMNS = (
     "last_error",
     "sent_at",
     "failed_at",
+    "terminal_outcome",
 )
 
 
 async def _enqueue(db_pool, *, body: str = _BODY) -> int:
+    """Enqueue a non-action notice and return its message ID."""
     async with get_db_cursor(db_pool) as cur:
         return await enqueue_email_cur(
             cur,
@@ -73,6 +73,7 @@ async def _enqueue(db_pool, *, body: str = _BODY) -> int:
 
 
 async def _enqueue_worker_test_email(db_pool) -> int:
+    """Enqueue the synthetic worker-test notice and return its ID."""
     email = OutboundEmail(
         message_type="account_locked_notice",
         recipient="worker-test@example.org",
@@ -90,6 +91,7 @@ async def _enqueue_worker_test_email(db_pool) -> int:
 
 
 def _fetch_outbox_state(sync_conn, message_id: int) -> dict[str, Any]:
+    """Read the outbox state columns into a dictionary; require the row to exist."""
     row = sync_conn.execute(
         f"""
         SELECT {", ".join(_STATE_COLUMNS)}
@@ -114,6 +116,7 @@ class TestLeases:
         db_pool,
         sync_conn,
     ):
+        """Verify enqueue stores encrypted body and claim decrypts it."""
         message_id = await _enqueue(db_pool)
 
         stored = sync_conn.execute(
@@ -147,6 +150,7 @@ class TestLeases:
         db_pool,
         sync_conn,
     ):
+        """Verify enqueue participates in callers transaction."""
         with pytest.raises(_DeliberateRollback):
             async with get_db_cursor(db_pool) as cur:
                 await enqueue_email_cur(
@@ -168,6 +172,7 @@ class TestLeases:
         self,
         db_pool,
     ):
+        """Verify competing workers cannot claim same message."""
         message_id = await _enqueue(db_pool)
 
         first, second = await asyncio.gather(
@@ -194,6 +199,7 @@ class TestLeases:
         db_pool,
         sync_conn,
     ):
+        """Verify expired lease is reclaimed and old owner is rejected."""
         message_id = await _enqueue(db_pool)
 
         original = (
@@ -257,6 +263,7 @@ class TestLeases:
         assert stored[3] is not None
 
     async def test_preflight_renews_live_lease_and_rejects_reclaimed_owner(self, db_pool):
+        """Verify preflight renews live lease and rejects reclaimed owner."""
         async with get_db_cursor(db_pool) as cur:
             await enqueue_email_cur(
                 cur,
@@ -309,6 +316,7 @@ class TestLeases:
         db_pool,
         sync_conn,
     ):
+        """Verify retry releases lease but is not immediately claimable."""
         message_id = await _enqueue(db_pool)
 
         message = (
@@ -364,6 +372,7 @@ class TestLeases:
         db_pool,
         sync_conn,
     ):
+        """Verify undecryptable message can be marked dead."""
         message_id = await _enqueue(db_pool)
 
         sync_conn.execute(
@@ -426,6 +435,7 @@ class TestDeliveryOutcomes:
         db_pool,
         sync_conn,
     ) -> None:
+        """Verify delivery worker marks real outbox row sent."""
         message_id = await _enqueue_worker_test_email(db_pool)
 
         with patch(
@@ -450,6 +460,7 @@ class TestDeliveryOutcomes:
         db_pool,
         sync_conn,
     ) -> None:
+        """Verify delivery worker reschedules real outbox row after failure."""
         message_id = await _enqueue_worker_test_email(db_pool)
 
         with patch(
@@ -474,6 +485,7 @@ class TestDeliveryOutcomes:
         db_pool,
         sync_conn,
     ) -> None:
+        """Verify delivery worker marks exhausted row dead."""
         message_id = await _enqueue_worker_test_email(db_pool)
         sync_conn.execute(
             "UPDATE email_outbox SET attempt_count = 6 WHERE id = %s",
@@ -502,6 +514,7 @@ class TestDeliveryOutcomes:
         db_pool,
         sync_conn,
     ) -> None:
+        """Verify delivery worker marks undecryptable row dead."""
         message_id = await _enqueue_worker_test_email(db_pool)
         sync_conn.execute(
             "UPDATE email_outbox SET body_ciphertext = %s WHERE id = %s",
@@ -534,11 +547,14 @@ class TestRecipientRowContention:
     delivery attempt."""
 
     async def test_locked_recipient_does_not_block_other_mail_or_consume_attempt(
-        self, db_pool, sync_conn, user_factory
+        self, db_pool, sync_conn
     ):
-        user = user_factory(email_verified=False)
+        """Verify locked recipient does not block other mail or consume attempt."""
+        email = "contended-registration@example.org"
+        await begin_local_registration(db_pool, email=email)
+        user = await get_user_by_email(db_pool, email)
+        assert user is not None
         async with get_db_cursor(db_pool) as cur:
-            await queue_verification_email_cur(cur, await get_user_by_id(db_pool, user.id))
             notice_id = await enqueue_email_cur(
                 cur,
                 user_id=user.id,
@@ -562,6 +578,88 @@ class TestRecipientRowContention:
             "SELECT status, attempt_count FROM email_outbox WHERE message_type = 'email_verification'"
         ).fetchone() == ("pending", 0)
 
+    @pytest.mark.parametrize(
+        ("age", "expected_status"),
+        [
+            (timedelta(minutes=59), "pending"),
+            (timedelta(hours=1), "dead"),
+            (timedelta(minutes=61), "dead"),
+        ],
+        ids=["before-cutoff", "exact-cutoff", "after-cutoff"],
+    )
+    async def test_contention_has_independent_queue_age_budget(
+        self, db_pool, sync_conn, caplog, age, expected_status
+    ):
+        """An account lock cannot prevent terminal escalation; SMTP is never invoked."""
+        await begin_local_registration(db_pool, email="queue-age@example.org")
+        user = await get_user_by_email(db_pool, "queue-age@example.org")
+        assert user is not None
+        message_id = sync_conn.execute(
+            "UPDATE email_outbox SET created_at = clock_timestamp() - %s, attempt_count = 2 "
+            "WHERE user_id = %s RETURNING id",
+            (age, user.id),
+        ).fetchone()[0]
+        sync_conn.commit()
+        sync_conn.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user.id,))
+        with patch("app.services.email_delivery.send_claimed_email", autospec=True) as send:
+            try:
+                with caplog.at_level(logging.INFO):
+                    await deliver_email_outbox_batch(db_pool)
+            finally:
+                sync_conn.rollback()
+        send.assert_not_awaited()
+        state = _fetch_outbox_state(sync_conn, message_id)
+        assert state["status"] == expected_status
+        assert state["attempt_count"] == 2  # only the unattempted claim was refunded
+        assert state["locked_at"] is None and state["lock_token"] is None
+        assert state["sent_at"] is None
+        terminal = expected_status == "dead"
+        assert (state["failed_at"] is not None) is terminal
+        assert state["terminal_outcome"] == ("delivery_failed" if terminal else None)
+        assert state["last_error"] == (
+            "delivery_state_contention_exhausted" if terminal else "delivery_state_contended"
+        )
+        exhausted_events = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_type", None) == "email_outbox_contention_exhausted"
+        ]
+        assert len(exhausted_events) == int(terminal)
+        async with get_db_cursor(db_pool) as cur:
+            metrics = await get_outbox_metrics_cur(cur)
+        assert metrics["recent_failure_count"] == int(terminal)
+        if terminal:
+            assert outbox_is_degraded(metrics)
+            assert await claim_due_emails(db_pool, limit=1, lease_timeout=_LEASE_TIMEOUT) == []
+        else:
+            assert state["next_attempt_at"] > datetime.now(UTC)
+
+    @pytest.mark.parametrize("smtp_attempted", [False, True])
+    async def test_contention_preserves_attempt_accounting_and_lease_fence(
+        self, db_pool, sync_conn, smtp_attempted
+    ):
+        """Verify contention preserves attempt accounting and lease fence."""
+        message_id = await _enqueue(db_pool)
+        sync_conn.execute(
+            "UPDATE email_outbox SET created_at = clock_timestamp() - INTERVAL '1 hour', "
+            "attempt_count = 3 WHERE id = %s",
+            (message_id,),
+        )
+        sync_conn.commit()
+        message = (await claim_due_emails(db_pool, limit=1, lease_timeout=_LEASE_TIMEOUT))[0]
+        with pytest.raises(OutboxLeaseLostError):
+            await defer_contended_email(db_pool, replace(message, lock_token=UUID(int=0)))
+        assert _fetch_outbox_state(sync_conn, message_id)["status"] == "sending"
+        sync_conn.rollback()
+        assert (
+            await defer_contended_email(db_pool, message, smtp_attempted=smtp_attempted) == "dead"
+        )
+        state = _fetch_outbox_state(sync_conn, message_id)
+        assert state["attempt_count"] == (4 if smtp_attempted else 3)
+        assert state["status"] == "dead"
+        with pytest.raises(OutboxLeaseLostError):
+            await defer_contended_email(db_pool, message, smtp_attempted=smtp_attempted)
+
 
 class TestDevelopmentMailboxEndToEnd:
     """The development mailbox (SMTP disabled, ``.eml`` files on disk) is a
@@ -581,12 +679,22 @@ class TestDevelopmentMailboxEndToEnd:
         password = "Original-Strong-Password-9876!"
 
         async def delivered_token(path):
-            await deliver_email_outbox_batch(db_pool)
-            for message_path in mailbox.glob("*.eml"):
-                message = BytesParser(policy=policy.default).parsebytes(message_path.read_bytes())
-                match = re.search(re.escape(path) + r"([A-Za-z0-9_.-]+)", message.get_content())
-                if match:
-                    return match.group(1)
+            """Drain up to five outbox batches and extract the delivered action token; otherwise
+            assert.
+            """
+            for _ in range(5):
+                await deliver_email_outbox_batch(db_pool)
+                for message_path in mailbox.glob("*.eml"):
+                    message = BytesParser(policy=policy.default).parsebytes(
+                        message_path.read_bytes()
+                    )
+                    links = [
+                        line.strip()
+                        for line in message.get_content().splitlines()
+                        if line.strip().startswith("http") and path in line
+                    ]
+                    if links:
+                        return token_from_action_email(message.get_content(), links[0])
             raise AssertionError(f"No delivered capability for {path}")
 
         e2e_client.get("/register")
@@ -594,19 +702,57 @@ class TestDevelopmentMailboxEndToEnd:
             "/register",
             data={
                 "email": email,
-                "display_name": "Development User",
-                "password": password,
-                "password_confirm": password,
                 "csrf_token": e2e_client.cookies.get("csrf_token"),
             },
             follow_redirects=False,
         )
         assert response.status_code == 200
         verification = await delivered_token("/verify-email/")
+        assert e2e_client.get(action_path("/verify-email", verification)).status_code == 200
         response = e2e_client.post(
-            "/verify-email", data={"token": verification}, follow_redirects=False
+            "/verify-email",
+            data={
+                "token": verification,
+                "public_id": action_token_public_id(verification),
+                "csrf_token": e2e_client.cookies.get("csrf_token"),
+                "display_name": "Development User",
+                "password": password,
+                "password_confirm": password,
+            },
+            follow_redirects=False,
         )
         assert response.status_code == 303
+        assert response.headers["location"] == "/login?notice=registration_complete"
+
+        # A reset now needs an enrolled authenticator. Exercise the real setup
+        # route and use the previous valid step so reset has a fresh code.
+        with time_machine.travel(datetime.now(UTC), tick=False):
+            login = do_login(e2e_client, email, password)
+            assert login.status_code == 303
+            assert login.headers["location"] == "/setup-totp"
+            setup = e2e_client.get("/setup-totp")
+            assert setup.status_code == 200
+            document = html.fromstring(setup.text)
+            secret = document.xpath('string(//code[@class="totp-key"])').strip()
+            recovery_codes = document.xpath('//ol[@class="recovery-code-list"]/li/code/text()')
+            assert secret and recovery_codes
+            enrolled = e2e_client.post(
+                "/setup-totp",
+                data={
+                    "totp_code": pyotp.TOTP(secret).at(datetime.now(UTC) - timedelta(seconds=30)),
+                    "recovery_code_confirmation": recovery_codes[0],
+                    "csrf_token": e2e_client.cookies.get("csrf_token"),
+                },
+                follow_redirects=False,
+            )
+            assert enrolled.status_code == 303
+            assert enrolled.headers["location"] == "/login?notice=totp_setup_completed"
+            assert e2e_client.cookies.get("oha_session") is None
+        # Recovery mail becomes eligible after the earlier registration's cooldown.
+        sync_conn.execute(
+            "UPDATE anonymous_mail_issuance SET created_at=clock_timestamp()-INTERVAL '6 minutes'"
+        )
+        sync_conn.commit()
         e2e_client.get("/forgot-password")
         response = e2e_client.post(
             "/forgot-password",
@@ -614,14 +760,16 @@ class TestDevelopmentMailboxEndToEnd:
         )
         assert response.status_code == 200
         reset = await delivered_token("/reset-password/")
-        assert e2e_client.get(f"/reset-password/{reset}").status_code == 200
+        assert e2e_client.get(action_path("/reset-password", reset)).status_code == 200
         response = e2e_client.post(
             "/reset-password",
             data={
                 "token": reset,
+                "public_id": action_token_public_id(reset),
                 "csrf_token": e2e_client.cookies.get("csrf_token"),
                 "password": "Replacement-Strong-Password-2468!",
                 "password_confirm": "Replacement-Strong-Password-2468!",
+                "totp_code": pyotp.TOTP(secret).now(),
             },
             follow_redirects=False,
         )
@@ -637,7 +785,9 @@ class TestDevelopmentMailboxEndToEnd:
         )
         confirmation = await delivered_token("/account/confirm-email/")
         response = e2e_client.post(
-            "/account/confirm-email", data={"token": confirmation}, follow_redirects=False
+            "/account/confirm-email",
+            data={"token": confirmation, "public_id": action_token_public_id(confirmation)},
+            follow_redirects=False,
         )
         assert response.status_code == 303
         assert sync_conn.execute("SELECT email FROM users WHERE id=%s", (user_id,)).fetchone() == (

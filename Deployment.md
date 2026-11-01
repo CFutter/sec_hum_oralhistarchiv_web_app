@@ -1,6 +1,6 @@
 # Deployment Guide
 
-**Oral History Archive — University of Zurich**
+**Oral History Archive — Example University**
 
 This guide covers deploying the application on a single Ubuntu VM behind nginx
 with TLS, PostgreSQL, and Redis. Phase 1 uses local accounts; Shibboleth is a
@@ -34,8 +34,8 @@ separate, fail-closed Phase-2 activation.
 
 - Ubuntu 22.04 or 24.04 LTS
 - Root or sudo access
-- Domain name pointing to the VM's IP (e.g., `archive.example.uzh.ch`)
-- A dedicated PostgreSQL 16 cluster (same VM; the HBA policy in §3 ends with
+- Domain name pointing to the VM's IP (e.g., `archive.example.org`)
+- A dedicated PostgreSQL 18 cluster (same VM; the HBA policy in §3 ends with
   a local catch-all reject and must not be pasted into a shared cluster)
 - A dedicated Redis 7+ limiter endpoint. The reference deployment runs its
   own local instance; an approved external service is also supported. A
@@ -45,7 +45,7 @@ separate, fail-closed Phase-2 activation.
 
 The package commands below assume an institutionally approved APT source that
 provides these exact major versions. Ubuntu releases do not all ship Python
-3.11, PostgreSQL 16, and Redis 7 in their default repositories. Configure and
+3.11, PostgreSQL 18, and Redis 7 in their default repositories. Configure and
 record the approved source before installation; do not silently substitute an
 unreviewed PPA or a different major version.
 
@@ -160,15 +160,19 @@ sudo systemctl restart fail2ban
 
 ### Install PostgreSQL
 
-Install PostgreSQL 16 from the approved Ubuntu or PostgreSQL package channel,
-then verify the running server major version before creating any roles:
+Install PostgreSQL 18 from the institutionally approved
+[PostgreSQL APT repository](https://www.postgresql.org/download/linux/ubuntu/).
+Ubuntu 22.04/24.04 default packages do not supply this major version. Configure
+its signed package source, then verify the running server before creating roles:
 
 ```bash
-sudo apt install -y postgresql-16 postgresql-client-16
+sudo apt install -y postgresql-common ca-certificates
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+sudo apt install -y postgresql-18 postgresql-client-18
 sudo systemctl enable --now postgresql
 sudo -u postgres psql -XAt --dbname=postgres --command='SHOW server_version'
 sudo -u postgres psql -XAt --dbname=postgres --command="SELECT current_setting('server_version_num')::integer / 10000" \
-  | grep -qx '16'
+  | grep -qx '18'
 ```
 
 ### Create separated database identities
@@ -192,7 +196,7 @@ contain all rows.
 
 ### Configure exact local peer authentication
 
-Add this map to `/etc/postgresql/*/main/pg_ident.conf`:
+Add this map to `/etc/postgresql/18/main/pg_ident.conf`:
 
 ```text
 oralhistarchiv_app oralhistarchiv           oralhistarchiv_web
@@ -201,7 +205,7 @@ oralhistarchiv_app oralhistarchiv-migrate   oralhistarchiv
 ```
 
 Replace the generic local-authentication block in
-`/etc/postgresql/*/main/pg_hba.conf` with this complete, ordered block:
+`/etc/postgresql/18/main/pg_hba.conf` with this complete, ordered block:
 
 ```text
 local all             postgres                  peer
@@ -285,12 +289,10 @@ The synchronization mutex is PostgreSQL advisory locking, not Redis. The
 scheduler has no reason to receive the limiter credential or depend on the
 limiter service.
 
-Staging and production web startup requires and functionally probes the
-dedicated limiter. If it cannot execute the pinned PING/scripted
-increment/read/TTL/delete contract, affected requests fail closed with a
-retryable, non-cacheable `503` before the endpoint runs. A logical database on
-the optional Redis process is not isolation: memory pressure, eviction,
-restart and administrator authority would still be shared.
+Staging/production web startup aborts if the dedicated limiter's namespace or
+functional probes fail. Later backend failures reject affected requests with a
+retryable, non-cacheable `503` before endpoint execution. Use a separate Redis
+process: logical databases share memory pressure, eviction and restarts.
 
 The local config, unit, ACL generation, restart-persistence probe and systemd
 checks below form the **reference host-local path**. An external-limiter
@@ -360,15 +362,17 @@ properties:
 
 - a separate loopback-only port (`6380`), OS identity and state directory;
 - an ACL file that disables the default user and constrains the web credential
-  to `LIMITS:*` plus the commands exercised by the pinned fixed-window backend;
+  to `LIMITS:*` plus the commands exercised by the bounded fixed-window backend;
 - an explicit memory ceiling with `maxmemory-policy noeviction`;
 - AOF enabled with `appendfsync everysec`; and
 - fail-closed AOF loading if the file is truncated or corrupt.
 
 `allkeys-lru`, `volatile-lru`, and every other eviction policy are forbidden:
 evicting a live counter silently replenishes an attacker's quota. With
-`noeviction`, capacity exhaustion becomes an explicit Redis write error, which
-the web application maps to `503` instead of executing the protected endpoint.
+`noeviction`, physical capacity exhaustion becomes an explicit Redis write error,
+which the web application maps to `503` instead of executing the protected
+endpoint. The application also refuses new counter allocation at its logical
+capacity before client diversity can grow counter state without a bound.
 The operational cost is availability during a Redis incident; the independent
 nginx limits still constrain traffic while operators restore the backend.
 
@@ -398,6 +402,98 @@ limiter `503`. `evicted_keys` should remain unchanged under `noeviction`; an
 increase means the effective configuration is wrong or was previously unsafe.
 Credential-safe startup, durability and monitoring commands follow in §§6–7
 after the ACL and `web.env` exist.
+
+### Limiter capacity and existing counters
+
+`LIMITER_COUNTER_CAPACITY=20000` bounds registered fixed-window counters across
+all web workers sharing the dedicated Redis database. It is capped at 20,000;
+choose one value for every worker before initializing the namespace. The full
+Redis counter key is limited to 512 UTF-8 bytes and its TTL to 86,400 seconds.
+`LIMITER_CLEANUP_BATCH_SIZE=128` bounds expired registry work per admission.
+An atomic script owns each counter allocation and its expiry-registry entry.
+At capacity, existing registered quotas keep their values and original expiry;
+a new counter is refused with a non-cacheable, retryable 503. No live counter
+is evicted, reset or moved into process-local memory to make room.
+
+Four fixed control keys use
+`LIMITS:oralhistarchiv-security-v1:bounded:{meta,counters,search-start,readiness}`.
+The `counters` sorted set records expiry deadlines; shared search admission uses
+one fixed hash, so rotating client addresses cannot create search-gate keys.
+The dedicated database must have no other `LIMITS:*` writers. Startup rejects
+unregistered counter keys, incompatible capacity metadata, persistent counters
+without TTLs and other unsupported retained state. The shared search hash also
+pins its rate/burst policy; workers with different values refuse startup. A
+capacity or search-policy change requires a coordinated, reviewed state
+migration; this release supplies no automatic migration. Do not edit/delete
+registry, metadata or search-gate keys to force incompatible workers to start.
+
+The example sets `maxmemory 128mb`; the capacity test permits less than 64 MiB
+of additional `used_memory` for 20,000 maximum-length counters and their registry.
+This excludes baseline RSS and persistence costs. Before production, fill a
+disposable dedicated instance to the selected cap using maximum-length keys
+and representative route/window distributions.
+Measure `used_memory`, peak RSS, AOF growth and rewrite peaks, including old/new
+HMAC namespaces during a signing-key rotation. Refusing the next new key must
+leave existing values/TTLs intact and `evicted_keys` unchanged. Let short-lived
+entries expire and verify new admission recovers through bounded cleanup.
+Record the server/allocator version, selected cap and measured headroom; the
+logical cap does not bound client buffers or Redis/AOF allocator overhead.
+Do not increase the cap or enable eviction to conceal a capacity incident.
+
+An upgrade from the earlier unregistered counter layout requires a maintenance
+window. This release does not automatically adopt that layout. Preserve its
+counters and AOF, stop **every** old web writer, and allow their actual remaining
+TTLs to expire before starting the new release. Ordinary maximum retention is
+24 hours, but inspect the effective store instead of assuming the timer has
+already elapsed. Keep Redis running and the edge limits in place. Never run
+`FLUSHDB`, `FLUSHALL`, a counter reset, or a prefix delete as an upgrade step.
+Do not run old and new web workers concurrently against the store.
+
+```bash
+# Stop the web service on every application host sharing this limiter.
+sudo systemctl stop oralhistarchiv.service
+
+# Read-only TTL inventory; no credential or counter key is printed.
+sudo /opt/oralhistarchiv/.venv/bin/python -I - <<'PY'
+import math
+import shlex
+from pathlib import Path
+from redis import Redis
+
+lines = Path("/etc/oralhistarchiv/web.env").read_text(encoding="utf-8").splitlines()
+values = [shlex.split(line.partition("=")[2].strip())[0]
+          for line in lines
+          if line.partition("=")[0].strip() == "RATE_LIMIT_REDIS_URL"]
+if len(values) != 1:
+    raise SystemExit("Expected exactly one limiter URL")
+controls = {("LIMITS:oralhistarchiv-security-v1:bounded:" + suffix).encode()
+            for suffix in ("meta", "counters", "search-start", "readiness")}
+client = Redis.from_url(values[0], socket_connect_timeout=0.5, socket_timeout=0.5)
+count = longest_ms = 0
+try:
+    for key in client.scan_iter(match="LIMITS:*", count=128):
+        if key in controls:
+            continue
+        ttl = client.pttl(key)
+        if ttl == -1:
+            raise SystemExit("A retained counter has no expiry; preserve state and investigate")
+        if ttl >= 0:
+            count += 1
+            longest_ms = max(longest_ms, ttl)
+finally:
+    client.close()
+print(f"Live counters: {count}; wait at least {math.ceil(longest_ms / 1000)} seconds")
+PY
+```
+
+Install the updated ACL command allowlist before this inventory if the old ACL
+lacks `SCAN`/`PTTL`; preserve its passwords and key scope. After the reported wait,
+repeat the inventory and require zero live legacy counters, then start the new
+release and require its namespace/readiness checks. Counters that had no expiry
+need an explicit reviewed recovery decision; silently resetting them is not a
+safe default. Ordinary upgrades between compatible bounded namespaces retain
+live quotas and do not require this legacy drain. Backout to old writers can
+create unregistered state again and requires the same reviewed transition.
 
 ### Optional general Redis
 
@@ -447,6 +543,13 @@ PostgreSQL/Redis test job have all passed for the same commit. It records both
 the full source commit and GitHub's SHA-256 digest of the uploaded artifact in
 the workflow summary.
 
+Before upload, the release job checks all deployment assets listed in
+`required_release_paths` below. These include the migration runner, tmpfiles
+configuration, Redis configuration and dedicated Redis service unit, isolated
+parser launcher and units, and the search-policy rebuild command. The release
+contract tests keep the CI and runbook inventories aligned and verify that the
+installer requires every listed asset.
+
 From the repository's **Actions → CI → Run workflow** page, select `main` and
 run the workflow. Review the green jobs and source commit, download the single
 artifact whose name is `oralhistarchiv-release-` followed by that 40-character
@@ -495,11 +598,19 @@ required_release_paths=(
     oralhistarchiv.service
     oralhistarchiv-scheduler.service
     oralhistarchiv-migrate.service
+    oralhistarchiv-parser.socket
+    oralhistarchiv-parser@.service
+    run_parser.py
+    scripts/rebuild_search_policy.py
+    scripts/bootstrap_admin.py
+    scripts/acknowledge_source_binding.py
+    scripts/export_security_audit.py
     deploy/migrate_release.py
     deploy/oralhistarchiv-tmpfiles.conf
     deploy/bootstrap-database-roles.sql
     deploy/database-runtime-grants.sql
     deploy/verify-runtime-database-access.sql
+    deploy/invalidate-action-email-capabilities.sql
     deploy/nginx.conf.example
     deploy/nginx-ordinary-proxy-headers.conf.example
     deploy/nginx-shibboleth-phase2.conf.example
@@ -526,6 +637,13 @@ if [[ -e /opt/oralhistarchiv && ! -L /opt/oralhistarchiv ]]; then
 fi
 
 # Provision the shared stable lock inode BEFORE the first installer run.
+sudo groupadd --system --force oralhistarchiv-deploy-lock
+for account in oralhistarchiv oralhistarchiv-scheduler oralhistarchiv-migrate; do
+    sudo usermod --append --groups oralhistarchiv-deploy-lock "$account"
+done
+if id oralhistarchiv_backup >/dev/null 2>&1; then
+    sudo usermod --append --groups oralhistarchiv-deploy-lock oralhistarchiv_backup
+fi
 tar -xzf "${release_archives[0]}" -C "$artifact_directory" \
     "${release_root}/deploy/oralhistarchiv-tmpfiles.conf"
 sudo install -o root -g root -m 0644 \
@@ -567,6 +685,31 @@ An interrupted current attempt is cleaned up; the old current-release symlink
 is unchanged until final verification succeeds. Completed inactive releases
 must pass manifest and installed-import checks before reuse. The active release
 is never overwritten. Inspect quarantined content before manually retiring it.
+
+### Security configuration and first administrator
+
+Use the [initial administrator and browser configuration runbook](docs/runbooks/bootstrap-admin.md)
+for one-shot terminal bootstrap, host-prefixed security cookies, canonical
+request origins and explicit registration opt-in. Long-running services reject
+legacy seed credentials. Keep public access closed until initial authenticator
+enrollment and a fresh MFA login have succeeded.
+
+The [deployment boundary runbook](docs/runbooks/deployment-boundaries.md)
+explains the dedicated lock group, restricted scheduler account reads and clean
+installer-owned virtual environments. New archive payloads cannot contain a
+`.venv` directory at any depth.
+
+Configure independently acknowledged security-event delivery using the
+[security event delivery runbook](docs/runbooks/security-event-delivery.md).
+Monitor pending event count/age; stdout collection alone is not a durable sink.
+Mailbox capability preservation, issuance budgets and protected account unlock
+are documented in the [mail and recovery runbook](docs/runbooks/mail-recovery.md).
+Deliberate source rebinding requires the
+[source acknowledgement procedure](docs/runbooks/source-rebinding.md).
+
+CI retains dated advisory results for runtime, development/documentation and the
+actual build environment. The same checks run weekly; see the
+[dependency advisory runbook](docs/runbooks/dependency-advisories.md).
 
 ### Runtime state
 
@@ -610,11 +753,10 @@ environments.
 
 ```bash
 ENV_STATE=production
-PUBLIC_BASE_URL="https://archive.example.uzh.ch"
-ALLOWED_HOSTS='["archive.example.uzh.ch"]'
-CONTACT_EMAIL="archive@example.uzh.ch"
+PUBLIC_BASE_URL="https://archive.example.org"
+ALLOWED_HOSTS='["archive.example.org"]'
+CONTACT_EMAIL="archive@example.org"
 PAGINATION_SIZE=20
-SEED_MOCK_DATA=false
 
 DATABASE_POOL_SIZE=5
 DATABASE_POOL_MAX_WAITING=32
@@ -630,16 +772,21 @@ COOKIES_SECURE=true
 
 SECRET_KEY="GENERATE_INDEPENDENT_TOKEN_URLSAFE_64"
 SESSION_SECRET="GENERATE_INDEPENDENT_TOKEN_URLSAFE_64"
-TOTP_ENCRYPTION_KEYS='["GENERATE_INDEPENDENT_TOKEN_URLSAFE_64"]'
 OUTBOX_ENCRYPTION_KEYS='["GENERATE_INDEPENDENT_TOKEN_URLSAFE_64"]'
 HEALTH_DETAIL_TOKEN="GENERATE_INDEPENDENT_TOKEN_URLSAFE_64"
 
 SESSION_MAX_AGE_SECONDS=28800
-SESSION_COOKIE_NAME="oha_session"
+SESSION_COOKIE_NAME="__Host-oha_session"
 # Registration only: existing local accounts, including administrators,
 # retain /login access when new sign-ups are disabled.
 LOCAL_REGISTRATION_ENABLED=false
-TOTP_ISSUER_NAME="Oral History Archive UZH"
+# Site identity: single-line plain text; HTML is escaped in templates.
+SITE_NAME="Oral History Archive"
+INSTITUTION_NAME="Your institution"
+ABOUT_SUMMARY="Search and explore interview metadata from oral history research collections."
+FEDERATED_LOGIN_LABEL="Institutional login"
+# Blank uses SITE_NAME for newly provisioned authenticator entries.
+TOTP_ISSUER_NAME=""
 LOGIN_FAILURE_THRESHOLD=10
 LOGIN_LOCKOUT_MINUTES=15
 UNVERIFIED_REAP_AFTER_DAYS=7
@@ -651,6 +798,13 @@ SHIBBOLETH_TRUSTED_ISSUERS='[]'
 LOG_LEVEL="INFO"
 LOG_FORMAT="json"
 
+LIMITER_COUNTER_CAPACITY=20000
+LIMITER_CLEANUP_BATCH_SIZE=128
+SEARCH_STATEMENT_TIMEOUT_MS=500
+SEARCH_OPERATION_TIMEOUT_SECONDS=1
+SEARCH_POOL_TIMEOUT_SECONDS=0.1
+SEARCH_GLOBAL_RATE_PER_SECOND=0.5
+SEARCH_GLOBAL_BURST=1
 RATE_LIMIT_ENABLED=true
 RATE_LIMIT_PER_MINUTE=100
 RATE_LIMIT_PER_HOUR=1000
@@ -665,15 +819,13 @@ CORS_ALLOW_METHODS='["GET","POST"]'
 CORS_ALLOW_HEADERS='["Authorization","Content-Type"]'
 CORS_ALLOW_CREDENTIALS=false
 
-OAI_INSTITUTION_FILTER="REPLACE_WITH_EXACT_INSTITUTION_NAME"
-# Production catalogue example. For laptop-only Kassel staging, use
-# https://demo.swissubase.ch/oai-pmh/v1/oai instead (see local-staging.md).
-SWISSUBASE_OAI_PMH_URL="https://www.swissubase.ch/oai-pmh/v1/oai"
-SWISSUBASE_MAX_VISIBILITY="public"
-SYNC_INTERVAL_SECONDS=3600
-SYNC_WRITE_TIMEOUT_SECONDS=120
-FULL_REBUILD_INTERVAL_SECONDS=86400
-OAI_MAX_PAGES=500
+# Required by both runtime processes. Install the reviewed source file
+# using the source-file selection procedure before starting services.
+SOURCES_CONFIG_FILE="/etc/oralhistarchiv-sources/sources.toml"
+ALLOW_FIXTURE_SOURCE=false
+
+# Endpoints, source floors, schedules and harvest budgets are defined in the
+# selected source TOML. Do not repeat retired per-source environment settings.
 
 OUTBOX_SENT_RETENTION_DAYS=7
 OUTBOX_DEAD_RETENTION_DAYS=30
@@ -681,18 +833,17 @@ OUTBOX_RETENTION_BATCH_SIZE=1000
 OUTBOX_STALE_AFTER_SECONDS=600
 
 SMTP_ENABLED=true
-SMTP_HOST="smtp.example.uzh.ch"
+SMTP_HOST="smtp.example.org"
 SMTP_PORT=587
 SMTP_USER="REPLACE_WITH_SMTP_USER"
 SMTP_PASSWORD="REPLACE_WITH_SMTP_PASSWORD"
-SMTP_FROM_ADDRESS="noreply@example.uzh.ch"
+SMTP_FROM_ADDRESS="noreply@example.org"
 SMTP_FROM_NAME="Oral History Archive"
 SMTP_USE_TLS=true
 SMTP_CA_BUNDLE=""
 
-# First boot only. Remove both entries immediately after the admin has logged in.
-ADMIN_SEED_EMAIL="REPLACE_WITH_INITIAL_ADMIN_EMAIL"
-ADMIN_SEED_PASSWORD="GENERATE_STRONG_INITIAL_ADMIN_PASSWORD"
+# Initial administrator creation uses the one-shot terminal command.
+# Never put bootstrap credentials in web or scheduler environment files.
 ```
 
 Generate secret values from a trusted administrative session, for example:
@@ -707,6 +858,8 @@ immediately below replaces that placeholder; it rejects a missing, duplicate,
 or already populated entry:
 
 ```dotenv
+APP_PROCESS_ROLE=web
+TOTP_ENCRYPTION_KEYS='["GENERATE_INDEPENDENT_TOKEN_URLSAFE_64"]'
 DATABASE_URL="postgresql:///oralhistarchiv?host=%2Fvar%2Frun%2Fpostgresql&user=oralhistarchiv_web"
 RATE_LIMIT_REDIS_URL=""
 ```
@@ -727,8 +880,10 @@ atomically replaces the empty limiter placeholder in root-only `web.env`, and
 writes the monitor URL to a separate root-only file that no service loads.
 Each file replacement is atomic; the three files are not one filesystem
 transaction, so an interrupted run requires a custody check before retrying.
-The fixed-window command allowlist matches the pinned `limits` backend and its
-functional startup probe; a library/strategy change must review this ACL.
+The command allowlist matches the bounded fixed-window registry, shared search
+gate and functional startup probe. A backend/strategy change must review this
+ACL. Existing installations must add the new commands without rotating their
+passwords or deleting counters; the generator below is for first installation.
 
 ```bash
 sudo python3 - <<'PY'
@@ -766,7 +921,9 @@ monitor_password = secrets.token_urlsafe(64)
 acl = (
     "user default reset off\n"
     f"user limiter reset on >{limiter_password} ~LIMITS:* resetchannels "
-    "+ping +get +ttl +incrby +expire +del +evalsha +script|load\n"
+    "+ping +get +ttl +del +evalsha +script|load +time +exists +incrby "
+    "+pexpireat +pttl +zrangebyscore +zscore +zcard +zadd +zrem +zrange "
+    "+hget +hset +hsetnx +scan +set\n"
     f"user monitor reset on >{monitor_password} resetkeys resetchannels "
     "+ping +info\n"
 )
@@ -782,6 +939,7 @@ monitor_url = (
 )
 
 def atomic_write(path: Path, data: str, *, mode: int, uid: int, gid: int) -> None:
+    """Replace a file with fsynced text and explicit ownership/mode in its existing parent."""
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -834,9 +992,18 @@ ACL and `web.env` changes, restarting the limiter, then restarting the web
 process. Rotate the monitor credential independently in the ACL and its
 root-only file. The scheduler must remain unaware of every limiter credential.
 
-Populate `/etc/oralhistarchiv/scheduler.env` with exactly:
+Populate `/etc/oralhistarchiv/scheduler.env` with the following settings.
+Selected JSON-feed bearer/signing environment variables also belong only here,
+never in `common.env` or `web.env`; the web process rejects those names even
+when their values are empty. The shared TOML source description is nonsecret.
+`TOTP_ENCRYPTION_KEYS` belongs only in `web.env` (or an explicitly authorized
+TOTP-maintenance process), never in the scheduler environment. Scheduler mail
+uses its independent outbox key ring and does not import TOTP encryption.
 
 ```dotenv
+APP_PROCESS_ROLE=scheduler
+PARSER_EXECUTION_MODE=service
+ORALHISTARCHIV_PARSER_SOCKET=/run/oralhistarchiv-parser.sock
 DATABASE_URL="postgresql:///oralhistarchiv?host=%2Fvar%2Frun%2Fpostgresql&user=oralhistarchiv_scheduler"
 ```
 
@@ -849,14 +1016,11 @@ PGHOST=/var/run/postgresql
 PGUSER=oralhistarchiv
 ```
 
-`DATABASE_URL` must not exist in `common.env`; `MIGRATION_DATABASE_URL` must
-not exist in `common.env`, `web.env`, or `scheduler.env`. It is safe and useful
-to track the three passwordless snippets above as
-`deploy/environment/web.env.example`, `scheduler.env.example`, and
-`migration.env.example`. They are templates only: do not name one `.env` at
-the repository root, and do not make systemd read it from the release tree.
-The live `/etc` files must still be provisioned separately on every server and
-must never be committed with live secrets.
+Keep `DATABASE_URL` out of `common.env` and `MIGRATION_DATABASE_URL` out of all
+runtime files. The checked-in `deploy/environment/*.env.example` files are
+provisioning templates; systemd reads only the separately provisioned `/etc`
+files. Never commit live secrets. Setting semantics and defaults are in the
+[settings reference](docs/configuration/settings.md).
 
 Edit the files with `sudoedit`, then verify custody and key separation without
 printing any values:
@@ -920,25 +1084,31 @@ The application has two long-running runtime units and one static/manual
 migration unit:
 
 - **oralhistarchiv.service** — gunicorn web workers, handles HTTP requests
-- **oralhistarchiv-scheduler.service** — APScheduler, runs OAI-PMH syncs
-  and session cleanup in a dedicated process
+- **oralhistarchiv-scheduler.service** — configured-source harvests, mail
+  delivery and maintenance jobs through APScheduler
 - **oralhistarchiv-migrate.service** — reviewed Alembic upgrade plus exact
   runtime-grant reapplication; never enabled at boot
 
-Running the scheduler separately prevents sync jobs from running once per
-gunicorn worker (4× per interval), which would rate-limit SWISSUbase and
-produce inconsistent state.
+Run one scheduler per deployment; web workers do not create a scheduler.
+PostgreSQL advisory locks serialize competing ingestion jobs.
 
 ### Existing databases
 
-The repository contains only initial revision `4f73ae3ff827` with no predecessor.
-It creates tables; it does not migrate an earlier prototype or quarantine its
-federated identities. For an existing database, stop before applying this release
-until a reviewed schema/data migration or isolated restore/import plan exists.
-Preserve a usable local administrator and verify the complete schema and runtime
-grants before reopening traffic. Never stamp an incompatible schema as current.
+This pre-deployment release uses fresh initialization; current databases are
+disposable. Provision an empty PostgreSQL 18 database and run the manual migration
+unit plus runtime grants before starting either runtime. Revision `4f73ae3ff827`
+creates schema with zero users and catalogue records; sources and registration
+populate them, with an explicit bootstrap command for the initial administrator.
 
-### Install all three units
+Recreate any disposable database made from an earlier body of that baseline:
+`upgrade head` does not rerun a recorded revision, and stamping does not install
+missing objects. Database recreation remains an explicit operator action;
+application/updater tools do not drop databases. Verify the schema and runtime
+grants before serving traffic. Once an installation retains data, use the
+[inventory and recovery procedure](docs/runbooks/retained-staging-inventory.md)
+and a new migration for later schema changes.
+
+### Install the runtime, migration and parser units
 
 ```bash
 sudo install -o root -g root -m 0644 \
@@ -950,7 +1120,12 @@ sudo install -o root -g root -m 0644 \
 sudo install -o root -g root -m 0644 \
   /opt/oralhistarchiv/oralhistarchiv-migrate.service \
   /etc/systemd/system/oralhistarchiv-migrate.service
+sudo install -o root -g root -m 0644 \
+  /opt/oralhistarchiv/oralhistarchiv-parser.socket \
+  /opt/oralhistarchiv/oralhistarchiv-parser@.service \
+  /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now oralhistarchiv-parser.socket
 sudo systemctl enable oralhistarchiv.service oralhistarchiv-scheduler.service
 # Reference host-local limiter only; omit for an external endpoint.
 sudo systemctl enable oralhistarchiv-rate-limit-redis.service
@@ -963,8 +1138,77 @@ fi
 sudo systemd-analyze verify \
   /etc/systemd/system/oralhistarchiv.service \
   /etc/systemd/system/oralhistarchiv-scheduler.service \
-  /etc/systemd/system/oralhistarchiv-migrate.service
+  /etc/systemd/system/oralhistarchiv-migrate.service \
+  /etc/systemd/system/oralhistarchiv-parser.socket \
+  /etc/systemd/system/oralhistarchiv-parser@.service
 ```
+
+### Parser privilege boundary
+
+The scheduler authenticates a socket-activated parser through Linux
+`SCM_CREDENTIALS` before transmitting job inputs. Each accepted connection has
+its own dynamic nonroot UID, receives exactly one bounded job, and exits. The
+parser starts without any application environment file. The unit executes
+`env -i` before Python, retaining only fixed `LANG`, `PATH` and `HOME` values;
+this also keeps inherited secrets out of Python's original process environment.
+`run_parser.py` repeats the environment reset before importing application modules. OAI uses no service
+secrets. A JSON job receives only that selected feed's bearer and signing key,
+which its combined fetching/parsing operation requires. No database URL,
+session/signing key, TOTP/outbox key, SMTP credential or other source's keys are
+included. The catalogue web workers retain nonsecret source policies only.
+
+Install the supplied socket and template unchanged. The socket is root-owned,
+mode `0660`, group `oralhistarchiv-scheduler`; its root-owned `/run` parent cannot
+be replaced by either runtime. Do not add web users to the scheduler group or
+create a database peer mapping for dynamic parser users. The worker unit denies
+new Unix sockets and loopback network access, hides other users' processes and
+service-secret paths, uses a read-only filesystem, and drops capabilities.
+Do not weaken these settings to make a source work. Outbound upstream HTTPS is
+allowed. The optional read-only resolver bind uses systemd-resolved's upstream
+DNS configuration; other hosts must provide a nonloopback resolver. A localhost
+DNS exception would also weaken the database network boundary and is not an
+acceptable workaround. Remote databases must require authentication; do not
+configure network `trust` rules for parser traffic.
+
+The socket admits at most two active jobs. Each has a 512 MiB memory cap, 16
+process/thread tasks, a 250-second service lifetime and whole-cgroup cleanup
+within two seconds after termination. Reserve up to 1 GiB for these parser
+cgroups **in addition to** the scheduler and web budgets. The existing OAI and
+JSON deadlines, bounded result protocol, child termination and cancellation
+remain in effect. Disconnecting the scheduler cancels and reaps its worker;
+systemd bounds the complete service even if its supervisor is compromised.
+
+`PARSER_EXECUTION_MODE=service` is the default. Staging/production refuse local
+mode, missing sockets, unsafe socket ownership and same-UID/root worker replies;
+there is no fallback to scheduler-owned parsing. Scheduler startup probes this
+boundary before opening PostgreSQL. `PARSER_EXECUTION_MODE=local` is an explicit
+`ENV_STATE=dev` convenience for development/tests, not a production sandbox.
+Before release, execute the host isolation proof in
+`src/tests/host_proofs/parser_sandbox.py` on the reference systemd host,
+including real denied process/file/database access. Use a checkout of the exact
+release commit on a disposable qualification host, with development test
+dependencies in a separate test environment and a disposable Redis instance.
+Install that release's wheel/runtime under `/opt` for the worker proof; the
+production environment itself does not need pytest or development dependencies.
+From the qualification checkout:
+
+```bash
+sudo env RUN_PARSER_SANDBOX_TESTS=1 REDIS_URL=redis://127.0.0.1:6379/0 \
+  PARSER_PROOF_PYTHON=/opt/oralhistarchiv/.venv/bin/python \
+  /path/to/test-environment/bin/python -m pytest --no-cov -q \
+  src/tests/host_proofs/parser_sandbox.py
+```
+
+The proof interpreter and its installed runtime dependencies must be outside
+`/home` and `/root`, which the sandbox hides. The second proof runs the actual
+entrypoint, identity handshake and a spawned worker. The test suite resets its
+selected Redis database. Pure unit tests cannot
+establish kernel/systemd enforcement. Before accepting each job, the service
+also verifies its different UID, minimal environment, denied parent-process and
+service-file access, forbidden Unix sockets, enforced loopback denial against
+its own live test listeners, no new privileges and empty capability set.
+Unsupported or ineffective sandboxing fails before the worker's identity hello;
+the scheduler therefore sends no job credentials to that service.
 
 The base web unit waits for `network-online.target` and therefore supports an
 institutionally managed external limiter. For the reference host-local
@@ -996,24 +1240,31 @@ stopping the dedicated service also stops the web tier. Runtime limiter
 failures are still handled inside the web process because a capacity, command,
 or network failure does not necessarily deactivate the systemd service.
 
-Start the dedicated store and prove the exact pinned `limits` operations plus
+Start the dedicated store and prove the bounded counter operations plus
 ordinary-restart durability without putting its URL/password in argv, stdout,
 or the shell environment. This must succeed before the web service starts:
+
+The durability probe needs one free counter slot. If the registry is full,
+wait for natural expiry; do not clear a live quota. Normal application readiness
+uses a reserved control key and can succeed with a full valid counter registry.
 
 ```bash
 sudo systemctl start oralhistarchiv-rate-limit-redis.service
 sudo /opt/oralhistarchiv/.venv/bin/python -I - <<'PY'
+import os
 import shlex
 import subprocess
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from limits.storage.redis import RedisStorage
 from redis import Redis
+from redis.backoff import NoBackoff
 from redis.exceptions import AuthenticationError, NoPermissionError
+from redis.retry import Retry
 
 def load_url(path: str, key: str) -> str:
+    """Read one shell-quoted assignment; exit on a missing, duplicate or malformed value."""
     content = Path(path).read_text(encoding="utf-8")
     matches = [
         line.partition("=")[2].strip()
@@ -1043,18 +1294,46 @@ for candidate, expected_user in ((url, "limiter"), (monitor_url, "monitor")):
     ):
         raise SystemExit(f"{expected_user} URL does not select its local ACL user")
 
-def storage() -> RedisStorage:
-    return RedisStorage(
+# Load the web unit's configuration in the same order before the public
+# middleware facade initializes settings. The Shibboleth file is optional;
+# the examples use one NAME=value assignment per line.
+for env_path, optional in (
+    ("/etc/oralhistarchiv/common.env", False),
+    ("/etc/oralhistarchiv/web.env", False),
+    ("/etc/oralhistarchiv/shibboleth.env", True),
+):
+    path = Path(env_path)
+    if optional and not path.exists():
+        continue
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        name, separator, value = stripped.partition("=")
+        parts = shlex.split(value, comments=True)
+        if not separator or len(parts) != 1:
+            raise SystemExit("Unsupported application environment-file assignment")
+        os.environ[name.strip()] = parts[0]
+
+from app.middleware import BoundedRedisStorage
+from config import settings
+
+def storage() -> BoundedRedisStorage:
+    """Build limiter storage with configured capacity, half-second I/O limits and no retries."""
+    return BoundedRedisStorage(
         url,
+        counter_capacity=settings.limiter_counter_capacity,
+        cleanup_batch_size=settings.limiter_cleanup_batch_size,
         socket_connect_timeout=0.5,
         socket_timeout=0.5,
         retry_on_timeout=False,
+        retry=Retry(NoBackoff(), retries=0),
         wrap_exceptions=True,
     )
 
 probe = f"deployment-aof-probe-{time.time_ns()}"
 before = storage()
-if not before.check() or before.incr(probe, 300) != 1:
+if not before.probe() or before.incr(probe, 300) != 1:
     raise SystemExit("limiter functional probe failed")
 remaining_before_restart = before.get_expiry(probe) - time.time()
 if before.get(probe) != 1 or not 0 < remaining_before_restart <= 300:
@@ -1066,7 +1345,7 @@ subprocess.run(
     check=True,
 )
 after = storage()
-if not after.check():
+if not after.probe():
     raise SystemExit("limiter did not recover after ordinary restart")
 remaining_after_restart = after.get_expiry(probe) - time.time()
 if (
@@ -1140,8 +1419,9 @@ print("Dedicated limiter command, policy and restart checks passed")
 PY
 ```
 
-The subsequent web startup repeats PING, scripted increment, read, TTL and
-delete through the configured SlowAPI object before opening PostgreSQL. That
+The subsequent web startup validates retained counter registration and capacity,
+probes reserved control-key write/read/expiry/delete operations, and checks the
+shared search start gate before opening PostgreSQL. That
 probe is the final ACL/command compatibility gate; `systemctl is-active` alone
 is not readiness.
 
@@ -1153,8 +1433,11 @@ certificate verification, a non-default
 username, independently generated `secrets.token_urlsafe(64)` password,
 database 0 (an empty path or `/0`), and no URL query parameters. Plain
 `redis://` is permitted only for the loopback endpoint; query parameters are
-forbidden because redis-py can use them to override reviewed connection
-options. Replace the one empty `RATE_LIMIT_REDIS_URL` placeholder in root-only
+forbidden because redis-py can use them to override connection options. URL
+fragments are also rejected. Settings and startup enforce the URL policy, then
+inspect the effective connection pool for bounded timeouts, disabled retries,
+required certificate verification and hostname checks. Replace the one empty
+`RATE_LIMIT_REDIS_URL` placeholder in root-only
 `web.env` through the approved secret-provisioning channel; never put it in
 `common.env` or `scheduler.env`.
 
@@ -1164,6 +1447,13 @@ platform's protected secret store, never an application environment file.
 Record provider evidence for capacity, policy, persistence, ACLs and restart
 survival, then require the web startup's functional probe before admitting
 traffic.
+
+Per-client admission is mandatory for staging and production web processes.
+When Redis is unavailable, retain the fail-closed refusals or stop public web
+traffic while repairing it. Do not set `RATE_LIMIT_ENABLED=false`, flush live
+counters, or substitute process-local memory. Restore the backend, repeat the
+functional readiness probe, and restart with admission enabled before reopening
+traffic. Use a separately restricted administrative channel for maintenance.
 
 All three unit files ship at the repository root. The runtime units must load
 `common.env` plus their own database overlay; only the web unit may also load
@@ -1202,7 +1492,8 @@ UnsetEnvironment=PYTHONPATH PYTHONHOME VIRTUAL_ENV RATE_LIMIT_MONITOR_REDIS_URL
 # oralhistarchiv-scheduler.service
 EnvironmentFile=/etc/oralhistarchiv/common.env
 EnvironmentFile=/etc/oralhistarchiv/scheduler.env
-UnsetEnvironment=PYTHONPATH PYTHONHOME VIRTUAL_ENV RATE_LIMIT_REDIS_URL RATE_LIMIT_MONITOR_REDIS_URL
+Environment=APP_PROCESS_ROLE=scheduler PARSER_EXECUTION_MODE=service
+UnsetEnvironment=PYTHONPATH PYTHONHOME VIRTUAL_ENV RATE_LIMIT_REDIS_URL RATE_LIMIT_MONITOR_REDIS_URL TOTP_ENCRYPTION_KEYS
 
 # oralhistarchiv-migrate.service
 EnvironmentFile=/etc/oralhistarchiv/migration.env
@@ -1239,9 +1530,11 @@ import application code from a source-tree `PYTHONPATH`.
 
 ### Apply the reviewed schema and runtime grants
 
-For the first installation and every schema-changing release, keep both
-runtimes stopped, take and restore-verify an encrypted backup when the database
-already contains data, and start the manual unit:
+For a fresh installation, keep both runtimes stopped and start the manual unit
+against the operator-prepared empty database. For any later schema-changing
+release, retain the maintenance/backup procedure and its reviewed migration
+plan; this changed baseline is not an in-place upgrade for an initialized
+database:
 
 ```bash
 sudo systemctl stop oralhistarchiv.service oralhistarchiv-scheduler.service \
@@ -1268,9 +1561,92 @@ performs the upgrade followed by `deploy/database-runtime-grants.sql` under one
 exclusive deployment lock. There is no separate `ExecStartPost` lock gap.
 Both inventory checks above must succeed before a runtime starts.
 
-The initial migration creates an empty catalogue and a NULL source cursor.
-It contains no DOI backfill or upgrade of legacy rows. Existing databases need
-the reviewed migration/import plan described under “Existing databases”.
+The web role has `DELETE` on `users` for guarded account deletion and trusted
+federation replacement of an unverified local reservation. Application services
+validate current authority and credentials before deleting; account-owned rows
+cascade in the same transaction. Keep this grant and the exact runtime privilege
+contract together when applying a release. It does not grant catalogue deletion
+to the web role.
+
+The initial revision `4f73ae3ff827` creates an empty catalogue and empty
+`sync_status`; source rows provisioned later start with NULL clean and consumed
+cursors/fingerprints. It enables base-table RLS and creates `catalogue_discovery` and
+`dataset_admin_catalogue` for a fresh installation. It requires the matching
+grants/access-inventory checks above. It performs no DOI backfill,
+historical-account conversion or retrofit of a database already marked with
+that revision. See “Existing databases” before using an initialized database.
+
+Catalogue RLS is a record-tier boundary for the exact web role. Unset, empty or
+invalid viewer context defaults to public; query services set trusted context
+transaction-locally. The public discovery view deliberately uses the owner to
+preserve only approved discovery and opaque ordering, and the separate control
+view exposes only identity/classification. Scheduler ingestion and read-only
+`BYPASSRLS` backups retain their separate authority. The shared web role can set
+its viewer setting; authenticated application code and E2 field redaction remain
+part of the boundary. See `docs/architecture/field-visibility.md` for scope.
+
+### Required source-file selection
+
+Both runtime processes require an explicit nonempty `SOURCES_CONFIG_FILE`.
+Select the same reviewed TOML for web and scheduler. Missing or empty selection,
+file errors, invalid configuration and startup-policy failures abort startup
+without fallback. Settings may omit the selector for imports and migration
+tools; that does not permit either runtime process to start.
+
+Keep `/etc/oralhistarchiv` root:root `0700` and its environment files `0600`.
+The application opens source TOML itself, so install it in a separate readable
+directory. Store no secrets or credential-bearing URLs in this file.
+
+Prepare a reviewed TOML using `deploy/environment/sources.example.toml` as a
+schema example. Replace its placeholders and review the fixture entry. When
+preserving an existing catalogue, retain its source name and exact interpretation
+inputs, including endpoint, institution filter and visibility policy.
+
+While both runtime services are stopped:
+
+```bash
+sudo install -d -o root -g root -m 0755 /etc/oralhistarchiv-sources
+sudo install -o root -g root -m 0644 /path/to/reviewed-sources.toml \
+  /etc/oralhistarchiv-sources/sources.toml
+sudo namei -l /etc/oralhistarchiv-sources/sources.toml
+```
+
+Every ancestor must be a direct root-owned directory without group/other write
+permission. Both runtime identities need directory read/search access and file
+read access. The existing `ProtectSystem=strict` permits these reads.
+
+Set these values in shared `common.env`, with no conflicting process overlays:
+
+```dotenv
+SOURCES_CONFIG_FILE="/etc/oralhistarchiv-sources/sources.toml"
+ALLOW_FIXTURE_SOURCE=false
+```
+
+Remove retired source settings and the mock-seeding key from every active
+environment file and inherited environment; false or empty values are still
+rejected. The [settings reference](docs/configuration/settings.md) lists their
+source-TOML replacements. Normal production keeps `ALLOW_FIXTURE_SOURCE=false`.
+Both bundled synthetic adapters, `fixture` and `static_json`, require explicit
+permission when selected in production. Permission does not select an adapter
+or bypass source-file validation.
+
+Validate as both runtime identities before starting services:
+
+```bash
+for runtime_user in oralhistarchiv oralhistarchiv-scheduler; do
+  sudo -u "$runtime_user" /opt/oralhistarchiv/.venv/bin/python -I -c \
+    'from app.sources import load_sources_for_startup; sources = load_sources_for_startup("/etc/oralhistarchiv-sources/sources.toml", environment="production"); print(tuple(source.name for source in sources))'
+done
+```
+
+Both checks must print the same reviewed ordered selection. They construct and
+validate without fetching or touching PostgreSQL. Actual service startup still
+applies shared-security and database preflights.
+
+Keep both services stopped during file replacement, then restart both. Each
+process retains its startup snapshot. Actual ownership, access under deployed
+identities and service namespaces, endpoints and resource limits remain VM
+acceptance checks.
 
 ### Start and verify
 
@@ -1295,7 +1671,7 @@ sudo stat -Lc 'type=%F owner=%U group=%G mode=%a path=%n' \
 
 sudo -u oralhistarchiv curl --fail --silent --show-error \
   --unix-socket /run/oralhistarchiv/gunicorn.sock \
-  -H 'Host: archive.example.uzh.ch' \
+  -H 'Host: archive.example.org' \
   http://localhost/health | jq -e '.status == "alive"'
 
 sudo journalctl -u oralhistarchiv.service --since=-10m --no-pager
@@ -1327,22 +1703,16 @@ Gunicorn TCP listener blocks deployment. A firewall is not a substitute for
 the directory and socket inode permissions. The positive nginx-worker test is
 performed immediately after nginx is authorized in §8.
 
-**Note:** `MemoryMax=256M` applies to the scheduler cgroup, including the
-spawned OAI-harvest child. Source A has code-owned ceilings of 4 MiB per
-response page, 32 MiB aggregate response bytes, 20,000 records, 1 MiB per
-record, and 16 MiB of retained serialized results. Worker execution and result
-reception stop at the absolute 240-second deadline; bounded
-terminate/kill/reap cleanup and bounded JSON decoding may add small bounded
-overhead before the parent returns. A controlled resource-limit failure is
-recorded in `sync_status` and preserves the catalogue and watermark.
+`MemoryMax=1G` covers the scheduler and its SMTP children. In production,
+harvests run in separate parser cgroups: reserve their combined capacity of up
+to 1 GiB in addition to scheduler/web memory. OAI limits are 4 MiB per response
+page, 32 MiB aggregate response bytes, 20,000 records, 1 MiB per record and
+16 MiB serialized results. Its 240-second deadline excludes bounded cleanup
+and result decoding. These byte budgets do not bound Python RSS.
 
-These byte limits are not a complete RSS bound because the XML tree, parsed
-Python objects, parent, and child coexist. Before raising a code-owned limit or
-adding Source B, run a representative full rebuild and check
-`systemctl show oralhistarchiv-scheduler -p MemoryPeak`; keep the measured peak
-comfortably below `MemoryMax`. An operating-system OOM kill can prevent an
-error row from being recorded, so a rising `last_harvest_date` with
-`oom-kill`/signal 9 in `journalctl -u oralhistarchiv-scheduler` is an incident.
+Before activation or budget changes, qualify near-limit harvests alongside mail
+delivery and measure both scheduler and parser cgroup peaks. An OOM kill may
+leave no `sync_status` diagnostic; alert on kernel/service OOM evidence too.
 
 ### Verify the scheduler isn't running in web workers
 
@@ -1455,7 +1825,7 @@ entire block after every nginx `user` directive, group, unit, or socket change.
 
 ```bash
 sudo apt install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d archive.example.uzh.ch
+sudo certbot --nginx -d archive.example.org
 ```
 
 **Option B — Institutional certificate:**
@@ -1516,8 +1886,9 @@ callback location: duplicate exact-match locations make `nginx -t` fail.
 3. The application-facing federation header contract is fixed in code:
    `X-OHA-Internal-Auth`, `X-OHA-Shib-Issuer`, `X-OHA-Shib-Subject`,
    `X-OHA-Shib-Mail`, `X-OHA-Shib-Authn-Context`,
-   `X-OHA-Shib-Display-Name`, `X-OHA-Shib-Affiliation`, and
-   `X-OHA-Shib-Country`. Ordinary locations clear all of them. Only the
+   `X-OHA-Shib-Display-Name`, `X-OHA-Shib-Affiliation`,
+   `X-OHA-Shib-Entitlement`, and `X-OHA-Shib-Country`. Ordinary locations clear
+   all of them, plus the raw `eduPersonEntitlement` and `entitlement` names. Only the
    SP-authorized callback may populate them, from explicitly mapped SP output.
    Legacy/raw Shibboleth names are also cleared and must never be consumed by
    application code.
@@ -1525,16 +1896,29 @@ callback location: duplicate exact-match locations make `nginx -t` fail.
 4. location / uses oralhistarchiv_req (20 requests/s, burst 40) and
    oralhistarchiv_conn (20 connections per client address). /health uses
    separate 2 requests/s, burst 10 and 5-connection limits. The optional exact
-   health-detail block and Phase-2 Shibboleth locations have no such directives;
-   sibling locations do not inherit them. Add and verify reviewed admission
-   limits before enabling those blocks. Load-test university NAT and monitoring
-   traffic before tuning. If another proxy is added, review trusted real-IP
+   health-detail block still needs explicit limits before activation. The
+   Phase-2 fragment explicitly applies separate SSO limits to both public
+   locations: 2 requests/s with burst 10 and 8 concurrent requests per client;
+   a shared virtual-host budget of 10 requests/s with burst 20 and 16 concurrent
+   requests across both locations. Those nginx preaccess checks run before the
+   access-phase authorizer and before responder FastCGI work. Shared-memory
+   zones cover all workers on one nginx instance, not independent edge hosts.
+   Keep the Phase-1 callback closed until the SP capacity and the largest
+   expected university NAT pass the federation runbook's acceptance checks.
+   If another proxy is added, review trusted real-IP
    handling; never key limits from arbitrary request paths or forwarding headers.
 
-5. Use oralhistarchiv_safe for access logs and remove inherited duplicate
-   access logs. This format omits paths, queries and Referer; it does not
-   sanitize nginx error logs, which can contain capability-bearing URLs.
-   Review error-log exposure before handling sensitive traffic.
+5. `/static/` repeats the server's HSTS policy because its `Cache-Control`
+   directive replaces inherited `add_header` directives. Keep both HSTS values
+   identical when changing the policy; `always` also covers missing assets.
+
+6. Use oralhistarchiv_safe for access logs and remove inherited duplicate
+   access logs. This format omits paths, queries and Referer. Generated email
+   actions carry only a non-secret public ID in the HTTP request target; their
+   separately emailed security code is entered explicitly in a POST body.
+   nginx error logs can still retain arbitrary targets, including obsolete token URLs sent by a
+   client. Review error-log custody and the action-link cutover before opening
+   traffic; see docs/runbooks/action-links.md.
 
 ### Enable the site
 
@@ -1618,437 +2002,25 @@ app's `RATE_LIMIT_TRUST_PROXY=true` with the right `TRUSTED_PROXY_IPS`.
 
 ## 9. Shibboleth SP
 
-> **Phase 2 — deployment-blocking acceptance procedure.** This repository
-> supplies a fail-closed application contract and nginx templates; it cannot
-> prove the behavior of the deployed SP, IdP, Unix-socket ACLs, or effective
-> nginx configuration. Keep `SHIBBOLETH_ENABLED=false` throughout preparation.
-> Initially leave the internal secret unset and retain the Phase-1 callback's
-> direct `return 404`. After the SP services and offline configuration checks
-> pass, provision the root-only secret and install the Phase-2 edge while the
-> application flag is still false. Set the application flag only at the final
-> step below.
+Use [Integrating a Shibboleth SP with the fixed header contract](docs/runbooks/federation-integration.md)
+for the generic SP configuration, attribute mapping, ordered pre-flip checklist,
+negative spoofing tests, controlled canary and federation rollback boundary.
+The reviewed deployment record holds the actual federation registration,
+issuer, attribute release and host acceptance evidence outside this repository.
 
-The Python application does not validate SAML. The edge must validate the
-assertion and export trusted facts, and the application independently requires:
+Keep `SHIBBOLETH_ENABLED=false` and the exact callback at nginx's direct
+`return 404` until the runbook's staged edge preparation permits replacement.
+Do not set the application flag until every pre-flip gate has passed. Repository
+tests and a completed documentation template do not establish real Gate F.
 
-- an absolute HTTPS issuer that exactly matches an entry in
-  `SHIBBOLETH_TRUSTED_ISSUERS`;
-- a persistent, non-reassigned subject identifier. The supplied template maps
-  `eduPersonUniqueId`; do not substitute email or a mutable/recyclable `eppn`;
-- exactly the REFEDS MFA authentication context
-  `https://refeds.org/profile/mfa` (intentionally not configurable); and
-- the independently generated `X-OHA-Internal-Auth` callback credential.
+The generic runbook describes the current application behavior, including
+`POST /logout`: whenever federation is enabled, all callers pass through the
+fixed same-origin SP logout handler after application-session deletion; when
+disabled, logout returns to `/`. No request parameter chooses the return URL.
 
-Identity is the exact `(issuer, subject)` pair. Email and profile attributes
-are not identity keys. A first valid assertion creates an
-`federated_status='pending'`, `access_tier='public'`, `is_active=false`,
-`is_admin=false`, `email_verified=false` row with null approval metadata and
-**no session**. An administrator must verify the enrollment out of band and use
-the dedicated approval action, which re-matches the exact pair, assigns the
-approved tier, activates the row, records the actor/time, bumps
-`auth_revision`, and deletes every target session atomically. Only a later
-valid assertion for the same pair can create a full session. No assertion
-header can grant a tier or administrator role. For federated rows,
-`email_verified` records local
-mailbox-verification state; federation authentication does not silently turn a
-SAML `mail` value into proof of mailbox ownership.
-
-Both approval and session issuance lock the persisted federation-policy row and
-require its fingerprint to match the current process before any identity write.
-A worker running an earlier secret, issuer set, flag, MFA rule, or policy
-version therefore cannot recreate authority after a newer worker reconciles.
-
-### Install the Shibboleth SP (nginx variant)
-
-```bash
-sudo apt install -y shibboleth-sp-utils   # shibd + FastCGI shibauthorizer/shibresponder
-sudo systemctl enable shibd
-```
-
-Do **not** install `libapache2-mod-shib` — that is the Apache module and
-pulls Apache (`apache2-bin`) onto the nginx VM. There is no "mod_shib" for
-nginx: nginx integrates with `shibd` via the two FastCGI applications above
-plus the third-party **nginx-http-shibboleth** module, which provides the
-`shib_request*` directives and the `$shib_*` variables the callback config
-uses. That module is not in Ubuntu's nginx packages — provision it as a
-dynamic module or custom build (coordinate with UZH IT / LeoMed). The
-FastCGI apps also do not start themselves: run `shibauthorizer` and
-`shibresponder` as services (systemd units or supervisor) listening on
-Unix sockets.
-
-### Install the nginx fragments
-
-The tracked examples contain no live credential:
-
-```bash
-sudo install -o root -g root -m 0644 \
-  /opt/oralhistarchiv/deploy/nginx-ordinary-proxy-headers.conf.example \
-  /etc/nginx/snippets/oralhistarchiv-ordinary-proxy-headers.conf
-sudo install -o root -g root -m 0644 \
-  /opt/oralhistarchiv/deploy/nginx-shibboleth-phase2.conf.example \
-  /etc/nginx/snippets/oralhistarchiv-shibboleth-phase2.conf
-sudo install -o root -g root -m 0600 \
-  /opt/oralhistarchiv/deploy/nginx-shibboleth-secret.conf.example \
-  /etc/nginx/snippets/oralhistarchiv-shibboleth-secret.conf
-sudoedit /etc/nginx/snippets/oralhistarchiv-shibboleth-secret.conf
-```
-
-Replace the secret placeholder with a new `secrets.token_urlsafe(64)` value.
-Put the same value in the web-only Shibboleth environment overlay described
-below. Do not put it on a command line or in shell history. The nginx include
-must remain `root:root` mode `0600`; the tracked site and Phase-2 template must
-contain only the `include`, never the literal.
-
-`deploy/nginx-shibboleth-phase2.conf.example` contains the protocol handler,
-internal FastCGI authorizer, explicit SP-variable mappings, and exact callback.
-Confirm every `$upstream_http_variable_*` name against the installed
-nginx-http-shibboleth build and `attribute-map.xml`. The callback pins
-`satisfy all` so an inherited access-policy setting cannot make the
-Shibboleth authorizer optional, disables the module's ambient header-copy mode
-with `shib_request_use_headers off`, disables forwarding of the client's general header set with
-`proxy_pass_request_headers off`, and assigns every fixed `X-OHA-Shib-*`
-header from explicit SP output variables. Do not weaken these directives or
-restore configurable/raw header names.
-
-After the SP services, configuration syntax, metadata trust, identity/MFA
-policy, secret-custody, and socket checks below pass, remove the Phase-1 exact
-callback and include the Phase-2 locations once, inside the HTTPS `server`
-block. Keep `SHIBBOLETH_ENABLED=false` during this edge-integration step:
-
-```nginx
-include /etc/nginx/snippets/oralhistarchiv-shibboleth-phase2.conf;
-```
-
-There must be exactly one `location = /auth/shibboleth/callback`. Never leave
-the Phase-1 and Phase-2 exact locations active together.
-
-### Configure SP
-
-Edit `/etc/shibboleth/shibboleth2.xml`:
-
-```xml
-<ApplicationDefaults entityID="https://archive.example.uzh.ch/shibboleth"
-                     REMOTE_USER="eduPersonUniqueId"
-                     signing="true"
-                     encryption="true">
-
-    <Sessions lifetime="28800" timeout="3600"
-              checkAddress="false"
-              handlerSSL="true"
-              redirectLimit="exact"
-              relayState="ss:mem"
-              cookieProps="https">
-
-        <SSO entityID="https://eduid.ch/idp/shibboleth">
-            SAML2
-        </SSO>
-
-        <!-- SAML2 attempts IdP/global logout; Local guarantees that the SP
-             session is removed even when the IdP cannot complete SLO. -->
-        <Logout>SAML2 Local</Logout>
-
-        <Handler type="MetadataGenerator" Location="/Metadata"
-                 signing="true"/>
-    </Sessions>
-
-    <AttributeExtractor type="XML" validate="true"
-                        path="attribute-map.xml"/>
-</ApplicationDefaults>
-```
-
-Protect the callback in the SP request map with `requireSession="true"`,
-request `authnContextClassRef="https://refeds.org/profile/mfa"`, and require
-that same context in an SP access-control rule. SWITCH additionally recommends
-that the application check the returned `Shib-AuthnContext-Class`; the fixed
-callback contract does so. Enabling the REFEDS-MFA checkbox in the Resource
-Registry alone is insufficient for IdPs outside its coverage.
-
-`redirectLimit="exact"` is mandatory: the underlying SP default can otherwise
-turn login/logout handlers into off-origin redirectors. `relayState="ss:mem"`
-keeps return targets in server-side storage rather than disclosing them through
-the IdP flow. In staging, prove that external `target` and `return` values sent
-to `/Shibboleth.sso/Login` and `/Shibboleth.sso/Logout` are rejected or reduced
-to the archive's exact scheme, host, and port.
-
-`POST /logout` deletes the archive session first. For a resolved federated
-user it then redirects to `/Shibboleth.sso/Logout` with a fixed return derived
-only from validated `PUBLIC_BASE_URL`; local and anonymous logout return
-directly to `/`. The institutional-login button asks the SP for
-`forceAuthn=true` as defense in depth, but a query parameter in HTML is not an
-authentication boundary. Before activation, verify with SWITCH/UZH that the
-configured SAML2 logout actually terminates the IdP session. If reliable global
-logout is unavailable, shared-browser use must be prohibited and the user
-guidance must require IdP logout plus browser closure; otherwise the next user
-may inherit upstream SSO state even though the archive and SP sessions ended.
-
-The supplied nginx mapping also exports `Shib-Identity-Provider`. Copy the
-actual signed-session issuer value into `SHIBBOLETH_TRUSTED_ISSUERS` exactly;
-do not infer it from an email domain, affiliation, Host header, or discovery
-selection. Coordinate the final XML/request-map syntax and metadata trust with
-UZH IT for the installed SP version.
-
-### Register with SWITCH AAI
-
-1. Generate SP metadata: `https://archive.example.uzh.ch/Shibboleth.sso/Metadata`
-2. Submit to SWITCH AAI resource registry: https://rr.aai.switch.ch/
-3. Request a persistent, non-reassigned subject (`eduPersonUniqueId` in the
-   shipped mapping), plus `mail`, `displayName`, `affiliation`, and
-   `schacHomeOrganizationCountry`.
-4. Require REFEDS MFA and verify the returned `Shib-AuthnContext-Class`.
-5. Wait for approval and use the Attribute Release Inspector to confirm the
-   actual release. A documented attribute request is not evidence of release.
-
-Relevant SWITCH contracts are the
-[MFA deployment guidance](https://help.switch.ch/eduid/service/saml/mfa/),
-[persistent identifier specification](https://help.switch.ch/eduid/federation/attributes/spec/edupersonuniqueid/),
-and [mail attribute caveat](https://help.switch.ch/eduid/federation/attributes/spec/mail/).
-
-### Reconcile legacy federated rows
-
-The schema permits `legacy_quarantined` rows, but this repository does not
-convert legacy identities or assign their issuer. An existing database needs a
-reviewed data migration before federation can be enabled. If such a migration
-has introduced quarantined rows, inventory them with the read-only backup identity:
-
-```bash
-sudo -u oralhistarchiv_backup psql -X --no-password \
-  --dbname=oralhistarchiv --set=ON_ERROR_STOP=1 <<'SQL'
-SELECT id, email, shibboleth_subject_id
-FROM users
-WHERE shibboleth_issuer = 'urn:oralhistarchiv:legacy-unverified'
-   OR federated_status = 'legacy_quarantined';
-SQL
-```
-
-Expected on the first production deployment: zero rows. Otherwise stop. With
-UZH IT and the account owner, establish the real absolute HTTPS issuer and
-stable subject and record the evidence. Ship the exact-pair reconciliation as
-a reviewed data migration and run it only through the static/manual migration
-unit; do not open an owner-role interactive shell. The migration may replace
-the sentinel pair and set `federated_status='pending'`, but it must keep
-`access_tier='public'`, `is_active=false`, `is_admin=false`,
-`email_verified=false`, and both approval fields null. Verify those exact
-postconditions and that no session exists. The administrator must then use the
-dedicated federated-approval action, which re-matches the exact pair and records
-the selected tier, approval actor, timestamp, authentication-revision bump, and
-target-session deletion atomically. Generic
-reactivation/tier/admin actions deliberately reject quarantine and pending
-states. Never reactivate a sentinel identity, infer its issuer from email, or
-copy a demo/staging identity into production.
-
-After the first web startup on this schema (still with federation disabled),
-verify that startup created a valid policy fingerprint and left no legacy
-federated session:
-
-```bash
-sudo -u oralhistarchiv_backup psql -X --no-password \
-  --dbname=oralhistarchiv --set=ON_ERROR_STOP=1 <<'SQL'
-SELECT id, length(fingerprint) = 64 AS digest_shape_ok, updated_at
-FROM federation_policy_state;
-
-SELECT count(*) AS federated_sessions
-FROM sessions
-JOIN users ON users.id = sessions.user_id
-WHERE users.auth_method = 'shibboleth';
-SQL
-```
-
-Expect exactly one policy row with `id=1`/`digest_shape_ok=true` and a zero
-session count. Do not log or export the fingerprint itself.
-
-### Provision the web-only settings
-
-The Phase-1 `common.env` retains the disabled flag and an empty issuer list but
-does not define the internal secret. Create a web-only overlay only after the
-preceding SP and identity work succeeds:
-
-```bash
-sudo install -o root -g root -m 0600 /dev/null \
-  /etc/oralhistarchiv/shibboleth.env
-sudoedit /etc/oralhistarchiv/shibboleth.env
-```
-
-```dotenv
-SHIBBOLETH_ENABLED=false
-SHIBBOLETH_INTERNAL_SECRET=<same-new-value-as-the-root-only-nginx-include>
-SHIBBOLETH_TRUSTED_ISSUERS='["https://eduid.ch/idp/shibboleth"]'
-```
-
-The web unit loads this root-only overlay after the common environment.
-systemd's root manager reads it before dropping privilege. The scheduler uses
-a distinct OS identity, does not load the overlay, and cannot read it or the
-Gunicorn runtime directory. Keep the credential out of the scheduler's
-environment even though scheduler code does not consume it.
-
-After restarting the web unit with the flag still false, verify the effective
-files and process environments without printing the credential:
-
-```bash
-sudo systemctl show oralhistarchiv oralhistarchiv-scheduler \
-  --property=EnvironmentFiles
-
-sudo sh -c '
-  oha_web_pid=$(systemctl show --property=MainPID --value oralhistarchiv)
-  oha_scheduler_pid=$(systemctl show --property=MainPID --value oralhistarchiv-scheduler)
-  tr "\0" "\n" <"/proc/$oha_web_pid/environ" \
-    | grep -q "^SHIBBOLETH_INTERNAL_SECRET=." \
-    || { echo "FAIL: web secret absent"; exit 1; }
-  if tr "\0" "\n" <"/proc/$oha_scheduler_pid/environ" \
-      | cut -d= -f1 | grep -qx SHIBBOLETH_INTERNAL_SECRET; then
-    echo "FAIL: scheduler received the Shibboleth secret"
-    exit 1
-  fi
-  echo "OK: credential is web-only"
-'
-```
-
-Do not replace the quiet `grep` with output that would print the matching
-environment entry.
-
-### Mandatory pre-flip acceptance checklist
-
-All items are release gates; record the commands/results in the deployment
-change record without retaining secrets or personal attributes. The list is
-ordered so no production application trusts federation before its edge exists.
-
-1. Establish the fail-closed starting state: `SHIBBOLETH_ENABLED=false`, the
-   production callback is nginx's direct `404`, and the common environment has
-   no internal credential value.
-2. Apply the reviewed schema/data migration plan only through the static/manual
-   `oralhistarchiv-migrate.service`, then verify the database is at the expected
-   Alembic head and both runtime-grant inventories pass. Every legacy identity
-   is either still quarantined or has been
-   moved to an authoritative exact pair in `pending` and then approved through
-   the dedicated action. Confirm an active local administrator survived (or
-   the fresh, non-colliding recovery seed succeeded). Start the web app once
-   with federation disabled: the initially absent `federation_policy_state`
-   fingerprint must be recorded only in the same transaction that revokes all
-   pre-existing federated sessions.
-3. Deploy shibd, shibauthorizer, shibresponder, and the reviewed nginx module.
-   Verify their service accounts, sockets, configuration syntax, metadata
-   signature trust, and failure behavior before connecting them to the app.
-4. With UZH/SWITCH, establish that the selected subject is persistent and
-   non-reassigned, record the exact absolute HTTPS issuer, and verify that the
-   SP both requests and enforces REFEDS MFA. A password-only session must fail;
-   an approved MFA session must report exactly
-   `https://refeds.org/profile/mfa`. Use an operator-only SP diagnostic or a
-   production-equivalent staging deployment; do not expose an attribute dump.
-   Also send off-origin `target` and `return` values to the SP login/logout
-   handlers and confirm `redirectLimit="exact"` prevents either redirect.
-   Exercise logout on a clean shared-browser test: the application session and
-   local SP session must both disappear, and the IdP must demand a fresh user
-   gesture before the next institutional login. Confirm that a direct handler
-   request omitting `forceAuthn` cannot silently restore the prior identity. If
-   the federation cannot guarantee that result, formally prohibit shared
-   browsers and require IdP logout/browser closure before enabling the flag.
-5. Verify the effective header contract: every ordinary proxy includes the
-   clearing fragment, while the callback has `satisfy all`,
-   `shib_request_use_headers off` and `proxy_pass_request_headers off` and
-   overwrites every fixed `X-OHA-*` name from an explicit SP variable. New and
-   legacy client-supplied identity headers must have no effect.
-6. Verify the socket boundary with `systemctl cat/show`, `namei -l`, `stat`,
-   `getfacl`, `ss -ltnp`, and positive/negative
-   `sudo -u ... curl --unix-socket ...` checks. The parent/socket must be
-   `0750`/`0660`, nginx must connect, the scheduler and an unrelated UID must
-   fail, and Gunicorn must have no TCP listener. Inventory every process under
-   the proxy UID with `ps -eo pid,user,group,comm,args` and `/proc/*/status`;
-   if the account runs anything besides the intended nginx workers, use a
-   dedicated worker identity/instance before granting proxy-group membership.
-7. Generate an independent internal secret. Put it only in the root-owned
-   mode-`0600` web overlay and nginx include; prove the scheduler does not
-   receive it. Restart the web unit while the flag remains false and the
-   callback remains 404; startup strength validation must accept it and the
-   changed fingerprint must reconcile/revoke federated sessions. Treat it as
-   an arbitrary federated-impersonation credential.
-8. Run the release tests and a production-equivalent staging integration. They
-   must prove rejection of missing/duplicated/spoofed headers, wrong issuer and
-   non-MFA contexts; pending inactive/public/unverified enrollment without a
-   session; the dedicated exact-pair administrator approval transition and its
-   actor/time record, revision bump, and target-session purge; exact
-   issuer+subject login; email-collision refusal; and preservation of assigned
-   tier/admin state. The two reconciliation races must also pass: an earlier
-   session commits before reconciliation and is deleted, while a stale worker
-   ordered after reconciliation is refused before any identity write. Generic
-   admin mutations must not release a pending or legacy-quarantined identity.
-   Route tests must additionally pin local/anonymous logout to `/`, federated
-   logout to the fixed same-origin SP handler, application-session deletion,
-   cookie clearing, and the absence of request-controlled return values.
-9. Still with `SHIBBOLETH_ENABLED=false`, replace the production Phase-1 `404`
-   location with the Phase-2 include. Run `nginx -t`, reload, and verify the SP
-   authorization path. A root-controlled `nginx -T` review must show exactly
-   one callback, its authorizer and secret include, and clearing includes on
-   every ordinary proxy. Do not retain the secret-bearing output. Confirm that
-   the disabled app still issues no federated session.
-10. Have a second operator review the evidence, exact issuer, MFA result,
-    effective nginx configuration, file/socket modes, group membership,
-    migration state, and rollback plan. Approve the production flag change as
-    its own final change.
-
-Only after all ten checks pass may the production flag be changed. Because a
-real production login cannot occur before that final change, the controlled
-canary in the next subsection is an immediate post-flip acceptance test: on any
-unexpected result, restore `SHIBBOLETH_ENABLED=false`, restart the web service,
-restore the Phase-1 `404`, reload nginx, and investigate while federation is
-closed.
-
-### Enable in application
-
-Change the web-only overlay, leaving `common.env` untouched:
-
-```bash
-sudoedit /etc/oralhistarchiv/shibboleth.env
-# Change only SHIBBOLETH_ENABLED=false to SHIBBOLETH_ENABLED=true.
-sudo systemctl restart oralhistarchiv
-```
-
-The application refuses to start if the secret or exact issuer allowlist is
-missing, or if the public origin, secure-cookie, or host-allowlist settings are
-not hardened. This applies even if an operator attempts the flip under
-`ENV_STATE=dev`. On this restart the federation-policy fingerprint changes
-because the enabled flag changed, so startup deletes all existing Shibboleth
-sessions before accepting requests; local sessions are untouched. The
-scheduler neither needs nor receives a restart.
-
-### Test Shibboleth flow
-
-1. Visit `https://archive.example.uzh.ch/login`
-2. Click "Login with SWITCH edu-ID"
-3. Authenticate with MFA at the approved IdP.
-4. For a new identity, confirm that no session cookie is issued and the admin
-   dashboard shows a pending, inactive/public/non-admin/unverified row with no
-   approval actor/time.
-5. Use only the dedicated federated-approval form. Confirm it binds the exact
-   issuer and subject under review, assigns the selected tier, leaves admin and
-   email verification false, records the approval actor/time, bumps the target's
-   authentication revision, and deletes every target session.
-6. Repeat the login and confirm a full session at only the assigned tier.
-
-### Federation rollback boundary
-
-Revision `4f73ae3ff827` is the initial schema; its downgrade drops all application 
-tables. The repository supplies no earlier compatible release. Keep federation 
-closed while executing a separately reviewed restore/forward-repair plan:
-
-1. Replace the Phase-2 callback with the Phase-1 exact `return 404` location;
-   run `nginx -t`, reload nginx, and verify the public callback returns 404.
-2. Set `SHIBBOLETH_ENABLED=false` while the current code is still installed and
-   restart the web service. Its policy reconciliation must commit before
-   continuing; verify SQL reports zero sessions owned by Shibboleth users.
-3. Remove `/etc/oralhistarchiv/shibboleth.env` and the root-only nginx secret
-   include after confirming neither is referenced by the effective config.
-4. Enter maintenance and stop both services. Follow the release's reviewed
-   forward-repair or encrypted-restore plan; do not run an ad-hoc Alembic
-   downgrade. Reapply the runtime grants that belong to the restored/repaired
-   schema before deploying matching application code.
-5. Verify the recovered deployment remains local-auth-only with callback 404. 
-    Federation must never be re-enabled before the recovered release passes the 
-    complete federation acceptance checks.
-
-If the callback is rejected, check the application log for
-`"Shibboleth callback rejected"` without logging attribute values. Common
-causes are a missing/mismatched internal secret, an issuer outside the exact
-allowlist, a missing stable subject, or a non-REFEDS-MFA context. Do not weaken
-one of those checks to make a test login work.
+For a suspected internal-credential disclosure, follow the stopped-web-first
+[key-rotation incident procedure](docs/runbooks/key-rotation.md) before
+configuration changes. Routine federation rollback has a different boundary.
 
 ---
 
@@ -2083,11 +2055,9 @@ redis-cli -h YOUR_VM_IP -p 6379 PING
 
 ## 11. Backups
 
-The database contains more than rebuildable Source A catalogue data. A logical
-archive also contains account identities, password and action-token hashes,
-session metadata, email-outbox metadata, the complete raw dataset JSONB, and
-future Source B rows. PostgreSQL custom format (`pg_dump --format=custom`) is
-not encryption.
+Back up all selected and retained source data, accounts, credentials, sessions,
+outbox state and administrative state. PostgreSQL custom format
+(`pg_dump --format=custom`) is not encryption.
 
 The shipped backup path therefore has five mandatory boundaries:
 
@@ -2155,7 +2125,9 @@ sudo -u oralhistarchiv_backup psql -XAt --no-password -d oralhistarchiv -c \
             has_table_privilege('oralhistarchiv_backup', 'users', 'INSERT');"
 ```
 
-Expected output is `t|f`. If `SELECT` is false, keep the runtimes stopped and
+Expected output is `t|f`. This smoke check does not replace the complete backup
+preflight: the backup role must remain read-only `BYPASSRLS`, have no memberships
+and hold SELECT on every managed table. If `SELECT` is false, keep the runtimes stopped and
 reapply the reviewed grant manifest through the manual migration unit; never
 solve it by giving the backup role ownership or write permission.
 
@@ -2164,9 +2136,11 @@ The unit creates `/var/lib/oralhistarchiv-backup` as
 allows only the PostgreSQL Unix-socket address family, and makes
 `/etc/oralhistarchiv` protected by root-only filesystem permissions. The script 
 refuses a missing, symlinked, wrongly owned, or non-`0700` directory. Before dumping, 
-it confirms the configured database and role, the exact Alembic revision shipped 
-with the backup script, and all critical tables. It then streams the custom-format 
-dump directly through `age` into a hidden `0600` ciphertext file: no plaintext dump 
+it confirms the configured database and role, its `BYPASSRLS`/membership contract,
+the exact Alembic revision shipped with the backup script, and SELECT coverage
+for all managed tables. `pg_dump` retains its default `row_security=off`; it
+must fail rather than silently produce an RLS-filtered archive. It then streams
+the custom-format dump directly through `age` into a hidden `0600` ciphertext file: no plaintext dump
 is written to any filesystem. `set -o pipefail` makes a `pg_dump` or `age` failure 
 abort publication; a completed ciphertext is synced, renamed atomically to `*.dump.age`, 
 and its directory is synced. Retention runs only after successful publication and always 
@@ -2174,10 +2148,31 @@ keeps the new archive plus the immediately preceding local archive. That previou
 is not automatically "known good"—only an isolated restore can establish that.
 
 `EXPECTED_ALEMBIC_REVISION` deliberately binds the installed backup script to
-the release schema. Every migration must update that constant (the unit contract
-test compares it with Alembic's head) and deployment must reinstall the script.
+the release schema. A changed Alembic head requires the matching constant (the
+unit contract compares it with the head); deployment must install the matching script.
 A mismatched release fails the backup visibly instead of silently archiving an
-unexpected schema.
+unexpected revision. This release pins the single baseline head `4f73ae3ff827`.
+The baseline label alone cannot distinguish its older bodies; the complete
+schema/view/policy and runtime inventories must also
+pass. Pause/drain the old backup before replacing its executable, complete the
+operator-prepared schema and grant checks, then restart the timer only after
+the current baseline schema and both runtime access inventories pass (§17).
+
+The supplied config enables `BACKUP_STATUS_DIR`. Provision its separate
+backup-owned `0755` directory before the first run, or set that variable empty
+to disable the marker:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  /opt/oralhistarchiv/deploy/oralhistarchiv-backup-tmpfiles.conf \
+  /etc/tmpfiles.d/oralhistarchiv-backup.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/oralhistarchiv-backup.conf
+```
+
+To report its age through authenticated health detail, set
+`BACKUP_STATUS_FILE="/var/lib/oralhistarchiv-backup-status/last-success"` in
+`web.env` before restarting web. The marker proves local publication only;
+continue monitoring the backup unit result, off-host copies and restore drills.
 
 Enable the timer and force one initial run:
 
@@ -2271,10 +2266,10 @@ not as a scheduled service on the application VM. Install `age` and a
 local archive and the private identity:
 
 ```bash
-install -m 0755 deploy/oralhistarchiv-backup-verify.sh \
+install -D -m 0755 deploy/oralhistarchiv-backup-verify.sh \
     "$HOME/.local/bin/oralhistarchiv-backup-verify"
 
-oralhistarchiv-backup-verify \
+"$HOME/.local/bin/oralhistarchiv-backup-verify" \
     oralhistarchiv_YYYYMMDDTHHMMSSZ.dump.age \
     /secure/escrow/oralhistarchiv-backup.agekey
 ```
@@ -2286,8 +2281,12 @@ the archive table of contents; it is **not** a data-completeness or restore test
 
 At least once per release and after any key/custody change, use an
 isolated, disposable PostgreSQL cluster that cannot reach production. Create a new empty
-database, restore into it, and require the following commands to succeed (set
-the `PGHOST`, `PGPORT`, and `PGUSER` values for that disposable cluster only):
+database, restore into it as its owner/recovery identity, and require the
+following commands to succeed (set the `PGHOST`, `PGPORT`, and `PGUSER` values
+for that disposable cluster only). The backup identity does not receive DDL or
+DML to perform restoration. Provision reviewed runtime/backup role attributes
+in the isolated cluster separately; production role membership or peer mapping
+is not inherited by a logical restore.
 
 ```bash
 set -Eeuo pipefail
@@ -2322,10 +2321,23 @@ SQL
 Both Boolean queries must return `t`. Review the counts for obvious truncation
 and compare them with an independently approved backup-time metric if one is
 collected; the backup job deliberately does not place sensitive catalogue or
-account counts in its logs. Then exercise login/TOTP and outbox decryption using
+account counts in its logs. Reapply the reviewed grant inventory to this
+explicitly isolated target, then repeat the complete catalogue/source-state
+comparison as the read-only `oralhistarchiv_backup` identity. Its `BYPASSRLS`
+attribute and all-table SELECT must reveal public, registered, vetted and hidden
+rows, matching the owner result. Check the restored view definitions, RLS flags,
+policies, web default-public reads and scheduler operations under their actual
+restricted identities. Do not give backup ownership, CREATE, INSERT, UPDATE or
+DELETE to make these checks pass. The tracked grant manifest names the production
+database explicitly; review its database target before using it in a drill.
+
+Then exercise login/TOTP and outbox decryption using
 the application key-ring versions applicable to that archive. Preserve the
 dated result without secrets or row contents, drop the database, and destroy the
 disposable recovery environment.
+
+E3's automated checks use disposable roles/databases and do not close E4's
+deployment-host role, custody or representative encrypted-restore acceptance.
 
 For a production restore, enter the maintenance procedure in §17 and stream
 directly to `pg_restore` under `set -o pipefail`, as in the isolated drill. Add
@@ -2372,10 +2384,8 @@ This caps journal disk usage and sets retention policy.
 
 ### Application logs via systemd-journald
 
-All application and audit logs go to stdout. systemd-journald captures both
-streams and handles rotation/retention. This is multi-process safe — unlike
-Python's TimedRotatingFileHandler, which can corrupt logs when gunicorn
-workers rotate concurrently.
+Application/audit logging uses stdout; systemd-journald also captures stderr
+and manages host-wide rotation and retention for all workers.
 
 ### Retention configuration
 
@@ -2395,17 +2405,15 @@ SystemMaxFileSize=128M
 MaxRetentionSec=30day
 ```
 
-**Note:** the shipped journald config retains application and audit logs for 30
-days. Confirm this against the compliance baseline before go-live. If audit
-records need longer retention, increase `MaxRetentionSec` and `SystemMaxUse`
-accordingly or ship the audit stream off-host under the collector's approved
-retention policy. Do not create an unencrypted local log export.
+These host-wide settings cap age at 30 days and total journal usage at 2 GiB;
+space pressure can remove records sooner. Approve both limits against required
+retention, or provide sufficient off-host retention. Do not create an
+unencrypted local log export.
 
 ### Off-host audit log shipping (optional)
 
-The application does not ship logs itself — it writes to journald. To
-forward audit logs to a central collector for long-term, tamper-evident
-retention, use a host-level rsyslog agent over RELP+TLS:
+Use host-level rsyslog over RELP+TLS to forward the journal. The collector must
+separately provide approved retention, access control and tamper evidence:
 
 ```bash
 sudo apt install -y rsyslog-relp   # omrelp is not in the base rsyslog package
@@ -2420,7 +2428,7 @@ sudo systemctl restart rsyslog
 ```
 
 Collector endpoint, transport (RELP vs RFC 5425 TLS-syslog), CA, and client
-certificate enrollment are provided by Central IT — confirm these in the
+certificate enrollment are provided by your infrastructure team — confirm these in the
 onboarding consultation.
 
 **PRE-FLIGHT — remote shipping is not an active control until every item passes:**
@@ -2517,10 +2525,16 @@ in tickets, CI logs, or shared terminals. Confirm manually that every active
 `access_log` for this site selects `oralhistarchiv_safe`; the presence of a
 safe format definition alone is not sufficient.
 
-Use a synthetic canary action path and confirm the canary is absent from all
-nginx access/error logs, the application journal, and any forwarded copies
-after GET, 403, 415, 422, 429, and same-origin static-asset requests. Never
-use a genuine live action token for this test.
+Use a synthetic public-ID action link and a separate canary security code.
+Confirm the code is absent from all nginx access/error logs, the application
+journal, and forwarded copies after GET, 403, 415, 422, 429, and same-origin
+static-asset requests. The generated URL has no query, fragment or secret. For
+the 429 case, verify the non-secret public ID is present in the error log so the check
+proves rejection logging was exercised. Keep the shipped error-log settings;
+do not suppress the log to obtain a pass. Never use a live action token or
+record POST bodies. Raw legacy targets can still be logged before the app
+rejects them. Follow docs/runbooks/action-links.md for queued-message cutover,
+reissue and complete-link custody.
 
 Standard nginx logrotate remains configured at `/etc/logrotate.d/nginx`.
 
@@ -2594,8 +2608,8 @@ the same HTTPS check to the institutional monitoring service instead of cron.
 #!/bin/bash
 set -euo pipefail
 
-HEALTH_URL="https://archive.example.uzh.ch/health"
-ALERT_EMAIL="admin@example.uzh.ch"
+HEALTH_URL="https://archive.example.org/health"
+ALERT_EMAIL="admin@example.org"
 
 HTTP_CODE="$(
   curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
@@ -2628,7 +2642,7 @@ sudo crontab -e
 
 ```bash
 curl -H "Authorization: Bearer YOUR_HEALTH_DETAIL_TOKEN" \
-    https://archive.example.uzh.ch/health/detail
+    https://archive.example.org/health/detail
 ```
 
 `/health` is process liveness, not Redis readiness. Monitor the limiter backend
@@ -2671,6 +2685,15 @@ operation; and unexpected means an unclassified dependency or adapter defect
 that requires code/dependency investigation. Public responses deliberately
 remain the same generic 503. Do not alert on a single edge `429`; ordinary
 client bursts can legitimately consume a burst allowance.
+
+The logical counter cap can produce `capacity` refusals while Redis still has
+physical memory headroom. Treat this as controlled admission pressure; do not
+flush counters, delete registry entries or enable eviction. Monitor the
+`search_start_budget_exhausted` and `search_unavailable` events separately from
+ordinary pool failures, and correlate their rates with mixed-traffic latency
+and PostgreSQL activity. A search refusal alone does not mean that the ordinary
+account pool is exhausted.
+
 The detailed health route intentionally does not make limiter failure look
 like database failure. Optional general Redis health is a separate cache
 performance signal, not limiter readiness.
@@ -2685,12 +2708,18 @@ systemctl is-active oralhistarchiv-scheduler
 
 # When was the last sync?
 sudo -u oralhistarchiv-scheduler psql -X --no-password \
-  --dbname=oralhistarchiv --username=oralhistarchiv_scheduler --set=ON_ERROR_STOP=1 --command="SELECT last_harvest_date, last_sync_error, last_sync_error_at, last_rebuild_error, last_rebuild_error_at FROM sync_status WHERE id = 1"
+  --dbname=oralhistarchiv --username=oralhistarchiv_scheduler --set=ON_ERROR_STOP=1 --command="SELECT source, last_harvest_date, last_sync_error, last_sync_error_at, last_rebuild_error, last_rebuild_error_at FROM sync_status ORDER BY source"
 ```
 
-Alert when last_harvest_date is older than twice SYNC_INTERVAL_SECONDS; 
-inspect sync errors and service state to distinguish failed harvesting 
-from a stopped scheduler.
+`last_harvest_date` records the start time of a successfully finalized harvest;
+it is not a process heartbeat. For each selected source, alert when it is
+missing or older than twice that source's `incremental_interval_seconds` in the
+selected TOML. Check `last_full_rebuild_date` against that source's
+`rebuild_interval_seconds` as well. Inspect both error channels, scheduler logs
+and service state to distinguish failed, stalled or long-running work from a
+stopped scheduler. Historical rows for unselected sources are not scheduled
+sources' liveness signals.
+
 ---
 
 ## 14. Memory Tuning
@@ -2698,7 +2727,13 @@ from a stopped scheduler.
 Both systemd units set `MemoryMax` as a safety net. Initial values:
 
 - **oralhistarchiv.service** — 1024M (up to 4 gunicorn workers)
-- **oralhistarchiv-scheduler.service** — 256M (1 scheduler process)
+- **oralhistarchiv-scheduler.service** — 1G (scheduler and SMTP children;
+  parser cgroups are additional)
+
+The scheduler value is a conservative starting ceiling, not reserved memory or
+a proven bound for every source. Confirm host capacity alongside web workers,
+PostgreSQL and Redis, and qualify the aggregate scheduler `MemoryPeak` before
+activation. Reducing the ceiling requires repeating that qualification.
 
 All password hashing, checking, rehashing and dummy work share a dedicated
 per-worker limiter. `PASSWORD_WORK_CONCURRENCY=1` is the default: four workers
@@ -2708,8 +2743,17 @@ The setting is capped at two; four workers at two operations consume about 512 M
 parameters are unchanged. Existing hashes can encode different memory costs:
 measure representative retained hashes and the aggregate cgroup peak before
 raising concurrency or worker count. General-purpose thread-pool capacity is
-not the password memory budget. Waiting requests still consume request memory,
-so keep the existing request/rate limits and monitor `MemoryCurrent` under load.
+not the password memory budget.
+
+`PASSWORD_WORK_ADMISSION_TIMEOUT_SECONDS` bounds each operation's wait for a
+slot: default 1 second, finite range 0.01–5 seconds. Exhausted admission starts no
+password work and returns HTTP 503 with `Retry-After: 5`. Tune against measured
+hash durations and expected arrivals. The budget does not interrupt running
+hashes or impose an absolute queue-size limit; waiting requests still consume
+request memory. Keep the existing request/rate limits and monitor
+`MemoryCurrent` under load. Requests that verify and then rehash may wait twice.
+Step-up and recovery reservations made before waiting remain consumed on a
+capacity timeout, so repeated retries still spend the existing attempt budget.
 
 Tune these after observing real usage. To check current memory:
 
@@ -2740,6 +2784,29 @@ sudo systemctl daemon-reload
 sudo systemctl restart oralhistarchiv
 sudo systemctl show oralhistarchiv --property=MemoryMax
 ```
+
+Search reserves one additional PostgreSQL connection per web worker in its
+dedicated pool. Include it in the database connection budget; it never borrows
+the ordinary pool. Defaults admit one shared search start every two seconds,
+with burst one, a 500 ms SQL timeout, a one-second operation deadline and a
+100 ms acquisition timeout. A nonblocking PostgreSQL transaction advisory lock
+allows one active search across workers sharing the database. The operation
+deadline is followed by rollback/connection cleanup before the local permit is
+released. Rollback has a separate one-second deadline; a failed rollback closes
+the connection, and connection close/pool return can extend the cleanup period.
+Empty browsing, filters, literal/full-text terms, numbered pages,
+cursor continuation and page restarts all use this boundary.
+
+Staging/production requires `SEARCH_GLOBAL_BURST=1` and
+`SEARCH_GLOBAL_RATE_PER_SECOND * SEARCH_OPERATION_TIMEOUT_SECONDS <= 0.5`.
+The SQL and acquisition timeouts must each be shorter than the operation
+deadline. Search gates remain active when ordinary per-client limiting is
+disabled. A refusal or timeout returns retryable, non-cacheable 503 without
+using the ordinary pool or retrying through another query mode. Validate
+simultaneous search/login/detail traffic using the
+[capacity acceptance procedure](docs/runbooks/search-fulltext.md#capacity-and-load-acceptance).
+Connection separation does not reserve PostgreSQL CPU, memory or I/O; retain
+representative latency measurements before changing the budgets.
 
 Gunicorn uses one worker when `RATE_LIMIT_REDIS_URL` is absent and up to four
 when the dedicated limiter is configured. General `REDIS_ENABLED` does not
@@ -2791,13 +2858,15 @@ first release.
 
 ```
 Configuration
-[ ] common.env has independent production SECRET_KEY, SESSION_SECRET,
-    TOTP_ENCRYPTION_KEYS, OUTBOX_ENCRYPTION_KEYS, and HEALTH_DETAIL_TOKEN
-    values; none is a default or reused from another environment
+[ ] common.env has independent SECRET_KEY, SESSION_SECRET,
+    OUTBOX_ENCRYPTION_KEYS and HEALTH_DETAIL_TOKEN values; independent
+    TOTP_ENCRYPTION_KEYS belong only in web.env; no live key is a placeholder
+    or reused across purposes/environments
 [ ] PUBLIC_BASE_URL is the public https:// URL; ALLOWED_HOSTS lists the
     public hostname
 [ ] FASTAPI_DEBUG=false
-[ ] SEED_MOCK_DATA=false
+[ ] Both runtime processes use the same reviewed source selection;
+    ALLOW_FIXTURE_SOURCE=false for the normal production catalogue
 [ ] RATE_LIMIT_ENABLED=true
 [ ] web.env alone contains the generated dedicated RATE_LIMIT_REDIS_URL;
     common.env, scheduler.env, migration.env, logs and command lines do not
@@ -2808,12 +2877,20 @@ Configuration
     REDIS_URL select a different process/credential from the limiter
 [ ] RATE_LIMIT_TRUST_PROXY=true
 [ ] DATABASE_POOL_MAX_WAITING has a positive, load-tested bound (initially 32)
+[ ] PostgreSQL connection sizing includes one additional search connection per
+    web worker; search never uses the ordinary pool as fallback
+[ ] Search budgets retain burst one and rate × operation deadline ≤0.5; all
+    modes meet the representative mixed search/login load acceptance
 [ ] journald retention config installed at
     /etc/systemd/journald.conf.d/oralhistarchiv.conf
 [ ] `/etc/oralhistarchiv` is root:root 0700; `common.env`, `web.env`,
     `scheduler.env`, and `migration.env` are root:root 0600
-[ ] `common.env` contains no `DATABASE_URL`, `MIGRATION_DATABASE_URL`, or
-    `SHIBBOLETH_INTERNAL_SECRET`; runtime overlays contain no migration URL
+[ ] `common.env` contains no `DATABASE_URL`, `MIGRATION_DATABASE_URL`,
+    `TOTP_ENCRYPTION_KEYS`, feed credentials or `SHIBBOLETH_INTERNAL_SECRET`;
+    runtime overlays contain no migration URL
+[ ] TOTP keys are web/maintenance-only; selected feed credentials are scheduler-only
+[ ] The separate parser socket/service is installed; its real denial proof passes
+    and scheduler startup authenticates a distinct, sandboxed worker identity
 [ ] web, scheduler, migration-owner, and backup peer mappings pass; requesting
     any other role/database as those OS identities is rejected
 [ ] `oralhistarchiv-migrate.service` is installed, static, and inactive
@@ -2841,6 +2918,10 @@ Services
     and restart persistence, and disables the default user. The reference local
     config is loopback port 6380, AOF `everysec`, and fail-closed on truncated
     AOF; an external provider has equivalent reviewed controls
+[ ] Bounded counter capacity and cleanup settings match across all workers;
+    the old unregistered layout was drained with writers stopped, without reset
+[ ] Maximum-length counter load at the chosen cap leaves measured Redis/AOF
+    headroom; next-new-key refusal preserves live values/TTLs and later recovers
 [ ] A live TTL probe survives an ordinary Redis restart; AOF write/rewrite
     status is `ok`, and memory has measured headroom below `maxmemory`
 [ ] Limiter memory and AOF disk sizing includes the temporary old/new
@@ -2888,6 +2969,8 @@ Authentication flows
     an ordinary Redis restart
 [ ] Redis unavailable/full causes a prompt non-cacheable 503 and does not run
     the protected endpoint or create per-worker fallback quotas
+[ ] Search overload/timeout returns non-cacheable retryable 503 without
+    ordinary-pool or query-mode fallback, including RATE_LIMIT_ENABLED=false
 [ ] Random 404 paths and 405 method probes share a bounded fallback quota and
     over-budget requests perform no session-database lookup
 
@@ -2903,9 +2986,15 @@ Shibboleth (if enabled)
 Security
 [ ] Anonymous `/`, `/search`, `/health`, and bearer-authorized
     `/health/detail` responses return `Cache-Control: no-store`.
-[ ] `/reset-password/{token}`, `/verify-email/{token}`, and
-    `/account/confirm-email/{token}` return both `Cache-Control: no-store`
-    and `Referrer-Policy: no-referrer`.
+[ ] `/reset-password/{public_id}`, `/verify-email/{public_id}`, and
+    `/account/confirm-email/{public_id}` return generic forms with both
+    `Cache-Control: no-store` and `Referrer-Policy: no-referrer`; GET reveals
+    no secret or account state, and legacy token-bearing paths return 404.
+[ ] A public path/query alone cannot redeem an action; POST requires its bound
+    secret, plus CSRF for reset/registration. Open the public link and copy the
+    separate email code into the form; verify this flow without JavaScript.
+[ ] Pending old-format action messages were cancelled under the cutover plan;
+    required requests were reissued through the deployed application.
 [ ] `/static/` responses do not receive application `no-store` and nginx
     applies only the reviewed static-asset cache policy.
 [ ] Security headers present (curl -I https://...)
@@ -2919,11 +3008,13 @@ Security
     jq -R 'fromjson? | select(.event_type == "request") | .client_ip')
 [ ] Every nginx server uses the `oralhistarchiv_safe` log format
 [ ] Effective nginx config contains the dynamic and independent health
-    request/connection zones; Phase-2 Shibboleth locations carry the dynamic
-    controls when installed
-[ ] No active nginx log records URI, query arguments, or Referer
-[ ] A synthetic action-token canary is absent from nginx, journald, and
-    forwarded logs after GET, 403, 415, 422, 429, and static requests
+    request/connection zones; both public Phase-2 Shibboleth locations carry
+    their per-client and shared aggregate SSO controls when installed
+[ ] No active nginx access log records URI, query arguments, or Referer;
+    error-log custody accounts for arbitrary request targets.
+[ ] A synthetic new-format action secret is absent from nginx, journald, and
+    forwarded logs after GET, 403, 415, 422, 429, and static requests; the 429
+    error-log record includes its non-secret public ID as a positive control.
 
 Operations
 [ ] oralhistarchiv-backup.timer is enabled and the forced initial oneshot
@@ -2938,8 +3029,8 @@ Operations
     documented, and an isolated restore drill succeeded
 [ ] Health check cron is running
 [ ] Both long-running runtime units restart on failure; migration remains static
-[ ] Remove ADMIN_SEED_EMAIL and ADMIN_SEED_PASSWORD from common.env after
-    first successful admin login
+[ ] Bootstrap the initial administrator with the one-shot terminal command
+    and verify fresh MFA login before opening public access
 ```
 
 ---
@@ -2966,8 +3057,9 @@ Operations
    Backups also hold the stable deployment inode shared from before preflight
    through publication (manual invocations included). They wait at most 60
    seconds for the lock and fail with a diagnostic if maintenance holds it.
-   Migration waits for the exclusive lock; the installer fails immediately if it is held.
-   Keep the root-owned lock inode mode `0644`; backup requires read access only.
+   Migration waits at most 60 seconds for the exclusive lock; the installer fails immediately if it is held.
+   Keep the stable lock inode mode `0640`, owned by `root:oralhistarchiv-deploy-lock`;
+   backup and the other approved participants require group read access only.
 
    Stop both runtime units:
 
@@ -3120,67 +3212,21 @@ reopening traffic. The federation rollback ordering in §9 takes precedence.
 
 ### Viewing logs
 
-All application and audit logs go through systemd-journald.
-
-```bash
-# All web service logs (live)
-sudo journalctl -u oralhistarchiv -f
-
-# Audit events only (filter for event_type field)
-sudo journalctl -u oralhistarchiv -o cat | jq -R 'fromjson? | select(.event_type)'
-
-# Specific audit event types
-sudo journalctl -u oralhistarchiv -o cat | jq -R 'fromjson? | select(.event_type == "login_success")'
-
-# Trace a specific request across all logs
-sudo journalctl -u oralhistarchiv -o cat | jq -R 'fromjson? | select(.request_id == "abc12345")'
-
-# Scheduler journal (live)
-sudo journalctl -u oralhistarchiv-scheduler -f
-
-# Encrypted backup output and schedule
-sudo journalctl -u oralhistarchiv-backup.service --since "1 week ago"
-sudo systemctl list-timers oralhistarchiv-backup.timer
-
-# Nginx access
-sudo tail -f /var/log/nginx/oralhistarchiv_access.log
-```
+Use the journal/nginx commands in [Log Management](#12-log-management).
+Check the backup schedule with
+`sudo systemctl list-timers oralhistarchiv-backup.timer`.
 
 ### Memory check
 
-```bash
-systemctl show oralhistarchiv --property=MemoryCurrent
-systemctl show oralhistarchiv-scheduler --property=MemoryCurrent
-```
+Use the cgroup measurements and qualification steps in
+[Memory Tuning](#14-memory-tuning).
 
 ### Rotating secrets
 
-The step-by-step operator procedure for every secret — including the
-delicate `TOTP_ENCRYPTION_KEYS` re-encryption — lives in
-**`docs/runbooks/key-rotation.md`**. Read it before rotating anything.
-The short version:
-
-- **`SECRET_KEY`** — invalidates all outstanding password-reset,
-  email-verification, and email-change links (they are short-lived; users
-  simply request new ones) and breaks audit-email-hash correlation across
-  the rotation boundary. It also derives pseudonymous limiter client IDs, so
-  every client receives a fresh allowance after rotation. Stop all old web
-  workers before changing it and start only new-key workers; a rolling restart
-  would temporarily multiply quotas. It does **not** affect TOTP secrets
-  (those are encrypted under `TOTP_ENCRYPTION_KEYS`) and does **not** log
-  anyone out.
-- **`SESSION_SECRET`** — invalidates all signed session cookies (every
-  user must log in again). CSRF cookies regenerate automatically on the
-  next GET.
-- **`TOTP_ENCRYPTION_KEYS`** — the careful one: **prepend** the new key,
-  re-encrypt every stored TOTP secret, verify, and only then retire the
-  old key. Dropping the old key before re-encryption completes locks
-  every enrolled user out of 2FA. Follow the runbook — do not improvise
-  this one.
-
-Do not substitute a rolling or abbreviated restart for the linked runbook. It
-defines the maintenance boundary, token-message cancellation, non-overlapping
-process restart, expected limiter reset, and verification for each secret.
+Follow [key rotation](docs/runbooks/key-rotation.md) for each signing/encryption
+key. It specifies maintenance, token-message cancellation, non-overlapping
+restarts, limiter-namespace changes and verification. Keep historical TOTP and
+outbox keys until both live data and retained backups no longer need them.
 
 ### Rotating SHIBBOLETH_INTERNAL_SECRET
 
@@ -3241,7 +3287,7 @@ sudo systemctl status oralhistarchiv-scheduler
 
 # Check last sync status in the DB
 sudo -u oralhistarchiv-scheduler psql -X --no-password \
-  --dbname=oralhistarchiv --username=oralhistarchiv_scheduler --set=ON_ERROR_STOP=1 --command="SELECT last_harvest_date, last_sync_error, last_sync_error_at, last_rebuild_error, last_rebuild_error_at FROM sync_status WHERE id = 1"
+  --dbname=oralhistarchiv --username=oralhistarchiv_scheduler --set=ON_ERROR_STOP=1 --command="SELECT source, last_harvest_date, last_sync_error, last_sync_error_at, last_rebuild_error, last_rebuild_error_at FROM sync_status ORDER BY source"
 
 # Restart it
 sudo systemctl restart oralhistarchiv-scheduler
@@ -3262,23 +3308,39 @@ sudo -u oralhistarchiv-scheduler \
 
 **Database pool exhausted:**
 
-```bash
-# Check for pool exhaustion warnings in the journal
-sudo journalctl -u oralhistarchiv -o cat | \
-  jq -R 'fromjson? | select(.event_type == "database_pool_admission_unavailable")'
+The database helper logs pool-admission rejections at `WARNING`. With
+`LOG_FORMAT=json` and `LOG_LEVEL` set to `WARNING`, `INFO` or `DEBUG`, inspect
+the real warning message:
 
-# Check active connections in postgres
+```bash
+sudo journalctl -u oralhistarchiv.service --since=-1h --no-pager -o cat | \
+  jq -R 'fromjson? | objects |
+    select(.logger == "app.services.db" and
+      ((.message // "") | startswith("Database pool admission rejected "))) |
+    {timestamp, level, message}'
+
+# Check active connections in PostgreSQL.
 sudo -u postgres psql -d oralhistarchiv -c \
     "SELECT pid, usename, application_name, state, query_start, state_change FROM pg_stat_activity WHERE datname = 'oralhistarchiv'"
-
-# Review both DATABASE_POOL_SIZE and DATABASE_POOL_MAX_WAITING only after
-# identifying slow/stuck queries and checking PostgreSQL's connection budget.
 ```
+
+These warnings have no dedicated `event_type` or request ID. A request audit
+record with `status_code=503` alone does not establish pool exhaustion:
+rate-limit admission and other failures can produce the same status. Review
+the warning timestamps, application logs and PostgreSQL activity before
+changing `DATABASE_POOL_SIZE` or `DATABASE_POOL_MAX_WAITING`.
+
+Search uses an additional, separately bounded one-connection pool per web worker.
+Its local permit, global PostgreSQL try-lock, start budget and operation deadline
+can return 503 without exhausting the ordinary pool. Check the search-specific
+capacity/timeout diagnostics and `application_name` alongside ordinary pool
+warnings; do not route failed search work into the ordinary pool.
 
 The bounded waiter queue deliberately returns retryable, non-cacheable `503`
 instead of allowing request objects to accumulate without limit. Do not raise
 it as a substitute for fixing slow queries or upstream admission; a larger
 queue consumes more memory and increases tail latency during an outage.
+
 
 **Redis connection failed:**
 

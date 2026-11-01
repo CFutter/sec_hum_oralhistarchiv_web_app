@@ -1,22 +1,4 @@
-"""Unit tests for the shape-recursive value handling in src/config/logging.py:
-`_iter_secret_values` (the runtime mirror that flattens a Settings field value
-down to its raw string leaves) and `AuditEmailAutoHash._sanitize` (the audit
-channel's non-string extra-value walk).
-
-Pins, against src/config/logging.py:
-- `_iter_secret_values` walks not just list/tuple/set/frozenset (already
-  exercised by the SecretStr-list Settings fields) but also dict VALUES, and
-  stringifies a plain leaf — the shape a
-  `json_schema_extra={"sensitive": True}` field without SecretStr typing
-  would take. `None` yields nothing at every level.
-- `AuditEmailAutoHash._sanitize` recurses into dict values, list/tuple
-  elements, and stringifies an arbitrary object, applying the SAME
-  hash-preserving email rewrite at every leaf — a raw address nested inside a
-  structured `extra` cannot bypass the audit channel's guarantee by hiding a
-  level deeper than the message string.
-
-No database is touched anywhere in this file.
-"""
+"""Recursive Settings-secret extraction and audit-email hashing of structured values."""
 
 import logging
 
@@ -29,13 +11,16 @@ class _StringsAs:
     shape `_sanitize`'s final `self._apply(str(value))` branch exists for."""
 
     def __init__(self, text: str) -> None:
+        """Retain the supplied value for text conversion."""
         self._text = text
 
     def __str__(self) -> str:
+        """Return the retained text unchanged."""
         return self._text
 
 
 def _audit_record(msg: str = "event", **extra) -> logging.LogRecord:
+    """Build an unhandled INFO audit record with the supplied extra attributes."""
     return logging.getLogger("audit").makeRecord(
         "audit", logging.INFO, __file__, 1, msg, (), None, extra=extra
     )
@@ -60,15 +45,13 @@ class TestIterSecretValuesWalksDictsAndStringifiesScalars:
         assert values == ["one", "two"]
 
     def test_a_plain_non_container_leaf_is_stringified(self):
-        """The `json_schema_extra={"sensitive": True}` plain-field shape: no
-        SecretStr wrapper, no container, just a value that must still become
-        a string leaf the caller can build a redaction pattern from."""
+        """Stringify unwrapped sensitive scalar values into pattern-building leaves."""
         assert list(_iter_secret_values(12345678)) == ["12345678"]
 
     def test_none_at_a_dict_value_position_yields_nothing(self):
-        """Positive control: an unset optional secret nested in a dict value
-        still contributes no pattern, matching the documented top-level
-        `None` behaviour."""
+        """An unset optional secret nested in a dict value still contributes no pattern, matching
+        the documented top-level `None` behaviour.
+        """
         assert list(_iter_secret_values({"key": None})) == []
 
 
@@ -77,6 +60,7 @@ class TestAuditEmailAutoHashSanitizesNestedExtraShapes:
     how deep it sits inside a dict/list-shaped `extra` value."""
 
     def test_an_email_nested_in_a_dict_extra_is_hashed(self):
+        """An email nested in a dict extra is hashed."""
         expected = audit_email_hash("alice@example.org")
         record = _audit_record("profile_updated", changes={"contact": "alice@example.org"})
 
@@ -85,6 +69,7 @@ class TestAuditEmailAutoHashSanitizesNestedExtraShapes:
         assert record.changes == {"contact": f"[email:{expected}]"}
 
     def test_an_email_nested_in_a_list_extra_is_hashed(self):
+        """An email nested in a list extra is hashed."""
         expected = audit_email_hash("bob@example.org")
         record = _audit_record("recipients_notified", recipients=["bob@example.org"])
 
@@ -93,9 +78,7 @@ class TestAuditEmailAutoHashSanitizesNestedExtraShapes:
         assert record.recipients == [f"[email:{expected}]"]
 
     def test_a_custom_objects_string_form_is_hashed(self):
-        """The `default=str` bypass shape: an object with no dict/list/str
-        type still gets its __str__ scrubbed, so a lazily-stringified value
-        cannot smuggle a raw address past the filter."""
+        """Hash emails exposed by arbitrary-object string conversion."""
         expected = audit_email_hash("carol@example.org")
         record = _audit_record("actor_identified", actor=_StringsAs("actor=carol@example.org"))
 
@@ -104,8 +87,9 @@ class TestAuditEmailAutoHashSanitizesNestedExtraShapes:
         assert record.actor == f"actor=[email:{expected}]"
 
     def test_non_email_content_in_the_same_nested_shapes_survives_untouched(self):
-        """Positive control: the recursive walk rewrites ONLY email-shaped
-        text — everything else nested alongside it is unaffected."""
+        """The recursive walk rewrites ONLY email-shaped text — everything else nested alongside it
+        is unaffected.
+        """
         record = _audit_record(
             "profile_updated",
             changes={"tier": "vetted", "count": 3, "active": True, "note": None},

@@ -1,3 +1,5 @@
+"""PostgreSQL integration-test package."""
+
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -14,8 +16,8 @@ from psycopg.errors import DivisionByZero
 from psycopg.rows import dict_row
 
 from app.services import authentication, sessions, totp, users
-from app.services.crypto import encrypt_value
 from app.services.db import get_db_cursor
+from app.services.totp_crypto import encrypt_value
 from tests.integration.conftest import TEST_DATABASE_URL
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -31,11 +33,13 @@ _IP = "127.0.0.1"
 @pytest.fixture(autouse=True)
 def _fixed_totp_clock(monkeypatch):
     # Scope the fixed clock to TOTP verification, not the database or asyncio.
+    """Freeze the TOTP service's wall clock at the test instant."""
     monkeypatch.setattr(totp, "time", SimpleNamespace(time=lambda: _TOTP_TIME))
 
 
 @pytest.fixture
 async def deactivation_observer(db_pool):
+    """Yield an independent autocommit observer with a five-second statement timeout."""
     assert db_pool.max_size >= 2, "Races need at least two pooled connections"
     async with await psycopg.AsyncConnection.connect(
         TEST_DATABASE_URL,
@@ -47,6 +51,7 @@ async def deactivation_observer(db_pool):
 
 
 def _state(sync_conn, user_id):
+    """Read the required user state as a dictionary and commit the observer transaction."""
     with sync_conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """SELECT is_active, auth_revision, failed_login_count, locked_until,
@@ -61,6 +66,7 @@ def _state(sync_conn, user_id):
 
 
 def _session_rows(sync_conn, user_id):
+    """Read the user's session rows in ID order and commit the observer transaction."""
     rows = sync_conn.execute(
         """SELECT id, user_id, expires_at, ip_address, purpose
            FROM sessions WHERE user_id = %s ORDER BY id""",
@@ -71,6 +77,7 @@ def _session_rows(sync_conn, user_id):
 
 
 def _login_case(user_factory, *, with_totp):
+    """Create a revision-zero login case, optionally with a fixed TOTP factor."""
     return SimpleNamespace(
         user=user_factory(
             auth_revision=0,
@@ -83,6 +90,7 @@ def _login_case(user_factory, *, with_totp):
 
 
 async def _password_proof(db_pool, case, *, expected_revision):
+    """Verify the case password and assert its identity and expected revision."""
     check = await authentication.verify_password(db_pool, case.user.email, case.user.password)
     assert check.password_ok is True
     assert check.user is not None and check.user.id == case.user.id
@@ -91,6 +99,7 @@ async def _password_proof(db_pool, case, *, expected_revision):
 
 
 async def _finalize(db_pool, case, check):
+    """Finalize login using the verified revision and case's TOTP proof."""
     assert check.auth_revision is not None
     return await authentication.finalize_local_login(
         db_pool,
@@ -189,6 +198,9 @@ async def test_deactivation_sql_failure_rolls_back_flag_revision_and_sessions_th
     real_delete = users.delete_user_sessions_cur
 
     async def fail_deletion(cur, user_id):
+        """Inject a PostgreSQL error during or after session deletion while checking deactivation
+        state.
+        """
         assert user_id == user.id
         await cur.execute("SELECT is_active, auth_revision FROM users WHERE id = %s", (user_id,))
         row = await cur.fetchone()
@@ -338,20 +350,25 @@ async def test_unlocking_an_active_account_advances_revision_and_preserves_sessi
 
 @dataclass
 class _Gate:
+    """Transaction gate carrying readiness/release events and the lock-owner backend PID."""
+
     reached: asyncio.Event = field(default_factory=asyncio.Event)
     release: asyncio.Event = field(default_factory=asyncio.Event)
     pid: int | None = None
 
     async def hold(self, cur):
+        """Record the backend PID, signal the gate and hold the transaction until released."""
         self.pid = cur.connection.info.backend_pid
         self.reached.set()
         await self.release.wait()
 
 
 def _pause_deactivation(monkeypatch, gate):
+    """Patch session deletion to pause its transaction after the real deletion."""
     real_delete = users.delete_user_sessions_cur
 
     async def paused_delete(cur, user_id):
+        """Delete sessions with the real helper, then hold the transaction at the gate."""
         await real_delete(cur, user_id)
         await gate.hold(cur)
 
@@ -363,9 +380,11 @@ def _pause_deactivation(monkeypatch, gate):
 
 
 def _pause_login(monkeypatch, gate):
+    """Patch session creation to pause its transaction after the real insert."""
     real_create = authentication.create_session_cur
 
     async def paused_create(cur, *, user_id, ip_address, purpose, max_age_seconds):
+        """Create the real session, hold its transaction at the gate and return the token."""
         token = await real_create(
             cur,
             user_id=user_id,
@@ -384,10 +403,12 @@ def _pause_login(monkeypatch, gate):
 
 
 def _track_connections(monkeypatch):
+    """Patch cursor scopes to track each active task's PostgreSQL backend PID."""
     active = {}
 
     @asynccontextmanager
     async def tracked_cursor(pool, *args, **kwargs) -> AsyncIterator[Any]:
+        """Yield a real cursor while tracking the current task's backend PID; remove it on exit."""
         async with get_db_cursor(pool, *args, **kwargs) as cur:
             task = asyncio.current_task()
             active[task] = cur.connection.info.backend_pid
@@ -402,6 +423,7 @@ def _track_connections(monkeypatch):
 
 
 async def _wait_for_gate(gate, leader):
+    """Require the leader to reach its gate before finishing; clean up the waiter task."""
     waiter = asyncio.create_task(gate.reached.wait())
     try:
         await asyncio.wait((waiter, leader), return_when=asyncio.FIRST_COMPLETED)
@@ -444,6 +466,7 @@ async def _wait_for_database_block(observer, active, follower, leader_pid):
 
 
 async def _ordered_race(observer, active, gate, leading_call, following_call):
+    """Run a gated leader and blocked follower; release and cancel outstanding tasks on exit."""
     tasks = []
     try:
         async with asyncio.timeout(_RACE_TIMEOUT):
@@ -476,6 +499,7 @@ async def test_deactivation_first_blocks_login_and_preserves_unused_totp_step(
     with_totp,
     admin_actor,
 ):
+    """Verify deactivation first blocks login and preserves unused TOTP step."""
     case = _login_case(user_factory, with_totp=with_totp)
     session_factory(case.user.id)
     check = await _password_proof(db_pool, case, expected_revision=0)
@@ -516,6 +540,7 @@ async def test_login_first_has_its_new_session_deleted_by_waiting_deactivation(
     with_totp,
     admin_actor,
 ):
+    """Verify login first has its new session deleted by waiting deactivation."""
     case = _login_case(user_factory, with_totp=with_totp)
     old_token = session_factory(case.user.id)
     check = await _password_proof(db_pool, case, expected_revision=0)

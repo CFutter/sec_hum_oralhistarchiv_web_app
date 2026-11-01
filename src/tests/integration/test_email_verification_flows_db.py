@@ -1,388 +1,249 @@
-"""Email-verification integration tests — real PostgreSQL, real services, real routes.
+"""Real HTTP registration: only the mailbox owner chooses the password."""
 
-Covers two-click email verification: single-use confirmation, expiry, and
-binding to the recipient email and the currently-stored token hash, at both
-the service layer (`app.services.email_verification`) and the
-`/verify-email` routes, plus the actual emailed link driven end-to-end from
-registration.
-
-These guard the awaits that mypy cannot see are missing (`coroutine is
-not None` shapes) and that only a real database exercise catches: an
-un-awaited coroutine is truthy even on a ZERO-row UPDATE, so mocked cursors
-would happily "pass."
-"""
-
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+from unittest.mock import create_autospec
 
+import pytest
 import time_machine
+from argon2.exceptions import VerifyMismatchError
+from lxml import html
 
-from app.services.crypto import decrypt_outbox_body
-from app.services.email_verification import (
-    confirm_email_verification,
-    generate_verification_token,
-    store_verification_token_hash,
-)
-from app.services.tokens import hash_token
+from app.services import registration_setup
+from app.services.crypto import decrypt_outbox_body, password_hasher
+from app.services.tokens import action_token_public_id, hash_token
 from config import settings
-from tests.fixtures import sign_session_id
+from tests.action_links import action_path, token_from_action_email
+
+EMAIL = "newcomer@example.org"
+OWNER_PASSWORD = "Fresh-N3w-Passw0rd!"
+ATTACKER_PASSWORD = "An0ther-G00d-Pw!x"
+SUCCESS_LOCATION = "/login?notice=registration_complete"
 
 
-def _email_verified(sync_conn, user_id: int) -> bool:
-    row = sync_conn.execute("SELECT email_verified FROM users WHERE id = %s", (user_id,)).fetchone()
+def _request(client, **extra):
+    """Submit a CSRF-bound registration request after fetching its form."""
+    assert client.get("/register").status_code == 200
+    return client.post(
+        "/register",
+        data={"email": EMAIL, "csrf_token": client.cookies.get("csrf_token"), **extra},
+        follow_redirects=False,
+    )
+
+
+def _emailed_setup(sync_conn):
+    """Decrypt the latest verification email and return its user ID and validated token."""
+    row = sync_conn.execute(
+        """SELECT user_id, body_ciphertext, action_token_hash FROM email_outbox
+           WHERE message_type = 'email_verification' ORDER BY id DESC LIMIT 1"""
+    ).fetchone()
+    sync_conn.commit()
+    assert row is not None
+    body = decrypt_outbox_body(row[1])
+    assert body is not None
+    prefix = settings.public_base_url + "/verify-email/"
+    url = next(line.strip() for line in body.splitlines() if "/verify-email/" in line)
+    assert url.startswith(prefix)
+    token = token_from_action_email(body, url)
+    assert token not in row[1] and hash_token(token) == row[2]
+    return row[0], token
+
+
+def _state(sync_conn, user_id):
+    """Read the required user row as JSON and commit the observer transaction."""
+    row = sync_conn.execute(
+        "SELECT to_jsonb(users) FROM users WHERE id = %s", (user_id,)
+    ).fetchone()
+    sync_conn.commit()
+    assert row is not None
     return row[0]
 
 
-def _store_verification_hash_sync(sync_conn, user_id: int, token: str) -> None:
-    """Sync-side equivalent of store_verification_token_hash for e2e setup."""
-    sync_conn.execute(
-        """UPDATE users
-           SET email_verification_token_hash = %s,
-               email_verification_created_at = CURRENT_TIMESTAMP
-           WHERE id = %s""",
-        (hash_token(token), user_id),
-    )
-    sync_conn.commit()
+def _form(client, token):
+    """Build a verification form bound to the token and current CSRF cookie."""
+    return {
+        "token": token,
+        "public_id": action_token_public_id(token),
+        "csrf_token": client.cookies.get("csrf_token"),
+        "display_name": "Mira Cole",
+        "affiliation": "Research Centre",
+        "country": "GB",
+        "password": OWNER_PASSWORD,
+        "password_confirm": OWNER_PASSWORD,
+    }
 
 
-def _path_of(url: str) -> str:
-    assert url.startswith(settings.public_base_url + "/"), (
-        f"emailed URL {url!r} does not use settings.public_base_url — "
-        "Host-header-derived links are poisonable"
-    )
-    return url[len(settings.public_base_url) :]
-
-
-class TestEmailVerificationConfirmation:
-    """`confirm_email_verification` is single-use and bound to the token's
-    age, the recipient email, and the currently-stored hash."""
-
-    async def test_confirm_email_verification_is_single_use(self, db_pool, user_factory, sync_conn):
-        """First confirm returns True and flips email_verified; the SAME
-        token a second time returns False.
-
-        `cur.fetchone()` must be awaited before the `is not None` test — the
-        coroutine object itself is never None, so a zero-row UPDATE (token
-        already consumed) would still report success.
-        """
-        u = user_factory(email_verified=False)
-        token = generate_verification_token(u.id, u.email)
-        await store_verification_token_hash(
-            db_pool,
-            u.id,
-            hash_token(token),
-            expected_email=u.email,
-        )
-
-        first = await confirm_email_verification(db_pool, u.id, u.email, hash_token(token))
-        assert first is True
-        assert _email_verified(sync_conn, u.id) is True
-
-        second = await confirm_email_verification(db_pool, u.id, u.email, hash_token(token))
-        assert second is False
-
-    async def test_confirm_email_verification_rejects_expired_token(
-        self, db_pool, user_factory, sync_conn
-    ):
-        """A token whose created_at is older than 24h fails the DB-level
-        expiry check (defense-in-depth beyond itsdangerous), returning
-        False."""
-        u = user_factory(email_verified=False)
-        token = generate_verification_token(u.id, u.email)
-        await store_verification_token_hash(
-            db_pool,
-            u.id,
-            hash_token(token),
-            expected_email=u.email,
-        )
-
-        sync_conn.execute(
-            """UPDATE users
-               SET email_verification_created_at = CURRENT_TIMESTAMP - INTERVAL '25 hours'
-               WHERE id = %s""",
-            (u.id,),
-        )
-        sync_conn.commit()
-
-        ok = await confirm_email_verification(db_pool, u.id, u.email, hash_token(token))
-        assert ok is False
-        assert _email_verified(sync_conn, u.id) is False
-
-    async def test_confirm_email_verification_rejects_changed_email(
-        self, db_pool, user_factory, sync_conn
-    ):
-        """A token is bound to the email it was issued for — if the user's
-        current email no longer matches, the stale token must not verify."""
-        u = user_factory(email_verified=False)
-        token = generate_verification_token(u.id, u.email)
-        await store_verification_token_hash(
-            db_pool,
-            u.id,
-            hash_token(token),
-            expected_email=u.email,
-        )
-
-        sync_conn.execute("UPDATE users SET email = %s WHERE id = %s", ("other@x.org", u.id))
-        sync_conn.commit()
-
-        ok = await confirm_email_verification(db_pool, u.id, u.email, hash_token(token))
-        assert ok is False
-        assert _email_verified(sync_conn, u.id) is False
-
-    async def test_confirm_email_verification_rejects_replaced_token(
-        self, db_pool, user_factory, sync_conn
-    ):
-        """Storing a newer token overwrites the previous hash, so the
-        EARLIER link no longer verifies (one outstanding token per user)."""
-        u = user_factory(email_verified=False)
-        token_a = generate_verification_token(u.id, u.email)
-        await store_verification_token_hash(
-            db_pool,
-            u.id,
-            hash_token(token_a),
-            expected_email=u.email,
-        )
-
-        with time_machine.travel(datetime.now(UTC) + timedelta(seconds=2)):
-            token_b = generate_verification_token(u.id, u.email)
-        assert token_b != token_a
-
-        await store_verification_token_hash(
-            db_pool,
-            u.id,
-            hash_token(token_b),
-            expected_email=u.email,
-        )
-
-        ok = await confirm_email_verification(db_pool, u.id, u.email, hash_token(token_a))
-        assert ok is False
-        assert _email_verified(sync_conn, u.id) is False
-
-
-class TestEmailVerificationRoute:
-    """`POST /verify-email` and `GET /verify-email/{token}` end to end."""
-
-    def test_verify_email_post_consumes_token_once(self, e2e_client, user_factory, sync_conn):
-        """First POST /verify-email (deliberately WITHOUT CSRF — the signed
-        single-use token IS the capability, per the route's security note)
-        redirects 303 to /login; the SECOND POST with the same token renders
-        the 200 'Already verified' page, NOT a second success redirect."""
-        u = user_factory(email_verified=False)
-        token = generate_verification_token(u.id, u.email)
-        _store_verification_hash_sync(sync_conn, u.id, token)
-
-        resp = e2e_client.post("/verify-email", data={"token": token}, follow_redirects=False)
-        assert resp.status_code == 303
-        assert resp.headers["location"] == "/login"
-        assert _email_verified(sync_conn, u.id) is True
-
-        resp2 = e2e_client.post("/verify-email", data={"token": token}, follow_redirects=False)
-        assert resp2.status_code == 200
-        assert "Already verified" in resp2.text
-
-    def test_verify_email_post_tampered_token_is_400(self, e2e_client, user_factory, sync_conn):
-        """A token with a broken signature renders the 400 invalid-link error
-        page and does not verify anyone."""
-        u = user_factory(email_verified=False)
-        token = generate_verification_token(u.id, u.email)
-        _store_verification_hash_sync(sync_conn, u.id, token)
-
-        resp = e2e_client.post(
-            "/verify-email", data={"token": token + "tampered"}, follow_redirects=False
-        )
-        assert resp.status_code == 400
-        assert "Invalid verification link" in resp.text
-        assert _email_verified(sync_conn, u.id) is False
-
-    def test_verify_email_with_active_session_redirects_to_setup_totp(
-        self, e2e_client, user_factory, session_factory, sync_conn
-    ):
-        """Verifying while holding an active session for the SAME user gives
-        a success flash and 303 to /setup-totp — not /login. Redirecting to
-        /login here strands a new user mid-onboarding at the login page with
-        no message.
-
-        The session is planted directly (login blocks unverified users, but
-        the session middleware resolves on is_active, not email_verified — a
-        session can legitimately outlive the verified flag flipping during
-        this request). The verify-email POST is CSRF-exempt (the token is the
-        capability), so no CSRF cookie is needed for the planted session."""
-        u = user_factory(email_verified=False)
-        raw = session_factory(u.id, purpose="totp_setup")
-        e2e_client.cookies.set(settings.session_cookie_name, sign_session_id(raw))
-
-        token = generate_verification_token(u.id, u.email)
-        _store_verification_hash_sync(sync_conn, u.id, token)
-
-        resp = e2e_client.post("/verify-email", data={"token": token}, follow_redirects=False)
-        assert resp.status_code == 303
-        assert resp.headers["location"] == "/setup-totp"
-        assert _email_verified(sync_conn, u.id) is True
-
-        flash = sync_conn.execute(
-            "SELECT flash_message FROM sessions WHERE user_id = %s", (u.id,)
-        ).fetchone()
-        assert flash is not None
-        assert "set up two-factor" in flash[0].lower()
-
-    def test_verify_email_replaced_hash_while_unverified_is_400(
-        self, e2e_client, user_factory, sync_conn
-    ):
-        """A valid-SIGNATURE token whose stored hash was replaced (a newer
-        link issued) while the user is STILL unverified must render the 400
-        'no longer valid' page — the distinct arm from the already-verified
-        200 case."""
-        u = user_factory(email_verified=False)
-        token_a = generate_verification_token(u.id, u.email)
-        _store_verification_hash_sync(sync_conn, u.id, token_a)
-        # Replace the stored hash with a different token's, user still unverified.
-        with time_machine.travel(datetime.now(UTC) + timedelta(seconds=2)):
-            token_b = generate_verification_token(u.id, u.email)
-        assert token_b != token_a
-        _store_verification_hash_sync(sync_conn, u.id, token_b)
-
-        resp = e2e_client.post("/verify-email", data={"token": token_a}, follow_redirects=False)
-        assert resp.status_code == 400
-        assert "no longer valid" in resp.text
-        assert _email_verified(sync_conn, u.id) is False
-
-    def test_verify_email_get_does_not_consume_token(self, e2e_client, user_factory, sync_conn):
-        """GET /verify-email/{token} is side-effect-free (prefetcher guard) —
-        two GETs must not burn the token, so the POST still succeeds."""
-        u = user_factory(email_verified=False)
-        token = generate_verification_token(u.id, u.email)
-        _store_verification_hash_sync(sync_conn, u.id, token)
-
-        for _ in range(2):
-            resp = e2e_client.get(f"/verify-email/{token}")
-            assert resp.status_code == 200
-        assert _email_verified(sync_conn, u.id) is False
-
-        resp = e2e_client.post("/verify-email", data={"token": token}, follow_redirects=False)
-        assert resp.status_code == 303
-        assert resp.headers["location"] == "/login"
-        assert _email_verified(sync_conn, u.id) is True
-
-
-class TestEmailVerificationEmailedLink:
-    """The actual emailed link — not a synthetically minted token — verifies
-    a freshly registered account end to end."""
-
-    def test_register_flow_emailed_link_verifies_account(
-        self,
+def test_email_only_request_ignores_initial_credentials_until_owner_completes(
+    e2e_client, sync_conn
+):
+    """Verify email only request ignores initial credentials until owner completes."""
+    fields = html.fromstring(e2e_client.get("/register").text).xpath("//form//input/@name")
+    assert "email" in fields and "password" not in fields and "display_name" not in fields
+    response = _request(
         e2e_client,
-        sync_conn,
-    ):
-        """Registration queues a working verification link.
+        display_name="Attacker Name",
+        affiliation="Attacker Institute",
+        country="US",
+        password=ATTACKER_PASSWORD,
+        password_confirm=ATTACKER_PASSWORD,
+        is_admin="true",
+        access_tier="vetted",
+        email_verified="true",
+    )
+    assert response.status_code == 200 and "Check your email" in response.text
+    user_id, token = _emailed_setup(sync_conn)
+    pending = _state(sync_conn, user_id)
+    assert not pending["is_active"] and not pending["email_verified"] and not pending["is_admin"]
+    assert pending["access_tier"] == "public"
+    assert all(
+        pending[key] is None for key in ("password_hash", "display_name", "affiliation", "country")
+    )
+    assert pending["email_verification_token_hash"] == hash_token(token)
+    for _ in range(2):
+        page = e2e_client.get(action_path("/verify-email", token))
+        assert page.status_code == 200
+        document = html.fromstring(page.text)
+        assert document.xpath('//input[@name="token"]/@value') == [""]
+        assert document.xpath('//input[@name="public_id"]/@value') == [
+            action_token_public_id(token)
+        ]
+        assert token not in page.text and EMAIL not in page.text
+        assert document.xpath('//input[@name="csrf_token"]/@value') == [
+            e2e_client.cookies.get("csrf_token")
+        ]
+    assert _state(sync_conn, user_id) == pending
+    form = _form(e2e_client, token)
+    response = e2e_client.post(
+        "/verify-email",
+        data={**form, "is_admin": "true", "access_tier": "vetted"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303 and response.headers["location"] == SUCCESS_LOCATION
+    completed = _state(sync_conn, user_id)
+    assert completed["is_active"] and completed["email_verified"] and not completed["is_admin"]
+    assert completed["access_tier"] == "public" and completed["display_name"] == "Mira Cole"
+    assert completed["affiliation"] == "Research Centre" and completed["country"] == "GB"
+    assert password_hasher.verify(completed["password_hash"], OWNER_PASSWORD)
+    with pytest.raises(VerifyMismatchError):
+        password_hasher.verify(completed["password_hash"], ATTACKER_PASSWORD)
+    assert settings.session_cookie_name not in e2e_client.cookies
+    sessions = sync_conn.execute(
+        "SELECT count(*) FROM sessions WHERE user_id = %s", (user_id,)
+    ).fetchone()
+    assert sessions[0] == 0
+    assert e2e_client.get(action_path("/verify-email", token)).status_code == 200
+    assert e2e_client.post("/verify-email", data=form).status_code == 400
+    assert _state(sync_conn, user_id) == completed
 
-        The token extracted from the encrypted outbox message matches the
-        hash stored on the user, and submitting that token verifies the
-        account. Hostile privilege-related form fields remain ignored.
-        """
-        PENDING_PAGE_MARKER = "Check your email"  # send_verification.html success branch
-        email = "newcomer@uzh.ch"
 
-        e2e_client.get("/register")
-        csrf = e2e_client.cookies.get("csrf_token")
-
+@pytest.mark.parametrize("verified", [False, True])
+def test_duplicate_response_matches_new_request_without_password_work(
+    e2e_client, sync_conn, monkeypatch, verified
+):
+    """Verify duplicate response matches new request without password work."""
+    real_work = registration_setup.run_password_work
+    work = create_autospec(real_work, spec_set=True, side_effect=real_work)
+    monkeypatch.setattr(registration_setup, "run_password_work", work)
+    first = _request(e2e_client)
+    assert first.status_code == 200
+    work.assert_not_awaited()
+    user_id, token = _emailed_setup(sync_conn)
+    if verified:
+        assert e2e_client.get(action_path("/verify-email", token)).status_code == 200
         response = e2e_client.post(
-            "/register",
-            data={
-                "email": email,
-                "display_name": "New Comer",
-                "affiliation": "UZH",
-                "country": "CH",
-                "password": "Str0ng-Horse-Battery!9",
-                "password_confirm": "Str0ng-Horse-Battery!9",
-                "csrf_token": csrf,
-                # Hostile mass-assignment extras must be ignored.
-                "is_admin": "true",
-                "access_tier": "vetted",
-                "email_verified": "true",
-            },
-            follow_redirects=False,
+            "/verify-email", data=_form(e2e_client, token), follow_redirects=False
         )
+        assert response.status_code == 303
+    before = _state(sync_conn, user_id)
+    hash_calls = work.await_count
+    duplicate = _request(e2e_client, password=ATTACKER_PASSWORD, display_name="Attacker Name")
+    assert duplicate.status_code == first.status_code and duplicate.text == first.text
+    assert work.await_count == hash_calls
+    assert _state(sync_conn, user_id) == before
+    notice = sync_conn.execute(
+        "SELECT message_type, user_id FROM email_outbox ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert notice == ("email_verification", user_id)
 
-        assert response.status_code == 200
-        assert PENDING_PAGE_MARKER in response.text
 
-        row = sync_conn.execute(
-            """
-            SELECT
-                users.email_verification_token_hash,
-                users.is_admin,
-                users.access_tier,
-                users.email_verified,
-                email_outbox.recipient,
-                email_outbox.body_ciphertext,
-                email_outbox.status,
-                email_outbox.attempt_count
-            FROM users
-            JOIN email_outbox
-              ON email_outbox.user_id = users.id
-             AND email_outbox.message_type = 'email_verification'
-            WHERE users.email = %s
-            ORDER BY email_outbox.id DESC
-            LIMIT 1
-            """,
-            (email,),
-        ).fetchone()
-
-        assert row is not None
-
-        (
-            stored_hash,
-            is_admin,
-            access_tier,
-            email_verified,
-            recipient,
-            body_ciphertext,
-            outbox_status,
-            attempt_count,
-        ) = row
-
-        assert recipient == email
-        assert outbox_status == "pending"
-        assert attempt_count == 0
-
-        body = decrypt_outbox_body(body_ciphertext)
-        assert body is not None
-
-        verification_url = next(
-            line.strip() for line in body.splitlines() if "/verify-email/" in line
+@pytest.mark.parametrize(
+    "change", ["database_expiry", "signature_expiry", "email", "cancelled", "tampered"]
+)
+def test_live_form_cannot_complete_after_capability_changes(e2e_client, sync_conn, change):
+    """Verify live form cannot complete after capability changes."""
+    assert _request(e2e_client).status_code == 200
+    user_id, token = _emailed_setup(sync_conn)
+    assert e2e_client.get(action_path("/verify-email", token)).status_code == 200
+    if change == "database_expiry":
+        sync_conn.execute(
+            "UPDATE users SET email_verification_created_at = clock_timestamp() - INTERVAL '25 hours' WHERE id = %s",
+            (user_id,),
         )
-        path = _path_of(verification_url)
-
-        assert path.startswith("/verify-email/")
-
-        token = path.removeprefix("/verify-email/")
-        assert token
-        assert stored_hash == hash_token(token)
-
-        # Hostile privilege-related form fields were ignored.
-        assert is_admin is False
-        assert access_tier == "public"
-        assert email_verified is False
-
-        confirm = e2e_client.post(
-            "/verify-email",
-            data={"token": token},
-            follow_redirects=False,
+    elif change == "email":
+        sync_conn.execute(
+            "UPDATE users SET email = 'changed@example.org' WHERE id = %s", (user_id,)
         )
+    elif change == "cancelled":
+        sync_conn.execute(
+            "UPDATE users SET email_verification_token_hash = NULL, email_verification_created_at = NULL WHERE id = %s",
+            (user_id,),
+        )
+    sync_conn.commit()
+    before = _state(sync_conn, user_id)
+    candidate = token + "tampered" if change == "tampered" else token
+    travel = (
+        time_machine.travel(datetime.now(UTC) + timedelta(hours=25))
+        if change == "signature_expiry"
+        else nullcontext()
+    )
+    with travel:
+        assert e2e_client.get(action_path("/verify-email", candidate)).status_code == 200
+        form = {**_form(e2e_client, candidate), "password": "weak", "password_confirm": "different"}
+        assert e2e_client.post("/verify-email", data=form).status_code == 400
+    assert _state(sync_conn, user_id) == before
 
-        assert confirm.status_code == 303
-        assert confirm.headers["location"] == "/login"
 
-        verified = sync_conn.execute(
-            """
-            SELECT
-                email_verified,
-                email_verification_token_hash
-            FROM users
-            WHERE email = %s
-            """,
-            (email,),
-        ).fetchone()
+@pytest.mark.parametrize(
+    "failure,expected", [("missing_csrf", 403), ("wrong_csrf", 403), ("json", 415)]
+)
+def test_completion_transport_guards_preserve_live_capability(
+    e2e_client, sync_conn, failure, expected
+):
+    """Verify completion transport guards preserve live capability."""
+    assert _request(e2e_client).status_code == 200
+    user_id, token = _emailed_setup(sync_conn)
+    assert e2e_client.get(action_path("/verify-email", token)).status_code == 200
+    before = _state(sync_conn, user_id)
+    form = _form(e2e_client, token)
+    if failure == "missing_csrf":
+        form.pop("csrf_token")
+    elif failure == "wrong_csrf":
+        form["csrf_token"] = "wrong"
+    response = e2e_client.post(
+        "/verify-email", **({"json": form} if failure == "json" else {"data": form})
+    )
+    assert response.status_code == expected
+    assert _state(sync_conn, user_id) == before
+    response = e2e_client.post(
+        "/verify-email", data=_form(e2e_client, token), follow_redirects=False
+    )
+    assert response.status_code == 303 and response.headers["location"] == SUCCESS_LOCATION
 
-        assert verified is not None
-        assert verified[0] is True
-        assert verified[1] is None
+
+def test_live_setup_form_still_completes_after_anonymous_resend(e2e_client, sync_conn):
+    """Verify live setup form still completes after anonymous resend."""
+    assert _request(e2e_client).status_code == 200
+    user_id, token = _emailed_setup(sync_conn)
+    assert e2e_client.get(action_path("/verify-email", token)).status_code == 200
+    before = _state(sync_conn, user_id)
+    response = e2e_client.post(
+        "/send_verification",
+        data={"email": EMAIL, "csrf_token": e2e_client.cookies.get("csrf_token")},
+    )
+    assert response.status_code == 200
+    assert _emailed_setup(sync_conn)[1] == token
+    assert _state(sync_conn, user_id) == before
+    completion = e2e_client.post(
+        "/verify-email", data=_form(e2e_client, token), follow_redirects=False
+    )
+    assert completion.status_code == 303

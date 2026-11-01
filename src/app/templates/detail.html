@@ -1,40 +1,63 @@
 {% extends "base.html" %}
 {% set active_page = "search" %}
-{% block title %}{{ dataset.title }} — Oral History Archive{% endblock %}
+{% block title %}{{ dataset.title }} — {{ site_name }}{% endblock %}
 
 {% block content %}
-{% set can_view = can_view_full(dataset, user_tier) %}
+{% set can_view = can_view_full(dataset, user_tier, configured_sources=configured_sources) %}
+{% set required_tier = full_required_tier(dataset, configured_sources=configured_sources) %}
+{# Render a labeled field-tier restriction using dataset and configured_sources. #}
+{% macro restricted(field, label) -%}
+<p class="metadata-restricted" data-field="{{ field }}">{{ label }} requires <strong>{{ field_required_tier(dataset, field, configured_sources=configured_sources) }}</strong> access or higher.</p>
+{%- endmacro %}
 <section class="container detail-page">
 
   <a href="{{ path_for(request, 'search_page') }}" class="back-link">← Back to search</a>
+  {% if user and user.is_admin %}
+  <p><a href="{{ path_for(request, 'admin_dataset_detail', dataset_id=dataset.id) }}">Manage visibility</a></p>
+  {% endif %}
 
   <div class="detail-header">
     <span class="card-access {{ dataset.access_level }}">{{ dataset.access_level }}</span>
     <h1>{{ dataset.title }}</h1>
-    {% if can_view and dataset.project_title %}
-    <p class="detail-project">{{ dataset.project_title }}</p>
+    {% if can_view_field(dataset, user_tier, 'project_title', configured_sources=configured_sources) and dataset.project_title %}
+    <p class="detail-project" data-field="project_title">{{ dataset.project_title }}</p>
     {% endif %}
   </div>
 
-  {% if can_view %}
+  {% if record_visible %}
   <div class="detail-layout">
 
     <div class="detail-main">
       <h2>Description</h2>
-      <p>{{ dataset.description or 'No description available.' }}</p>
-    
-      {% if dataset.resource_description %}
-      <h2>Resource</h2>
-      <p>{{ dataset.resource_description }}</p>
+      {% if can_view_field(dataset, user_tier, 'description', configured_sources=configured_sources) %}
+      <p data-field="description">{{ dataset.description or 'No description available.' }}</p>
+      {% else %}
+      {{ restricted('description', 'Description') }}
       {% endif %}
     
+      {% if can_view_field(dataset, user_tier, 'resource_description', configured_sources=configured_sources) %}
+      {% if dataset.resource_description %}
+      <h2>Resource</h2>
+      <p data-field="resource_description">{{ dataset.resource_description }}</p>
+      {% endif %}
+      {% else %}
+      <h2>Resource</h2>
+      {{ restricted('resource_description', 'Resource description') }}
+      {% endif %}
+    
+      {% if can_view_field(dataset, user_tier, 'project_description', configured_sources=configured_sources) %}
       {% if dataset.project_description %}
       <h2>Project</h2>
-      <p>{{ dataset.project_description }}</p>
+      <p data-field="project_description">{{ dataset.project_description }}</p>
+      {% endif %}
+      {% else %}
+      <h2>Project</h2>
+      {{ restricted('project_description', 'Project description') }}
       {% endif %}
     
       <h2>Keywords</h2>
-      <div class="card-topics">
+      {% if can_view_field(dataset, user_tier, 'keywords', configured_sources=configured_sources) %}
+      <div class="card-topics" data-field="keywords">
         {% for keyword in dataset.keywords %}
         {% if keyword|length <= facet_label_max_chars %}
         <a href="{{ path_for(request, 'search_page') }}?keyword={{ keyword|urlencode }}" class="tag">{{ keyword }}</a>
@@ -43,10 +66,18 @@
         {% endif %}
         {% endfor %}
       </div>
+      {% else %}
+      {{ restricted('keywords', 'Keywords') }}
+      {% endif %}
     
+      {% if can_view_field(dataset, user_tier, 'bibliographical_citation', configured_sources=configured_sources) %}
       {% if dataset.bibliographical_citation %}
       <h2>Citation</h2>
-      <p class="detail-citation">{{ dataset.bibliographical_citation }}</p>
+      <p class="detail-citation" data-field="bibliographical_citation">{{ dataset.bibliographical_citation }}</p>
+      {% endif %}
+      {% else %}
+      <h2>Citation</h2>
+      {{ restricted('bibliographical_citation', 'Citation') }}
       {% endif %}
     </div>
 
@@ -54,62 +85,94 @@
       <div class="meta-card">
         <h3>Dataset Details</h3>
         <dl class="meta-list">
+          <dt>Source</dt>
+          <dd>{{ source_display.label }}</dd>
           <dt>Authors</dt>
           <dd>
+            {% if can_view_field(dataset, user_tier, 'authors', configured_sources=configured_sources) %}
+            <span data-field="authors">
             {% for author in dataset.authors %}
               {{ author.name }}<br>
             {% endfor %}
+            </span>
+            {% else %}
+            {{ restricted('authors', 'Authors') }}
+            {% endif %}
           </dd>
+          {% if can_view_field(dataset, user_tier, 'resource_type', configured_sources=configured_sources) %}
           {% if dataset.resource_type %}
           <dt>Type</dt>
-          <dd>{{ dataset.resource_type }}</dd>
+          <dd data-field="resource_type">{{ dataset.resource_type }}</dd>
+          {% endif %}
+          {% else %}
+          <dt>Type</dt>
+          <dd>{{ restricted('resource_type', 'Resource type') }}</dd>
           {% endif %}
           <dt>Languages</dt>
-          <dd>{{ dataset.languages | join(', ') or '—' }}</dd>
+          <dd>
+            {% if can_view_field(dataset, user_tier, 'languages', configured_sources=configured_sources) %}
+            <span data-field="languages">{{ dataset.languages | join(', ') or '—' }}</span>
+            {% else %}
+            {{ restricted('languages', 'Languages') }}
+            {% endif %}
+          </dd>
           <dt>Version</dt>
           <dd>{{ dataset.version or '—' }}</dd>
+          {% if can_view_field(dataset, user_tier, 'doi', configured_sources=configured_sources) %}
           {% if dataset.doi %}
           <dt>DOI</dt>
-          <dd><a href="{{ dataset.doi | doi_url }}">{{ dataset.doi }}</a></dd>
+          <dd data-field="doi"><a href="{{ dataset.doi | doi_url }}">{{ dataset.doi }}</a></dd>
+          {% endif %}
+          {% else %}
+          <dt>DOI</dt>
+          <dd>{{ restricted('doi', 'DOI') }}</dd>
           {% endif %}
           <dt>Download access</dt>
           <dd><span class="card-access {{ dataset.access_level }}">{{ dataset.access_level }}</span></dd>
           <dt>License</dt>
           <dd>
-            {% if dataset.license_url %}
-            <a href="{{ dataset.license_url | safe_url }}">{{ dataset.license_val or 'View license' }}</a>
-            {% else %}
-            {{ dataset.license_val or '—' }}
+            {% set license_value_visible = can_view_field(dataset, user_tier, 'license_val', configured_sources=configured_sources) %}
+            {% set license_url_visible = can_view_field(dataset, user_tier, 'license_url', configured_sources=configured_sources) %}
+            {% if license_url_visible and dataset.license_url %}
+            <a data-field="license_url" href="{{ dataset.license_url | safe_url }}">{{ dataset.license_val if license_value_visible and dataset.license_val else 'View license' }}</a>
+            {% elif license_value_visible %}
+            <span data-field="license_val">{{ dataset.license_val or '—' }}</span>
+            {% endif %}
+            {% if not license_value_visible %}
+            {{ restricted('license_val', 'License') }}
+            {% endif %}
+            {% if not license_url_visible %}
+            {{ restricted('license_url', 'License link') }}
             {% endif %}
           </dd>
           <dt>Download</dt>
           <dd>
-            {% if dataset.source == 'swissubase' and dataset.resource_access_url %}
+            {% if not can_view %}
+            <p class="metadata-restricted" data-field="resource_proxies">Resource access requires full metadata access at <strong>{{ required_tier }}</strong> tier or higher.</p>
+            {% else %}
+            {% if resource_href %}
               <a
-                href="{{ dataset.resource_access_url | safe_url }}"
-                class="btn btn-primary btn-small"
+                href="{{ resource_href }}"
+                class="btn {{ 'btn-primary' if resource_kind == 'Resource' else 'btn-secondary' }} btn-small"
                 target="_blank"
                 rel="noopener"
               >
-                Access dataset on SWISSUbase
-              </a>
-            {% elif dataset.source == 'swissubase' and dataset.landing_page_url %}
-              <a
-                href="{{ dataset.landing_page_url | safe_url }}"
-                class="btn btn-secondary btn-small"
-                target="_blank"
-                rel="noopener"
-              >
-                View on SWISSUbase
+                {{ source_display.resource_link_label if resource_kind == 'Resource' else source_display.landing_link_label }}
               </a>
             {% else %}
               <p class="download-unavailable">No online resource link is available.</p>
               <p class="download-contact">Contact <a href="mailto:{{ contact_email }}">{{ contact_email }}</a> for information about accessing this resource.</p>
             {% endif %}
+            {% endif %}
           </dd>
+          {% if can_view_field(dataset, user_tier, 'project_title', configured_sources=configured_sources) %}
           {% if dataset.project_title %}
           <dt>Project</dt>
-          <dd>{{ dataset.project_title }}</dd>
+          <dd data-field="project_title">{{ dataset.project_title }}</dd>
+          {% endif %}
+          {% else %}
+          <dt>Project</dt>
+          <dd>{{ restricted('project_title', 'Project title') }}</dd>
           {% endif %}
         </dl>
       </div>
@@ -117,11 +180,13 @@
 
   </div>
 
-  {% else %}
+  {% endif %}
+
+  {% if not can_view %}
 
   <div class="detail-restricted">
     <h2>Restricted Dataset</h2>
-    <p>Full metadata is available to users with <strong>{{ dataset.visibility_tier }}</strong> access or higher.</p>
+    <p>Full metadata is available to users with <strong>{{ required_tier }}</strong> access or higher.</p>
     {% if not user %}
     <p><a href="{{ path_for(request, 'login_page') }}?next={{ request.url.path }}" class="btn btn-primary">Login to view</a></p>
     {% endif %}

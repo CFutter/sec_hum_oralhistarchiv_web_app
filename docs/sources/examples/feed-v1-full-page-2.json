@@ -1,0 +1,56 @@
+{
+    "feed_version": 1,
+    "snapshot_id": "00000000-0000-4000-8000-000000000001",
+    "generated_at": "2030-01-02T03:04:05Z",
+    "request": {
+      "nonce": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "since": null,
+      "cursor": "synthetic-page-2"
+    },
+    "records": [
+      {
+        "uuid": "33333333-3333-4333-8333-333333333333",
+        "title": "Vetted demonstration record",
+        "project_title": null,
+        "description": "Synthetic example metadata; no real participant or recording.",
+        "resource_description": null,
+        "languages": [
+          "en"
+        ],
+        "project_description": null,
+        "authors": [
+          "Synthetic Example Contributor"
+        ],
+        "keywords": [
+          "synthetic example"
+        ],
+        "resource_proxies": [
+          {
+            "type": "Resource",
+            "ref": "https://archive.example.org/synthetic/resource"
+          },
+          {
+            "type": "LandingPage",
+            "ref": "https://archive.example.org/synthetic/record"
+          }
+        ],
+        "license_val": "Restricted access",
+        "license_url": null,
+        "version": "1.0",
+        "doi": null,
+        "resource_type": "interview",
+        "institutions": [
+          "Synthetic Example Archive"
+        ],
+        "main_disciplines": [],
+        "bibliographical_citation": null,
+        "modified_at": "2030-01-02T02:00:00Z",
+        "visibility_tier": "vetted"
+      }
+    ],
+    "withdrawn": [
+      "44444444-4444-4444-8444-444444444444"
+    ],
+    "next_cursor": null,
+    "complete": true
+  }

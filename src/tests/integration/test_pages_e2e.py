@@ -1,16 +1,33 @@
-"""E2E page-route tests — real PostgreSQL, real CatalogueStatsCache, real middleware.
-
-Covers home & search rendering through the REAL async CatalogueStatsCache
-(the requests that would hand a template a coroutine if the cache were called
-through run_in_threadpool), plus tier redaction on the detail page, the search
-presence-oracle gating in search_datasets, ILIKE wildcard escaping, the
-empty-page pagination redirect, and the full login/logout cookie roundtrip.
-"""
+"""E2E page-route tests — real PostgreSQL, real CatalogueStatsCache, real middleware."""
 
 import logging
+from datetime import UTC, datetime
+from unittest.mock import patch
 
+import pytest
+from lxml import html
+
+from app.paths import PROJECT_ROOT
+from app.services import ensure_source_status_rows
+from app.services.scheduler import sync_and_invalidate
+from app.sources import (
+    FixtureAdapter,
+    FixtureConfig,
+    OaiPmhCmdiConfig,
+    SourceDisplay,
+    configure_sources,
+)
 from config import settings
 from tests.integration.conftest import login_with_totp as _login_with_totp
+from tests.integration.sync_doubles import FETCH
+
+
+def _assert_search_rows(response, expected):
+    """Pin the bounded rendered rows without requesting an exact catalogue count."""
+    assert response.context["result_count"] is None
+    assert response.context["total_pages"] is None
+    assert len(response.context["results"]) == expected
+    assert ("No datasets found." in response.text) is (expected == 0)
 
 
 def _audit_records(caplog, event_type):
@@ -22,21 +39,13 @@ def _audit_records(caplog, event_type):
     ]
 
 
-# ---------------------------------------------------------------------------
 # Home & search render through the real async CatalogueStatsCache
-# ---------------------------------------------------------------------------
 
 
 def test_home_and_search_render_for_guest_and_authenticated(
     e2e_client, user_factory, dataset_factory
 ):
-    """GET / and GET /search return 200 for a guest AND for an
-    authenticated user (a second tier — the cache holds one entry per tier).
-
-    The routes must await the async get_cached_facets directly: calling it
-    through run_in_threadpool hands the template a coroutine —
-    "'coroutine' object has no attribute 'get'" → 500 on every page load.
-    """
+    """Verify home and search render for guest and authenticated."""
     for _ in range(3):
         dataset_factory()
 
@@ -48,7 +57,7 @@ def test_home_and_search_render_for_guest_and_authenticated(
 
     search = e2e_client.get("/search")
     assert search.status_code == 200
-    assert "3 datasets found" in search.text
+    _assert_search_rows(search, 3)
 
     # Authenticated at a different tier — a second, lazily-built cache entry.
     _login_with_totp(e2e_client, user_factory, access_tier="registered")
@@ -59,12 +68,10 @@ def test_home_and_search_render_for_guest_and_authenticated(
 
     search2 = e2e_client.get("/search")
     assert search2.status_code == 200
-    assert "3 datasets found" in search2.text
+    _assert_search_rows(search2, 3)
 
 
-# ---------------------------------------------------------------------------
 # Detail page — tier redaction + audit trail
-# ---------------------------------------------------------------------------
 
 
 def test_detail_redacts_below_tier_and_audits_access(
@@ -122,9 +129,7 @@ def test_detail_unknown_id_renders_branded_404(e2e_client):
     assert "exist or has been removed" in resp.text
 
 
-# ---------------------------------------------------------------------------
 # Search — full-blob gating (the presence oracle)
-# ---------------------------------------------------------------------------
 
 
 def test_search_full_blob_matches_only_visible_rows(e2e_client, user_factory, dataset_factory):
@@ -140,20 +145,20 @@ def test_search_full_blob_matches_only_visible_rows(e2e_client, user_factory, da
     # Guest probing the redacted description: nothing leaks.
     resp = e2e_client.get("/search", params={"q": "SENSITIVE-DETAIL-TEXT"})
     assert resp.status_code == 200
-    assert "0 datasets found" in resp.text
+    _assert_search_rows(resp, 0)
     assert "Public Title" not in resp.text
 
     # Guest searching the title: public discovery search matches everywhere.
     resp = e2e_client.get("/search", params={"q": "Public Title"})
     assert resp.status_code == 200
-    assert "1 dataset found" in resp.text
+    _assert_search_rows(resp, 1)
     assert "Public Title" in resp.text
 
     # Vetted user: the full blob (description) matches.
     _login_with_totp(e2e_client, user_factory, access_tier="vetted")
     resp = e2e_client.get("/search", params={"q": "SENSITIVE-DETAIL-TEXT"})
     assert resp.status_code == 200
-    assert "1 dataset found" in resp.text
+    _assert_search_rows(resp, 1)
     assert "Public Title" in resp.text
 
 
@@ -169,21 +174,17 @@ def test_keyword_filter_is_tier_gated(e2e_client, user_factory, dataset_factory)
 
     resp = e2e_client.get("/search", params={"keyword": "sec-kw"})
     assert resp.status_code == 200
-    assert "0 datasets found" in resp.text
+    _assert_search_rows(resp, 0)
 
     _login_with_totp(e2e_client, user_factory, access_tier="vetted")
     resp = e2e_client.get("/search", params={"keyword": "sec-kw"})
     assert resp.status_code == 200
-    assert "1 dataset found" in resp.text
+    _assert_search_rows(resp, 1)
     assert "Public Title" in resp.text
 
 
 def test_access_level_filter_is_deliberately_not_gated(e2e_client, dataset_factory):
-    """The ?access_level filter is NOT tier-gated: access_level stays visible
-    on redacted rows (it's in PUBLIC_DISCOVERY_FIELDS), so filtering on it
-    reveals nothing new. A guest filtering access_level=restricted gets the
-    redacted vetted-tier row back — title visible, per the explicit comment
-    in search_datasets ("access_level is visible on redacted rows")."""
+    """Verify access level filter is deliberately not gated."""
     dataset_factory(title="Open Dataset", access_level="public")
     dataset_factory(
         visibility_tier="vetted",
@@ -195,31 +196,24 @@ def test_access_level_filter_is_deliberately_not_gated(e2e_client, dataset_facto
     # Baseline: the ungated filter works for plainly visible rows.
     resp = e2e_client.get("/search", params={"access_level": "public"})
     assert resp.status_code == 200
-    assert "1 dataset found" in resp.text
+    _assert_search_rows(resp, 1)
     assert "Open Dataset" in resp.text
 
     # The vetted-tier row IS returned to a guest — redacted, but listed.
     resp = e2e_client.get("/search", params={"access_level": "restricted"})
     assert resp.status_code == 200
-    assert "1 dataset found" in resp.text
+    _assert_search_rows(resp, 1)
     assert "Hidden But Listed" in resp.text
     assert "SENSITIVE-DETAIL-TEXT" not in resp.text
 
 
-# ---------------------------------------------------------------------------
 # The middle tier — a 'registered' dataset AND a 'registered' logged-in actor
-# ---------------------------------------------------------------------------
 
 
 def test_registered_dataset_hidden_from_guest_visible_to_registered(
     e2e_client, user_factory, dataset_factory
 ):
-    """A visibility_tier='registered' dataset must be invisible to a guest on
-    BOTH gated search channels (full-text description match and ?keyword
-    filter), and visible to a logged-in registered user on both. Flipping a
-    single CASE copy's `WHEN 'registered' THEN 1` to `THEN 0` leaks
-    middle-tier metadata to guests — this is the test that turns that
-    mutation red."""
+    """Verify registered dataset hidden from guest visible to registered."""
     dataset_factory(
         visibility_tier="registered",
         title="Reg DS",
@@ -229,17 +223,17 @@ def test_registered_dataset_hidden_from_guest_visible_to_registered(
 
     # Guest (rank 0): neither channel may confirm the dataset's contents.
     resp = e2e_client.get("/search", params={"q": "REG-SENSITIVE-TEXT"})
-    assert "0 datasets found" in resp.text
+    _assert_search_rows(resp, 0)
     resp = e2e_client.get("/search", params={"keyword": "reg-kw"})
-    assert "0 datasets found" in resp.text
+    _assert_search_rows(resp, 0)
 
     # Positive control: the registered actor sees it through both channels.
     _login_with_totp(e2e_client, user_factory, access_tier="registered")
     resp = e2e_client.get("/search", params={"q": "REG-SENSITIVE-TEXT"})
-    assert "1 dataset found" in resp.text
+    _assert_search_rows(resp, 1)
     assert "Reg DS" in resp.text
     resp = e2e_client.get("/search", params={"keyword": "reg-kw"})
-    assert "1 dataset found" in resp.text
+    _assert_search_rows(resp, 1)
 
 
 def test_registered_actor_is_below_vetted_tier(e2e_client, user_factory, dataset_factory):
@@ -256,7 +250,7 @@ def test_registered_actor_is_below_vetted_tier(e2e_client, user_factory, dataset
     _login_with_totp(e2e_client, user_factory, access_tier="registered")
 
     resp = e2e_client.get("/search", params={"q": "VETTED-ONLY-TEXT"})
-    assert "0 datasets found" in resp.text
+    _assert_search_rows(resp, 0)
 
     detail = e2e_client.get(f"/dataset/{ds_id}")
     assert detail.status_code == 200
@@ -288,19 +282,16 @@ def test_registered_detail_page_shows_middle_tier_content(
     assert "REG-DETAIL-TEXT" in full_view.text
 
 
-# ---------------------------------------------------------------------------
 # Download link rendering — both directions, first proxy fixture
-# ---------------------------------------------------------------------------
 
 
 def test_resource_access_link_shown_only_at_sufficient_metadata_tier(
     e2e_client, user_factory, dataset_factory
 ):
     """detail.html renders the Download button only inside {% if can_view %},
-    and filter_for_tier nulls resource_access_url below tier. Before this test no
-    dataset ever HAD a resource proxy, so the positive direction ('Download
-    Dataset' actually renders for an authorized user) was never exercised and
-    the template gate itself was unpinned."""
+    and filter_for_tier nulls resource_access_url below tier. A real proxy
+    fixture proves both denial below tier and a rendered download link for
+    the authorized user."""
     ds_id = dataset_factory(
         visibility_tier="vetted",
         title="Proxied DS",
@@ -367,9 +358,7 @@ def test_restricted_swissubase_resource_is_rendered_as_upstream_access_action(
     assert "Available to vetted researchers only." not in response.text
 
 
-# ---------------------------------------------------------------------------
 # Facet sidebar (HTTP channel) — the leak as a user would see it
-# ---------------------------------------------------------------------------
 
 
 def test_search_sidebar_facets_are_tier_scoped_end_to_end(
@@ -377,8 +366,8 @@ def test_search_sidebar_facets_are_tier_scoped_end_to_end(
 ):
     """The service-level facet pins live in test_access_tiers_db.py; this is
     the same property driven through GET /search → CatalogueStatsCache → get_facets →
-    sidebar template, per tier — the channel probe P12 actually leaked
-    through. Keywords need two sharers (HAVING >= 2)."""
+    sidebar template, per tier — a facet channel previously leaked through
+    the sidebar. Keywords need two sharers (HAVING >= 2)."""
     dataset_factory(visibility_tier="public", keywords=["pub-kw"])
     dataset_factory(visibility_tier="public", keywords=["pub-kw"])
     dataset_factory(visibility_tier="vetted", keywords=["secret-kw"], languages=["Rumantsch"])
@@ -400,8 +389,10 @@ def _set_visibility_tier(sync_conn, dataset_ids, tier):
     """Change stored records' visibility tier without any application call,
     so nothing can publish a cache-invalidation signal along the way."""
     sync_conn.execute(
-        "UPDATE oral_history_datasets SET visibility_tier = %s WHERE id = ANY(%s)",
-        (tier, list(dataset_ids)),
+        "UPDATE oral_history_datasets SET visibility_tier = %s, "
+        "data = jsonb_set(COALESCE(data, '{}'::jsonb), '{visibility_tier}', to_jsonb(%s::text)) "
+        "WHERE id = ANY(%s)",
+        (tier, tier, list(dataset_ids)),
     )
     sync_conn.commit()
 
@@ -409,18 +400,7 @@ def _set_visibility_tier(sync_conn, dataset_ids, tier):
 def test_a_direct_tier_change_is_reflected_in_the_next_visitor_s_facets(
     e2e_client, dataset_factory, sync_conn
 ):
-    """A record's visibility tier can become stricter at any time — a later
-    harvest, a withdrawal, a corrected source assertion. The keyword and
-    language suggestions in the search sidebar are derived from the same
-    records, so a restriction that has landed in the database must not keep
-    being advertised to visitors below the new tier while some cached copy
-    lives out its lifetime.
-
-    Nothing here calls the application to announce the change, and Redis is
-    switched off in this environment, so there is no invalidation channel to
-    rescue a stale copy. The suggestions have to come from the same live,
-    tier-scoped query the results do.
-    """
+    """Verify a direct tier change is reflected in the next visitor s facets."""
     assert settings.redis_enabled is False, (
         "this test relies on there being no invalidation channel"
     )
@@ -455,9 +435,7 @@ def test_a_direct_tier_change_is_reflected_in_the_next_visitor_s_facets(
     assert "Sursilvan" in released.text
 
 
-# ---------------------------------------------------------------------------
 # Search — ILIKE wildcard escaping
-# ---------------------------------------------------------------------------
 
 
 def test_search_percent_is_literal_not_wildcard(e2e_client, dataset_factory):
@@ -470,7 +448,7 @@ def test_search_percent_is_literal_not_wildcard(e2e_client, dataset_factory):
     # httpx encodes the params dict, so the wire query is q=100%25.
     resp = e2e_client.get("/search", params={"q": "100%"})
     assert resp.status_code == 200
-    assert "1 dataset found" in resp.text
+    _assert_search_rows(resp, 1)
     assert "Zurich 100% oral" in resp.text
     assert "Zurich 100x oral" not in resp.text
 
@@ -484,52 +462,41 @@ def test_search_underscore_is_literal_not_wildcard(e2e_client, dataset_factory):
 
     resp = e2e_client.get("/search", params={"q": "100_"})
     assert resp.status_code == 200
-    assert "0 datasets found" in resp.text
+    _assert_search_rows(resp, 0)
     assert "Zurich 100" not in resp.text
 
 
 def test_search_backslash_is_a_literal(e2e_client, dataset_factory):
-    """The escaping does the backslash FIRST
-    (.replace('\\\\','\\\\\\\\')) so a query containing a backslash (e.g. a
-    Windows path 'C:\\data') matches the literal backslash rather than
-    corrupting the following escape sequence. Dropping the backslash escape
-    would make the ILIKE pattern's own escape char leak into match semantics.
-    A dataset whose title has a literal backslash matches; a sibling without
-    one does not."""
+    """Verify search backslash is a literal."""
     dataset_factory(title=r"Archive C:\data set")
     dataset_factory(title="Archive C data set")
 
     resp = e2e_client.get("/search", params={"q": r"C:\data"})
     assert resp.status_code == 200
-    assert "1 dataset found" in resp.text
+    _assert_search_rows(resp, 1)
     assert r"Archive C:\data set" in resp.text
     assert "Archive C data set" not in resp.text
 
 
-# ---------------------------------------------------------------------------
 # Search — empty-page fallback redirect
-# ---------------------------------------------------------------------------
 
 
-def test_search_past_last_page_redirects_to_last_page(e2e_client, dataset_factory):
-    """GET /search?page=99 with only one dataset (one page) 303-redirects to
-    the real last page instead of rendering an empty page (search_page's
-    empty-results + page>1 fallback recomputes the total and redirects)."""
+def test_search_past_last_page_restarts_at_page_one(e2e_client, dataset_factory):
+    """Empty numbered pages restart at page one without computing a total."""
     dataset_factory(title="Solo Dataset")
 
     resp = e2e_client.get("/search", params={"page": "99"}, follow_redirects=False)
     assert resp.status_code == 303
-    assert resp.headers["location"] == "/search?page=1"
+    assert resp.headers["location"] == "/search?page=1&pagination=empty"
 
     # Following the redirect lands on a populated page.
     followed = e2e_client.get("/search", params={"page": "99"})
     assert followed.status_code == 200
     assert "Solo Dataset" in followed.text
+    assert "That search page is empty. Showing page 1." in followed.text
 
 
-# ---------------------------------------------------------------------------
 # Cookie roundtrip — login, authenticated page, server-side logout
-# ---------------------------------------------------------------------------
 
 
 def test_login_account_logout_roundtrip(e2e_client, user_factory, sync_conn):
@@ -561,9 +528,44 @@ def test_login_account_logout_roundtrip(e2e_client, user_factory, sync_conn):
     assert bounced.headers["location"].startswith("/login")
 
 
-# ---------------------------------------------------------------------------
+def test_logout_retry_is_inert_and_an_old_form_cannot_revoke_a_new_login(
+    e2e_client, user_factory, sync_conn
+):
+    """Replay an actual logout form across anonymous and newly logged-in states."""
+    _login_with_totp(e2e_client, user_factory)
+    assert e2e_client.get("/account").status_code == 200
+    old_form = {"csrf_token": e2e_client.cookies[settings.csrf_cookie_name]}
+    first = e2e_client.post("/logout", data=old_form, follow_redirects=False)
+    assert first.status_code == 303
+    assert settings.session_cookie_name not in e2e_client.cookies
+    assert settings.csrf_cookie_name not in e2e_client.cookies
+    assert sync_conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
+
+    retry = e2e_client.post("/logout", data=old_form, follow_redirects=False)
+    assert retry.status_code == 303
+    assert retry.headers["location"] == "/"
+    assert retry.headers.get_list("set-cookie") == []
+    assert retry.headers["cache-control"] == "no-store"
+    assert sync_conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
+
+    new_user = _login_with_totp(e2e_client, user_factory)
+    assert e2e_client.get("/account").status_code == 200
+    assert e2e_client.cookies[settings.csrf_cookie_name] != old_form["csrf_token"]
+    before = dict(e2e_client.cookies)
+    # Apply a late anonymous response after the newer login's cookies arrive.
+    e2e_client.cookies.extract_cookies(retry)
+    assert dict(e2e_client.cookies) == before
+    rejected = e2e_client.post("/logout", data=old_form, follow_redirects=False)
+    assert rejected.status_code == 403
+    assert rejected.headers.get_list("set-cookie") == []
+    assert dict(e2e_client.cookies) == before
+    assert sync_conn.execute("SELECT user_id FROM sessions").fetchall() == [(new_user.id,)]
+    account = e2e_client.get("/account")
+    assert account.status_code == 200
+    assert new_user.email in account.text
+
+
 # (HTTP channel) — the leak as a visitor would see it
-# ---------------------------------------------------------------------------
 
 
 def test_home_recent_list_is_tier_redacted(e2e_client, user_factory, dataset_factory):
@@ -593,3 +595,195 @@ def test_home_recent_list_is_tier_redacted(e2e_client, user_factory, dataset_fac
     assert full.status_code == 200
     assert "SECRET-DESC" in full.text
     assert "secret-kw" in full.text
+
+
+def test_about_sources_follow_persisted_state_without_public_diagnostics(
+    replace_bound_catalogue_sources, e2e_client, sync_conn, monkeypatch
+):
+    """About renders configured sources and changes only the affected badge."""
+    sources = configure_sources(
+        (
+            OaiPmhCmdiConfig(
+                name="online_archive",
+                display=SourceDisplay(
+                    label="Recorded archive", sensitivity_badge="Public catalogue"
+                ),
+                endpoint="https://endpoint-canary.example.edu/oai",
+                institution_filter="Configured archive",
+            ),
+            FixtureConfig(
+                name="offline_archive",
+                display=SourceDisplay(label="Offline archive", sensitivity_badge="Mixed access"),
+            ),
+        )
+    )
+    replace_bound_catalogue_sources(monkeypatch, e2e_client.app, sources)
+    now = datetime.now(UTC)
+    for source in sources:
+        sync_conn.execute(
+            """INSERT INTO sync_status (source, last_harvest_date, last_full_rebuild_date)
+               VALUES (%s, %s, %s)""",
+            (source.name, now, now),
+        )
+    # Unselected stored identities do not belong in the public table.
+    sync_conn.execute(
+        "INSERT INTO sync_status (source, last_sync_error) VALUES (%s, %s)",
+        ("unselected_archive", "UNSELECTED-DIAGNOSTIC-CANARY"),
+    )
+    sync_conn.commit()
+
+    response = e2e_client.get("/about")
+    assert response.status_code == 200
+    rendered_pages = [response.text]
+    document = html.fromstring(response.text)
+    rows = document.xpath("//table[contains(@class, 'about-table')]/tbody/tr")
+    assert [row.xpath("string(td[1])").strip() for row in rows] == [
+        source.display.label for source in sources
+    ]
+    assert [row.xpath("string(td[2])").strip() for row in rows] == [
+        "Public catalogue",
+        "Mixed access",
+    ]
+    assert [row.xpath("string(td[3])").strip() for row in rows] == ["Active", "Active"]
+
+    sync_conn.execute(
+        "UPDATE sync_status SET last_rebuild_error = %s WHERE source = %s",
+        ("PRIVATE-UPSTREAM-DIAGNOSTIC-CANARY", sources[1].name),
+    )
+    sync_conn.commit()
+    response = e2e_client.get("/about")
+    assert response.status_code == 200
+    rendered_pages.append(response.text)
+    document = html.fromstring(response.text)
+    rows = document.xpath("//table[contains(@class, 'about-table')]/tbody/tr")
+    assert [row.xpath("string(td[3])").strip() for row in rows] == ["Active", "Needs attention"]
+
+    sync_conn.execute("DELETE FROM sync_status WHERE source = %s", (sources[1].name,))
+    sync_conn.commit()
+    response = e2e_client.get("/about")
+    assert response.status_code == 200
+    rendered_pages.append(response.text)
+    document = html.fromstring(response.text)
+    rows = document.xpath("//table[contains(@class, 'about-table')]/tbody/tr")
+    assert [row.xpath("string(td[3])").strip() for row in rows] == ["Active", "Awaiting sync"]
+
+    for canary in (
+        "endpoint-canary.example.edu",
+        "PRIVATE-UPSTREAM-DIAGNOSTIC-CANARY",
+        "UNSELECTED-DIAGNOSTIC-CANARY",
+        "unselected_archive",
+    ):
+        assert all(canary not in page for page in rendered_pages)
+
+
+def test_web_startup_loads_the_selected_source_file_without_harvesting(
+    tmp_path, monkeypatch, e2e_client_from_address, sync_conn
+):
+    """Real web startup reads the file and exposes its pending configured sources."""
+    path = tmp_path / "sources.toml"
+    path.write_text(
+        """[[sources]]
+name = "file_archive_one"
+adapter = "fixture"
+label = "First file archive"
+sensitivity_badge = "Synthetic examples"
+
+[[sources]]
+name = "file_archive_two"
+adapter = "fixture"
+label = "Second file archive"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings, "sources_config_file", str(path))
+    monkeypatch.setattr(settings, "allow_fixture_source", False)
+    with patch.object(FixtureAdapter, "fetch", autospec=True) as fetch:
+        client = e2e_client_from_address("127.0.0.51")
+        sources = client.app.state.configured_sources
+        assert tuple(source.name for source in sources) == (
+            "file_archive_one",
+            "file_archive_two",
+        )
+        response = client.get("/about")
+
+    assert response.status_code == 200
+    rows = html.fromstring(response.text).xpath("//table[@class='about-table']/tbody/tr")
+    assert [row.xpath("string(td[1])").strip() for row in rows] == [
+        "First file archive",
+        "Second file archive",
+    ]
+    assert [row.xpath("string(td[3])").strip() for row in rows] == [
+        "Awaiting sync",
+        "Awaiting sync",
+    ]
+    fetch.assert_not_called()
+    assert (
+        sync_conn.execute(
+            "SELECT source FROM sync_status WHERE source = ANY(%s::text[])",
+            ([source.name for source in sources],),
+        ).fetchall()
+        == []
+    )
+
+
+@pytest.mark.parametrize("viewer_tier", ["public", "registered", "vetted"])
+async def test_ingested_fixture_metadata_respects_the_viewer_tier(
+    db_pool, sync_conn, e2e_client_from_address, user_factory, monkeypatch, viewer_tier
+):
+    """Verify ingested fixture metadata respects the viewer tier."""
+    monkeypatch.setattr(settings, "env_state", "dev")
+    monkeypatch.setattr(
+        settings,
+        "sources_config_file",
+        str(PROJECT_ROOT / "deploy/environment/sources.dev.toml"),
+    )
+    monkeypatch.setattr(settings, "allow_fixture_source", False)
+    client = e2e_client_from_address("127.0.0.53")
+    sources = client.app.state.configured_sources
+    assert tuple(source.name for source in sources) == ("fixture_demo",)
+    assert not hasattr(sources[0], "adapter")
+    source = configure_sources(tuple(item.config for item in sources))[0]
+    assert isinstance(source.adapter, FixtureAdapter)
+    await ensure_source_status_rows(db_pool, (source.name,))
+    with patch(
+        FETCH, autospec=True, side_effect=AssertionError("Fixture ingestion used OAI")
+    ) as oai:
+        outcome = await sync_and_invalidate(db_pool, client.app.state.catalogue_stats_cache, source)
+    oai.assert_not_called()
+    assert (outcome.status, outcome.affected_count) == ("success", 3)
+    rows = sync_conn.execute(
+        "SELECT id, visibility_tier, title FROM oral_history_datasets "
+        "WHERE source = %s ORDER BY uuid",
+        (source.name,),
+    ).fetchall()
+    assert [row[1] for row in rows] == ["public", "registered", "vetted"]
+    if viewer_tier != "public":
+        _login_with_totp(client, user_factory, access_tier=viewer_tier)
+    ranks = {"public": 0, "registered": 1, "vetted": 2}
+    description = "Synthetic example; no real interview or participant."
+    for dataset_id, required_tier, title in rows:
+        permitted = ranks[viewer_tier] >= ranks[required_tier]
+        detail = client.get(f"/dataset/{dataset_id}")
+        assert detail.status_code == 200
+        document = html.fromstring(detail.text)
+        assert document.xpath("string(//h1)") == title
+        assert (description in detail.text) is permitted
+        keywords = document.xpath("//div[@class='card-topics']/a/text()")
+        assert sorted(keywords) == (sorted(["sample", required_tier]) if permitted else [])
+        resource_url = f"https://archive.example.org/resources/{required_tier}"
+        resource_path = f"/dataset/{dataset_id}/resource/0"
+        assert source.log_resource_access is True
+        assert (resource_path in document.xpath("//a/@href")) is permitted
+        assert resource_url not in detail.text
+
+        resource = client.get(resource_path, follow_redirects=False)
+        assert resource.status_code == (303 if permitted else 404)
+        if permitted:
+            assert resource.headers["location"] == resource_url
+        else:
+            assert "location" not in resource.headers
+
+        search = client.get("/search", params={"keyword": required_tier})
+        assert search.status_code == 200
+        _assert_search_rows(search, int(permitted))
+        assert (title in search.text) is permitted

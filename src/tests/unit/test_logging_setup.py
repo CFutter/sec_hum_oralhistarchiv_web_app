@@ -1,19 +1,4 @@
-"""Unit tests for `setup_logging` in src/config/logging.py: handler wiring,
-audit-logger levels and propagation, and text/JSON format selection.
-
-Pins, against src/config/logging.py:
-- the audit logger keeps its own INFO level and a dedicated handler with no
-  level filter, so raising the app LOG_LEVEL to WARNING cannot silently
-  discard audit events, and audit records never double-emit through root's
-  handlers;
-- `setup_logging(log_format=...)` wires the app handler to the requested
-  formatter (JSON or text) while the audit handler always gets `JSONFormatter`
-  regardless of the app's chosen format;
-- `AuditEmailAutoHash` is attached to the audit logger exactly once even
-  across repeated `setup_logging()` calls.
-
-No database is touched anywhere in this file.
-"""
+"""Logging handler wiring, audit levels and text/JSON formatter selection."""
 
 import json
 import logging
@@ -34,10 +19,12 @@ class _ListHandler(logging.Handler):
     """Minimal capture handler: appends every record that reaches it."""
 
     def __init__(self) -> None:
+        """Initialize the logging handler with an empty record buffer."""
         super().__init__()
         self.records: list[logging.LogRecord] = []
 
     def emit(self, record: logging.LogRecord) -> None:
+        """Append the record to the capture buffer."""
         self.records.append(record)
 
 
@@ -47,14 +34,7 @@ class TestAuditLoggerLevelAndHandlerIsolation:
 
     @pytest.mark.usefixtures("restore_logging")
     def test_audit_info_survives_app_log_level_raised_to_warning(self):
-        """With the app configured at WARNING, an INFO audit event must still
-        reach the audit logger's handlers.
-
-        With the audit logger's level left at NOTSET, its effective level
-        would inherit root's WARNING and the record would die BEFORE handler
-        dispatch — a silent compliance hole triggered by an ordinary
-        quiet-the-app move.
-        """
+        """Retain INFO audit events when application logging is WARNING."""
         setup_logging(log_level="WARNING", log_format="json")
 
         audit_logger = logging.getLogger("audit")
@@ -68,24 +48,18 @@ class TestAuditLoggerLevelAndHandlerIsolation:
         assert len(capture.records) == 1
         assert capture.records[0].event_type == "login_success"
 
-        # Both halves of the split: audit stays at INFO, the app side really is
-        # at WARNING (proving the test exercised the dangerous configuration).
         assert audit_logger.isEnabledFor(logging.INFO)
         assert logging.getLogger().level == logging.WARNING
 
     @pytest.mark.usefixtures("restore_logging")
     def test_audit_logger_has_dedicated_handler_and_no_propagation(self):
-        """setup_logging gives 'audit' its own handler (no LOG_LEVEL-derived
-        handler level) and propagate=False, so audit records neither
-        re-couple to root's level nor double-emit through root handlers."""
+        """Use a dedicated unfiltered audit handler without root propagation."""
         setup_logging(log_level="WARNING", log_format="json")
 
         audit_logger = logging.getLogger("audit")
         assert audit_logger.propagate is False
         assert audit_logger.level == logging.INFO
         assert len(audit_logger.handlers) == 1
-        # The dedicated handler must not filter by level (NOTSET = 0) and must
-        # carry the audit-channel redactor, not the app one.
         handler = audit_logger.handlers[0]
         assert handler.level == logging.NOTSET
         assert config_logging._audit_redactor in handler.filters
@@ -116,11 +90,7 @@ class TestFormatSelection:
 
     @pytest.mark.usefixtures("restore_logging")
     def test_audit_channel_stays_json_when_app_format_is_text(self, capsys):
-        """The audit handler always carries `JSONFormatter` (never the text
-        formatter), so an audit record logs as one JSON object with its extra
-        fields intact even when `setup_logging(log_format="text")` switches
-        the app channel to text — and a secret value placed in `extra` is
-        still never reproduced in the output."""
+        """Keep audit output JSON and redact secrets when application output is text."""
         setup_logging(log_format="text")
         logging.getLogger("audit").info(
             "admin_user_tier_changed",
@@ -148,9 +118,7 @@ class TestSetupIdempotency:
 
     @pytest.mark.usefixtures("restore_logging")
     def test_repeated_setup_logging_does_not_duplicate_audit_email_autohash(self):
-        """setup_logging registers the singleton on the audit LOGGER (so it
-        runs before every handler, including test-capture handlers), and
-        repeated setup_logging calls don't stack duplicate filters."""
+        """Attach the audit-email hashing filter exactly once across repeated setup."""
         setup_logging()
         setup_logging()
         hits = [f for f in logging.getLogger("audit").filters if isinstance(f, AuditEmailAutoHash)]

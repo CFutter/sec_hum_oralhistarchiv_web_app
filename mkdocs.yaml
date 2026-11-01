@@ -1,5 +1,9 @@
 site_name: Oral History Archive Documentation
 site_description: Developer, operator, and user documentation for the Digital Oral History Archive
+hooks:
+  - scripts/mkdocs_hooks.py
+watch:
+  - Deployment.md
 theme:
   name: material
   features:
@@ -26,24 +30,68 @@ theme:
 
 nav:
   - Home: index.md
+  - Status: project-status.md
   - User Guide:
       - Overview: user-guide/overview.md
       - Browsing & Searching: user-guide/browsing.md
       - Accounts & Access Tiers: user-guide/accounts.md
+  - Sources:
+      - Overview: sources/index.md
+      - Feed Contract v1: sources/feed-contract-v1.md
+      - JSON-feed configuration: sources/json-feed-configuration.md
+      - JSON-feed transport: sources/json-feed-transport.md
+      - JSON-feed pages: sources/json-feed-pages.md
+      - JSON-feed records: sources/json-feed-records.md
+      - JSON-feed adapter: sources/json-feed-adapter.md
+      - JSON-feed persistence: sources/json-feed-persistence.md
+      - JSON-feed acceptance: sources/json-feed-acceptance.md
+      - OAI Ingestion Limits: sources/oai-ingestion-limits.md
+      - Sensitive Source Contract: architecture/source-b-ingestion-contract.md
   - Architecture:
       - Overview: architecture/overview.md
       - Request Lifecycle: architecture/request-lifecycle.md
       - Data Model: architecture/data-model.md
       - Authentication & Sessions: architecture/auth.md
+      - Federated Tier Proposals: architecture/federated-tier-rules.md
       - Access Control & Visibility: architecture/access-control.md
-      - OAI-PMH Sync Pipeline: architecture/sync.md
+      - Field Visibility: architecture/field-visibility.md
+      - Resource Access & Audit: architecture/resource-access.md
+      - Source Ingestion Pipeline: architecture/sync.md
       - Security Layers: architecture/security.md
   - Configuration & Operations:
       - Settings Reference: configuration/settings.md
       - Deployment: configuration/deployment.md
+      - Deployment Runbook: Deployment.md
       - Laptop Staging: runbooks/local-staging.md
+      - Retained Staging Inventory: runbooks/retained-staging-inventory.md
+      - Retained Staging Record Template: runbooks/retained-staging-record-template.md
+      - External Dependencies & Decisions: runbooks/external-dependencies-and-decisions.md
+      - External Dependency Record Template: runbooks/external-dependencies-record-template.md
+      - Before-staging & PoC Handoff: runbooks/before-staging-handoff.md
+      - Staging Candidate Record Template: runbooks/staging-candidate-record-template.md
       - Logging & Audit: configuration/logging.md
       - Runbook — Key Rotation: runbooks/key-rotation.md
+      - Runbook — Search Policy: runbooks/search-policy.md
+      - Runbook — Initial Administrator: runbooks/bootstrap-admin.md
+      - Runbook — Mail and Account Recovery: runbooks/mail-recovery.md
+      - Runbook — Security Event Delivery: runbooks/security-event-delivery.md
+      - Runbook — Deployment Boundaries: runbooks/deployment-boundaries.md
+      - Runbook — Dependency Advisories: runbooks/dependency-advisories.md
+      - Runbook — Source Rebinding: runbooks/source-rebinding.md
+      - Runbook — Visibility & Recovery Acceptance: runbooks/visibility-recovery-acceptance.md
+      - Runbook — Federated Tier Acceptance: runbooks/federated-tier-acceptance.md
+      - Runbook — Federation Integration: runbooks/federation-integration.md
+      - Runbook — Account Deletion: runbooks/account-deletion.md
+      - Runbook — Action Links: runbooks/action-links.md
+      - Runbook — Monitoring: runbooks/monitoring.md
+      - Runbook — Point-in-Time Recovery: runbooks/point-in-time-recovery.md
+  - Compliance:
+      - Processing Register & Asset Inventory: compliance/processing-register.md
+      - DPIA Questionnaire: compliance/dpia-questionnaire.md
+      - DSAR Procedure: compliance/dsar-procedure.md
+      - Incident Response: compliance/incident-response.md
+      - Data Classification: compliance/data-classification.md
+      - Retention & DSAR Supplement: runbooks/retention-dsar-template.md
   - Code Reference:
       - Application Entry: reference/main.md
       - Route Security Contract: reference/route-security.md

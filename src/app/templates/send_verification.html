@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Resend verification — Oral History Archive{% endblock %}
+{% block title %}Resend verification — {{ site_name }}{% endblock %}
 
 {% block content %}
 <section class="container auth-page">
@@ -20,7 +20,7 @@
         <div class="form-group">
           <label for="email">Email</label>
           <input type="email" id="email" name="email" value="{{ email|default('') }}" required
-                 maxlength="200" autocomplete="email">
+                 maxlength="{{ local_email_max_chars }}" autocomplete="email">
         </div>
 
         <button type="submit" class="btn btn-primary">Send verification email</button>

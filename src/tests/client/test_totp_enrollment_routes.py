@@ -1,36 +1,4 @@
-"""TOTP enrollment routes (`GET`/`POST /setup-totp`) — the MFA-critical surface.
-
-POST /setup-totp verifies a TOTP code AND confirms one of the codes from the
-just-displayed recovery-code set in a single atomic call
-(`verify_and_enroll_totp`); a form missing either field is a 422 before the
-handler runs. Two of enrollment's security properties are pinned here:
-
-1. A pending secret is created or reused by one transaction-scoped service
-   operation, and verification reads the persisted value from the database —
-   never from the form. The success test posts a hostile `secret` form field
-   and pins that it is ignored.
-2. A wrong code persists nothing and upgrades nothing (no enrollment with an
-   unverified authenticator); the totp_setup session purpose is upgraded to
-   full exactly on success.
-
-Plus two route-policy interaction guards:
-- A `totp_setup` session (password-only login) can NOT execute a
-  full-session POST. Without this a dependency defect is a full MFA
-  bypass (password-only attacker changes the account email).
-- GET and POST /setup-totp use the exact TOTP-enrollment policy and remain
-  reachable during enrollment.
-
-A `totp_setup` session left behind after enrollment completes elsewhere (a
-race, or a browser tab reopened later) must terminate at a fresh login
-rather than bouncing between /account and /setup-totp, even if session
-revocation itself fails.
-
-The rotation flow (`/account/reset-totp[/confirm]`) is the sibling scenario
-class, in test_totp_rotation_routes.py; each module is named for the
-scenario it proves. All service calls are patched with autospec so arity
-drift fails loudly. The integration tier drives both flows against the real
-database.
-"""
+"""TOTP enrollment routes (`GET`/`POST /setup-totp`) — the MFA-critical surface."""
 
 import re
 from unittest.mock import patch
@@ -52,10 +20,12 @@ RECOVERY_CODE = "AAAAA-BBBBB-CCCCC-DDDDD"
 
 
 def _patch(name, **kw):
+    """Patch the route collaborator with its real signature."""
     return patch(f"app.routes.auth.totp.{name}", autospec=True, **kw)
 
 
 def _pending_ready(secret=SECRET):
+    """Build a ready pending-secret result from the supplied seed."""
     return PendingTotpResult(PendingTotpOutcome.READY, secret)
 
 
@@ -71,6 +41,7 @@ def _extract_new_secret(text: str) -> str:
 
 
 def _assert_auth_cookies_cleared(response):
+    """Require deletion headers for the authentication cookies."""
     set_cookie_headers = response.headers.get_list("set-cookie")
     for cookie_name in (settings.session_cookie_name, CSRF_COOKIE_NAME):
         assert any(
@@ -80,6 +51,7 @@ def _assert_auth_cookies_cleared(response):
 
 
 def _deleted_cookie_headers(response, name: str) -> list[str]:
+    """Select deletion headers for the named cookie."""
     return [
         header
         for header in response.headers.get_list("set-cookie")
@@ -88,6 +60,7 @@ def _deleted_cookie_headers(response, name: str) -> list[str]:
 
 
 def _post_setup(client, totp_code="123456", recovery_code_confirmation=RECOVERY_CODE, **extra):
+    """Submit the valid CSRF-protected form without following redirects."""
     data = {
         "totp_code": totp_code,
         "recovery_code_confirmation": recovery_code_confirmation,
@@ -95,11 +68,6 @@ def _post_setup(client, totp_code="123456", recovery_code_confirmation=RECOVERY_
         **extra,
     }
     return client.post("/setup-totp", data=data, follow_redirects=False)
-
-
-# ---------------------------------------------------------------------------
-# GET /setup-totp — enrollment page
-# ---------------------------------------------------------------------------
 
 
 class TestSetupTotpPage:
@@ -115,7 +83,7 @@ class TestSetupTotpPage:
             resp = totp_setup_client.get("/setup-totp", follow_redirects=False)
 
         assert resp.status_code == 200
-        assert _extract_new_secret(resp.text) == SECRET  # manual-entry secret rendered
+        assert _extract_new_secret(resp.text) == SECRET
         pending.assert_awaited_once_with(
             totp_setup_client.mock_pool,
             1,
@@ -136,7 +104,7 @@ class TestSetupTotpPage:
             resp = totp_setup_client.get("/setup-totp", follow_redirects=False)
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == "/login?error=totp_setup_completed"
+        assert resp.headers["location"] == "/login?notice=totp_setup_completed"
         pending.assert_awaited_once_with(
             totp_setup_client.mock_pool,
             1,
@@ -170,20 +138,12 @@ class TestSetupTotpPage:
             resp = client.get("/setup-totp", follow_redirects=False)
 
         assert resp.status_code == 200
-        assert user.email in resp.text  # verify_email_pending.html
+        assert user.email in resp.text
         pending.assert_not_awaited()
 
 
-# ---------------------------------------------------------------------------
-# A totp_setup session left behind after enrollment completes elsewhere must
-# terminate the gate loop at a fresh login, even if revocation itself fails.
-# ---------------------------------------------------------------------------
-
-
 class TestCompletedSetupSessionEscapesLoop:
-    """A ``totp_setup`` session whose account is already fully configured
-    (completed by another request, or simply stale) is sent to a fresh login
-    instead of bouncing forever between /account and /setup-totp."""
+    """Cover completed setup session escapes loop."""
 
     def test_setup_totp_page_invalidates_completed_restricted_session(self, client_builder):
         """A configured user left in a ``totp_setup`` session is sent to a
@@ -198,7 +158,7 @@ class TestCompletedSetupSessionEscapesLoop:
             resp = client.get("/setup-totp", follow_redirects=False)
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == "/login?error=totp_setup_completed"
+        assert resp.headers["location"] == "/login?notice=totp_setup_completed"
         pending.assert_not_awaited()
         delete.assert_awaited_once_with(client.mock_pool, RAW_SESSION_ID)
         _assert_auth_cookies_cleared(resp)
@@ -223,7 +183,7 @@ class TestCompletedSetupSessionEscapesLoop:
             second = client.get(first.headers["location"], follow_redirects=False)
 
         assert second.status_code == 303
-        assert second.headers["location"] == "/login?error=totp_setup_completed"
+        assert second.headers["location"] == "/login?notice=totp_setup_completed"
         delete.assert_awaited_once_with(client.mock_pool, RAW_SESSION_ID)
 
         for cookie_name in (settings.session_cookie_name, CSRF_COOKIE_NAME):
@@ -236,26 +196,20 @@ class TestCompletedSetupSessionEscapesLoop:
         final = client.get(second.headers["location"], follow_redirects=False)
 
         assert final.status_code == 200
-        assert "Authenticator setup is complete. Please sign in again." in final.text
-
-
-# ---------------------------------------------------------------------------
-# POST /setup-totp — enrollment verification
-# ---------------------------------------------------------------------------
+        assert (
+            "Authenticator setup is complete. Wait for a fresh code, then sign in again."
+            in final.text
+        )
 
 
 class TestSetupTotpSubmit:
     """POST /setup-totp verifies the code and a displayed recovery code in one
-    atomic call; only a fully-verified pair upgrades the session."""
+    atomic call; a fully verified pair requires a fresh login."""
 
-    def test_setup_totp_valid_code_persists_db_secret_and_upgrades_purpose(self, totp_setup_client):
-        """Successful atomic enrollment upgrades this session to full.
-
-        The submitted form cannot substitute a secret: the route passes only
-        the user ID, code and recovery-code confirmation to
-        verify_and_enroll_totp(), which reads the pending secret from the
-        database.
-        """
+    def test_setup_totp_success_clears_the_old_cookie_and_requires_fresh_login(
+        self, totp_setup_client
+    ):
+        """Successful atomic enrollment signs out the setup session."""
         with _patch(
             "verify_and_enroll_totp",
             return_value=TotpEnrollmentOutcome.ENROLLED,
@@ -263,7 +217,8 @@ class TestSetupTotpSubmit:
             resp = _post_setup(totp_setup_client, secret="EVILATTACKERSECRET")
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == "/account"
+        assert resp.headers["location"] == "/login?notice=totp_setup_completed"
+        assert any("Max-Age=0" in value for value in resp.headers.get_list("set-cookie"))
 
         enroll.assert_awaited_once_with(
             totp_setup_client.mock_pool,
@@ -375,7 +330,12 @@ class TestSetupTotpSubmit:
             resp = _post_setup(totp_setup_client)
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == "/login?error=totp_setup_completed"
+        expected_location = (
+            "/login?error=session_expired"
+            if outcome is TotpEnrollmentOutcome.SESSION_EXPIRED
+            else "/login?notice=totp_setup_completed"
+        )
+        assert resp.headers["location"] == expected_location
 
         enroll.assert_awaited_once_with(
             totp_setup_client.mock_pool,
@@ -388,17 +348,10 @@ class TestSetupTotpSubmit:
         _assert_auth_cookies_cleared(resp)
 
 
-# ---------------------------------------------------------------------------
-# The MFA-bypass guard: totp_setup sessions cannot reach full-session routes
-# ---------------------------------------------------------------------------
-
-
 class TestTotpSetupSessionFullSessionGuard:
-    """A ``totp_setup`` session (minted from password alone) must not be able
-    to reach any full-session route, GET or POST. If the router applied a
-    weaker access dependency, a password-only attacker could execute
-    /account/change-name (or worse, /account/change-email — whose only
-    re-auth is the password they already hold) — a full MFA bypass."""
+    """A ``totp_setup`` session (minted from password alone) must not be able to reach any full-session
+    route, GET or POST.
+    """
 
     def test_totp_setup_session_cannot_execute_state_changing_post(self, totp_setup_client):
         """A totp_setup session that POSTs a full-session mutation is 303'd to
@@ -414,22 +367,14 @@ class TestTotpSetupSessionFullSessionGuard:
             )
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == "/setup-totp"  # full-session policy
-        update.assert_not_awaited()  # …and never executed
+        assert resp.headers["location"] == "/setup-totp"
+        update.assert_not_awaited()
 
     def test_totp_setup_session_cannot_reach_account_page(self, totp_setup_client):
-        """The account route's full-session policy redirects a setup-purpose
-        session — this is the positive-control pair's rejection half; the
-        setup session's own destination page is exercised throughout
-        ``TestSetupTotpPage``."""
+        """Check TOTP setup session cannot reach account page (HTTP 303)."""
         resp = totp_setup_client.get("/account", follow_redirects=False)
         assert resp.status_code == 303
         assert resp.headers["location"] == "/setup-totp"
-
-
-# ---------------------------------------------------------------------------
-# GET /setup-totp — recovery-purpose sessions (`totp_recovery`)
-# ---------------------------------------------------------------------------
 
 
 def _recovery_client(client_builder, **user_overrides):
@@ -441,14 +386,10 @@ def _recovery_client(client_builder, **user_overrides):
 
 
 class TestSetupTotpRecoveryPurposeGet:
-    """A `totp_recovery` session (administrator-authorized recovery capability,
-    not a full login) reaches the same enrollment page, but every terminal
-    outcome routes through the recovery restart, not the setup restart —
-    ending at /recover-totp or a fresh /login, never at /account."""
+    """Cover setup TOTP recovery purpose GET."""
 
     def test_recovery_purpose_session_renders_the_same_enrollment_page(self, client_builder):
-        """Positive control: a healthy pending secret renders normally for a
-        recovery-purpose session, exactly as it does for a totp_setup one."""
+        """Check recovery purpose session renders the same enrollment page (HTTP 200)."""
         client = _recovery_client(client_builder)
         with _patch("get_or_create_pending_totp_secret", return_value=_pending_ready()) as pending:
             resp = client.get("/setup-totp", follow_redirects=False)
@@ -465,9 +406,7 @@ class TestSetupTotpRecoveryPurposeGet:
     def test_expired_recovery_session_is_sent_back_to_the_recovery_entry_point(
         self, client_builder
     ):
-        """An expired recovery session cannot restart at /login like a
-        stale totp_setup session would — it must return to /recover-totp,
-        since the account never had a completed login to resume."""
+        """Check expired recovery session is sent back to the recovery entry point (HTTP 303)."""
         client = _recovery_client(client_builder)
         with (
             _patch(
@@ -490,11 +429,6 @@ class TestSetupTotpRecoveryPurposeGet:
         _assert_auth_cookies_cleared(resp)
 
 
-# ---------------------------------------------------------------------------
-# GET /setup-totp — pending-secret outcomes untested by the happy path
-# ---------------------------------------------------------------------------
-
-
 class TestSetupTotpPendingOutcomeVariants:
     """Two typed pending-secret outcomes besides SESSION_EXPIRED and READY,
     each with its own destination."""
@@ -502,12 +436,7 @@ class TestSetupTotpPendingOutcomeVariants:
     def test_already_configured_outside_a_totp_setup_session_returns_to_account(
         self, client_builder
     ):
-        """A full-session user whose middleware snapshot still shows
-        totp_configured False (about to be corrected) discovers, through the
-        pending-secret service, that enrollment already completed elsewhere;
-        unlike the totp_setup-purpose race (redirected to a fresh login), a
-        full session simply returns to /account.
-        """
+        """Check already configured outside a TOTP setup session returns to account (HTTP 303)."""
         user = make_sample_user(totp_configured=False)
         client = client_builder(session_user=user, session_purpose="full")
         with _patch(
@@ -521,9 +450,7 @@ class TestSetupTotpPendingOutcomeVariants:
         pending.assert_awaited_once()
 
     def test_ineligible_pending_outcome_renders_branded_403(self, client_builder):
-        """The positive control for this outcome is any READY-outcome test in
-        TestSetupTotpPage: the same pending-secret call renders the
-        enrollment form instead of this branded 403."""
+        """Check ineligible pending outcome renders branded 403."""
         user = make_sample_user(totp_configured=False)
         client = client_builder(session_user=user, session_purpose="full")
         with _patch(
@@ -543,6 +470,7 @@ class TestSetupTotpPendingContractViolation:
     a QR code for `None`."""
 
     def test_ready_outcome_without_a_secret_fails_closed(self, client_builder):
+        """Check ready outcome without a secret fails closed (HTTP 500)."""
         user = make_sample_user(totp_configured=False)
         client = client_builder(session_user=user, session_purpose="full")
         with _patch(
@@ -554,21 +482,11 @@ class TestSetupTotpPendingContractViolation:
         assert resp.status_code == 500
 
 
-# ---------------------------------------------------------------------------
-# GET /setup-totp — best-effort session revocation with no derivable cookie
-# ---------------------------------------------------------------------------
-
-
 class TestSetupTotpBestEffortRevocation:
-    """The restart helpers re-derive the session id from the raw cookie
-    (rather than trusting request.state) so they can run even when
-    request.state was never populated; when no session id can be derived at
-    all, revocation is skipped rather than attempted with `None` — the
-    redirect and cookie clearing still happen."""
+    """Cover setup TOTP best effort revocation."""
 
-    def test_skips_revocation_when_no_session_id_is_derivable_from_the_cookie(
-        self, totp_setup_client
-    ):
+    def test_skips_revocation_when_no_session_id_was_resolved(self, totp_setup_client):
+        """Check skips revocation when no session ID was resolved (HTTP 303)."""
         with (
             _patch(
                 "get_or_create_pending_totp_secret",
@@ -576,7 +494,7 @@ class TestSetupTotpBestEffortRevocation:
             ),
             _patch("delete_session") as delete,
             patch(
-                "app.routes.auth.totp.get_session_id_from_cookie",
+                "app.routes.auth.totp.get_resolved_session_id",
                 autospec=True,
                 return_value=None,
             ),
@@ -584,17 +502,14 @@ class TestSetupTotpBestEffortRevocation:
             resp = totp_setup_client.get("/setup-totp", follow_redirects=False)
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == "/login?error=totp_setup_completed"
+        assert resp.headers["location"] == "/login?notice=totp_setup_completed"
         delete.assert_not_awaited()
         _assert_auth_cookies_cleared(resp)
 
     def test_positive_control_revokes_the_session_when_the_cookie_is_present(
         self, totp_setup_client
     ):
-        """Positive control: with the real cookie in place (every other test
-        in this module), the same race calls delete_session with the derived
-        id — pinned already by
-        TestSetupTotpPage.test_setup_totp_page_handles_already_configured_race."""
+        """Check positive control revokes the session when the cookie is present (HTTP 303)."""
         with (
             _patch(
                 "get_or_create_pending_totp_secret",
@@ -608,19 +523,11 @@ class TestSetupTotpBestEffortRevocation:
         delete.assert_awaited_once_with(totp_setup_client.mock_pool, RAW_SESSION_ID)
 
 
-# ---------------------------------------------------------------------------
-# POST /setup-totp — recovery-purpose sessions
-# ---------------------------------------------------------------------------
-
-
 class TestSetupTotpSubmitRecoveryPurpose:
-    """Every terminal outcome of a recovery-purpose submission routes through
-    the recovery restart (ending at /login or /recover-totp), never through
-    the totp_setup restart and never at /account."""
+    """Cover setup TOTP submit recovery purpose."""
 
     def test_recovered_outcome_redirects_to_login_and_clears_cookies(self, client_builder):
-        """Positive control for the rejections below: a verified code and
-        verified recovery code together complete recovery."""
+        """Check recovered outcome redirects to login and clears cookies (HTTP 303)."""
         client = _recovery_client(client_builder)
         with _patch(
             "verify_and_enroll_totp", return_value=TotpEnrollmentOutcome.RECOVERED
@@ -628,13 +535,14 @@ class TestSetupTotpSubmitRecoveryPurpose:
             resp = _post_setup(client)
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == "/login?error=totp_recovery_completed"
+        assert resp.headers["location"] == "/login?notice=totp_recovery_completed"
         _assert_auth_cookies_cleared(resp)
         enroll.assert_awaited_once_with(
             client.mock_pool, 1, "123456", RECOVERY_CODE, session_id=RAW_SESSION_ID
         )
 
     def test_session_expired_returns_to_the_recovery_entry_point(self, client_builder):
+        """Check session expired returns to the recovery entry point (HTTP 303)."""
         client = _recovery_client(client_builder)
         with (
             _patch(
@@ -650,10 +558,7 @@ class TestSetupTotpSubmitRecoveryPurpose:
         delete.assert_awaited_once_with(client.mock_pool, RAW_SESSION_ID)
 
     def test_already_configured_race_redirects_to_a_fresh_login(self, client_builder):
-        """Discovered mid-submission (another admin or the owner completed
-        recovery first): the recovery session is invalidated and treated as
-        completed, exactly like the totp_setup race — but through the
-        recovery restart's completed=True login destination."""
+        """Check already configured race redirects to a fresh login (HTTP 303)."""
         client = _recovery_client(client_builder)
         with (
             _patch(
@@ -665,10 +570,11 @@ class TestSetupTotpSubmitRecoveryPurpose:
             resp = _post_setup(client)
 
         assert resp.status_code == 303
-        assert resp.headers["location"] == "/login?error=totp_recovery_completed"
+        assert resp.headers["location"] == "/login?notice=totp_recovery_completed"
         delete.assert_awaited_once_with(client.mock_pool, RAW_SESSION_ID)
 
     def test_ineligible_account_returns_to_the_recovery_entry_point(self, client_builder):
+        """Check ineligible account returns to the recovery entry point (HTTP 303)."""
         client = _recovery_client(client_builder)
         with (
             _patch(
@@ -684,16 +590,8 @@ class TestSetupTotpSubmitRecoveryPurpose:
         delete.assert_awaited_once_with(client.mock_pool, RAW_SESSION_ID)
 
 
-# ---------------------------------------------------------------------------
-# POST /setup-totp — outcomes not reachable from a recovery or setup session
-# ---------------------------------------------------------------------------
-
-
 class TestSetupTotpSubmitAlreadyConfiguredFullSession:
-    """A full session (already past enrollment) that resubmits /setup-totp
-    and discovers ALREADY_CONFIGURED gets a plain error page — distinct from
-    both restricted-session restart destinations, since a full session is
-    not itself invalidated by this discovery."""
+    """Cover setup TOTP submit already configured full session."""
 
     def test_full_session_already_configured_renders_a_conflict_page(self, authenticated_client):
         """authenticated_client's default user already has TOTP configured
@@ -711,13 +609,12 @@ class TestSetupTotpSubmitAlreadyConfiguredFullSession:
 
 
 class TestSetupTotpSubmitInvalidCodeStaleSecondPending:
-    """If the pending secret expires between an invalid submission and the
-    re-render's own pending-secret lookup, the invalid-code branch cannot
-    display a secret it no longer has — it restarts enrollment instead."""
+    """Cover setup TOTP submit invalid code stale second pending."""
 
     def test_invalid_code_with_a_since_expired_pending_secret_restarts_enrollment(
         self, totp_setup_client
     ):
+        """Check invalid code with a since expired pending secret restarts enrollment (HTTP 303)."""
         with (
             _patch(
                 "verify_and_enroll_totp",
@@ -736,12 +633,10 @@ class TestSetupTotpSubmitInvalidCodeStaleSecondPending:
 
 
 class TestSetupTotpSubmitContractViolation:
-    """verify_and_enroll_totp's outcome is a closed enum the route maps
-    exhaustively; an outcome this route does not recognise fails loudly
-    instead of silently doing nothing, so a future outcome added to the enum
-    without a matching route branch cannot ship silently unhandled."""
+    """Cover setup TOTP submit contract violation."""
 
     def test_unrecognised_outcome_fails_closed(self, totp_setup_client):
+        """Check unrecognised outcome fails closed (HTTP 500)."""
         with _patch(
             "verify_and_enroll_totp",
             return_value=object(),

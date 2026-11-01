@@ -1,17 +1,4 @@
-"""Exact-session isolation of ``app.services.totp``'s rotation challenge.
-
-``begin_totp_rotation``/``confirm_totp_rotation`` bind a replacement
-authenticator seed to the exact session and authentication revision that
-proved possession of the current one (totp.py:603-938). These tests pin
-what a mocked cursor cannot: that a second live session of the same user can
-neither read nor confirm another session's challenge, that two sessions
-racing to start rotation serialize on the real user-row lock without ever
-leaving two challenge rows or leaking a seed across sessions, and that
-exhausting the confirmation budget never touches unrelated credential or
-session state. The integration conftest applies the application's Alembic
-migration and skips this module when the configured test database is
-unavailable.
-"""
+"""Exact-session isolation of ``app.services.totp``'s rotation challenge."""
 
 import asyncio
 import re
@@ -23,7 +10,6 @@ import pytest
 import time_machine
 
 from app.middleware.cookies import SESSION_SIGNER
-from app.services.crypto import decrypt_value, encrypt_value
 from app.services.session_ids import hash_session_id
 from app.services.totp import (
     PendingTotpPurpose,
@@ -35,6 +21,7 @@ from app.services.totp import (
     matched_step,
     verify_and_consume_totp,
 )
+from app.services.totp_crypto import decrypt_value, encrypt_value
 from config import settings
 from tests.integration.conftest import TEST_DATABASE_URL, install_active_recovery_codes
 
@@ -44,6 +31,7 @@ _NEW_SECRET_RE = re.compile(r'class="totp-key">([A-Z2-7]+)<')
 
 
 def _pending_rotation(sync_conn, user_id: int):
+    """Read the pending rotation fields as a dictionary, or None if absent."""
     row = sync_conn.execute(
         """
         SELECT session_id, encrypted_secret, auth_revision, confirmation_attempt_count
@@ -63,6 +51,7 @@ def _pending_rotation(sync_conn, user_id: int):
 
 
 def _pending_rotation_count(sync_conn, user_id: int) -> int:
+    """Count pending rotation rows for the user."""
     return sync_conn.execute(
         "SELECT COUNT(*) FROM pending_totp_rotations WHERE user_id = %s",
         (user_id,),
@@ -70,6 +59,7 @@ def _pending_rotation_count(sync_conn, user_id: int) -> int:
 
 
 def _credential_snapshot(sync_conn, user_id: int):
+    """Read credentials, authentication revision and login-lock state for comparison."""
     return sync_conn.execute(
         """
         SELECT totp_secret, auth_revision, failed_login_count, locked_until
@@ -81,6 +71,7 @@ def _credential_snapshot(sync_conn, user_id: int):
 
 
 def _session_state(sync_conn, raw_session_id: str):
+    """Read the presented session's purpose and unexpired state."""
     return sync_conn.execute(
         "SELECT purpose, expires_at > clock_timestamp() FROM sessions WHERE id = %s",
         (hash_session_id(raw_session_id),),
@@ -88,6 +79,7 @@ def _session_state(sync_conn, raw_session_id: str):
 
 
 def _recovery_code_summary(sync_conn, user_id: int):
+    """Read recovery-code generation, position, usage and attempt counts in code order."""
     return sync_conn.execute(
         """
         SELECT generation, position, used_at, password_attempt_count
@@ -100,6 +92,7 @@ def _recovery_code_summary(sync_conn, user_id: int):
 
 
 def _csrf_after_get(client, path):
+    """Require a successful GET and return its response with the CSRF cookie."""
     resp = client.get(path)
     assert resp.status_code == 200, resp.text
     return client.cookies.get("csrf_token"), resp
@@ -116,6 +109,7 @@ class TestRotationRequiresAFreshCurrentProof:
     async def test_an_invalid_or_replayed_proof_creates_no_challenge(
         self, db_pool, user_factory, session_factory, sync_conn, proof
     ):
+        """Verify an invalid or replayed proof creates no challenge."""
         secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(secret))
         raw_session = session_factory(user.id, purpose="full")
@@ -165,6 +159,7 @@ class TestRotationChallengeSessionIsolation:
     async def test_a_different_session_cannot_confirm_or_rebind_the_challenge(
         self, db_pool, user_factory, session_factory, sync_conn
     ):
+        """Verify a different session cannot confirm or rebind the challenge."""
         secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(secret))
         session_a = session_factory(user.id, purpose="full")
@@ -200,6 +195,7 @@ class TestRotationSecretDisclosure:
     def test_another_sessions_page_never_shows_the_replacement_seed(
         self, e2e_client, user_factory, session_factory
     ):
+        """Verify another sessions page never shows the replacement seed."""
         secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(secret))
         session_a = session_factory(user.id, purpose="full")
@@ -264,15 +260,7 @@ class TestConcurrentRotationStarts:
     async def test_concurrent_starts_never_leave_two_challenges_or_cross_disclose(
         self, user_factory, session_factory, sync_conn
     ):
-        """Both proofs are frozen at a fixed instant, so whichever of the two
-        genuinely concurrent, independently-connected starts the real
-        ``users`` row lock admits first always succeeds (its prior consumed
-        step is unset); the other either also succeeds, because its own
-        proof is a later step than the winner's, or is correctly rejected as
-        a replay of an already-consumed step. Either way the ON CONFLICT
-        (user_id) upsert leaves exactly one challenge row, and neither
-        response ever discloses the other session's seed.
-        """
+        """Verify concurrent starts never leave two challenges or cross disclose."""
         frozen = datetime.now(UTC)
         with time_machine.travel(frozen, tick=False):
             secret = pyotp.random_base32()
@@ -284,9 +272,12 @@ class TestConcurrentRotationStarts:
             code_b = pyotp.TOTP(secret).at(frozen + timedelta(seconds=30))
 
             async def start(session_id, code):
+                """Begin rotation on an independent database connection with the supplied session
+                and code.
+                """
                 async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn:
                     return await begin_totp_rotation(
-                        conn,  # type: ignore[arg-type] - supported direct-connection path
+                        conn,
                         user.id,
                         user.password,
                         code,
@@ -332,6 +323,7 @@ class TestRotationConfirmationExhaustionIsolation:
     async def test_exhaustion_leaves_every_unrelated_state_untouched(
         self, db_pool, user_factory, session_factory, sync_conn, monkeypatch
     ):
+        """Verify exhaustion leaves every unrelated state untouched."""
         monkeypatch.setattr(settings, "totp_rotation_confirmation_attempt_limit", 1)
         old_secret = pyotp.random_base32()
         user = user_factory(
@@ -391,6 +383,7 @@ class TestConcurrentConfirmations:
     async def test_concurrent_invalid_confirmations_never_lose_an_increment(
         self, user_factory, session_factory, sync_conn, monkeypatch
     ):
+        """Verify concurrent invalid confirmations never lose an increment."""
         limit = 3
         monkeypatch.setattr(settings, "totp_rotation_confirmation_attempt_limit", limit)
         old_secret = pyotp.random_base32()
@@ -399,7 +392,7 @@ class TestConcurrentConfirmations:
 
         async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as setup_conn:
             begun = await begin_totp_rotation(
-                setup_conn,  # type: ignore[arg-type] - supported direct-connection path
+                setup_conn,
                 user.id,
                 user.password,
                 pyotp.TOTP(old_secret).now(),
@@ -411,10 +404,11 @@ class TestConcurrentConfirmations:
         barrier = asyncio.Barrier(caller_count)
 
         async def confirm_invalid_on_independent_connection():
+            """Submit an invalid rotation code on an independent connection after the barrier."""
             async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn:
                 await barrier.wait()
                 return await confirm_totp_rotation(
-                    conn,  # type: ignore[arg-type] - supported direct-connection path
+                    conn,
                     user.id,
                     "not-a-code",
                     session_id=raw_session,
@@ -439,6 +433,7 @@ class TestConcurrentConfirmations:
     async def test_a_valid_confirmation_racing_the_exhausting_one_never_yields_both(
         self, user_factory, session_factory, sync_conn, monkeypatch
     ):
+        """Verify a valid confirmation racing the exhausting one never yields both."""
         monkeypatch.setattr(settings, "totp_rotation_confirmation_attempt_limit", 1)
         old_secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(old_secret))
@@ -446,7 +441,7 @@ class TestConcurrentConfirmations:
 
         async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as setup_conn:
             begun = await begin_totp_rotation(
-                setup_conn,  # type: ignore[arg-type] - supported direct-connection path
+                setup_conn,
                 user.id,
                 user.password,
                 pyotp.TOTP(old_secret).now(),
@@ -458,10 +453,11 @@ class TestConcurrentConfirmations:
         barrier = asyncio.Barrier(2)
 
         async def submit(code):
+            """Submit the supplied rotation code on an independent connection after the barrier."""
             async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn:
                 await barrier.wait()
                 return await confirm_totp_rotation(
-                    conn,  # type: ignore[arg-type] - supported direct-connection path
+                    conn,
                     user.id,
                     code,
                     session_id=raw_session,

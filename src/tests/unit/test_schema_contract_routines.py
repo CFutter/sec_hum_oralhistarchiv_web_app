@@ -1,16 +1,5 @@
-"""Unit tests for the function/trigger half of the PostgreSQL schema contract
-and the top-level validator that ties every contract check together.
-
-`app.services.db_schema_contract` declares, per application table, the exact
-non-internal triggers PostgreSQL must have, plus a small set of managed
-functions shared across tables. `app.services.db_drift` converts live
-`pg_proc`/`pg_trigger` catalog rows into the same dataclasses and compares
-them for exact equality. This module also covers `validate_schema_against_db`,
-the entry point that runs every per-table column/constraint/index/trigger
-check plus the function check, and requires the four table-keyed contract
-maps to agree on which tables exist. These tests exercise catalog-row
-conversion and contract comparison without a database; PostgreSQL catalog
-behavior itself is covered by the integration companion module.
+"""Unit tests for the function/trigger half of the PostgreSQL schema contract and the top-level
+validator that ties every contract check together.
 """
 
 from contextlib import asynccontextmanager
@@ -23,12 +12,16 @@ from psycopg.rows import tuple_row
 
 from app.services import db_drift
 from app.services.db_schema_contract import (
+    FUNCTION_CONTRACTS,
     ColumnSpec,
     ConstraintSpec,
     FunctionSpec,
     IndexKeySpec,
     IndexSpec,
+    PolicySpec,
+    RowSecuritySpec,
     TriggerSpec,
+    ViewSpec,
 )
 
 _POOL = object()
@@ -109,6 +102,7 @@ def _install_catalog_rows(monkeypatch, rows):
 
     @asynccontextmanager
     async def _cursor_context(pool, *, row_factory):
+        """Yield the scripted cursor after checking the database boundary."""
         assert pool is _POOL
         assert row_factory is tuple_row
         yield cursor
@@ -122,6 +116,7 @@ class TestFunctionCatalogConversion:
     """`_get_function_specs` converts `pg_proc` rows for managed functions."""
 
     async def test_function_catalog_row_is_converted_exactly(self, monkeypatch):
+        """Check function catalog row is converted exactly."""
         row = (
             "probe_trigger",
             "",
@@ -148,7 +143,34 @@ class TestFunctionCatalogConversion:
         assert "function_record.prokind = 'f'" in query
         assert params == (["probe_trigger"],)
 
+    async def test_named_catalogue_arguments_match_the_declared_contract_key(self, monkeypatch):
+        # PostgreSQL includes declared argument names in identity arguments.
+        # A type-only mapping key would make startup reject the fresh schema.
+        """Check named catalogue arguments match the declared contract key."""
+        arguments = (
+            "p_anchor integer, p_ceiling integer, p_backward boolean, "
+            "p_limit integer, p_offset integer, p_query jsonb"
+        )
+        signature = f"catalogue_page_ids({arguments})"
+        expected = FUNCTION_CONTRACTS[signature]
+        row = (
+            "catalogue_page_ids",
+            arguments,
+            "SETOF integer",
+            "plpgsql",
+            "s",
+            True,
+            False,
+            "u",
+            ["search_path=pg_catalog, public"],
+            expected.source,
+        )
+        _install_catalog_rows(monkeypatch, [row])
+        actual = await db_drift._get_function_specs(_POOL, {"catalogue_page_ids"})
+        assert actual == {signature: expected}
+
     async def test_function_catalog_rejects_wrong_row_shape(self, monkeypatch):
+        """Check function catalog rejects wrong row shape (RuntimeError)."""
         _install_catalog_rows(monkeypatch, [("too", "short")])
 
         with pytest.raises(RuntimeError, match="expected 10 values"):
@@ -172,6 +194,7 @@ class TestFunctionCatalogConversion:
         parallel,
         message,
     ):
+        """Check function catalog rejects unknown mode codes (RuntimeError)."""
         row = (
             "probe_trigger",
             "",
@@ -193,6 +216,7 @@ class TestFunctionCatalogConversion:
             )
 
     async def test_function_catalog_returns_empty_without_managed_names(self, monkeypatch):
+        """Check function catalog returns empty without managed names."""
         get_cursor = create_autospec(db_drift.get_db_cursor, spec_set=True)
         monkeypatch.setattr(db_drift, "get_db_cursor", get_cursor)
 
@@ -204,6 +228,7 @@ class TestFunctionContract:
     """`assert_function_contract` verifies exact managed-function shape."""
 
     async def test_function_check_accepts_exact_contract(self, monkeypatch):
+        """Check function check accepts exact contract."""
         get_specs = _mock_get_function_specs(monkeypatch, dict(_FUNCTION_CONTRACT))
 
         await db_drift.assert_function_contract(
@@ -214,6 +239,7 @@ class TestFunctionContract:
         get_specs.assert_awaited_once_with(_POOL, {"probe_trigger"})
 
     async def test_function_check_rejects_invalid_contract_signature(self, monkeypatch):
+        """Check function check rejects invalid contract signature (RuntimeError)."""
         get_specs = _mock_get_function_specs(monkeypatch, None)
 
         with pytest.raises(RuntimeError, match="Invalid function-contract signature"):
@@ -225,6 +251,7 @@ class TestFunctionContract:
         get_specs.assert_not_called()
 
     async def test_function_check_rejects_missing_function(self, monkeypatch):
+        """Check function check rejects missing function (RuntimeError)."""
         _mock_get_function_specs(monkeypatch, {})
 
         with pytest.raises(RuntimeError, match=r"missing functions.*probe_trigger\(\)"):
@@ -234,6 +261,7 @@ class TestFunctionContract:
             )
 
     async def test_function_check_rejects_unexpected_overload(self, monkeypatch):
+        """Check function check rejects unexpected overload (RuntimeError)."""
         actual = {
             **_FUNCTION_CONTRACT,
             "probe_trigger(integer)": replace(
@@ -253,6 +281,7 @@ class TestFunctionContract:
             )
 
     async def test_function_check_allows_explicit_transitional_overload(self, monkeypatch):
+        """Check function check allows explicit transitional overload."""
         actual = {
             **_FUNCTION_CONTRACT,
             "probe_trigger(integer)": replace(
@@ -298,6 +327,7 @@ class TestFunctionContract:
         monkeypatch,
         actual_function,
     ):
+        """Check function check rejects structural drift (RuntimeError)."""
         _mock_get_function_specs(monkeypatch, {"probe_trigger()": actual_function})
 
         with pytest.raises(RuntimeError, match=r"function 'probe_trigger\(\)'"):
@@ -311,6 +341,7 @@ class TestTriggerCatalogConversion:
     """`_get_table_trigger_specs` converts `pg_trigger` rows exactly."""
 
     async def test_trigger_catalog_row_is_converted_exactly(self, monkeypatch):
+        """Check trigger catalog row is converted exactly."""
         row = (
             "probe_trigger",
             "O",
@@ -335,6 +366,7 @@ class TestTriggerCatalogConversion:
         assert params == ("probe",)
 
     async def test_trigger_catalog_rejects_wrong_row_shape(self, monkeypatch):
+        """Check trigger catalog rejects wrong row shape (RuntimeError)."""
         _install_catalog_rows(monkeypatch, [("too", "short")])
 
         with pytest.raises(RuntimeError, match="expected 7 values"):
@@ -344,6 +376,7 @@ class TestTriggerCatalogConversion:
             )
 
     async def test_trigger_catalog_rejects_unknown_enabled_mode(self, monkeypatch):
+        """Check trigger catalog rejects unknown enabled mode (RuntimeError)."""
         row = (
             "probe_trigger",
             "?",
@@ -366,6 +399,7 @@ class TestTriggerContract:
     """`assert_table_trigger_contract` verifies exact non-internal trigger shape."""
 
     async def test_trigger_check_accepts_exact_contract(self, monkeypatch):
+        """Check trigger check accepts exact contract."""
         get_specs = _mock_get_table_trigger_specs(monkeypatch, dict(_TRIGGER_CONTRACT))
 
         await db_drift.assert_table_trigger_contract(
@@ -377,6 +411,7 @@ class TestTriggerContract:
         get_specs.assert_awaited_once_with(_POOL, "probe")
 
     async def test_trigger_check_rejects_missing_trigger(self, monkeypatch):
+        """Check trigger check rejects missing trigger (RuntimeError)."""
         _mock_get_table_trigger_specs(monkeypatch, {})
 
         with pytest.raises(RuntimeError, match=r"missing triggers.*probe_trigger"):
@@ -387,6 +422,7 @@ class TestTriggerContract:
             )
 
     async def test_trigger_check_rejects_unexpected_trigger(self, monkeypatch):
+        """Check trigger check rejects unexpected trigger (RuntimeError)."""
         actual = {
             **_TRIGGER_CONTRACT,
             "legacy_trigger": _TRIGGER,
@@ -401,6 +437,7 @@ class TestTriggerContract:
             )
 
     async def test_trigger_check_allows_explicit_transitional_trigger(self, monkeypatch):
+        """Check trigger check allows explicit transitional trigger."""
         actual = {
             **_TRIGGER_CONTRACT,
             "legacy_trigger": _TRIGGER,
@@ -438,6 +475,7 @@ class TestTriggerContract:
         monkeypatch,
         actual_trigger,
     ):
+        """Check trigger check rejects structural drift (RuntimeError)."""
         _mock_get_table_trigger_specs(monkeypatch, {"probe_trigger": actual_trigger})
 
         with pytest.raises(RuntimeError, match=r"trigger 'probe_trigger'"):
@@ -449,9 +487,10 @@ class TestTriggerContract:
 
 
 class TestFullValidatorWiring:
-    """`validate_schema_against_db` runs every per-table and function check."""
+    """`validate_schema_against_db` runs every table, view and function check."""
 
     async def test_validate_schema_runs_all_contract_checks(self, monkeypatch):
+        """Check validate schema runs all contract checks."""
         column_contracts = {
             "probe": _COLUMN_CONTRACT,
             "probe_two": _COLUMN_CONTRACT,
@@ -467,6 +506,25 @@ class TestFullValidatorWiring:
         trigger_contracts = {
             "probe": _TRIGGER_CONTRACT,
             "probe_two": {},
+        }
+        row_security_contracts = {
+            "probe": RowSecuritySpec(enabled=True, forced=False),
+            "probe_two": RowSecuritySpec(enabled=False, forced=False),
+        }
+        policy_contracts = {
+            "probe": {
+                "probe_read": PolicySpec(
+                    command="r", permissive=True, roles=("PUBLIC",), using="true", with_check=None
+                )
+            },
+            "probe_two": {},
+        }
+        view_contracts = {
+            "probe_view": ViewSpec(
+                columns=(("id", "integer"),),
+                definition="SELECT id FROM public.probe;",
+                options=("security_barrier=true", "security_invoker=false"),
+            )
         }
 
         monkeypatch.setattr(
@@ -494,6 +552,9 @@ class TestFullValidatorWiring:
             "FUNCTION_CONTRACTS",
             _FUNCTION_CONTRACT,
         )
+        monkeypatch.setattr(db_drift, "TABLE_ROW_SECURITY_CONTRACTS", row_security_contracts)
+        monkeypatch.setattr(db_drift, "TABLE_POLICY_CONTRACTS", policy_contracts)
+        monkeypatch.setattr(db_drift, "VIEW_CONTRACTS", view_contracts)
 
         check_columns = create_autospec(
             db_drift.assert_table_column_contract,
@@ -510,6 +571,8 @@ class TestFullValidatorWiring:
         check_functions = create_autospec(
             db_drift.assert_function_contract,
         )
+        check_row_security = create_autospec(db_drift.assert_table_row_security_contract)
+        check_views = create_autospec(db_drift.assert_view_contract)
 
         monkeypatch.setattr(
             db_drift,
@@ -536,6 +599,8 @@ class TestFullValidatorWiring:
             "assert_function_contract",
             check_functions,
         )
+        monkeypatch.setattr(db_drift, "assert_table_row_security_contract", check_row_security)
+        monkeypatch.setattr(db_drift, "assert_view_contract", check_views)
 
         await db_drift.validate_schema_against_db(_POOL)
 
@@ -557,6 +622,11 @@ class TestFullValidatorWiring:
             call(_POOL, "probe", _TRIGGER_CONTRACT),
             call(_POOL, "probe_two", {}),
         ]
+        assert check_row_security.await_args_list == [
+            call(_POOL, name, row_security_contracts[name], policy_contracts[name])
+            for name in ("probe", "probe_two")
+        ]
+        check_views.assert_awaited_once_with(_POOL, "probe_view", view_contracts["probe_view"])
         check_functions.assert_awaited_once_with(
             _POOL,
             _FUNCTION_CONTRACT,
@@ -564,17 +634,20 @@ class TestFullValidatorWiring:
 
     @pytest.mark.parametrize(
         "missing_map",
-        ["columns", "constraints", "indexes", "triggers"],
+        ["columns", "constraints", "indexes", "triggers", "row_security", "policies"],
     )
     async def test_validate_schema_rejects_mismatched_table_sets(
         self,
         monkeypatch,
         missing_map,
     ):
+        """Check validate schema rejects mismatched table sets (RuntimeError)."""
         column_contracts = {"probe": _COLUMN_CONTRACT}
         constraint_contracts = {"probe": _CONSTRAINT_CONTRACT}
         index_contracts = {"probe": _INDEX_CONTRACT}
         trigger_contracts = {"probe": _TRIGGER_CONTRACT}
+        row_security_contracts = {"probe": RowSecuritySpec(enabled=True, forced=False)}
+        policy_contracts: dict[str, dict[str, PolicySpec]] = {"probe": {}}
 
         if missing_map == "columns":
             column_contracts = {}
@@ -582,8 +655,12 @@ class TestFullValidatorWiring:
             constraint_contracts = {}
         elif missing_map == "indexes":
             index_contracts = {}
-        else:
+        elif missing_map == "triggers":
             trigger_contracts = {}
+        elif missing_map == "row_security":
+            row_security_contracts = {}
+        else:
+            policy_contracts = {}
 
         monkeypatch.setattr(
             db_drift,
@@ -605,6 +682,8 @@ class TestFullValidatorWiring:
             "TRIGGER_CONTRACTS",
             trigger_contracts,
         )
+        monkeypatch.setattr(db_drift, "TABLE_ROW_SECURITY_CONTRACTS", row_security_contracts)
+        monkeypatch.setattr(db_drift, "TABLE_POLICY_CONTRACTS", policy_contracts)
 
         with pytest.raises(RuntimeError, match="table sets do not match"):
             await db_drift.validate_schema_against_db(_POOL)

@@ -14,7 +14,7 @@ from cryptography.fernet import InvalidToken
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from app.services.crypto import _fernet_instance  # MultiFernet over [new, old]
+from app.services import rotate_totp_value
 from app.services.db import create_pool, get_db_cursor
 from app.services.totp_maintenance import (
     DEFAULT_BATCH_SIZE,
@@ -49,7 +49,7 @@ async def main(batch_size: int = DEFAULT_BATCH_SIZE) -> int:
                         if ct is None:
                             continue
                         try:
-                            rotated = _fernet_instance.rotate(ct.encode()).decode()
+                            rotated = rotate_totp_value(ct)
                         except InvalidToken:
                             skipped += 1
                             print(
@@ -79,7 +79,7 @@ async def main(batch_size: int = DEFAULT_BATCH_SIZE) -> int:
                 for row in rows:
                     ct = row["encrypted_secret"]
                     try:
-                        rotated = _fernet_instance.rotate(ct.encode()).decode()
+                        rotated = rotate_totp_value(ct)
                     except InvalidToken:
                         skipped += 1
                         print(f"  user {row['user_id']}: rotation challenge (undecryptable)")

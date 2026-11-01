@@ -1,27 +1,10 @@
-"""`.env.example` <-> `Settings` model bijection, and the dev-mode default.
-
-A `Settings` field added without documenting it in `.env.example` leaves
-operators with no discoverable record that the knob exists (for example a
-prod-mandatory field like RATE_LIMIT_TRUST_PROXY). A stale or typo'd key left
-in the example (for example a removed field like the historical CACHE_PATH)
-is silently swallowed by `extra="ignore"` at startup, so anyone who copies the
-example gets that key silently dropped.
-
-The example file is parsed with EXACTLY the same rules as the startup guard
-`config.settings.warn_unconsumed_env_keys` (skip blank/comment/no-'=' lines,
-strip an 'export ' prefix, uppercase the key), so the test and the runtime
-check cannot drift apart on what counts as a "documented" key.
-
-The last class covers the other half of the environment contract: leaving
-ENV_STATE unset is the ordinary way to run the application in development, so
-the setting keeps its `dev` default, and it is the production systemd units —
-not the application default — that refuse to start on that same absence.
-
-Pure unit tests: no DB, no app, no async.
-"""
+"""Settings examples and explicit process-environment selection contracts."""
 
 import logging
+import os
 from pathlib import Path
+
+import pytest
 
 from app.paths import PROJECT_ROOT
 from config.settings import Settings, warn_unconsumed_env_keys
@@ -34,23 +17,16 @@ from tests.unit.systemd_units import (
 
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 
-# Settings fields deliberately NOT documented in .env.example.
-#
-# This allowlist is the design element that makes these tests fail only on
-# REAL drift: adding a Settings field forces a conscious choice — document it
-# in .env.example, or exempt it HERE with an inline comment explaining WHY it
-# is intentionally undocumented (e.g. an OS-environment-only field that must
-# never live in a .env file). Never add a key here without a reason.
-_INTENTIONALLY_UNDOCUMENTED: set[str] = set()
+# Every omitted example key needs an explicit reason here to keep coverage deliberate.
+_INTENTIONALLY_UNDOCUMENTED: set[str] = {
+    # Retained solely to reject legacy service inputs and redact accidental values.
+    "ADMIN_SEED_EMAIL",
+    "ADMIN_SEED_PASSWORD",
+}
 
 
 def _parse_documented_keys(env_file: Path) -> set[str]:
-    """Parse an env file exactly like warn_unconsumed_env_keys does.
-
-    Mirrors config.settings.warn_unconsumed_env_keys line by line: skip
-    blank lines, comments, and lines without '='; take the text before the
-    first '='; strip a leading 'export '; uppercase.
-    """
+    """Extract uppercased env assignment keys, ignoring blanks/comments and stripping optional export."""
     declared: set[str] = set()
     for line_raw in env_file.read_text().splitlines():
         line = line_raw.strip()
@@ -64,11 +40,7 @@ def _parse_documented_keys(env_file: Path) -> set[str]:
 
 
 def _known_settings_keys() -> set[str]:
-    """Uppercased Settings field names plus any explicit field aliases.
-
-    Same "known" set warn_unconsumed_env_keys builds from
-    Settings.model_fields — the single source of truth for both directions.
-    """
+    """Collect uppercased Settings field names and explicit aliases."""
     known: set[str] = set()
     for name, field in Settings.model_fields.items():
         known.add(name.upper())
@@ -105,22 +77,16 @@ class TestEnvExampleBijection:
         )
 
     def test_warn_unconsumed_env_keys_flags_bogus_keys(self, tmp_path, monkeypatch, caplog):
-        """The startup guard warns for each unconsumed .env key.
-
-        The temp .env exercises every parse rule the two set-comparison tests
-        rely on — blank lines, comments, a no-'=' line, an 'export ' prefix —
-        so this test also fails if the runtime parser and _parse_documented_keys
-        ever diverge. Also pins the difflib "did you mean" typo hint.
-        """
+        """The startup guard warns for each unconsumed .env key."""
         env_file = tmp_path / ".env"
         env_file.write_text(
             "# a comment line — must be skipped\n"
             "\n"
             "THIS_LINE_HAS_NO_EQUALS_SIGN\n"
-            "export SESSION_SECRET=abc\n"  # consumed (real field) — no warning
-            "DATABASE_URL=postgresql://x:y@localhost/db\n"  # consumed — no warning
-            "CACHE_PATH=/tmp/cache\n"  # dead key — must warn
-            "RATE_LIMIT_ENABELD=true\n"  # typo of RATE_LIMIT_ENABLED — must warn + hint
+            "export SESSION_SECRET=abc\n"
+            "DATABASE_URL=postgresql://x:y@localhost/db\n"
+            "CACHE_PATH=/tmp/cache\n"
+            "RATE_LIMIT_ENABELD=true\n"
         )
         # warn_unconsumed_env_keys reads the env-file path from model_config;
         # monkeypatch.setitem restores the original entry after the test.
@@ -130,7 +96,6 @@ class TestEnvExampleBijection:
             warn_unconsumed_env_keys()
 
         records = [r for r in caplog.records if r.name == "config.settings"]
-        # logger.warning("Unconsumed .env key: %s%s", key, hint) -> args[0] is the key.
         warned_keys = {r.args[0] for r in records}
         assert warned_keys == {"CACHE_PATH", "RATE_LIMIT_ENABELD"}, (
             "Expected warnings for exactly the two unconsumed keys "
@@ -142,28 +107,34 @@ class TestEnvExampleBijection:
         )
 
 
-class TestUnsetEnvironmentModeStaysDevelopment:
-    """Development is the mode you get by doing nothing; production is the
-    mode you have to ask for."""
+class TestEnvExampleValues:
+    """The canonical example constructs development Settings on its own."""
 
-    def test_an_invocation_without_an_environment_mode_runs_in_development(self, monkeypatch):
-        """A developer who never sets ENV_STATE gets `dev` — the relaxed
-        settings, the local `.env`, and no production-only requirements."""
+    def test_example_loads_without_shell_overrides(self, monkeypatch):
+        """Check example loads without shell overrides."""
+        known = _known_settings_keys()
+        for name in tuple(os.environ):
+            if name.upper() in known:
+                monkeypatch.delenv(name)
+
+        monkeypatch.setenv("ENV_STATE", "dev")
+        configured = Settings(_env_file=ENV_EXAMPLE)
+
+        assert configured.env_state == "dev"
+        assert configured.shibboleth_enabled is False
+
+
+class TestEnvironmentSelectionIsExplicit:
+    """All launchers require an exact OS mode before application configuration."""
+
+    def test_missing_process_mode_is_rejected(self, monkeypatch):
+        """Check missing process mode is rejected (ValueError)."""
         monkeypatch.delenv("ENV_STATE", raising=False)
-        kwargs = base_kwargs()
-        del kwargs["env_state"]
-
-        settings = Settings(_env_file=None, **kwargs)
-
-        assert settings.env_state == "dev"
-        assert settings.is_production is False
-        assert settings.is_hardened is False
+        with pytest.raises(ValueError, match="uppercase ENV_STATE"):
+            Settings(_env_file=None, **base_kwargs())
 
     def test_the_production_service_refuses_that_same_absence(self):
-        """The production unit must not inherit the development default: with
-        no ENV_STATE in its environment files it refuses to start, so a
-        forgotten variable cannot quietly run the live deployment under
-        development security policy."""
+        """Check the production service refuses that same absence."""
         environment_files = environment_file_paths(WEB_SERVICE)
 
         assert start_guards_accept(WEB_SERVICE, {}) is False

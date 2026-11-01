@@ -1,15 +1,4 @@
-"""Integration tests: the login-lockout contract observed through the real
-/login route over `e2e_client` — status codes, messages, cookies, audit
-events, session issuance/revocation, and the per-route rate-limit budget.
-
-The service-level contract (verify_password's PasswordCheck, record_login_
-failure's threshold/transition behaviour) is covered in
-`test_login_lockout_db.py`. The safe-redirect-target (`?next=`) contract is
-covered in `test_login_redirect_target_routes_db.py`.
-
-/login POST is rate-limited 5/minute in the test env; no test here issues
-more than 4 login POSTs.
-"""
+"""PostgreSQL integration checks for login lockout routes."""
 
 import html
 import logging
@@ -23,8 +12,8 @@ import time_machine
 
 from app.middleware.cookies import SESSION_SIGNER
 from app.middleware.csrf import _compute_csrf_token
-from app.services.crypto import encrypt_value
 from app.services.session_ids import hash_session_id
+from app.services.totp_crypto import encrypt_value
 from config import settings
 from tests.fixtures import sign_session_id
 from tests.integration.conftest import DEFAULT_PASSWORD, do_login
@@ -63,10 +52,12 @@ def _wrong_totp_code(secret, instant=_FIXED_TOTP_INSTANT):
 
 
 def _audit_records(caplog, event):
+    """Select the requested audit event from captured log records."""
     return [rec for rec in caplog.records if rec.name == "audit" and rec.getMessage() == event]
 
 
 def _login_form_action(page: str) -> str:
+    """Extract and HTML-unescape the required authentication-form action."""
     m = re.search(r'<form class="auth-form"\s+action="([^"]+)"', page)
     assert m, "login form not found in page"
     return html.unescape(m.group(1))  # undo Jinja attribute-escaping (e.g. &amp;)
@@ -154,23 +145,7 @@ class TestLoginCredentialAndTotpBranching:
     def test_unverified_email_blocked_after_credential_check(
         self, e2e_client, user_factory, sync_conn
     ):
-        """Unverified local account with the CORRECT password -> 401 with the
-        'verify your email' message, and pre-existing failures are NOT
-        cleared — clear_login_failures runs only on a fully COMPLETED login,
-        so the clear sits BELOW the unverified block (pins the route's
-        ordering in the direction the code chose; a reordering that clears
-        on proven credentials turns this red).
-
-        The wrong-password leg (POSITIVE CONTROL for the ordering) pins that
-        the block really sits AFTER the credential check: without the
-        correct password the response is the uniform generic error, never
-        the 'verify your email' message — otherwise unverified-account
-        status would leak to anyone probing an email address (user
-        enumeration).
-
-        Seeds count=1 (not 2): the wrong-password leg increments to 2, which
-        must stay below LOGIN_FAILURE_THRESHOLD=3 in the test env, or the
-        correct-password leg would hit the locked branch instead."""
+        """Verify unverified email blocked after credential check."""
         u = user_factory(email_verified=False)
         sync_conn.execute("UPDATE users SET failed_login_count = 1 WHERE id = %s", (u.id,))
         sync_conn.commit()
@@ -197,13 +172,7 @@ class TestLoginCredentialAndTotpBranching:
         assert row is None
 
     def test_undecryptable_totp_secret_fails_closed(self, e2e_client, user_factory, sync_conn):
-        """login.py catches TotpDecryptionError and returns 401 fail-closed.
-        A 'fix' that mapped the failure to totp_secret=None would fall into
-        the no-TOTP branch and mint a totp_setup session from the PASSWORD
-        ALONE — an attacker with just the password could re-enroll. Pins
-        that the correct password on a user whose secret is un-decryptable
-        (key-rotation accident) yields 401 AND no session row of ANY
-        purpose."""
+        """Verify undecryptable TOTP secret fails closed."""
         u = user_factory(totp_secret="garbage-not-a-fernet-token")
 
         resp = do_login(e2e_client, u.email, DEFAULT_PASSWORD, totp_code="123456")
@@ -261,11 +230,7 @@ class TestSuccessfulLoginEffects:
         assert rec.request_id
 
     def test_successful_login_updates_last_login(self, e2e_client, user_factory, sync_conn):
-        """login.py awaits update_last_login on every success. Dropping this
-        await yields only a RuntimeWarning while every login test still
-        passes and last_login silently stops updating (corrupting the admin
-        UI and the reaper). Pin the EFFECT: NULL before, a recent timestamp
-        after."""
+        """Verify successful login updates last login."""
         secret = pyotp.random_base32()
         u = user_factory(totp_secret=encrypt_value(secret))
         sync_conn.execute("UPDATE users SET last_login = NULL WHERE id = %s", (u.id,))
@@ -310,12 +275,7 @@ class TestLockoutEnforcementThroughTheRoute:
     def test_lockout_after_threshold_and_blocked_audit(
         self, e2e_client, user_factory, sync_conn, caplog
     ):
-        """3 wrong-password logins set users.locked_until; audit
-        'account_locked' fires exactly once (the just_locked flag on the 3rd
-        failure only); the 4th attempt WITH THE CORRECT password is still
-        401 and audits 'login_blocked_locked' whose locked_until field is a
-        valid isoformat string (the .isoformat() crash guard). 4 login POSTs
-        total — under the 5/minute route limit."""
+        """Verify lockout after threshold and blocked audit."""
         u = user_factory()
 
         with caplog.at_level(logging.INFO, logger="audit"):
@@ -366,11 +326,7 @@ class TestLockoutEnforcementThroughTheRoute:
     def test_locked_account_attempts_do_not_extend_the_lock(
         self, e2e_client, user_factory, sync_conn
     ):
-        """The route returns on locked_until BEFORE calling
-        record_login_failure, so an attacker hammering a locked account
-        cannot keep pushing the unlock time out (a permanent victim-lockout
-        DoS). Pins that a 4th attempt while locked leaves
-        failed_login_count AND locked_until UNCHANGED."""
+        """Verify locked account attempts do not extend the lock."""
         u = user_factory()
         for _ in range(3):
             assert do_login(e2e_client, u.email, "wrong-password").status_code == 401
@@ -391,14 +347,7 @@ class TestLockoutEnforcementThroughTheRoute:
     def test_after_an_expired_lock_wrong_passwords_count_from_one_again(
         self, e2e_client, user_factory, sync_conn, caplog
     ):
-        """An account whose old streak ran past the threshold and whose lock
-        has since expired gets a complete new budget: the first wrong
-        password counts as one and leaves the account usable, and the account
-        is locked again only once the new streak reaches the threshold —
-        announced by exactly one 'account_locked' audit event. Anything less
-        would let one guess per lockout window keep the owner locked out for
-        as long as the attacker cares to continue. Three login POSTs, under
-        the route's 5/minute limit."""
+        """Verify after an expired lock wrong passwords count from one again."""
         threshold = settings.login_failure_threshold  # 3 in the test env
         u = user_factory(
             failed_login_count=threshold + 2,
@@ -516,15 +465,7 @@ class TestSessionRevocationOnLogin:
     """Session issuance/revocation around re-login and failed attempts."""
 
     def test_relogin_revokes_previous_session(self, e2e_client, user_factory, sync_conn):
-        """Logging in again while carrying session S1's cookie issues a new
-        session S2 AND deletes S1 (session-fixation guard) — the old cookie
-        no longer authenticates.
-
-        Uses a TOTP-configured user so both sessions have purpose ``full``. A
-        ``totp_setup`` session is rejected by the login route's
-        public-or-full dependency. The second login uses the next
-        time-step's code because ``verify_and_consume_totp`` consumes the
-        step (anti-replay)."""
+        """Verify relogin revokes previous session."""
         secret = pyotp.random_base32()
         u = user_factory(totp_secret=encrypt_value(secret))
         totp = pyotp.TOTP(secret)
@@ -597,11 +538,7 @@ class TestSessionRevocationOnLogin:
     def test_failed_login_does_not_revoke_presented_session(
         self, e2e_client, user_factory, session_factory, sync_conn
     ):
-        """The logout-DoS guard's counterpart: POSTing garbage credentials
-        while carrying a victim's valid session cookie returns 401 and the
-        presented session is STILL valid — revocation is gated on SUCCESS,
-        so an attacker can't log a victim out by replaying their cookie with
-        bad creds."""
+        """Verify failed login does not revoke presented session."""
         secret = pyotp.random_base32()
         u = user_factory(totp_secret=encrypt_value(secret))
         raw_s1 = session_factory(u.id, purpose="full")
@@ -636,12 +573,7 @@ class TestLoginRedirectTarget:
     through a hand-crafted POST where it needs to stay independent of it."""
 
     def test_safe_next_param_is_honoured_through_the_form(self, e2e_client, user_factory):
-        """A safe relative ?next= is honoured after a full (TOTP) login,
-        driven through the REAL form action. Hand-crafting the POST URL
-        bypasses login.html's action attribute. The GET-rendered action must
-        itself carry the next param, and POSTing credentials to that
-        extracted action must land on /account. POSITIVE CONTROL for the
-        evil-URL fallback siblings below."""
+        """Verify safe next param is honoured through the form."""
         secret = pyotp.random_base32()
         u = user_factory(totp_secret=encrypt_value(secret))
 
@@ -665,11 +597,7 @@ class TestLoginRedirectTarget:
         assert resp.headers["location"] == "/account"
 
     def test_offsite_next_param_falls_back_to_root_through_the_form(self, e2e_client, user_factory):
-        """An absolute off-site ?next= is rejected by safe_redirect_url even
-        when the POST is driven through the REAL form action — the redirect
-        falls back to '/', never the attacker's URL. This exercises the
-        open-redirect guard through the template seam, not just the route
-        contract (the direct-POST sibling below pins that half)."""
+        """Verify offsite next param falls back to root through the form."""
         secret = pyotp.random_base32()
         u = user_factory(totp_secret=encrypt_value(secret))
         evil = "https://evil.example.com/phish"
@@ -694,12 +622,7 @@ class TestLoginRedirectTarget:
         assert "evil.example.com" not in resp.headers["location"]
 
     def test_offsite_next_param_falls_back_to_root_on_direct_post(self, e2e_client, user_factory):
-        """ROUTE-level contract pin, independent of the template — a
-        hand-crafted POST /login?next=<absolute off-site URL> still falls
-        back to '/' (safe_redirect_url composed at the redirect site). The
-        form-driven twin above pins the template seam; this one stays red
-        even if login.html's form action changes shape. If a refactor read
-        request.query_params['next'] directly, this would leak."""
+        """Verify offsite next param falls back to root on direct post."""
         secret = pyotp.random_base32()
         u = user_factory(totp_secret=encrypt_value(secret))
         evil = "https://evil.example.com/phish"
@@ -720,12 +643,7 @@ class TestLoginRedirectTarget:
         assert "evil.example.com" not in resp.headers["location"]
 
     def test_next_param_survives_a_failed_attempt(self, e2e_client, user_factory):
-        """The 401 error re-render must keep carrying ?next= in its form
-        action — a template that rebuilt the action without the query would
-        silently strand users at '/' after they correct a typo'd password.
-        Wrong password to the GET-extracted action (401), re-extract from
-        the ERROR page, then correct credentials to THAT action → lands on
-        /account. 2 login POSTs — under the 5/minute route limit."""
+        """Verify next param survives a failed attempt."""
         secret = pyotp.random_base32()
         u = user_factory(totp_secret=encrypt_value(secret))
 
@@ -765,11 +683,7 @@ class TestLoginRedirectTarget:
     def test_next_param_with_its_own_query_string_round_trips_exactly(
         self, e2e_client, user_factory
     ):
-        """A next target with its OWN query string (/search?q=a&b) survives
-        the encode-into-the-form / decode-on-POST round trip exactly once.
-        Double-encoding (%2526… in the action) or an un-encoded '&' splitting
-        the action's query would corrupt the target — the final location
-        must equal the original value verbatim."""
+        """Verify next param with its own query string round trips exactly."""
         secret = pyotp.random_base32()
         u = user_factory(totp_secret=encrypt_value(secret))
         target = "/search?q=a&b"

@@ -1,22 +1,10 @@
-"""Integration tests for app.services.sessions against real PostgreSQL.
-
-Covers session id hashing independent of the app's own hasher, the
-expired-session cleanup job, the get_session_user JOIN semantics (expiry +
-users.is_active gate), session purpose lifecycle, the flash set/consume
-exactly-once contract, and flash surviving a redirect end-to-end through the
-real middleware (consume-before-call_next ordering).
-
-Revocation cascades that also touch pending account capabilities (email
-change, password reset, incident-response revoke-all) live in
-test_session_revocation_db.py.
-"""
+"""Integration tests for app.services.sessions against real PostgreSQL."""
 
 import hashlib
 
 import pyotp
 import pytest
 
-from app.services.crypto import encrypt_value
 from app.services.session_revocation import delete_user_sessions
 from app.services.sessions import (
     cleanup_expired_sessions,
@@ -26,6 +14,7 @@ from app.services.sessions import (
     restore_flash_if_empty,
     set_flash,
 )
+from app.services.totp_crypto import encrypt_value
 from tests.integration.conftest import DEFAULT_PASSWORD, do_login
 
 
@@ -34,12 +23,7 @@ class TestSessionIdStorage:
     independently of the app's own hasher."""
 
     async def test_session_id_stored_as_sha256_never_raw(self, db_pool, user_factory, sync_conn):
-        """Every session row is built and queried THROUGH hash_session_id, so
-        a downgrade to identity (or a weak/truncated digest) would pass
-        everything while the sessions table became a pile of directly usable
-        login cookies. This recomputes the expected digest with hashlib
-        directly — the same independent-pin pattern test_tokens.py uses for
-        email-token hashes."""
+        """Verify session ID stored as sha256 never raw."""
         u = user_factory()
         raw = await create_session(db_pool, u.id, "127.0.0.1", purpose="full")
 
@@ -56,6 +40,7 @@ class TestCleanupExpiredSessions:
     async def test_deletes_only_expired_and_returns_count(
         self, db_pool, user_factory, session_factory, sync_conn
     ):
+        """Verify deletes only expired and returns count."""
         user = user_factory()
         session_factory(user.id, expires_in_seconds=-10)
         session_factory(user.id, expires_in_seconds=-10)
@@ -73,6 +58,7 @@ class TestCleanupExpiredSessions:
     async def test_second_run_with_nothing_left_returns_zero(
         self, db_pool, user_factory, session_factory
     ):
+        """Verify second run with nothing left returns zero."""
         user = user_factory()
         session_factory(user.id, expires_in_seconds=-10)
 
@@ -196,6 +182,7 @@ class TestFlashLifecycle:
     async def test_restore_flash_if_empty_restores_consumed_message(
         self, db_pool, user_factory, session_factory
     ):
+        """Verify restore flash if empty restores consumed message."""
         user = user_factory()
         raw = session_factory(user.id, flash=("Saved earlier.", "success"))
 
@@ -210,6 +197,7 @@ class TestFlashLifecycle:
     async def test_restore_flash_if_empty_preserves_newer_message(
         self, db_pool, user_factory, session_factory
     ):
+        """Verify restore flash if empty preserves newer message."""
         user = user_factory()
         raw = session_factory(user.id, flash=("Saved earlier.", "success"))
 
@@ -223,6 +211,7 @@ class TestFlashLifecycle:
         assert await consume_flash(db_pool, raw) == ("New operation succeeded.", "info")
 
     async def test_restore_flash_if_empty_tolerates_deleted_session(self, db_pool):
+        """Verify restore flash if empty tolerates deleted session."""
         assert (
             await restore_flash_if_empty(
                 db_pool,
@@ -271,6 +260,7 @@ class TestDeleteUserSessions:
     """delete_user_sessions scopes force-logout-everywhere to one user."""
 
     async def test_only_removes_target_users_rows(self, db_pool, user_factory, session_factory):
+        """Verify only removes target users rows."""
         target = user_factory()
         other = user_factory()
         t1 = session_factory(target.id)

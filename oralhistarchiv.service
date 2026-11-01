@@ -29,6 +29,7 @@ StartLimitBurst=5
 # services to oralhistarchiv-proxy.
 User=oralhistarchiv
 Group=oralhistarchiv-proxy
+SupplementaryGroups=oralhistarchiv-deploy-lock
 UMask=0077
 
 # /opt/oralhistarchiv is a root-managed symlink created by install_release.py.
@@ -54,7 +55,7 @@ EnvironmentFile=/etc/oralhistarchiv/common.env
 EnvironmentFile=/etc/oralhistarchiv/web.env
 EnvironmentFile=-/etc/oralhistarchiv/shibboleth.env
 ExecStartPre=/usr/bin/test ${ENV_STATE} = production
-ExecStart=/usr/bin/flock --shared --no-fork /run/lock/oralhistarchiv-deploy.lock /opt/oralhistarchiv/.venv/bin/python -I -m gunicorn -c /opt/oralhistarchiv/gunicorn.conf.py app.main:app
+ExecStart=/usr/bin/flock --shared --timeout 60 --conflict-exit-code 75 --no-fork /run/lock/oralhistarchiv-deploy.lock /opt/oralhistarchiv/.venv/bin/python -I -m gunicorn -c /opt/oralhistarchiv/gunicorn.conf.py app.main:app
 
 Restart=on-failure
 RestartSec=5

@@ -1,25 +1,21 @@
-"""Structured audit logging helpers for security-relevant events.
+"""Log account events and persist dataset restriction changes.
 
-The application has an audit log channel separate from the regular
-application log. This module provides two helpers that emit structured
-records to that channel:
-
-  - audit_user_event:  events about the acting user's own account
-                       (login, password reset, TOTP change, etc.)
-  - audit_admin_action: events about an admin acting on another user's
-                       account (tier change, deactivation, etc.)
-
-Both helpers ensure events carry consistent fields (event_type,
-request_id, IP, timestamps via the log formatter) so downstream
-SIEM/analytics queries can filter and group reliably.
+Local events use the audit logger; dataset changes can also be appended to
+the mutation transaction for delivery by audit_outbox.
 """
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Request
 
 from ..request_utils import get_client_ip
+from .audit_outbox import append_security_event_cur
+
+if TYPE_CHECKING:
+    from psycopg import AsyncCursor
+
+    from .dataset_admin import DatasetAdminChange, DatasetAdminContext
 
 audit_logger = logging.getLogger("audit")
 
@@ -32,24 +28,11 @@ def audit_user_event(
     exc_info: bool = False,
     **fields: Any,
 ) -> None:
-    """Record an audit event for an action a user performs on their own account.
+    """Log an account event with request IP and optional request ID.
 
-    Examples:
-        login_success, login_failed, password_reset_requested,
-        totp_configured, email_verified.
-
-    Args:
-        level: The log level the event should be logged as.
-        request: The current request, used for IP and request_id.
-        event_type: A stable, machine-readable event name (snake_case).
-            Used by SIEM rules to filter; never change for an
-            existing event without a migration plan.
-        user_id: The user being acted on. May be None for failed events
-            where the email didn't match a registered user.
-        exc_info: If True, appends the active exception context (error type,
-            message, and full traceback) to the log output. Defaults to False.
-        **fields: Additional structured fields specific to this event
-            (e.g., reason="wrong_password", failed_count=3).
+    user_id may be None for an unidentified actor. fields override the default
+    extra fields; logging-reserved keys raise KeyError. exc_info passes the
+    active exception to the configured formatter.
     """
     audit_logger.log(
         level,
@@ -74,27 +57,14 @@ def audit_admin_action(
     exc_info: bool = False,
     **fields: Any,
 ) -> None:
-    """Record an audit event for an admin action on another user's account.
+    """Log an administrator event using request.state.user as the actor.
 
-    Examples: admin_user_active_changed, admin_user_tier_changed,
-    admin_user_admin_changed.
-
-    Args:
-        level: The level, the event should be loged as.
-        request: The current request — request.state.user must be the
-                 acting admin.
-        event_type: A stable event name (snake_case, prefixed admin_).
-        target_user_id: The user whose account was modified. Distinct
-                        from request.state.user.id, which is the admin.
-        exc_info: Defaults to False, if set to True, exception information
-                  can be added to the logging message.
-        **fields: Additional structured fields, typically including
-                  old_value and new_value for the modified attribute.
+    The user attribute must exist; None logs a critical missing-actor event
+    instead. fields override default extra fields; logging-reserved keys raise
+    KeyError. exc_info passes the active exception to the configured formatter.
     """
     admin = request.state.user
     if admin is None:
-        # Shouldn't happen — admin routes are gated by require_admin.
-        # If it does, log a critical-level event for investigation.
         audit_logger.critical(
             "admin_action_no_actor",
             stacklevel=2,
@@ -122,3 +92,49 @@ def audit_admin_action(
             **fields,
         },
     )
+
+
+def _dataset_admin_event(
+    change: "DatasetAdminChange", context: "DatasetAdminContext"
+) -> tuple[str, dict[str, object]]:
+    """Return the action event name and identity/restriction payload without logging."""
+    event_type = {
+        "raise_tier": "admin_dataset_tier_raised",
+        "hide": "admin_dataset_hidden",
+        "restore": "admin_dataset_restored",
+    }[change.action]
+    states: dict[str, object] = {}
+    for name, state in (("before", change.before), ("after", change.after)):
+        states[name] = {
+            "stored_tier": state.stored_tier,
+            "admin_tier": state.admin_tier,
+            "effective_tier": state.effective_tier,
+            "hidden_at": state.hidden_at.isoformat() if state.hidden_at is not None else None,
+        }
+    return event_type, {
+        "actor_admin_id": context.actor_id,
+        "dataset_id": change.dataset_id,
+        "dataset_source": change.source,
+        "dataset_uuid": change.uuid,
+        "request_id": context.request_id,
+        "client_ip": context.client_ip,
+        **states,
+    }
+
+
+async def append_dataset_admin_action_cur(
+    cur: "AsyncCursor[Any]", change: "DatasetAdminChange", context: "DatasetAdminContext"
+) -> None:
+    """Append one restriction change with the owning mutation transaction."""
+    if change.changed:
+        event_type, fields = _dataset_admin_event(change, context)
+        await append_security_event_cur(cur, event_type, fields)
+
+
+def audit_dataset_admin_action(
+    change: "DatasetAdminChange", context: "DatasetAdminContext"
+) -> None:
+    """Emit an optional local copy of one already committed restriction change."""
+    if change.changed:
+        event_type, fields = _dataset_admin_event(change, context)
+        audit_logger.info(event_type, stacklevel=2, extra={"event_type": event_type, **fields})

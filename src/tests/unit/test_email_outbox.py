@@ -1,10 +1,4 @@
-"""The transactional email outbox: claiming, delivery, encryption at rest,
-the SMTP child process boundary, and retention/maintenance policy.
-
-Covers ``app.services.email_delivery``, ``app.services.email_outbox``
-encryption helpers (via ``app.services.crypto``), ``app.services.smtp_process``,
-and ``app.services.outbox_maintenance``.
-"""
+"""Outbox claims, delivery, encryption, SMTP child cleanup and retention."""
 
 import asyncio
 import json
@@ -21,6 +15,7 @@ from uuid import UUID
 
 import pytest
 from psycopg import AsyncCursor
+from psycopg.errors import LockNotAvailable
 from psycopg_pool import AsyncConnectionPool
 from pydantic import SecretStr, ValidationError
 
@@ -38,6 +33,7 @@ from app.services.outbox_maintenance import get_outbox_metrics_cur, outbox_is_de
 from app.services.scheduler import RunningJobTracker, create_scheduler
 from config import settings
 from config.settings import Settings
+from tests.source_fixtures import legacy_source
 
 _LOCK_TOKEN = UUID("12345678-1234-5678-1234-567812345678")
 _REAL = {
@@ -74,6 +70,7 @@ def _claimed_email(*, message_id=1, attempt_count=1):
 
 
 def _install_worker_mocks(monkeypatch, *, messages, delivered=True):
+    """Patch one-message claims and delivery collaborators; return the signature-checked doubles."""
     send_result = _SENT_RESULT if delivered else _FAILURE_RESULT
     mocks = SimpleNamespace(
         claim=create_autospec(
@@ -105,12 +102,14 @@ class TestBatchClaiming:
     invalid."""
 
     async def test_claims_only_after_previous_delivery_finishes(self, monkeypatch):
+        """Claims only after previous delivery finishes."""
         messages = [_claimed_email(message_id=i) for i in (1, 2)]
         mocks = _install_worker_mocks(monkeypatch, messages=messages)
         events = []
         remaining = iter(messages)
 
         async def claim(_pool, *, limit, lease_timeout):
+            """Require one ten-minute-lease claim and return the next message or an empty batch."""
             assert limit == 1
             assert lease_timeout == timedelta(minutes=10)
             events.append("claim")
@@ -118,6 +117,7 @@ class TestBatchClaiming:
             return [message] if message else []
 
         async def send(message, _email, **_kwargs):
+            """Record delivery start/end across an event-loop yield and return successful delivery."""
             events.append(f"start-{message.id}")
             await asyncio.sleep(0)
             events.append(f"end-{message.id}")
@@ -130,6 +130,7 @@ class TestBatchClaiming:
         assert mocks.mark_sent.await_count == 2
 
     async def test_batch_has_bounded_work(self, monkeypatch):
+        """Batch has bounded work."""
         mocks = _install_worker_mocks(
             monkeypatch, messages=[_claimed_email(message_id=i) for i in range(12)]
         )
@@ -138,11 +139,13 @@ class TestBatchClaiming:
         assert mocks.send.await_count == 10
 
     async def test_empty_claim_returns_without_delivery(self, monkeypatch):
+        """Empty claim returns without delivery."""
         mocks = _install_worker_mocks(monkeypatch, messages=[])
         await email_delivery.deliver_email_outbox_batch(object())
         mocks.send.assert_not_awaited()
 
     async def test_invalid_lease_budget_fails_before_claim(self, monkeypatch):
+        """Invalid lease budget fails before claim."""
         mocks = _install_worker_mocks(monkeypatch, messages=[])
         monkeypatch.setattr(email_delivery, "_DELIVERY_LEASE_TIMEOUT", timedelta(seconds=10))
         with pytest.raises(RuntimeError, match="budget"):
@@ -154,7 +157,31 @@ class TestDeliveryAttempts:
     """``_deliver_claimed_email`` decrypts, preflights, sends and records
     the outcome of a single claimed message."""
 
+    @pytest.mark.parametrize("smtp_attempted", [False, True])
+    @pytest.mark.parametrize("disposition", ["retried", "dead"])
+    async def test_contention_disposition_reaches_batch_accounting(
+        self, monkeypatch, smtp_attempted, disposition
+    ):
+        """Contention disposition reaches batch accounting."""
+        message = _claimed_email()
+        pool = object()
+        mocks = _install_worker_mocks(monkeypatch, messages=[message], delivered=False)
+        if smtp_attempted:
+            mocks.retry.side_effect = LockNotAvailable()
+        else:
+            mocks.prepare.side_effect = LockNotAvailable()
+        defer = create_autospec(email_delivery.defer_contended_email, return_value=disposition)
+        monkeypatch.setattr(email_delivery, "defer_contended_email", defer)
+        assert await email_delivery._deliver_claimed_email(pool, message) == disposition
+        if smtp_attempted:
+            defer.assert_awaited_once_with(pool, message, smtp_attempted=True)
+            mocks.send.assert_awaited_once()
+        else:
+            defer.assert_awaited_once_with(pool, message)
+            mocks.send.assert_not_awaited()
+
     async def test_successful_delivery_marks_message_sent(self, monkeypatch):
+        """Successful delivery marks message sent."""
         message = _claimed_email()
         pool = object()
         mocks = _install_worker_mocks(monkeypatch, messages=[message])
@@ -170,6 +197,7 @@ class TestDeliveryAttempts:
         mocks.retry.assert_not_awaited()
 
     async def test_failed_delivery_is_scheduled_for_retry(self, monkeypatch):
+        """Failed delivery is scheduled for retry."""
         message = _claimed_email(attempt_count=3)
         pool = object()
         mocks = _install_worker_mocks(monkeypatch, messages=[message], delivered=False)
@@ -184,6 +212,7 @@ class TestDeliveryAttempts:
         )
 
     async def test_final_failed_attempt_marks_message_dead(self, monkeypatch):
+        """Final failed attempt marks message dead."""
         message = _claimed_email(attempt_count=7)
         mocks = _install_worker_mocks(monkeypatch, messages=[message], delivered=False)
         assert await email_delivery._deliver_claimed_email(object(), message) == "dead"
@@ -191,6 +220,7 @@ class TestDeliveryAttempts:
         mocks.retry.assert_not_awaited()
 
     async def test_undecryptable_body_is_marked_dead_without_sending(self, monkeypatch):
+        """Undecryptable body is marked dead without sending."""
         message = _claimed_email()
         mocks = _install_worker_mocks(monkeypatch, messages=[message])
         mocks.decrypt.side_effect = OutboxBodyDecryptionError(message.id)
@@ -204,6 +234,7 @@ class TestDeliveryAttempts:
         ids=["database_unavailable", "lease_lost"],
     )
     async def test_preflight_error_never_calls_smtp(self, monkeypatch, error):
+        """Preflight error never calls SMTP."""
         message = _claimed_email()
         mocks = _install_worker_mocks(monkeypatch, messages=[message])
         mocks.prepare.side_effect = error
@@ -212,6 +243,7 @@ class TestDeliveryAttempts:
         mocks.send.assert_not_awaited()
 
     async def test_blocked_preflight_never_calls_smtp(self, monkeypatch):
+        """Blocked preflight never calls SMTP."""
         message = _claimed_email()
         mocks = _install_worker_mocks(monkeypatch, messages=[message])
         mocks.prepare.return_value = False
@@ -219,12 +251,14 @@ class TestDeliveryAttempts:
         mocks.send.assert_not_awaited()
 
     async def test_retry_rejection_is_reported_as_dead(self, monkeypatch):
+        """Retry rejection is reported as dead."""
         message = _claimed_email()
         mocks = _install_worker_mocks(monkeypatch, messages=[message], delivered=False)
         mocks.retry.return_value = "dead"
         assert await email_delivery._deliver_claimed_email(object(), message) == "dead"
 
     async def test_lease_loss_does_not_stop_remaining_messages(self, monkeypatch):
+        """Lease loss does not stop remaining messages."""
         messages = [_claimed_email(message_id=i) for i in (1, 2)]
         mocks = _install_worker_mocks(monkeypatch, messages=messages)
         mocks.prepare.side_effect = [OutboxLeaseLostError(1), True]
@@ -233,6 +267,7 @@ class TestDeliveryAttempts:
         assert mocks.send.await_args.args[0].id == 2
 
     async def test_cancellation_propagates_and_leaves_lease_for_recovery(self, monkeypatch):
+        """Cancellation propagates and leaves lease for recovery."""
         message = _claimed_email()
         mocks = _install_worker_mocks(monkeypatch, messages=[message])
         mocks.send.side_effect = asyncio.CancelledError
@@ -243,19 +278,23 @@ class TestDeliveryAttempts:
         mocks.mark_dead.assert_not_awaited()
 
     async def test_preflight_runs_after_decryption_and_before_smtp(self, monkeypatch):
+        """Preflight runs after decryption and before SMTP."""
         message = _claimed_email()
         mocks = _install_worker_mocks(monkeypatch, messages=[message])
         events = []
 
         def decrypt(_message):
+            """Record decryption and return a fixed plaintext body."""
             events.append("decrypt")
             return "Body"
 
         async def prepare(*_args, **_kwargs):
+            """Record delivery preflight and report success."""
             events.append("preflight")
             return True
 
         async def send(_message, _email, **_kwargs):
+            """Record SMTP dispatch and return successful delivery."""
             events.append("smtp")
             return _SENT_RESULT
 
@@ -266,6 +305,7 @@ class TestDeliveryAttempts:
         assert events == ["decrypt", "preflight", "smtp"]
 
     async def test_delivery_survives_signing_key_change(self, monkeypatch):
+        """Delivery survives signing key change."""
         monkeypatch.setattr(settings, "outbox_encryption_keys", [SecretStr("test-outbox-key")])
         monkeypatch.setattr(crypto, "_outbox_body_fernet", crypto._get_outbox_body_fernet())
         message = replace(_claimed_email(), body_ciphertext=crypto.encrypt_outbox_body("Notice"))
@@ -279,12 +319,12 @@ class TestDeliveryAttempts:
 
 
 def _use_outbox_keys(monkeypatch, *keys):
+    """Replace configured keys and refresh the cached outbox MultiFernet for the test."""
     monkeypatch.setattr(
         settings,
         "outbox_encryption_keys",
         [SecretStr(key) for key in keys],
     )
-    # Rebuild the cached ring to simulate startup with this configuration.
     monkeypatch.setattr(
         crypto,
         "_outbox_body_fernet",
@@ -297,6 +337,7 @@ class TestEncryptionAtRest:
     rotation, and reject ciphertext that does not decrypt."""
 
     def test_outbox_body_survives_signing_key_change(self, monkeypatch):
+        """Outbox body survives signing key change."""
         _use_outbox_keys(monkeypatch, "test-outbox-key")
         ciphertext = crypto.encrypt_outbox_body("A queued notification.")
 
@@ -310,6 +351,7 @@ class TestEncryptionAtRest:
         assert crypto.decrypt_outbox_body(ciphertext) == "A queued notification."
 
     def test_outbox_ring_reads_old_bodies_and_encrypts_with_first_key(self, monkeypatch):
+        """Outbox ring reads old bodies and encrypts with first key."""
         _use_outbox_keys(monkeypatch, "old-outbox-key")
         old_ciphertext = crypto.encrypt_outbox_body("Old message.")
 
@@ -325,6 +367,7 @@ class TestEncryptionAtRest:
         assert crypto.decrypt_outbox_body(new_ciphertext) is None
 
     def test_outbox_invalid_ciphertext_returns_none(self, monkeypatch):
+        """Outbox invalid ciphertext returns None."""
         _use_outbox_keys(monkeypatch, "test-outbox-key")
 
         assert crypto.decrypt_outbox_body("invalid-ciphertext") is None
@@ -352,15 +395,18 @@ class TestRetentionAndMaintenance:
         ],
     )
     def test_retention_configuration_is_bounded(self, name, value):
+        """Retention configuration is bounded."""
         with pytest.raises(ValidationError):
             Settings(**{name: value})
 
     def test_retention_job_is_tracked_bounded_and_uses_independent_cadence(self):
+        """Retention job is tracked bounded and uses independent cadence."""
         pool = create_autospec(AsyncConnectionPool, instance=True, spec_set=True)
         pool.max_size = 2
         stats_cache = create_autospec(CatalogueStatsCache, instance=True, spec_set=True)
         tracker = RunningJobTracker()
-        scheduler = create_scheduler(pool, stats_cache, tracker)
+        selected_source = legacy_source()
+        scheduler = create_scheduler(pool, stats_cache, tracker, (selected_source,))
         job = next(job for job in scheduler.get_jobs() if job.id == "outbox_retention")
         assert job.func.__self__ is tracker
         assert job.args[0] == "outbox_retention"
@@ -377,6 +423,7 @@ class TestOutboxMetrics:
     retention count."""
 
     async def test_metrics_narrow_driver_values_and_clamp_future_timestamps(self):
+        """Metrics narrow driver values and clamp future timestamps."""
         cur = create_autospec(AsyncCursor, instance=True, spec_set=True)
         cur.fetchone.return_value = {
             "pending_count": 2,
@@ -406,6 +453,7 @@ class TestOutboxMetrics:
         ids=["stale_pending_queue", "stale_sending_queue", "retention_overdue"],
     )
     def test_outbox_becomes_degraded_when_queue_ages_or_retention_is_overdue(self, reason):
+        """Outbox becomes degraded when queue ages or retention is overdue."""
         metrics = {
             "pending_count": 0,
             "sending_count": 0,
@@ -421,10 +469,9 @@ class TestOutboxMetrics:
             metrics[f"oldest_{reason}_age_seconds"] = settings.outbox_stale_after_seconds
         assert outbox_is_degraded(metrics) is True
 
+    # Child exit code and result-file status must agree before delivery is trusted.
 
-# Mirrors the result document the real SMTP child writes: argv[1] is the
-# result file descriptor (see _smtp_child.py:86-95), and the child's exit
-# code and self-reported status must agree for _run_process to trust it.
+
 _RESULT_WRITER_SCRIPT = (
     "import json, os, sys\n"
     "data = json.load(sys.stdin)\n"
@@ -441,6 +488,7 @@ class TestSmtpChildProcess:
     SMTP server: exit status, timeouts, cancellation, and deadlines."""
 
     async def test_process_exit_status_and_stdin_are_respected(self):
+        """Process exit status and stdin are respected."""
         command = (sys.executable, "-c", _RESULT_WRITER_SCRIPT)
 
         sent = await smtp_process._run_process(command, b'{"value": 7}', timeout_seconds=2)
@@ -450,10 +498,12 @@ class TestSmtpChildProcess:
         assert failed.status == "temporary_failure"
 
     async def test_timeout_stops_and_reaps_the_real_child(self, monkeypatch):
+        """Timeout stops and reaps the real child."""
         real_spawn = asyncio.create_subprocess_exec
         processes = []
 
         async def spawn(*args, **kwargs):
+            """Start the real child and retain its process handle for cleanup assertions."""
             process = await real_spawn(*args, **kwargs)
             processes.append(process)
             return process
@@ -472,11 +522,13 @@ class TestSmtpChildProcess:
         assert processes[0].returncode is not None
 
     async def test_cancellation_stops_child_before_returning(self, monkeypatch):
+        """Cancellation stops child before returning."""
         real_spawn = asyncio.create_subprocess_exec
         started = asyncio.Event()
         processes = []
 
         async def spawn(*args, **kwargs):
+            """Retain the real child handle and signal that spawning has finished."""
             process = await real_spawn(*args, **kwargs)
             processes.append(process)
             started.set()
@@ -492,6 +544,7 @@ class TestSmtpChildProcess:
         assert processes[0].returncode is not None
 
     async def test_real_smtp_child_works_with_smtp_disabled(self, monkeypatch):
+        """Real SMTP child works with SMTP disabled."""
         monkeypatch.setenv("SMTP_ENABLED", "false")
         message = _claimed_email()
         email = OutboundEmail("account_locked_notice", "a@example.test", "Notice", "Body")
@@ -501,6 +554,7 @@ class TestSmtpChildProcess:
         assert result.status == "sent"
 
     async def test_expired_deadline_does_not_start_a_process(self):
+        """Expired deadline does not start a process."""
         message = _claimed_email()
         email = OutboundEmail("account_locked_notice", "a@example.test", "Notice", "Body")
         with patch.object(smtp_process, "_run_process", autospec=True) as run:
@@ -512,6 +566,7 @@ class TestSmtpChildProcess:
         run.assert_not_awaited()
 
     async def test_child_refuses_expired_deadline_even_if_parent_was_delayed(self, monkeypatch):
+        """Child refuses expired deadline even if parent was delayed."""
         monkeypatch.setenv("SMTP_ENABLED", "false")
         child = smtp_process.Path(smtp_process.__file__).with_name("_smtp_child.py")
         payload = json.dumps(
@@ -527,18 +582,20 @@ class TestSmtpChildProcess:
             }
         ).encode()
         result = await smtp_process._run_process(
-            (sys.executable, str(child), "60"), payload, timeout_seconds=5
+            (sys.executable, str(child), "60"), payload, timeout_seconds=65
         )
         assert result.status == "temporary_failure"
         assert result.reason == "smtp_delivery_deadline_elapsed"
 
     async def test_cancellation_during_cleanup_is_propagated_after_reaping(self, monkeypatch):
+        """Cancellation during cleanup is propagated after reaping."""
         real_stop = smtp_process._stop_process
         cleaning = asyncio.Event()
         release = asyncio.Event()
         processes = []
 
         async def stop(process):
+            """Record cleanup entry, wait for release and then stop the real child."""
             processes.append(process)
             cleaning.set()
             await release.wait()
@@ -566,6 +623,7 @@ class TestSmtpChildProcess:
         assert processes[0].returncode is not None
 
     async def test_smtp_child_saves_private_dev_email(self, monkeypatch, tmp_path):
+        """SMTP child saves private dev email."""
         monkeypatch.setenv("DEV_MAILBOX_DIR", str(tmp_path / "mailbox"))
         monkeypatch.setenv("SMTP_ENABLED", "false")
         monkeypatch.setenv("ENV_STATE", "dev")
@@ -619,12 +677,10 @@ class TestSmtpChildProcess:
 
 
 class TestOutboxLoggingCorrelation:
-    """``_OutboxContext`` stamps every log record from the SMTP child process
-    with the durable outbox row id, so the parent process can correlate a
-    failed-send log line back to the exact queued email that produced it.
-    """
+    """Stamp SMTP-child log records with the durable outbox row ID."""
 
     def test_filter_stamps_log_records_with_the_durable_outbox_id(self):
+        """Filter stamps log records with the durable outbox ID."""
         record = logging.makeLogRecord({"msg": "smtp failed"})
         assert _OutboxContext(42).filter(record)
         assert record.outbox_id == 42

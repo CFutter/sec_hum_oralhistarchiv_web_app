@@ -1,18 +1,4 @@
-"""Durability of ``reserve_session_step_up_attempt`` across pools, failures and services.
-
-The reservation commits in its own short transaction before any credential
-work or protected mutation begins (credential_attempts.py:56-118). These
-tests pin what a mocked cursor cannot: the committed count is visible through
-any connection pool, not just the one that wrote it; it survives every kind
-of failure that can happen *after* it commits (a wrong credential, a
-downstream SQL error, or an enclosing service transaction's own rollback);
-but a failure *inside* the reservation's own transaction leaves the counter
-untouched and never even reaches credential verification. The admin
-promotion and admin-authorized recovery paths reserve this same budget
-before their own proof, and exhausting it blocks their mutation entirely.
-The integration conftest applies the application's Alembic migration and
-skips this module when the configured test database is unavailable.
-"""
+"""Durability of ``reserve_session_step_up_attempt`` across pools, failures and services."""
 
 from datetime import UTC, datetime, timedelta
 from unittest.mock import create_autospec
@@ -22,8 +8,8 @@ import pyotp
 import pytest
 
 from app.services import admin_promotion as admin_promotion_module
-from app.services import authentication as authentication_module
 from app.services import credential_attempts as credential_attempts_module
+from app.services import password_verification
 from app.services import totp as totp_module
 from app.services.admin_promotion import (
     AdminPromotionRejected,
@@ -35,10 +21,10 @@ from app.services.credential_attempts import (
     SessionStepUpAttemptOutcome,
     reserve_session_step_up_attempt,
 )
-from app.services.crypto import encrypt_value
 from app.services.db import create_pool, get_db_cursor
 from app.services.session_ids import hash_session_id
 from app.services.totp import TotpRotationStartOutcome, begin_totp_rotation
+from app.services.totp_crypto import encrypt_value
 from app.services.totp_recover import TotpRecoveryRejected, authorize_totp_recovery
 from app.services.totp_recovery_codes import TOTP_RECOVERY_CODE_COUNT
 from config import settings
@@ -48,6 +34,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
 
 def _step_up_state(sync_conn, raw_session_id: str) -> tuple[int, bool] | None:
+    """Read the session's attempt count and database-time expiry state."""
     return sync_conn.execute(
         """
         SELECT step_up_attempt_count, expires_at > clock_timestamp()
@@ -59,6 +46,7 @@ def _step_up_state(sync_conn, raw_session_id: str) -> tuple[int, bool] | None:
 
 
 def _credential_snapshot(sync_conn, user_id: int):
+    """Read credentials, authentication revision and login-lock state for comparison."""
     return sync_conn.execute(
         """
         SELECT password_hash, totp_secret, auth_revision, failed_login_count, locked_until
@@ -75,6 +63,7 @@ class TestReservationSharedAcrossIndependentPools:
     async def test_the_same_session_shares_its_count_through_two_independent_pools(
         self, user_factory, session_factory, sync_conn
     ):
+        """Verify the same session shares its count through two independent pools."""
         user = user_factory()
         raw_session = session_factory(user.id, purpose="full")
 
@@ -114,6 +103,7 @@ class TestReservationDurabilityAcrossLaterFailures:
     async def test_the_counter_stays_incremented_through_a_new_connection(
         self, user_factory, session_factory, monkeypatch, case
     ):
+        """Verify the counter stays incremented through a new connection."""
         secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(secret))
         raw_session = session_factory(user.id, purpose="full")
@@ -121,7 +111,7 @@ class TestReservationDurabilityAcrossLaterFailures:
         async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn:
             if case == "password_failure":
                 outcome = await begin_totp_rotation(
-                    conn,  # type: ignore[arg-type] - supported direct-connection path
+                    conn,
                     user.id,
                     "wrong-password",
                     pyotp.TOTP(secret).now(),
@@ -130,7 +120,7 @@ class TestReservationDurabilityAcrossLaterFailures:
                 assert outcome.outcome is TotpRotationStartOutcome.INVALID_CREDENTIALS
             elif case == "totp_failure":
                 outcome = await begin_totp_rotation(
-                    conn,  # type: ignore[arg-type] - supported direct-connection path
+                    conn,
                     user.id,
                     user.password,
                     "000000",
@@ -146,7 +136,7 @@ class TestReservationDurabilityAcrossLaterFailures:
                 monkeypatch.setattr(totp_module, "get_db_cursor", failing_cursor)
                 with pytest.raises(RuntimeError, match="forced downstream failure"):
                     await begin_totp_rotation(
-                        conn,  # type: ignore[arg-type] - supported direct-connection path
+                        conn,
                         user.id,
                         user.password,
                         pyotp.TOTP(secret).now(),
@@ -163,7 +153,7 @@ class TestReservationDurabilityAcrossLaterFailures:
                 )
                 with pytest.raises(RuntimeError, match="forced outer rollback"):
                     await prepare_admin_promotion(
-                        conn,  # type: ignore[arg-type] - supported direct-connection path
+                        conn,
                         user_id=user.id,
                         session_id=raw_session,
                         password=user.password,
@@ -187,7 +177,7 @@ class TestReservationDurabilityAcrossLaterFailures:
 
         async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn:
             outcome = await reserve_session_step_up_attempt(
-                conn,  # type: ignore[arg-type] - supported direct-connection path
+                conn,
                 user_id=user.id,
                 session_id=raw_session,
             )
@@ -202,6 +192,7 @@ class TestReservationFailureBeforeCommitVerifiesNothing:
     async def test_a_failure_before_the_reservation_commits_runs_no_credential_work(
         self, user_factory, session_factory, sync_conn, monkeypatch
     ):
+        """Verify a failure before the reservation commits runs no credential work."""
         secret = pyotp.random_base32()
         user = user_factory(totp_secret=encrypt_value(secret))
         raw_session = session_factory(user.id, purpose="full")
@@ -212,16 +203,16 @@ class TestReservationFailureBeforeCommitVerifiesNothing:
         )
         monkeypatch.setattr(credential_attempts_module, "get_db_cursor", failing_reservation_cursor)
 
-        real_run_password_work = totp_module.run_password_work
+        real_run_password_work = password_verification.run_password_work
         autospecced_password_work = create_autospec(
             real_run_password_work, spec_set=True, side_effect=real_run_password_work
         )
-        monkeypatch.setattr(totp_module, "run_password_work", autospecced_password_work)
-        real_verify_dummy = authentication_module.verify_dummy
+        monkeypatch.setattr(password_verification, "run_password_work", autospecced_password_work)
+        real_verify_dummy = password_verification.verify_dummy
         autospecced_verify_dummy = create_autospec(
             real_verify_dummy, spec_set=True, side_effect=real_verify_dummy
         )
-        monkeypatch.setattr(authentication_module, "verify_dummy", autospecced_verify_dummy)
+        monkeypatch.setattr(password_verification, "verify_dummy", autospecced_verify_dummy)
 
         with pytest.raises(RuntimeError, match="forced reservation failure"):
             await begin_totp_rotation(
@@ -252,13 +243,14 @@ class TestReservationFailureBeforeCommitVerifiesNothing:
         user = user_factory(totp_secret=encrypt_value(secret))
         raw_session = session_factory(user.id, purpose="full")
 
-        result = await begin_totp_rotation(
-            await psycopg.AsyncConnection.connect(TEST_DATABASE_URL),  # type: ignore[arg-type]
-            user.id,
-            user.password,
-            pyotp.TOTP(secret).now(),
-            session_id=raw_session,
-        )
+        async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn:
+            result = await begin_totp_rotation(
+                conn,
+                user.id,
+                user.password,
+                pyotp.TOTP(secret).now(),
+                session_id=raw_session,
+            )
 
         assert result.outcome is TotpRotationStartOutcome.READY
         assert _step_up_state(sync_conn, raw_session) == (1, True)
@@ -271,6 +263,7 @@ class TestAdminPromotionReservesBeforeItsOwnProof:
     async def test_prepare_reserves_before_the_proof_and_stages_one_code_set(
         self, db_pool, user_factory, session_factory, sync_conn, admin_actor
     ):
+        """Verify prepare reserves before the proof and stages one code set."""
         target_secret = pyotp.random_base32()
         target = user_factory(totp_secret=encrypt_value(target_secret))
         target_session = session_factory(target.id, purpose="full")
@@ -308,6 +301,7 @@ class TestAdminPromotionReservesBeforeItsOwnProof:
     async def test_accept_reserves_before_the_code_proof_and_grants_once(
         self, db_pool, user_factory, session_factory, sync_conn, admin_actor
     ):
+        """Verify accept reserves before the code proof and grants once."""
         target_secret = pyotp.random_base32()
         target = user_factory(totp_secret=encrypt_value(target_secret))
         target_session = session_factory(target.id, purpose="full")
@@ -351,6 +345,7 @@ class TestAdminPromotionReservesBeforeItsOwnProof:
     async def test_exhaustion_before_prepare_stages_no_code_set(
         self, db_pool, user_factory, session_factory, sync_conn, admin_actor, monkeypatch
     ):
+        """Verify exhaustion before prepare stages no code set."""
         target_secret = pyotp.random_base32()
         target = user_factory(totp_secret=encrypt_value(target_secret))
         target_session = session_factory(target.id, purpose="full")
@@ -386,6 +381,7 @@ class TestAdminPromotionReservesBeforeItsOwnProof:
     async def test_exhaustion_before_accept_grants_nothing(
         self, db_pool, user_factory, session_factory, sync_conn, admin_actor, monkeypatch
     ):
+        """Verify exhaustion before accept grants nothing."""
         target_secret = pyotp.random_base32()
         target = user_factory(totp_secret=encrypt_value(target_secret))
         target_session = session_factory(target.id, purpose="full")
@@ -430,6 +426,7 @@ class TestAdminRecoveryAuthorizationReservesTheActorsBudget:
     async def test_authorization_reserves_the_actors_budget(
         self, db_pool, user_factory, session_factory, sync_conn
     ):
+        """Verify authorization reserves the actors budget."""
         actor_secret = pyotp.random_base32()
         actor = user_factory(is_admin=True, totp_secret=encrypt_value(actor_secret))
         actor_session = session_factory(actor.id, purpose="full")
@@ -450,6 +447,7 @@ class TestAdminRecoveryAuthorizationReservesTheActorsBudget:
     async def test_exhaustion_before_the_proof_authorizes_nothing_and_leaves_lockout_untouched(
         self, user_factory, session_factory, sync_conn, monkeypatch
     ):
+        """Verify exhaustion before the proof authorizes nothing and leaves lockout untouched."""
         monkeypatch.setattr(settings, "session_step_up_attempt_limit", 0)
         actor_secret = pyotp.random_base32()
         actor = user_factory(is_admin=True, totp_secret=encrypt_value(actor_secret))
@@ -463,14 +461,15 @@ class TestAdminRecoveryAuthorizationReservesTheActorsBudget:
         )
         before = _credential_snapshot(sync_conn, target.id)
 
-        with pytest.raises(TotpRecoveryRejected) as excinfo:
-            await authorize_totp_recovery(
-                await psycopg.AsyncConnection.connect(TEST_DATABASE_URL),  # type: ignore[arg-type]
-                actor_id=actor.id,
-                actor_session_id=actor_session,
-                target_user_id=target.id,
-                admin_totp_code=pyotp.TOTP(actor_secret).now(),
-            )
+        async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn:
+            with pytest.raises(TotpRecoveryRejected) as excinfo:
+                await authorize_totp_recovery(
+                    conn,
+                    actor_id=actor.id,
+                    actor_session_id=actor_session,
+                    target_user_id=target.id,
+                    admin_totp_code=pyotp.TOTP(actor_secret).now(),
+                )
 
         assert excinfo.value.reason == "actor_step_up_exhausted"
         assert _credential_snapshot(sync_conn, target.id) == before

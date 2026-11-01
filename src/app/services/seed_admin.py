@@ -1,8 +1,7 @@
-"""Bootstrap the first local administrator from configured seed credentials.
+"""Bootstrap the first local administrator through an operator-only command.
 
-Startup supplies ADMIN_SEED_EMAIL/PASSWORD. Any existing administrator skips
-policy validation and hashing. An advisory transaction lock serializes
-seeders; remove the seed credentials after successful bootstrap.
+An advisory transaction lock serializes concurrent invocations. The command
+owns password input; long-running services do not receive bootstrap credentials.
 """
 
 import logging
@@ -32,7 +31,8 @@ async def seed_admin_user(
     TOTP must be enrolled at first login. Existing administrators skip credential
     checks; concurrent seeders recheck under an advisory transaction lock.
     Raises RuntimeError for invalid seed credentials/password strength or an
-    existing seed email; never elevates an existing user. Logs the new address.
+    existing seed email; never elevates an existing user. The creation log uses
+    the configured address-redaction policy.
     """
     async with get_db_cursor(pool) as cur:
         await cur.execute("SELECT 1 FROM users WHERE is_admin = true LIMIT 1")
@@ -47,7 +47,7 @@ async def seed_admin_user(
     if password_error:
         raise RuntimeError(
             f"ADMIN_SEED_PASSWORD rejected: {password_error} "
-            "Choose a stronger password and restart."
+            "Choose a stronger password and rerun the bootstrap command."
         )
 
     # Hash BEFORE taking the lock — argon2 is deliberately slow, and the
@@ -67,7 +67,7 @@ async def seed_admin_user(
             raise RuntimeError(
                 f"User {email} already exists; refusing to promote via seed. "
                 f"Use the admin UI to grant admin status to existing users, "
-                f"or set ADMIN_SEED_EMAIL to a fresh email address."
+                f"or give the bootstrap command a fresh email address."
             )
 
         await cur.execute(
@@ -78,8 +78,7 @@ async def seed_admin_user(
         )
 
     logger.warning(
-        "Admin user %s created. REMOVE ADMIN_SEED_EMAIL and ADMIN_SEED_PASSWORD "
-        "from .env now — they are no longer needed and their presence is a "
-        "security risk if .env is leaked.",
+        "Initial administrator %s created. Complete authenticator enrollment "
+        "before opening public access.",
         email,
     )

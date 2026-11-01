@@ -1,10 +1,26 @@
-# Cache, Scheduler, Email & Seeders
+# Cache, Scheduler, Email & Administrator Bootstrap
 
-Background jobs, catalogue cache, transactional mail, and seeders.
+Background jobs, catalogue cache, transactional mail and one-shot bootstrap.
 
 ## In-memory catalogue statistics cache
 
-Each web process caches total dataset count and last full-rebuild time for one hour. Optional Redis pub/sub invalidates these statistics across workers after sync attempts; TTL expiry covers missed notifications. Tier-sensitive counts and facets query PostgreSQL directly.
+Each web process caches selected-source rebuild freshness for one hour.
+`CatalogueStatsCache` requires explicit `source_names` and snapshots them before
+starting its subscriber. The private entry contains only the timestamp and its
+monotonic build time; an unknown timestamp is a cached result rather than an
+empty entry. Fills use the timestamp-only query and never count catalogue rows.
+Public dataset totals are queried live on every read. The returned total and
+cached freshness may come from different database snapshots.
+
+Freshness is the oldest successful rebuild among the selected sources. It is
+unknown if any selected source lacks a status row or successful rebuild.
+Unselected status rows do not affect freshness. Stored datasets remain counted
+even when their source is no longer selected, unless administrator-hidden.
+
+Optional Redis pub/sub invalidates rebuild freshness across workers after sync
+attempts; TTL expiry covers missed notifications. Dataset totals, tier-sensitive
+counts and facets query PostgreSQL directly. A hide/restore committed before
+the count query is visible without Redis invalidation.
 
 ::: app.services.cache
 
@@ -15,8 +31,8 @@ Each web process caches total dataset count and last full-rebuild time for one h
 | Job | Interval | First run |
 |---|---|---|
 | Email delivery | 15 seconds | Immediately |
-| Incremental sync | `SYNC_INTERVAL_SECONDS` | Immediately |
-| Full rebuild | `FULL_REBUILD_INTERVAL_SECONDS` | After five minutes |
+| Incremental sync, per source | `SourceSchedule.incremental_interval_seconds` | Immediately |
+| Full rebuild, per source | `SourceSchedule.rebuild_interval_seconds` | Five-minute steps in configuration order |
 | Session cleanup | One hour | Immediately |
 | Unverified-account cleanup | One hour | After ten minutes |
 | Outbox retention | `OUTBOX_RETENTION_INTERVAL_SECONDS` | After 30 seconds |
@@ -34,6 +50,8 @@ With SMTP disabled in development, delivery atomically publishes `.eml` files in
 ::: app.services.email
 
 ::: app.services.email_outbox
+
+::: app.services.mail_issuance
 
 ::: app.services.email_delivery
 
@@ -67,15 +85,12 @@ Typed event helpers for the dedicated audit channel; see [Logging & Audit](../..
 
 ::: app.services.redis_client
 
-## Seeders
+## Administrator bootstrap
 
-Administrator seeding creates one verified local account at public tier only when no administrator exists; it refuses to promote an existing email owner. The account must complete TOTP/recovery-code setup before privileged administration. Remove seed credentials after successful bootstrap.
-
-Mock seeding runs only when explicitly enabled: development web startup or staging scheduler startup. Production rejects the flag. Mock rows use source `mock`, restricted access, and vetted visibility; Source A rebuilds leave them intact.
+Run `scripts/bootstrap_admin.py --email ADDRESS` from a protected terminal to create the first verified local administrator at public tier. It reads the password without echo and refuses an existing administrator or email owner. Complete TOTP/recovery-code enrollment and log in again before administration. Runtime services reject seed credentials. See [bootstrap](../../runbooks/bootstrap-admin.md).
 
 ::: app.services.seed_admin
 
-::: app.services.seed_mock_data
 
 ## Service package exports
 

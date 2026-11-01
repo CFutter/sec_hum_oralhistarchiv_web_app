@@ -1,31 +1,20 @@
-"""Integration-tier fixtures — real PostgreSQL, schema from the app's own migrations.
+"""PostgreSQL integration fixtures using the application migrations.
 
-DATABASE SELECTION (launcher-agnostic): the URL comes from the DATABASE_URL
-environment variable with a local default matching docker-compose.yml, so the
-SAME suite runs against `docker compose up -d db` and the CI service container
-with no code difference. The root conftest also feeds DATABASE_URL to
-Settings, so the app under test connects to the same database.
-
-CLEAN STATE: TRUNCATE-between-tests, not transaction-rollback-per-test. The
-code under test manages its own transactions (per-record commits in the sync
-loop, SAVEPOINTs in the full rebuild, FOR UPDATE in consume_flash) — a
-wrapping rollback strategy would fight it.
-
-SCHEMA: ensured once per session by running the app's own Alembic migrations
-(idempotent no-op when CI already ran `alembic upgrade head`). If the database
-is unreachable, every test here SKIPS — the unit tier must never depend on it.
-
-PARALLEL WORKERS: under pytest-xdist the root conftest has already suffixed
-the database name with the worker id (oralhistarchiv_test_gw0, ...). This
-file creates that database on the same instance when it is missing, so every
-worker migrates and truncates a database of its own.
+DATABASE_URL defaults to the disposable database in docker-compose.yml. Tests
+truncate and commit shared tables before each test; use a *_test or *_test_gwN
+database, or explicitly set ALLOW_DESTRUCTIVE_DB=1. Unreachable PostgreSQL skips
+the tier unless REQUIRE_DB=1, which raises instead. xdist workers use separate
+databases; concurrent serial runs must use separate databases too.
 """
 
 import os
 import re
 import secrets
+import subprocess
+from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import create_autospec, patch
 
 import psycopg
@@ -42,11 +31,15 @@ import app.main as _app_main
 from alembic import command
 from app.main import app
 from app.paths import ALEMBIC_DIR, ALEMBIC_INI
-from app.services.crypto import encrypt_value
+from app.services import build_catalogue_policy, ensure_source_status_rows
 from app.services.db import create_pool
 from app.services.session_ids import hash_session_id
-from app.services.sync import _source_a_fingerprint
 from app.services.tokens import hash_token
+from app.services.totp_crypto import encrypt_value
+from tests.fixtures import replace_test_catalogue_sources
+from tests.source_fixtures import TEST_SOURCE_NAME, legacy_source
+
+from .server_processes import free_port, start_private_redis, terminate_process
 
 # The real lifespan collaborators the end-to-end client stubs, captured once
 # at import so every stub is signature-checked against the production
@@ -59,7 +52,6 @@ _REAL_LIFESPAN_TARGETS = {
         "validate_runtime_schema",
         "reconcile_federated_session_policy",
         "setup_logging",
-        "seed_admin_user",
     )
 }
 
@@ -82,6 +74,7 @@ _DESTRUCTIVE_OK = (
 
 
 def _assert_test_database() -> None:
+    """Refuse destructive fixtures unless the database name or explicit override permits them."""
     assert _DESTRUCTIVE_OK, (
         f"refusing to TRUNCATE non-test database {_DB_NAME!r} "
         f"(URL from DATABASE_URL); name a '*_test' database or set "
@@ -95,15 +88,11 @@ _WORKER_DATABASE_CREATION_LOCK = 8_212_026
 
 
 def _ensure_worker_database() -> None:
-    """Create this xdist worker's private database when it does not exist yet.
+    """Create a missing xdist database under a maintenance-database advisory lock.
 
-    Runs only in a worker process (PYTEST_XDIST_WORKER set), where the root
-    conftest has already put the worker-suffixed name into DATABASE_URL. The
-    maintenance connection goes to the instance's ``postgres`` database with
-    the same credentials; creation is serialised with an advisory lock so two
-    workers never run CREATE DATABASE against the same template at once. Any
-    failure is left to ``_db_reachable`` below, which then reports the tier
-    as unavailable with the usual skip or REQUIRE_DB error.
+    Use DATABASE_URL credentials against the same instance's postgres database.
+    Do nothing outside a worker; suppress setup errors so the later connectivity
+    probe determines whether the tier skips or errors under REQUIRE_DB=1.
     """
     if not os.environ.get("PYTEST_XDIST_WORKER"):
         return
@@ -132,6 +121,7 @@ _DEFAULT_PW_HASH = _PH.hash(DEFAULT_PASSWORD)
 
 
 def _db_reachable() -> bool:
+    """Probe PostgreSQL with a three-second connect timeout; return False on any exception."""
     try:
         with psycopg.connect(TEST_DATABASE_URL, connect_timeout=3) as conn:
             conn.execute("SELECT 1")
@@ -146,16 +136,10 @@ _DB_AVAILABLE = _db_reachable()
 
 @pytest.fixture(scope="session", autouse=True)
 def _ensure_schema():
-    """Skip the whole tier without a DB; otherwise migrate to head once.
+    """Migrate the disposable database to head once per session.
 
-    Uses the app's OWN migrations (never a hand-maintained schema copy), so
-    the test schema cannot drift from production. Idempotent when CI has
-    already migrated.
-
-    REQUIRE_DB=1 (set on the CI integration job) turns the silent skip into a
-    hard error: pytest exits 0 on an all-skipped tier, so without this a dead
-    service container would ship a green run that executed none of the
-    auth/session/access-control assurance.
+    An unreachable database skips the tier, or raises RuntimeError with REQUIRE_DB=1.
+    The destructive-database guard runs before migrations.
     """
     if not _DB_AVAILABLE:
         if os.environ.get("REQUIRE_DB") == "1":
@@ -173,61 +157,66 @@ def _ensure_schema():
 
 @pytest.fixture(autouse=True)
 def clean_db(_ensure_schema):
-    """Give every integration test clean tables and a bound sync_status singleton.
+    """Truncate test tables, reset identities and seed a bound source before each test.
 
-    ``source_fingerprint`` is seeded with the value production computes for
-    the current settings (``_source_a_fingerprint()``, sync.py:206-211) so
-    the catalogue starts bound to its configured source, matching every
-    catalogue that has completed a full rebuild. ``_sync_source_a``
-    (sync.py:557-578) raises ``_FullReharvestRequired`` when this column is
-    NULL — tests proving that unbound gate use the ``unbound_catalogue``
-    fixture to null it back out.
-
-    ``ingestion_failures`` is truncated explicitly: it has only a primary
-    key (source, uuid in db_schema_contract.py's
-    INGESTION_FAILURE_CONSTRAINT_CONTRACT), no foreign key to ``users`` or
-    ``oral_history_datasets``, so it is not reached by this TRUNCATE's
-    CASCADE and rows from one test would otherwise survive into the next.
-    ``totp_recovery_codes``, ``admin_promotion_requests`` and
-    ``pending_totp_rotations`` all carry a foreign key to ``users.id`` (see
-    the same contract file), so truncating ``users`` with CASCADE already
-    clears them and they need no explicit listing here.
+    Commits the reset; tests share this database and must not run concurrently in it.
+    Use unbound_catalogue when the test needs a fresh source without a binding.
     """
     _assert_test_database()
     with psycopg.connect(TEST_DATABASE_URL) as conn:
         conn.execute(
             """
             TRUNCATE
+                anonymous_mail_issuance,
+                security_audit_receipts,
+                security_audit_events,
+                source_security_state,
+                source_binding_acknowledgements,
+                catalogue_search_policy,
                 federation_policy_state,
                 email_outbox,
                 sessions,
                 users,
                 oral_history_datasets,
-                ingestion_failures
+                dataset_admin_state,
+                ingestion_failures,
+                ingestion_quarantine
             RESTART IDENTITY CASCADE
             """
         )
         conn.execute("DELETE FROM sync_status")
         conn.execute(
-            "INSERT INTO sync_status (id, last_harvest_date, source_fingerprint) "
-            "VALUES (1, %s, %s)",
-            (datetime(2026, 1, 1, tzinfo=UTC), _source_a_fingerprint()),
+            "INSERT INTO sync_status (source, last_harvest_date, source_fingerprint) "
+            "VALUES (%s, %s, %s)",
+            (
+                TEST_SOURCE_NAME,
+                datetime(2026, 1, 1, tzinfo=UTC),
+                legacy_source().adapter.config_fingerprint(),
+            ),
         )
         conn.commit()
     yield
 
 
 @pytest.fixture
-def unbound_catalogue():
-    """Null out sync_status.source_fingerprint for the unbound-gate positive control.
+def private_redis(tmp_path: Path) -> Iterator[tuple[int, subprocess.Popen[bytes]]]:
+    """A private, disposable redis-server with no persistence, owned by one test."""
+    port = free_port()
+    proc = start_private_redis(tmp_path, port, "--appendonly", "no")
+    try:
+        yield port, proc
+    finally:
+        terminate_process(proc)
 
-    Use in a test that must prove a fresh/unbound catalogue rejects an
-    incremental sync (``_FullReharvestRequired`` with "no source
-    configuration binding", sync.py:568-572) instead of the
-    ``clean_db``-seeded bound state every other test relies on.
-    """
+
+@pytest.fixture
+def unbound_catalogue():
+    """Clear and commit the test source binding so incremental sync requires a rebuild."""
     with psycopg.connect(TEST_DATABASE_URL) as conn:
-        conn.execute("UPDATE sync_status SET source_fingerprint = NULL WHERE id = 1")
+        conn.execute(
+            "UPDATE sync_status SET source_fingerprint = NULL WHERE source = %s",
+            (TEST_SOURCE_NAME,),
+        )
         conn.commit()
     yield
 
@@ -240,12 +229,53 @@ def sync_conn():
 
 
 @pytest.fixture
-async def db_pool():
-    """The application's own AsyncConnectionPool against the test database.
+def bind_catalogue_policy(clean_db):
+    """Explicit owner setup for the policy a test intends to serve.
 
-    Built via create_pool() so connection config (autocommit, statement
-    timeout, application_name) matches production exactly.
+    This is never installed in a query path. Repeated setup calls deliberately
+    perform an owner compare-and-swap transition when the test changes policy,
+    including rebuilding the physical projections through the real SQL API.
     """
+    del clean_db  # Fixture dependency orders binding after the destructive reset.
+
+    def bind(sources, *, database_url=TEST_DATABASE_URL):
+        """Initialize or replace durable search policy and return the constructed policy."""
+        policy = build_catalogue_policy(sources)
+        masks = Jsonb({str(rank): dict(values) for rank, values in policy.page_masks.items()})
+        with psycopg.connect(database_url) as owner:
+            previous = owner.execute(
+                "SELECT fingerprint FROM public.catalogue_search_policy WHERE singleton"
+            ).fetchone()
+            if previous is None:
+                owner.execute(
+                    "SELECT public.catalogue_initialize_search_policy(%s, %s)",
+                    (policy.fingerprint, masks),
+                )
+            else:
+                owner.execute(
+                    "SELECT public.catalogue_replace_search_policy(%s, %s, %s)",
+                    (previous[0], policy.fingerprint, masks),
+                )
+        return policy
+
+    return bind
+
+
+@pytest.fixture
+def replace_bound_catalogue_sources(bind_catalogue_policy):
+    """Explicit integration setup updates the durable binding and web snapshot."""
+
+    def replace(monkeypatch, app, sources):
+        """Bind the new catalogue policy and publish its test application snapshot."""
+        bind_catalogue_policy(sources)
+        return replace_test_catalogue_sources(monkeypatch, app, sources)
+
+    return replace
+
+
+@pytest.fixture
+async def db_pool():
+    """Open an application pool named oha-tests and close it after the test."""
     pool = create_pool(application_name="oha-tests")
     await pool.open()
     try:
@@ -254,13 +284,59 @@ async def db_pool():
         await pool.close()
 
 
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def approve_source_rebinding(sync_conn):
+    """Approve the exact transition as the owner before testing later recovery work."""
+
+    def approve(source):
+        """Approve the test identity against its expected issuer, subject and review revision."""
+        previous = sync_conn.execute(
+            "SELECT COALESCE(source_fetch_fingerprint, source_fingerprint) "
+            "FROM sync_status WHERE source = %s",
+            (source.name,),
+        ).fetchone()[0]
+        sync_conn.execute(
+            "INSERT INTO source_binding_acknowledgements "
+            "(source, previous_fingerprint, source_fingerprint) VALUES (%s, %s, %s) "
+            "ON CONFLICT (source) DO UPDATE SET "
+            "previous_fingerprint = EXCLUDED.previous_fingerprint, "
+            "source_fingerprint = EXCLUDED.source_fingerprint",
+            (source.name, previous, source.adapter.config_fingerprint()),
+        )
+        sync_conn.commit()
+
+    return approve
+
+
+@pytest.fixture(params=("archive_alpha", "archive_beta"))
+async def sync_source(request, db_pool, sync_conn):
+    """Provide a bound source under either explicit test identity."""
+    source = legacy_source(name=request.param)
+
+    await ensure_source_status_rows(db_pool, (source.name,))
+    sync_conn.execute(
+        """UPDATE sync_status
+           SET last_harvest_date = %s,
+               source_fingerprint = %s
+           WHERE source = %s""",
+        (
+            datetime(2026, 1, 1, tzinfo=UTC),
+            source.adapter.config_fingerprint(),
+            source.name,
+        ),
+    )
+    sync_conn.commit()
+    return source
+
+
 # Factories (synchronous — independent of the async loop under test)
-# ---------------------------------------------------------------------------
 
 
 class UserHandle:
+    """Inserted user identity and plaintext test password."""
+
     def __init__(self, id: int, email: str, password: str):
+        """Store the inserted user ID, email and plaintext test password."""
         self.id = id
         self.email = email
         self.password = password
@@ -273,18 +349,10 @@ def install_active_recovery_codes(
     generation: int = 1,
     count: int = 2,
 ) -> None:
-    """Give a user an active TOTP recovery-code generation with unused codes.
+    """Commit an active recovery-code generation containing count unused hashed codes.
 
-    Mirrors the row shape ``guard_current_admin_session_cur`` and
-    ``require_admin`` require of a local administrator (users.py:150-193): a
-    positive ``totp_recovery_code_generation`` plus at least one unused,
-    under-budget ``totp_recovery_codes`` row for that generation. The codes
-    themselves are opaque here (only their hashes are stored) since this
-    helper only needs to satisfy the recovery-availability check, not to
-    redeem a code.
-
-    ``psycopg.Connection`` has no ``executemany`` (only ``Cursor`` does), so
-    the batch insert runs through an explicit cursor.
+    Codes are random and not returned; this helper grants availability for guard
+    checks, not a redeemable plaintext fixture. Existing rows are not replaced.
     """
     conn.execute(
         "UPDATE users SET totp_recovery_code_generation = %s WHERE id = %s",
@@ -306,28 +374,23 @@ def install_active_recovery_codes(
 
 @pytest.fixture
 def user_factory():
-    """Insert a user row; returns UserHandle(id, email, password).
+    """Return a factory that inserts and commits users, returning UserHandle.
 
-    Defaults: local auth, verified, active, public tier, no TOTP, password
-    DEFAULT_PASSWORD. Override any column via kwargs (e.g. is_admin=True,
-    email_verified=False, totp_secret=<encrypted>, auth_method='shibboleth').
-    Shibboleth users get password_hash=None automatically unless overridden.
-
-    A local administrator (``is_admin=True``, default ``auth_method``) is
-    also given a healthy recovery state by default — an encrypted TOTP
-    secret (unless one was passed in) plus an active recovery-code
-    generation with unused codes — because
-    ``guard_current_admin_session_cur`` (users.py:141-193) and
-    ``require_admin`` (middleware/session.py:278-296) reject every local
-    administrator write and route without one. Pass
-    ``admin_recovery_ready=False`` for the explicit "incomplete recovery
-    configuration" double that those rejection tests need.
+    Keyword overrides are database columns, except password (plaintext to hash) and
+    admin_recovery_ready (True by default). Defaults are a unique email, active and
+    verified local public-tier account, DEFAULT_PASSWORD and no TOTP. Local admins
+    get a factor and unused recovery codes unless admin_recovery_ready=False.
+    Nonlocal accounts default to no password hash. Shibboleth fixtures force
+    unverified email and normalize pending/approved/disabled authority fields.
     """
     counter = [0]
 
     def make(**overrides):
+        """Insert and commit an overridden user; return its ID, email and plaintext password
+        handle.
+        """
         counter[0] += 1
-        email = overrides.pop("email", f"user{counter[0]}@uzh.ch")
+        email = overrides.pop("email", f"user{counter[0]}@example.org")
         password = overrides.pop("password", None)
         admin_recovery_ready = overrides.pop("admin_recovery_ready", True)
         if password is not None:
@@ -365,7 +428,7 @@ def user_factory():
                 cols["federated_status"] = "approved" if cols["is_active"] else "pending"
 
             federated_status = cols["federated_status"]
-            if federated_status in {"pending", "legacy_quarantined"}:
+            if federated_status == "pending":
                 cols["access_tier"] = "public"
                 cols["is_active"] = False
                 cols["is_admin"] = False
@@ -393,13 +456,14 @@ def user_factory():
 
 @pytest.fixture
 def session_factory():
-    """Insert a session row via the app's own hashing; returns the RAW id.
+    """Return a factory that commits hashed sessions and returns their raw IDs.
 
-    Uses hash_session_id from the app so the stored value matches what
-    get_session_user computes from the cookie.
+    The inner factory accepts user ID, purpose, lifetime in seconds and an optional
+    (message, category) flash pair; negative lifetimes create expired sessions.
     """
 
     def make(user_id, purpose="full", expires_in_seconds=28800, flash=None):
+        """Insert and commit a hashed session; return its raw ID; flash is a message/category pair."""
         raw = secrets.token_urlsafe(32)
         expires_at = datetime.now(UTC) + timedelta(seconds=expires_in_seconds)
         flash_message, flash_category = flash if flash else (None, None)
@@ -427,22 +491,23 @@ def session_factory():
 
 @pytest.fixture
 def dataset_factory():
-    """Insert a dataset row; returns its id. Array columns default to non-NULL
-    empties, mirroring what the real upsert writes.
+    """Return a factory that commits dataset column overrides and returns the row ID.
 
-    resource_proxies (JSONB) takes a plain list of {"type", "ref"} dicts —
-    e.g. [{"type": "Resource", "ref": "https://example.org/dl"}] to give the
-    dataset a resource_access_url, [{"type": "LandingPage", "ref": ...}] for a
-    landing page — and is adapted to JSONB here."""
+    Defaults provide a unique test UUID/title and public metadata. resource_proxies
+    is adapted to JSONB; derived URL columns are not populated by this helper.
+    """
 
     counter = [0]
 
     def make(**overrides):
+        """Insert and commit overridden dataset columns; adapt resource proxies to JSONB and return
+        the ID.
+        """
         counter[0] += 1
         cols = {
             "uuid": overrides.pop("uuid", f"oai:test:uuid-{counter[0]:04d}"),
             "title": overrides.pop("title", f"Dataset {counter[0]}"),
-            "source": "swissubase",
+            "source": TEST_SOURCE_NAME,
             "access_level": "public",
             "visibility_tier": "public",
             "description": "Full description text.",
@@ -468,13 +533,11 @@ def dataset_factory():
     return make
 
 
-# ---------------------------------------------------------------------------
 # End-to-end client (real pool, real CatalogueStatsCache, real middleware)
-# ---------------------------------------------------------------------------
 
 
 @contextmanager
-def _live_client(peer_address=None):
+def _live_client(peer_address=None, *, unix_peer=False):
     """TestClient over the real app, optionally from a chosen peer address.
 
     Only the lifespan's external side effects are stubbed (migrations — the
@@ -503,15 +566,17 @@ def _live_client(peer_address=None):
         patch(
             "app.main.setup_logging", new=create_autospec(_REAL_LIFESPAN_TARGETS["setup_logging"])
         ),
-        patch(
-            "app.main.seed_admin_user",
-            new=create_autospec(_REAL_LIFESPAN_TARGETS["seed_admin_user"]),
-        ),
         TestClient(
             app,
             base_url="http://localhost",
             raise_server_exceptions=False,
-            client=(peer_address, 50000) if peer_address is not None else ("testclient", 50000),
+            client=(
+                None
+                if unix_peer
+                else (peer_address, 50000)
+                if peer_address is not None
+                else ("testclient", 50000)
+            ),
         ) as client,
     ):
         yield client
@@ -535,6 +600,7 @@ def e2e_client_from_address():
     with ExitStack() as stack:
 
         def _build(peer_address):
+            """Enter a live client and register teardown with the fixture stack."""
             return stack.enter_context(_live_client(peer_address))
 
         yield _build
@@ -589,3 +655,15 @@ def login_admin(client, user_factory):
     page = client.get("/admin")
     assert page.status_code == status.HTTP_200_OK, page.text
     return admin, client.cookies.get("csrf_token")
+
+
+@pytest.fixture
+def e2e_unix_client():
+    """Real application client with a synthetic ASGI Unix-peer shape.
+
+    ``client=None`` exercises the callback's required no-TCP-peer boundary.
+    It does not prove an installed Unix socket's ownership, ACLs, nginx or SP.
+    The same ordinary lifespan stubs as e2e_client remain in force.
+    """
+    with _live_client(unix_peer=True) as client:
+        yield client

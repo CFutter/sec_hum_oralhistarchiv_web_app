@@ -1,0 +1,8 @@
+<input type="hidden" name="public_id" value="{{ public_id }}">
+<div class="form-group"{% if token %} hidden{% endif %}>
+  <label for="action-token">Security code from your email</label>
+  <input type="{{ 'hidden' if token else 'text' }}" id="action-token" name="token"
+         value="{{ token or '' }}" required maxlength="{{ action_token_max_chars }}" autocomplete="off"
+         autocapitalize="off" spellcheck="false">
+  <span class="form-hint">Copy the security code from the email into this field, then submit the form.</span>
+</div>

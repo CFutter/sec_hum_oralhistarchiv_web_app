@@ -1,39 +1,34 @@
 {% extends "base.html" %}
 {% set active_page = "login" %}
-{% block title %}Login — Oral History Archive{% endblock %}
+{% block title %}Login — {{ site_name }}{% endblock %}
 
 {% block content %}
 <section class="container auth-page">
-  {% if request.query_params.get('email_changed') %}
-  <div class="auth-success">Your email was changed. Please log in with your new address.</div>
-  {% endif %}
+  <h1>Login</h1>
+  <p class="auth-intro">Sign in to view the metadata available to your account.</p>
 
-  {% if request.query_params.get('totp_changed') == '1' %}
-  <div class="auth-success">Your authenticator was changed. Wait for its next code, then sign in again.</div>
+  {% if error %}
+  <div class="auth-error" role="alert">{{ error }}</div>
+  {% elif notice %}
+  <div class="auth-success" role="status">{{ notice }}</div>
   {% endif %}
 
   {% if request.query_params.get('resubmit') == '1' %}
   <p class="auth-intro">Your form was not submitted because your session ended.
     Sign in, then open the form and submit it again.</p>
   {% endif %}
-  <h1>Login</h1>
-  <p class="auth-intro">Sign in to access extended metadata and restricted datasets.</p>
-
-  {% if error %}
-  <div class="auth-error">{{ error }}</div>
-  {% endif %}
 
   {% if shibboleth_enabled %}
   <div class="auth-section">
-    <h2>Institutional Login</h2>
-    <p>Authenticate with your university account via SWITCH edu-ID.</p>
+    <h2>{{ federated_login_label }}</h2>
+    <p>Authenticate with your institutional account.</p>
     <p class="form-hint">Your first institutional sign-in creates a pending access request. An administrator must approve the account and its access tier before you can sign in.</p>
     {% set shib_target = path_for(request, 'shibboleth_callback') %}
     {% if request.query_params.get('next') %}
       {% set shib_target = shib_target ~ '?next=' ~ (request.query_params.get('next') | urlencode) %}
     {% endif %}
     <a href="/Shibboleth.sso/Login?target={{ shib_target | urlencode }}&amp;authnContextClassRef={{ required_shibboleth_authn_context | urlencode }}&amp;authnContextComparison=exact&amp;forceAuthn=true" class="btn btn-primary btn-institutional">
-      Login with SWITCH edu-ID
+      {{ federated_login_label }}
     </a>
   </div>
 
@@ -48,18 +43,18 @@
       <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
       <div class="form-group">
         <label for="email">Email</label>
-        <input type="email" id="email" name="email" required maxlength="200"
+        <input type="email" id="email" name="email" required maxlength="{{ local_email_max_chars }}"
                value="{{ email | default('') }}" autocomplete="email">
       </div>
       <div class="form-group">
         <label for="password">Password</label>
-        <input type="password" id="password" name="password" required maxlength="200"
+        <input type="password" id="password" name="password" required maxlength="{{ local_password_max_chars }}"
                autocomplete="current-password">
       </div>
       <div class="form-group">
         <label for="totp_code">Authentication Code</label>
-        <input type="text" id="totp_code" name="totp_code" maxlength="6"
-               pattern="[0-9]{0,6}" placeholder="6-digit code (if configured)"
+        <input type="text" id="totp_code" name="totp_code" maxlength="{{ totp_code_raw_max_chars }}"
+               pattern="[0-9\s]{0,{{ totp_code_raw_max_chars }}}" placeholder="6-digit code (if configured)"
                autocomplete="off" inputmode="numeric">
         <span class="form-hint">Leave blank if you haven't set up 2FA yet.</span>
         <span class="form-hint">Codes are single-use and change every 30 seconds — if you just signed in, wait for a new code.</span>

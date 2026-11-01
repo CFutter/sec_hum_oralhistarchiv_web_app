@@ -43,7 +43,7 @@ if (($!_SYSTEMD_UNIT == "oralhistarchiv.service")
     action(
         name="oralhistarchiv_remote_audit"
         type="omrelp"
-        target="<logcollector.uzh.ch>"
+        target="<logcollector.example.org>"
         port="<2514>"
 
         tls="on"
@@ -51,7 +51,7 @@ if (($!_SYSTEMD_UNIT == "oralhistarchiv.service")
         tls.myCert="/etc/rsyslog.d/tls/oralhistarchiv-client-cert.pem"
         tls.myPrivKey="/etc/rsyslog.d/tls/oralhistarchiv-client-key.pem"
         tls.authMode="name"   # omrelp accepts "name"/"fingerprint"/"certvalid" — NOT the imtcp-style "x509/name"
-        tls.permittedPeer=["<logcollector.uzh.ch>"]
+        tls.permittedPeer=["<logcollector.example.org>"]
 
         # Disk-assisted queue; retry indefinitely but monitor its 512 MiB disk
         # limit, suspension, and host free space. Exhaustion can block/drop input.

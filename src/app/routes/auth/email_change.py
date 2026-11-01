@@ -1,27 +1,36 @@
 """Stage local email changes and consume session-independent confirmation links."""
 
 import logging
+from secrets import compare_digest
 
-from fastapi import Form, Request, Response
+from fastapi import Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from ...credentials import LOCAL_EMAIL_MAX_CHARS, LOCAL_PASSWORD_MAX_CHARS
+from ...action_token_contract import ACTION_PUBLIC_ID_CHARS, ACTION_TOKEN_MAX_CHARS
+from ...credentials import (
+    LOCAL_EMAIL_MAX_CHARS,
+    LOCAL_PASSWORD_MAX_CHARS,
+    TOTP_CODE_RAW_MAX_CHARS,
+)
 from ...middleware import (
     clear_session_cookie,
-    get_session_id_from_cookie,
     limiter,
+    require_resolved_session_id,
 )
+from ...reason_contracts import require_reason_coverage
 from ...route_security import RouteAccess, SecureAPIRouter
 from ...services import (
     SelfEmailChangeRejected,
+    TotpDecryptionError,
+    action_token_public_id,
     audit_user_event,
     confirm_email_change,
-    hash_token,
-    pending_email_change_matches,
     set_flash_if_exists,
     stage_self_email_change,
+    valid_action_public_id,
     validate_email_change_token,
 )
+from ...services.email_change import SelfEmailChangeReason
 from ...template_setup import templates
 
 logger = logging.getLogger(__name__)
@@ -34,12 +43,21 @@ _SELF_EMAIL_CHANGE_ERRORS = {
     "invalid_email": "Please enter a valid email address.",
     "ineligible_account": "This account cannot change its email address.",
     "invalid_password": "Current password is incorrect.",
+    "invalid_totp": (
+        "Enter a fresh authentication code. If you just used a code, wait for the next one."
+    ),
     "account_locked": "This account is temporarily unavailable. Try again later.",
     "same_email": "That is already your email address.",
     "retry_required": (
         "Your credentials were refreshed while this request was processed. Please try again."
     ),
 }
+
+
+_SESSION_REJECTIONS = frozenset({"invalid_session", "step_up_exhausted"})
+require_reason_coverage(
+    SelfEmailChangeReason, _SELF_EMAIL_CHANGE_ERRORS, separately_handled=_SESSION_REJECTIONS
+)
 
 
 @local_router.get("/account/change-email", response_class=HTMLResponse)
@@ -61,17 +79,19 @@ async def change_email_submit(
     request: Request,
     new_email: str = Form(..., max_length=LOCAL_EMAIL_MAX_CHARS),
     current_password: str = Form(..., max_length=LOCAL_PASSWORD_MAX_CHARS),
+    totp_code: str = Form(..., max_length=TOTP_CODE_RAW_MAX_CHARS),
 ) -> Response:
-    """Prove the password and queue a revision-bound change without membership disclosure.
+    """Prove password/fresh TOTP and queue an enumeration-neutral email change.
 
-    Success audits/flashes and redirects 303 to /account. Policy errors render
-    422, lockout 423, and a refreshed hash 409. Invalid/exhausted sessions clear
-    cookies and redirect to login. RuntimeError/ValueError render 500; the
-    service's committed step-up attempt survives staging rejection.
+    Audit/flash success and redirect 303 to /account. Render 422 for policy
+    refusals, 423 lockout, 409 stale credentials or 503 unreadable TOTP. Invalid/
+    exhausted sessions clear cookies and redirect to login; staging RuntimeError/
+    ValueError renders 500. The durable step-up attempt survives staging refusal.
+    Missing resolved session state raises RuntimeError before staging.
     """
     user = request.state.user
     pool = request.app.state.db_pool
-    session_id = get_session_id_from_cookie(request)
+    session_id = require_resolved_session_id(request)
 
     def _form_error(msg: str, status: int = 422) -> Response:
         """Render the submitted address and error without echoing the password."""
@@ -90,12 +110,13 @@ async def change_email_submit(
         result = await stage_self_email_change(
             pool,
             user_id=user.id,
-            session_id=session_id or "",
+            session_id=session_id,
             current_password=current_password,
             new_email=new_email,
+            totp_code=totp_code,
         )
     except SelfEmailChangeRejected as exc:
-        if exc.reason in {"invalid_session", "step_up_exhausted"}:
+        if exc.reason in _SESSION_REJECTIONS:
             audit_user_event(
                 level=logging.WARNING,
                 request=request,
@@ -117,14 +138,23 @@ async def change_email_submit(
             return _form_error(_SELF_EMAIL_CHANGE_ERRORS[exc.reason], status=423)
         if exc.reason == "retry_required":
             return _form_error(_SELF_EMAIL_CHANGE_ERRORS[exc.reason], status=409)
-        if exc.reason == "invalid_password":
+        if exc.reason in {"invalid_password", "invalid_totp"}:
             audit_user_event(
                 level=logging.INFO,
                 request=request,
-                event_type="email_change_blocked_invalid_password",
+                event_type=(
+                    "email_change_blocked_invalid_password"
+                    if exc.reason == "invalid_password"
+                    else "email_change_blocked_invalid_totp"
+                ),
                 user_id=user.id,
             )
         return _form_error(_SELF_EMAIL_CHANGE_ERRORS[exc.reason])
+    except TotpDecryptionError:
+        return _form_error(
+            "Your authenticator is temporarily unavailable. Please contact support.",
+            status=503,
+        )
     except (RuntimeError, ValueError):
         logger.exception(
             "Email-change staging failed",
@@ -152,39 +182,19 @@ async def change_email_submit(
     return RedirectResponse(url="/account", status_code=303)
 
 
-@capability_router.get("/account/confirm-email/{token}", response_class=HTMLResponse)
+@capability_router.get("/account/confirm-email/{public_id}", response_class=HTMLResponse)
 @limiter.limit("10/minute;30/hour")
-async def confirm_email_page(request: Request, token: str) -> Response:
-    """Render a current signed pending change, or 400; never consume its token."""
-    pool = request.app.state.db_pool
-
-    data = validate_email_change_token(token)
-    if not data or not await pending_email_change_matches(
-        pool,
-        data["user_id"],
-        data["new_email"],
-        expected_auth_revision=data["auth_revision"],
-        expected_token_hash=hash_token(token),
-    ):
-        return templates.TemplateResponse(
-            request,
-            "error.html",
-            {
-                "error_title": "Link no longer valid",
-                "error_message": "This email-change link is invalid, has expired, "
-                "or has already been used. If you still want to "
-                "change your email, please request it again.",
-            },
-            status_code=400,
-        )
+async def confirm_email_page(request: Request, public_id: str) -> Response:
+    """Render unresolved confirmation fields; raise HTTPException(404) for malformed public IDs."""
+    if not valid_action_public_id(public_id):
+        raise HTTPException(status_code=404)
 
     return templates.TemplateResponse(
         request,
         "confirm_email.html",
         {
-            "token": token,
-            "new_email": data["new_email"],
-            "is_admin_initiated": data.get("acting_admin_id") is not None,
+            "public_id": public_id,
+            "token": None,
         },
     )
 
@@ -193,7 +203,8 @@ async def confirm_email_page(request: Request, token: str) -> Response:
 @limiter.limit("10/minute;30/hour")
 async def confirm_email_submit(
     request: Request,
-    token: str = Form(..., max_length=2000),
+    public_id: str = Form(..., max_length=ACTION_PUBLIC_ID_CHARS),
+    token: str = Form(..., max_length=ACTION_TOKEN_MAX_CHARS),
 ) -> Response:
     """Consume the signed change, revoke target sessions, and redirect 303 to login.
 
@@ -203,7 +214,12 @@ async def confirm_email_submit(
     """
     pool = request.app.state.db_pool
 
-    data = validate_email_change_token(token)
+    data = (
+        validate_email_change_token(token)
+        if valid_action_public_id(public_id)
+        and compare_digest(public_id, action_token_public_id(token))
+        else None
+    )
     if not data:
         return templates.TemplateResponse(
             request,
@@ -220,7 +236,7 @@ async def confirm_email_submit(
         pool,
         data["user_id"],
         data["new_email"],
-        hash_token(token),
+        token,
         expected_auth_revision=data["auth_revision"],
     )
 
@@ -245,7 +261,9 @@ async def confirm_email_submit(
 
     acting_admin_id = data.get("acting_admin_id")
     if acting_admin_id is not None:
-        # Deliberately audit_user_event, NOT audit_admin_action: that helper
+        # Confirmation may be anonymous or presented by another account.
+        # audit_admin_action takes its actor from request.state.user; use
+        # the initiating administrator ID from the validated token instead.
         audit_user_event(
             level=logging.INFO,
             request=request,
@@ -262,7 +280,7 @@ async def confirm_email_submit(
             user_id=data["user_id"],
         )
 
-    response = RedirectResponse(url="/login?email_changed=1", status_code=303)
+    response = RedirectResponse(url="/login?notice=email_changed", status_code=303)
     if request.state.user and request.state.user.id == data["user_id"]:
         clear_session_cookie(response)
     return response

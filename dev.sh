@@ -1,9 +1,19 @@
 #!/bin/bash
 # Bash 4.3+; from the repository root, run uv run bash dev.sh with ENV_STATE=dev.
-# Migrates the configured database, then starts scheduler and web; exits with
+# Validates development settings, migrates, then starts scheduler and web; exits with
 # the first child's status, terminating and reaping both children. INT/TERM exit
-# 130/143. Migration runs before the web launcher checks the environment.
+# 130/143. Settings validation and the dev-only guard run before any mutation.
 set -euo pipefail
+
+python3 - <<'PY'
+from config import settings
+
+if settings.env_state != "dev":
+    raise SystemExit(
+        "dev.sh requires ENV_STATE=dev; follow Deployment.md's reviewed migration workflow "
+        "and start the deployed services."
+    )
+PY
 
 python3 -m alembic -c src/alembic.ini upgrade head
 

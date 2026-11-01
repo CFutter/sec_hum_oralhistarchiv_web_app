@@ -1,31 +1,28 @@
 """Issue one-hour, revision-bound email-change capabilities.
 
 Self-service staging spends a durable session attempt and verifies a
-password snapshot; administrator staging guards the current admin session.
+password snapshot plus fresh TOTP; administrator staging guards the current admin session.
 Both atomically stage the hash and confirmation/security-notice emails.
-Confirmation needs no session but requires signature validation by its
-caller, then consumes current pending state and revokes sessions.
+Confirmation needs no session; it revalidates the signed capability after
+locking the account, then consumes current state and revokes sessions.
 """
 
 import logging
-import secrets
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Any, Literal, NotRequired, TypedDict
 
-from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from itsdangerous import BadSignature, SignatureExpired
 from psycopg import AsyncCursor
 from psycopg.errors import UniqueViolation
 from psycopg_pool import AsyncConnectionPool
 
 from config import settings
 
+from .account_clock import database_now_cur
 from .credential_attempts import (
     SessionStepUpAttemptOutcome,
     reserve_session_step_up_attempt,
 )
-from .crypto import password_hasher
 from .db import get_db_cursor
 from .db_constraints import is_users_email_collision
 from .email import build_email_change_notice, build_email_change_verification
@@ -34,18 +31,26 @@ from .email_outbox import (
     enqueue_outbound_email_cur,
 )
 from .email_utils import normalize_email
-from .password_work import run_password_work
+from .password_verification import PasswordVerified, verify_password_hash
 from .session_ids import hash_session_id
 from .session_revocation import (
     delete_user_sessions_cur,
     invalidate_pending_authentication_state_cur,
 )
-from .tokens import EMAIL_CHANGE_TOKEN_MAX_AGE_SECONDS, ActionEmailMetadata, hash_token
+from .tokens import (
+    EMAIL_CHANGE_TOKEN_MAX_AGE_SECONDS,
+    ActionEmailMetadata,
+    SignedActionToken,
+    action_token_url,
+    hash_token,
+)
+from .totp import verify_and_consume_totp_cur
 from .users import guard_current_admin_session_cur
 
 logger = logging.getLogger(__name__)
 
 _SALT = "email-change"
+_ACTION_TOKEN = SignedActionToken(_SALT, EMAIL_CHANGE_TOKEN_MAX_AGE_SECONDS)
 
 
 class EmailChangePayload(TypedDict):
@@ -62,6 +67,7 @@ AdminEmailChangeReason = Literal[
     "user_not_found",
     "federated_account",
     "inactive_account",
+    "self_change",
     "same_email",
     "email_in_use",
 ]
@@ -73,6 +79,7 @@ SelfEmailChangeReason = Literal[
     "step_up_exhausted",
     "ineligible_account",
     "invalid_password",
+    "invalid_totp",
     "same_email",
     "retry_required",
 ]
@@ -129,43 +136,19 @@ def generate_email_change_token(
     if not isinstance(auth_revision, int) or isinstance(auth_revision, bool) or auth_revision < 0:
         raise ValueError("auth_revision must be a non-negative integer")
 
-    signer = URLSafeTimedSerializer(settings.secret_key.get_secret_value())
     payload: dict[str, object] = {
         "user_id": user_id,
         "new_email": new_email,
         "auth_revision": auth_revision,
-        "nonce": secrets.token_urlsafe(16),
     }
     if acting_admin_id is not None:
         payload["acting_admin_id"] = acting_admin_id
-    return signer.dumps(payload, salt=_SALT)
+    return _ACTION_TOKEN.issue(payload)
 
 
-def email_change_token_email_metadata(
-    token: str,
-) -> ActionEmailMetadata:
-    """Return the token hash and signed UTC issue time plus its one-hour lifetime.
-
-    Invalid/expired signatures propagate itsdangerous exceptions.
-    """
-    signer = URLSafeTimedSerializer(
-        settings.secret_key.get_secret_value(),
-    )
-
-    _, issued_at = signer.loads(
-        token,
-        salt=_SALT,
-        max_age=EMAIL_CHANGE_TOKEN_MAX_AGE_SECONDS,
-        return_timestamp=True,
-    )
-
-    return ActionEmailMetadata(
-        token_hash=hash_token(token),
-        expires_at=issued_at
-        + timedelta(
-            seconds=EMAIL_CHANGE_TOKEN_MAX_AGE_SECONDS,
-        ),
-    )
+def email_change_token_email_metadata(token: str) -> ActionEmailMetadata:
+    """Return the hash and signed expiration; signature/expiry errors propagate."""
+    return _ACTION_TOKEN.email_metadata(token)
 
 
 def validate_email_change_token(token: str) -> EmailChangePayload | None:
@@ -176,15 +159,10 @@ def validate_email_change_token(token: str) -> EmailChangePayload | None:
     checked. Optional integer administrator IDs are retained, including
     nonpositive IDs; invalid optional values and extra keys are ignored.
     """
-    signer = URLSafeTimedSerializer(settings.secret_key.get_secret_value())
     try:
-        raw = signer.loads(
-            token,
-            salt=_SALT,
-            max_age=EMAIL_CHANGE_TOKEN_MAX_AGE_SECONDS,
-        )
-    except (BadSignature, SignatureExpired) as exc:
-        logger.warning("Invalid or expired email-change token: %s", exc)
+        raw = _ACTION_TOKEN.loads(token)
+    except (BadSignature, SignatureExpired):
+        logger.warning("Invalid or expired email-change token")
         return None
 
     if not isinstance(raw, dict):
@@ -281,16 +259,16 @@ async def stage_self_email_change(
     session_id: str,
     current_password: str,
     new_email: str,
+    totp_code: str,
 ) -> SelfEmailChangeResult:
-    """Verify the password and atomically stage normalized email plus two messages.
+    """Prove password/fresh TOTP and atomically stage email plus two messages.
 
-    session_id is a raw active full-session token. A separately committed
-    step-up reservation remains spent after later rejection. Verify the password
-    off-connection, then lock/recheck account, hash, revision, lockout, and
-    session. Queue confirmation to the new address and notice to the old one;
-    do not check whether the destination already belongs to another account.
-    Return committed addresses; SelfEmailChangeRejected.reason identifies
-    policy/credential failures, including retry_required after hash changes.
+    session_id is a raw full-session token. Spend a separately committed step-up
+    attempt, verify the password off-connection, then lock/recheck account, hash,
+    revision and session expiry. Login lockout is not checked. Consume TOTP and
+    queue confirmation to the new address plus notice to the old one in the same
+    transaction; destination membership is not checked. Return committed addresses;
+    SelfEmailChangeRejected.reason identifies policy/credential rejection.
     """
     normalized_email = normalize_email(new_email)
     if normalized_email is None:
@@ -332,20 +310,15 @@ async def stage_self_email_change(
         or not snapshot["password_hash"]
     ):
         raise SelfEmailChangeRejected("ineligible_account")
-    if not snapshot["login_unlocked"]:
-        raise SelfEmailChangeRejected("account_locked")
 
-    try:
-        await run_password_work(
-            password_hasher.verify,
-            snapshot["password_hash"],
-            current_password,
-        )
-    except VerifyMismatchError as exc:
-        raise SelfEmailChangeRejected("invalid_password") from exc
-    except (InvalidHashError, VerificationError) as exc:
-        logger.exception("Unverifiable password hash for user id=%s", user_id)
-        raise SelfEmailChangeRejected("invalid_password") from exc
+    result = await verify_password_hash(
+        password_hash=snapshot["password_hash"],
+        password=current_password,
+        user_id=user_id,
+        operation="email_change",
+    )
+    if not isinstance(result, PasswordVerified):
+        raise SelfEmailChangeRejected("invalid_password") from result.cause
 
     async with get_db_cursor(pool) as cur:
         await cur.execute(
@@ -355,8 +328,10 @@ async def stage_self_email_change(
                    auth_revision,
                    is_active,
                    auth_method,
-                   (locked_until IS NULL OR locked_until <= clock_timestamp())
-                       AS login_unlocked
+                   email_verified,
+                   totp_secret,
+                   totp_recovery_required,
+                   locked_until
             FROM users
             WHERE id = %s
             FOR UPDATE
@@ -369,24 +344,25 @@ async def stage_self_email_change(
             or not user["is_active"]
             or user["auth_method"] != "local"
             or not user["password_hash"]
+            or not user["email_verified"]
+            or not user["totp_secret"]
+            or user["totp_recovery_required"]
         ):
             raise SelfEmailChangeRejected("ineligible_account")
-        if not user["login_unlocked"]:
-            raise SelfEmailChangeRejected("account_locked")
-
         await cur.execute(
             """
-            SELECT 1
+            SELECT expires_at
             FROM sessions
             WHERE id = %s
               AND user_id = %s
               AND purpose = 'full'
-              AND expires_at > clock_timestamp()
             FOR UPDATE
             """,
             (hash_session_id(session_id), user_id),
         )
-        if await cur.fetchone() is None:
+        session = await cur.fetchone()
+        now = await database_now_cur(cur)
+        if session is None or session["expires_at"] <= now:
             raise SelfEmailChangeRejected("invalid_session")
 
         if user["auth_revision"] != snapshot["auth_revision"]:
@@ -399,6 +375,9 @@ async def stage_self_email_change(
         if normalized_email.lower() == old_email.lower():
             raise SelfEmailChangeRejected("same_email")
 
+        if not await verify_and_consume_totp_cur(cur, user_id, totp_code):
+            raise SelfEmailChangeRejected("invalid_totp")
+
         revision = user["auth_revision"]
         token = generate_email_change_token(
             user_id,
@@ -408,8 +387,9 @@ async def stage_self_email_change(
         action = email_change_token_email_metadata(token)
         verification_email = build_email_change_verification(
             normalized_email,
-            f"{settings.public_base_url}/account/confirm-email/{token}",
+            f"{settings.public_base_url}{action_token_url('/account/confirm-email', token)}",
             expires_at=action.expires_at,
+            security_code=token,
         )
         await store_pending_email_cur(
             cur,
@@ -452,7 +432,8 @@ async def stage_admin_email_change(
     """Guard the admin session and atomically stage email plus confirmation/notice.
 
     Normalize the destination, lock an active local target, and reject its
-    current address or another account's address. Return committed addresses.
+    current address or another account's address. Self changes must use the
+    password/TOTP-protected account flow. Return committed addresses.
     AdminEmailChangeRejected carries validation/target reasons; the admin guard
     may raise AdminActionRejected. Database/outbox failures roll back all writes.
     """
@@ -466,6 +447,8 @@ async def stage_admin_email_change(
             actor_id=actor_id,
             actor_session_id=actor_session_id,
         )
+        if actor_id == target_user_id:
+            raise AdminEmailChangeRejected("self_change")
         await cur.execute(
             """
             SELECT email, auth_method, is_active, auth_revision
@@ -510,8 +493,9 @@ async def stage_admin_email_change(
         action = email_change_token_email_metadata(token)
         verification_email = build_email_change_verification(
             normalized_email,
-            f"{settings.public_base_url}/account/confirm-email/{token}",
+            f"{settings.public_base_url}{action_token_url('/account/confirm-email', token)}",
             expires_at=action.expires_at,
+            security_code=token,
         )
         notice_email = build_email_change_notice(old_email, normalized_email)
 
@@ -546,21 +530,34 @@ async def confirm_email_change(
     pool: AsyncConnectionPool,
     user_id: int,
     new_email: str,
-    token_hash: str,
+    token: str,
     *,
     expected_auth_revision: int,
 ) -> bool:
     """Consume a current pending capability and return whether the address changed.
 
-    The caller validates the signature first. Require active/local state, exact
+    Validate the raw signed token and its identity, then recheck signed expiry
+    after acquiring the user lock. Require active/local state, exact
     pending address/hash/revision, age under one hour, and case-insensitive
     uniqueness. Success verifies the new email, increments auth_revision, and
     revokes sessions/pending capabilities atomically. Current recovery codes and
     the recovery-required flag remain. A stale capability or email collision
     returns False; other database failures propagate.
     """
+    data = validate_email_change_token(token)
+    if (
+        data is None
+        or data["user_id"] != user_id
+        or data["new_email"] != new_email
+        or data["auth_revision"] != expected_auth_revision
+    ):
+        return False
+    token_hash = hash_token(token)
     try:
         async with get_db_cursor(pool) as cur:
+            await cur.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
+            if await cur.fetchone() is None or validate_email_change_token(token) != data:
+                return False
             await cur.execute(
                 """
                 UPDATE users
@@ -579,7 +576,7 @@ async def confirm_email_change(
                   AND auth_method = 'local'
                   AND is_active
                   AND pending_email_created_at >
-                      CURRENT_TIMESTAMP - %s * INTERVAL '1 second'
+                      clock_timestamp() - %s * INTERVAL '1 second'
                   AND NOT EXISTS (
                       SELECT 1
                       FROM users u2

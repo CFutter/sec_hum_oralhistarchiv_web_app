@@ -1,26 +1,4 @@
-"""Recovery-code generation lifecycle and redemption races against real PostgreSQL.
-
-``app.services.totp_recovery_codes`` keeps at most one active and one pending
-generation per user. Staging a new generation must start every one of its
-per-code password-attempt counters at zero, and activating a pending
-generation must atomically remove whichever generation it replaces — never
-leaving two live generations, and never carrying a counter forward from the
-generation it replaces.
-
-``app.services.totp_recover.redeem_totp_recovery`` (totp_recover.py:500-643)
-matches a code without locking, reserves one password attempt against it in
-its own committed transaction, verifies the password outside any lock, and
-only then locks the user row to revalidate the exact snapshot and consume
-the reservation once. These tests pin what that ordering buys: an unknown or
-already-spent code touches no row belonging to the named account, two
-sessions racing the same correct code and password produce at most one
-recovery session, and any account state that changes between the reservation
-and the final lock (password, recovery authority, expiry, or an entirely
-replaced code generation) fails the whole redemption rather than partially
-applying it. The integration conftest applies the application's Alembic
-migration and skips this module when the configured test database is
-unavailable.
-"""
+"""Recovery-code generation lifecycle and redemption races against real PostgreSQL."""
 
 import asyncio
 from datetime import UTC, datetime, timedelta
@@ -29,7 +7,7 @@ from unittest.mock import create_autospec
 import psycopg
 import pytest
 
-from app.services import totp_recover
+from app.services import password_verification, totp_recover
 from app.services.crypto import password_hasher
 from app.services.db import get_db_cursor
 from app.services.tokens import hash_token
@@ -51,6 +29,7 @@ _UNRELATED_WELLFORMED_CODE = "11111-AAAAA-22222-BBBBB"
 
 
 def _generation_rows(sync_conn, user_id: int):
+    """Read recovery generations and password-attempt counts in code order."""
     return sync_conn.execute(
         """
         SELECT generation, password_attempt_count
@@ -63,6 +42,7 @@ def _generation_rows(sync_conn, user_id: int):
 
 
 def _generation_state(sync_conn, user_id: int):
+    """Read active and pending recovery-code generations."""
     return sync_conn.execute(
         """
         SELECT totp_recovery_code_generation, pending_totp_recovery_code_generation
@@ -80,6 +60,7 @@ class TestRecoveryCodeGenerationLifecycle:
     async def test_staging_a_new_generation_starts_every_counter_at_zero(
         self, db_pool, user_factory, sync_conn
     ):
+        """Verify staging a new generation starts every counter at zero."""
         user = user_factory()
 
         async with get_db_cursor(db_pool) as cur:
@@ -194,6 +175,7 @@ def _authorize_recovery(sync_conn, user_id: int, *, expires_at: datetime | None 
 
 
 def _recovery_code_rows(sync_conn, user_id: int):
+    """Read recovery-code generation, position, usage and attempt counts in code order."""
     return sync_conn.execute(
         """
         SELECT generation, position, used_at, password_attempt_count
@@ -206,6 +188,7 @@ def _recovery_code_rows(sync_conn, user_id: int):
 
 
 def _user_recovery_snapshot(sync_conn, user_id: int):
+    """Read credentials, recovery authority, generation and login-lock state."""
     return sync_conn.execute(
         """
         SELECT password_hash, auth_revision, totp_recovery_required,
@@ -220,6 +203,7 @@ def _user_recovery_snapshot(sync_conn, user_id: int):
 
 
 def _session_count(sync_conn, user_id: int) -> int:
+    """Count stored sessions for the user, including expired rows."""
     return sync_conn.execute(
         "SELECT COUNT(*) FROM sessions WHERE user_id = %s", (user_id,)
     ).fetchone()[0]
@@ -230,6 +214,7 @@ class TestRecoveryRedemptionRejectsUnusableCodes:
 
     @pytest.fixture
     def redeemable_user(self, user_factory, sync_conn):
+        """Create a user with a known active recovery code and current recovery authorization."""
         user = user_factory()
         _install_known_code(sync_conn, user.id, generation=1, code=_KNOWN_CODE)
         _authorize_recovery(sync_conn, user.id)
@@ -324,22 +309,68 @@ class TestRecoveryRedemptionRejectsUnusableCodes:
 
 
 class TestConcurrentValidRedemption:
-    """Independent connections racing the same correct code and password."""
+    """Race committed SQL reservations/finalisation with controlled valid password proofs."""
 
-    async def test_at_most_one_session_and_the_code_is_consumed_once(self, user_factory, sync_conn):
+    async def test_at_most_one_session_and_the_code_is_consumed_once(
+        self, user_factory, sync_conn, monkeypatch
+    ) -> None:
+        """Verify at most one session and the code is consumed once."""
         user = user_factory()
         _install_known_code(sync_conn, user.id, generation=1, code=_KNOWN_CODE)
         _authorize_recovery(sync_conn, user.id)
+
+        row = sync_conn.execute(
+            "SELECT password_hash FROM users WHERE id = %s", (user.id,)
+        ).fetchone()
+        assert row is not None
+        expected_hash = row[0]
+        sync_conn.commit()
+        proof = await password_verification.verify_password_hash(
+            password_hash=expected_hash,
+            password=user.password,
+            user_id=user.id,
+            operation="totp_recovery",
+        )
+        assert isinstance(proof, password_verification.PasswordVerified)
+
+        # Keep the database race independent of the finite hash-admission queue.
+        # All permitted reservations must commit before any finalisation starts.
+        proofs_ready = asyncio.Barrier(TOTP_RECOVERY_PASSWORD_ATTEMPT_LIMIT)
+
+        async def verify_known_password(
+            *, password_hash: str, password: str, user_id: int, operation: str
+        ) -> password_verification.PasswordVerificationResult:
+            """Check the expected password-work arguments, synchronize proofs and return
+            PasswordVerified.
+            """
+            assert password_hash == expected_hash
+            assert password == user.password
+            assert user_id == user.id
+            assert operation == "totp_recovery"
+            await proofs_ready.wait()
+            return password_verification.PasswordVerified()
+
+        verify = create_autospec(
+            password_verification.verify_password_hash,
+            spec_set=True,
+            side_effect=verify_known_password,
+        )
+        dummy = create_autospec(
+            password_verification.verify_dummy, spec_set=True, return_value=None
+        )
+        monkeypatch.setattr(totp_recover, "verify_password_hash", verify)
+        monkeypatch.setattr(totp_recover, "verify_dummy", dummy)
 
         caller_count = TOTP_RECOVERY_PASSWORD_ATTEMPT_LIMIT + 2
         barrier = asyncio.Barrier(caller_count)
 
         async def redeem_on_independent_connection(index: int):
+            """Redeem the known recovery code after a barrier; return success or rejection reason."""
             async with await psycopg.AsyncConnection.connect(TEST_DATABASE_URL) as conn:
                 await barrier.wait()
                 try:
                     result = await redeem_totp_recovery(
-                        conn,  # type: ignore[arg-type] - supported direct-connection path
+                        conn,
                         email=user.email,
                         password=user.password,
                         recovery_code=_KNOWN_CODE,
@@ -349,12 +380,16 @@ class TestConcurrentValidRedemption:
                     return ("rejected", exc.reason)
                 return ("ok", result)
 
-        results = await asyncio.wait_for(
-            asyncio.gather(
-                *(redeem_on_independent_connection(index) for index in range(caller_count))
-            ),
-            timeout=10,
-        )
+        async with asyncio.timeout(10):
+            async with asyncio.TaskGroup() as group:
+                tasks = [
+                    group.create_task(redeem_on_independent_connection(index))
+                    for index in range(caller_count)
+                ]
+        results = [task.result() for task in tasks]
+
+        assert verify.await_count == TOTP_RECOVERY_PASSWORD_ATTEMPT_LIMIT
+        assert dummy.await_count == caller_count - TOTP_RECOVERY_PASSWORD_ATTEMPT_LIMIT
 
         successes = [result for kind, result in results if kind == "ok"]
         rejections = [reason for kind, reason in results if kind == "rejected"]
@@ -384,6 +419,7 @@ class TestRecoveryRedemptionRejectsStaleStateAtFinalisation:
 
     @pytest.fixture
     def redeemable_user(self, user_factory, sync_conn):
+        """Create a user with a known active recovery code and current recovery authorization."""
         user = user_factory()
         _install_known_code(sync_conn, user.id, generation=1, code=_KNOWN_CODE)
         _authorize_recovery(sync_conn, user.id)
@@ -409,9 +445,13 @@ class TestRecoveryRedemptionRejectsStaleStateAtFinalisation:
     async def test_a_stale_snapshot_at_finalisation_fails_the_whole_redemption(
         self, db_pool, redeemable_user, sync_conn, monkeypatch, case, expected_reason
     ):
-        real_password_work = totp_recover.run_password_work
+        """Verify a stale snapshot at finalisation fails the whole redemption."""
+        real_password_work = password_verification.run_password_work
 
         async def verify_then_mutate_account_state(function, *args):
+            """Complete real password work, then apply and commit the parametrized authority
+            mutation.
+            """
             result = await real_password_work(function, *args)
             if case == "password_hash_changed":
                 sync_conn.execute(
@@ -465,11 +505,11 @@ class TestRecoveryRedemptionRejectsStaleStateAtFinalisation:
         # parameter it gains would raise here rather than silently stop being
         # exercised by this fault injection.
         autospecced_password_work = create_autospec(
-            totp_recover.run_password_work,
+            password_verification.run_password_work,
             spec_set=True,
             side_effect=verify_then_mutate_account_state,
         )
-        monkeypatch.setattr(totp_recover, "run_password_work", autospecced_password_work)
+        monkeypatch.setattr(password_verification, "run_password_work", autospecced_password_work)
 
         with pytest.raises(TotpRecoveryRedemptionRejected) as excinfo:
             await redeem_totp_recovery(

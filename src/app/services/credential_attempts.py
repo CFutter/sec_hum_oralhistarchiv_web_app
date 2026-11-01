@@ -5,13 +5,13 @@ before callers verify credentials, so rejection cannot refund an attempt.
 """
 
 import logging
+from datetime import timedelta
 from enum import StrEnum
-
-from psycopg_pool import AsyncConnectionPool
 
 from config import settings
 
-from .db import get_db_cursor
+from .account_clock import database_now_cur
+from .db import Database, get_db_cursor
 from .session_ids import hash_session_id
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ class SessionStepUpAttemptOutcome(StrEnum):
 
 
 async def reserve_session_step_up_attempt(
-    pool: AsyncConnectionPool,
+    pool: Database,
     *,
     user_id: int,
     session_id: str,
@@ -35,10 +35,14 @@ async def reserve_session_step_up_attempt(
     """Commit one attempt against an active user's unexpired full session.
 
     The session row lock serializes reservations. Return INVALID_SESSION for
-    a missing/ineligible session, ACCOUNT_LOCKED for an active login lock, or
-    RESERVED after incrementing the counter. At SESSION_STEP_UP_ATTEMPT_LIMIT,
+    a missing/ineligible session or RESERVED after incrementing the counter.
+    Username-triggered login lockout does not consume an authenticated session's
+    independent proof allowance. At SESSION_STEP_UP_ATTEMPT_LIMIT,
     expire the session, clear its flash, and return ATTEMPTS_EXHAUSTED. Account
     lockout state is unchanged; database failures propagate.
+
+    Use a pool or an idle caller-owned connection for an independent commit.
+    An existing outer transaction retains control of the final commit or rollback.
     """
     session_hash = hash_session_id(session_id)
     outcome: SessionStepUpAttemptOutcome
@@ -46,9 +50,7 @@ async def reserve_session_step_up_attempt(
     async with get_db_cursor(pool) as cur:
         await cur.execute(
             """
-            SELECT s.step_up_attempt_count,
-                   (u.locked_until IS NULL OR
-                    u.locked_until <= clock_timestamp()) AS login_unlocked
+            SELECT s.step_up_attempt_count, s.expires_at, s.last_activity_at
             FROM sessions AS s
             JOIN users AS u ON u.id = s.user_id
             WHERE s.id = %s
@@ -62,10 +64,16 @@ async def reserve_session_step_up_attempt(
         )
         row = await cur.fetchone()
         if row is None:
-            outcome = SessionStepUpAttemptOutcome.INVALID_SESSION
-        elif not row["login_unlocked"]:
-            outcome = SessionStepUpAttemptOutcome.ACCOUNT_LOCKED
-        elif row["step_up_attempt_count"] >= settings.session_step_up_attempt_limit:
+            return SessionStepUpAttemptOutcome.INVALID_SESSION
+
+        # The SELECT may have waited for the session lock. Check both
+        # deadlines against database wall time after acquiring that lock.
+        now = await database_now_cur(cur)
+        idle_cutoff = now - timedelta(seconds=settings.session_idle_timeout_seconds)
+        if row["expires_at"] <= now or row["last_activity_at"] <= idle_cutoff:
+            return SessionStepUpAttemptOutcome.INVALID_SESSION
+
+        if row["step_up_attempt_count"] >= settings.session_step_up_attempt_limit:
             # Expiring avoids the cascading challenge-row locks of DELETE.
             await cur.execute(
                 """

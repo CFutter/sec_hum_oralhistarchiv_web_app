@@ -47,6 +47,7 @@ async def invalidate_pending_authentication_state_cur(
         UPDATE users
         SET pending_totp_secret = NULL,
             pending_totp_created_at = NULL,
+            pending_totp_session_hash = NULL,
             pending_email = NULL,
             pending_email_token_hash = NULL,
             pending_email_created_at = NULL,

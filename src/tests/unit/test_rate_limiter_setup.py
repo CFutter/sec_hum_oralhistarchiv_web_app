@@ -1,31 +1,4 @@
-"""Unit coverage for how the rate limiter is built and how it identifies clients.
-
-Three production surfaces are pinned here:
-
-- ``app.middleware.rate_limiting.setup_rate_limiting`` and
-  ``validate_rate_limit_configuration``: the enable/disable wiring done at
-  startup, and the startup validator that must admit every storage mode
-  ``settings.rate_limit_storage_uri`` can resolve to.
-- ``app.request_utils.get_client_ip``: the trust-gated client identity that
-  becomes the limiter key. Forwarded headers (X-Real-IP, then
-  X-Forwarded-For) are honored ONLY when the request came through a trusted
-  upstream (TCP peer in the import-frozen ``_TRUSTED_UPSTREAM_IPS``, or a
-  Unix-socket connection) AND ``settings.rate_limit_trust_proxy`` is True.
-  Reading them unconditionally would let any client forge its apparent IP and
-  evade per-IP rate limits, so the untrusted-peer cases pin the security
-  boundary of this function.
-- ``app.middleware.rate_limiting.BoundedRateLimitMiddleware``: every check and
-  429-statistics read runs off the event loop in a worker thread, and the
-  Redis backend has a bounded admission deadline so a dead backend falls back
-  to in-memory storage instead of hanging every request.
-
-No client for the first two surfaces: a minimal FastAPI app and raw ASGI
-scopes are inspected structurally. The middleware class below is exercised
-through a minimal FastAPI app of its own via ``httpx.AsyncClient`` (not the
-application's ``guest_client`` fixtures); route-level rate-limit behavior on
-the real application routes lives in the client tier and is not covered
-here.
-"""
+"""Unit coverage for how the rate limiter is built and how it identifies clients."""
 
 import asyncio
 import logging
@@ -61,11 +34,7 @@ def make_request(
     server: tuple[str, int] | None = ("127.0.0.1", 8000),
     headers: list[tuple[bytes, bytes]] | None = None,
 ) -> Request:
-    """Build a starlette Request from a raw ASGI scope.
-
-    peer=None means no TCP client (Unix-socket style); combine with
-    server=None or server=(host, None) to make the scope socket-shaped.
-    """
+    """Build a request scope; peer=None models a Unix socket without a TCP client."""
     return Request(
         {
             "type": "http",
@@ -83,28 +52,21 @@ def make_request(
 class TestRateLimitingWiring:
     """setup_rate_limiting's enable/disable wiring.
 
-    setup_rate_limiting has a disabled early-return (when RATE_LIMIT_ENABLED
-    is false) that is otherwise unexercised — the test env runs with rate
-    limiting ON. Pins both arms:
-
-    - disabled -> returns without wiring anything (no app.state.limiter, no
-      SlowAPIMiddleware added), so a deployment that turns limiting off
-      doesn't half-install the middleware;
-    - enabled  -> installs app.state.limiter and adds the middleware.
+    Both modes retain the explicit instance on app.state for readiness.
+    Both modes retain admission middleware for the shared search gate.
     """
 
-    def test_disabled_setup_wires_nothing(self, monkeypatch):
-        """RATE_LIMIT_ENABLED=false -> early return: no limiter on app.state
-        and no middleware added. A disabled deployment must not pay for (or
-        half-wire) the SlowAPI middleware."""
+    def test_disabled_setup_keeps_shared_search_admission(self, monkeypatch):
+        """Disabled client limits retain the independent global search gate."""
         monkeypatch.setattr(settings, "rate_limit_enabled", False)
+        monkeypatch.setattr(rl.limiter, "enabled", False)
         app = FastAPI()
 
         with patch.object(app, "add_middleware", autospec=True) as add_mw:
-            setup_rate_limiting(app)
-            add_mw.assert_not_called()
+            setup_rate_limiting(app, rl.limiter)
+            add_mw.assert_called_once_with(BoundedRateLimitMiddleware, search_busy_response=None)
 
-        assert not hasattr(app.state, "limiter")
+        assert app.state.limiter is rl.limiter
 
     def test_enabled_setup_wires_limiter_and_middleware(self, monkeypatch):
         """RATE_LIMIT_ENABLED=true -> app.state.limiter is set and the
@@ -113,37 +75,24 @@ class TestRateLimitingWiring:
         app = FastAPI()
 
         with patch.object(app, "add_middleware", autospec=True) as add_mw:
-            setup_rate_limiting(app)
+            setup_rate_limiting(app, rl.limiter)
             assert add_mw.call_count == 1
 
         assert app.state.limiter is not None
 
 
 class TestStorageModeValidation:
-    """The startup validator accepts every storage mode the settings resolve to.
-
-    ``settings.rate_limit_storage_uri`` (config/settings.py) resolves to the
-    dedicated Redis URL, then the shared Redis URL, then ``"memory://"`` for a
-    development process without Redis. The validator must admit the limiter
-    that ``_build_limiter`` constructs for each of those outcomes.
-    """
+    """The startup validator accepts every storage mode the settings resolve to."""
 
     def test_validator_admits_the_limiter_built_for_a_redis_url(self, monkeypatch):
-        """Positive control: a dedicated Redis URL builds a limiter the validator accepts."""
+        """Check validator admits the limiter built for a Redis URL."""
         monkeypatch.setattr(settings, "rate_limit_redis_url", SecretStr("redis://fake-host:6379/9"))
         monkeypatch.setattr(settings, "redis_enabled", False)
 
         validate_rate_limit_configuration(rl._build_limiter())
 
     def test_validator_admits_the_limiter_built_for_process_local_memory_mode(self, monkeypatch):
-        """A development process without any Redis URL must still start.
-
-        With no dedicated URL and the shared Redis disabled the settings
-        resolve to ``"memory://"`` and ``_build_limiter`` constructs an
-        in-process MemoryStorage limiter; validating that limiter must not
-        raise. Today the validator treats the resolved URI as a Redis URL and
-        rejects the memory storage it asked for.
-        """
+        """A development process without any Redis URL must still start."""
         monkeypatch.setattr(settings, "rate_limit_redis_url", SecretStr(""))
         monkeypatch.setattr(settings, "redis_enabled", False)
 
@@ -151,17 +100,7 @@ class TestStorageModeValidation:
 
 
 class TestClientIpAttribution:
-    """Trust-gated client IP extraction — app.request_utils.get_client_ip.
-
-    Forwarded headers (X-Real-IP, then X-Forwarded-For) must be honored ONLY
-    when the request came through a trusted upstream (TCP peer in the
-    import-frozen _TRUSTED_UPSTREAM_IPS, or a Unix-socket connection) AND
-    settings.rate_limit_trust_proxy is True. Reading them unconditionally
-    would let any client forge its apparent IP and evade per-IP rate limits,
-    so the untrusted-peer and trust-off cases pin the security boundary of
-    this function; each has a positive control in this class proving the
-    permitted case still works.
-    """
+    """Trust-gated client IP extraction — app.request_utils.get_client_ip."""
 
     @pytest.mark.parametrize(
         ("peer", "server", "headers", "expected_ip"),
@@ -220,22 +159,15 @@ class TestClientIpAttribution:
     def test_trusted_upstream_honors_valid_forwarded_header(
         self, monkeypatch, peer, server, headers, expected_ip
     ):
-        """A trusted upstream (allowlisted TCP peer or Unix-socket connection)
-        with trust enabled gets its forwarded header honored: whitespace is
-        stripped, an invalid X-Real-IP falls through to the first
-        X-Forwarded-For hop, a fully malformed pair falls back to the peer,
-        both Unix-socket scope shapes count as trusted, and IPv6 values are
-        accepted as-is. Losing this collapses every client onto nginx's IP
-        and per-IP rate limits throttle everyone together."""
+        """Check trusted upstream honors valid forwarded header."""
         monkeypatch.setattr(settings, "rate_limit_trust_proxy", True)
         request = make_request(peer=peer, server=server, headers=headers)
         assert get_client_ip(request) == expected_ip
 
     def test_untrusted_peer_ignores_forwarded_headers(self, monkeypatch):
-        """The security boundary: a direct (untrusted) peer 5.5.5.5 sending
-        both forwarded headers gets attributed to 5.5.5.5, not the header
-        values. Honoring these headers from arbitrary peers would let any
-        client spoof its IP and evade per-IP rate limiting."""
+        """The security boundary: a direct (untrusted) peer 5.5.5.5 sending both forwarded headers gets
+        attributed to 5.5.5.5, not the header values.
+        """
         monkeypatch.setattr(settings, "rate_limit_trust_proxy", True)
         request = make_request(
             peer="5.5.5.5",
@@ -246,11 +178,9 @@ class TestClientIpAttribution:
         )
         assert get_client_ip(request) == "5.5.5.5"
 
-    def test_trust_proxy_off_ignores_headers_even_from_trusted_peer(self):
-        """Config gate: rate_limit_trust_proxy=False (the test-env default)
-        means forwarded headers are ignored even when the peer IS a trusted
-        upstream. Pins settings.rate_limit_trust_proxy being read at call time."""
-        assert settings.rate_limit_trust_proxy is False  # test-env default
+    def test_trust_proxy_off_ignores_headers_even_from_trusted_peer(self, monkeypatch):
+        """Disabling proxy trust ignores forwarded headers from a trusted peer."""
+        monkeypatch.setattr(settings, "rate_limit_trust_proxy", False)
         request = make_request(
             peer="127.0.0.1",
             headers=[
@@ -268,11 +198,9 @@ class TestClientIpAttribution:
         assert get_client_ip(request) == "unknown"
 
     def test_trusted_upstream_set_is_frozen_at_import(self, monkeypatch):
-        """_TRUSTED_UPSTREAM_IPS is frozen from settings.trusted_proxy_ips at
-        module import; mutating the setting afterwards must NOT widen the
-        trust set. Guards against a refactor that re-reads the setting at
-        call time and lets a runtime config mutation open the spoofing
-        boundary."""
+        """_TRUSTED_UPSTREAM_IPS is frozen from settings.trusted_proxy_ips at module import; mutating
+        the setting afterwards must NOT widen the trust set.
+        """
         monkeypatch.setattr(settings, "rate_limit_trust_proxy", True)
         monkeypatch.setattr(settings, "trusted_proxy_ips", ["5.5.5.5"])
         request = make_request(peer="5.5.5.5", headers=[(b"x-real-ip", b"9.9.9.9")])
@@ -287,15 +215,18 @@ def _rate_limited_app(limiter: Limiter) -> FastAPI:
 
     @app.get("/default")
     async def default(request: Request):
+        """Echo the request path from the rate-limited probe route."""
         return Response(request.url.path)
 
     @app.get("/decorated")
     @limiter.limit("1/minute")
     async def decorated(request: Request):
+        """Echo the request path from the rate-limited probe route."""
         return Response(request.url.path)
 
     @app.exception_handler(RateLimitExceeded)
     async def exceeded(request, _exc):
+        """Require collected limit statistics before returning HTTP 429."""
         assert request.state.rate_limit_stats is not None
         return Response("limited", status_code=429)
 
@@ -303,14 +234,8 @@ def _rate_limited_app(limiter: Limiter) -> FastAPI:
 
 
 class TestMiddlewareOffloadingAndBackendDeadlines:
-    """BoundedRateLimitMiddleware keeps the event loop free and bounds the
-    time it will wait on a dead storage backend.
-
-    Every limiter check and every 429-statistics read is dispatched onto a
-    worker thread, never run inline on the event loop; and a storage backend
-    that stops responding must not stall requests indefinitely — it has a
-    fixed admission deadline and the limiter falls back to in-memory
-    storage once that deadline is exceeded.
+    """BoundedRateLimitMiddleware keeps the event loop free and bounds the time it will wait on a dead
+    storage backend.
     """
 
     @pytest.mark.parametrize(
@@ -319,17 +244,7 @@ class TestMiddlewareOffloadingAndBackendDeadlines:
         ids=["default_route_uses_the_global_limit", "decorated_route_uses_its_own_limit"],
     )
     async def test_checks_and_429_statistics_run_off_the_event_loop(self, path, monkeypatch):
-        """`hit` and `get_window_stats` both run on a worker thread (never
-        the main thread) while the event loop keeps ticking, and a decorated
-        route's own limit check is not followed by a second, redundant
-        check.
-
-        Instead of sleeping a fixed wall-clock duration inside the worker
-        call, the worker parks on a `threading.Event` and a loop-side watcher
-        only releases it once the event loop has observably kept advancing
-        (a bounded tick counter) while the call was parked — proving the
-        offload, not just coincidental timing.
-        """
+        """Check checks and 429 statistics run off the event loop."""
         limiter = Limiter(
             key_func=lambda: "client", default_limits=["1/minute"], headers_enabled=False
         )
@@ -342,6 +257,9 @@ class TestMiddlewareOffloadingAndBackendDeadlines:
         release_worker = threading.Event()
 
         def slow(function, *args, **kwargs):
+            """Require a worker thread, wait up to two seconds for release, and run the limiter
+            operation.
+            """
             assert threading.get_ident() != main_thread
             worker_calls.append(function.__name__)
             worker_parked.set()
@@ -367,6 +285,7 @@ class TestMiddlewareOffloadingAndBackendDeadlines:
             release_worker.set()
 
         async def call_with_heartbeat(path: str) -> httpx.Response:
+            """Issue a bounded request while a loop-side watcher releases the parked worker."""
             worker_parked.clear()
             release_worker.clear()
             watcher = asyncio.create_task(watch_and_release())
@@ -380,17 +299,11 @@ class TestMiddlewareOffloadingAndBackendDeadlines:
         assert (await call_with_heartbeat(path)).status_code == 200
         assert (await call_with_heartbeat(path)).status_code == 429
         assert ticks >= 10
-        assert worker_calls.count("hit") == 2  # The decorator never performs a second check.
+        assert worker_calls.count("hit") == 2
         assert worker_calls.count("get_window_stats") == 1
 
     async def test_a_dead_backend_returns_503_without_falling_back_to_in_memory_counters(self):
-        """The application limiter policy (`_build_limiter`'s exact options:
-        `in_memory_fallback_enabled=False`, `swallow_errors=False`,
-        `redis_storage_options()`) against a backend that accepts the socket
-        and never replies returns a fail-closed 503 within the bounded
-        admission/socket deadline, never falls back to an in-process counter
-        (`limiter._storage_dead` stays False and storage is never swapped),
-        and never runs the endpoint body."""
+        """Check a dead backend returns 503 without falling back to in memory counters."""
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
         listener.listen()
@@ -398,6 +311,7 @@ class TestMiddlewareOffloadingAndBackendDeadlines:
         stop = threading.Event()
 
         def blackhole():
+            """Accept one TCP connection and hold it for up to five seconds without replying."""
             with listener:
                 connection, _ = listener.accept()
                 with connection:
@@ -427,12 +341,14 @@ class TestMiddlewareOffloadingAndBackendDeadlines:
 
         @app.get("/default")
         async def default(request: Request):
+            """Record route execution and echo the request path."""
             nonlocal endpoint_ran
             endpoint_ran = True
             return Response(request.url.path)
 
         @app.exception_handler(RateLimitExceeded)
         async def exceeded(_request, _exc):
+            """Return the synthetic HTTP 429 response for RateLimitExceeded."""
             return Response("limited", status_code=429)
 
         try:
@@ -467,17 +383,20 @@ def _counting_app(limiter: Limiter, **middleware_kwargs) -> tuple[FastAPI, list[
 
     @app.get("/default")
     async def default(request: Request):
+        """Record a default-route hit and echo the request path."""
         calls.append("default")
         return Response(request.url.path)
 
     @app.exception_handler(RateLimitExceeded)
     async def exceeded(_request, _exc):
+        """Return the synthetic HTTP 429 response for RateLimitExceeded."""
         return Response("limited", status_code=429)
 
     return app, calls
 
 
 def _unlimited_limiter() -> Limiter:
+    """Build a high-limit fixed-window limiter for middleware dispatch tests."""
     return Limiter(
         key_func=lambda: "client",
         default_limits=["1000/minute"],
@@ -487,18 +406,10 @@ def _unlimited_limiter() -> Limiter:
 
 
 class TestDispatchFailsClosedOnEveryRejectionPath:
-    """Every way BoundedRateLimitMiddleware.dispatch can refuse a request
-    returns the same fail-closed contract — 503, a Retry-After header, a
-    no-store cache directive, and the routed endpoint body never runs —
-    proven against the real middleware object, and each carries a log
-    record naming the failure so an operator can tell them apart. The
-    healthy-backend control in this class proves the contract isn't
-    tripped for an ordinary accepted request.
-    """
+    """Cover dispatch fails closed on every rejection path."""
 
     async def test_healthy_backend_admits_the_request_and_calls_the_endpoint(self):
-        """Positive control: a working limiter and backend admit the request
-        with 200 and the endpoint body runs exactly once."""
+        """Check healthy backend admits the request and calls the endpoint (HTTP 200)."""
         app, calls = _counting_app(_unlimited_limiter())
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -508,10 +419,7 @@ class TestDispatchFailsClosedOnEveryRejectionPath:
         assert calls == ["default"]
 
     async def test_backend_storage_error_returns_503_and_logs_its_category(self, caplog):
-        """A `StorageError`/`RedisError` raised while evaluating limits is
-        caught as a backend failure: 503, Retry-After, no-store, the
-        endpoint never runs, and the log record names the failure
-        category and exception class."""
+        """Check backend storage error returns 503 and logs its category."""
         app, calls = _counting_app(_unlimited_limiter())
         with (
             patch.object(rl, "run_thread_work", autospec=True) as run_thread_work,
@@ -526,6 +434,9 @@ class TestDispatchFailsClosedOnEveryRejectionPath:
         assert response.status_code == 503
         assert response.headers["Retry-After"] == "1"
         assert response.headers["Cache-Control"] == "no-store"
+        assert response.headers["X-Frame-Options"] == "DENY"
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert "frame-ancestors 'none'" in response.headers["Content-Security-Policy"]
         assert calls == []
         (record,) = [r for r in caplog.records if r.event_type == "rate_limit_backend_unavailable"]
         assert record.backend_failure_category == "connection"
@@ -553,10 +464,7 @@ class TestDispatchFailsClosedOnEveryRejectionPath:
         assert record.exception_type == "StorageError"
 
     async def test_admission_timeout_returns_503_and_logs_the_timeout(self, caplog):
-        """A `ThreadWorkAdmissionTimeout` from the worker adapter (the
-        bounded evaluation queue was full for too long) is a 503, not a
-        backend failure category: the endpoint never runs and the log
-        record names the timeout event."""
+        """Check admission timeout returns 503 and logs the timeout."""
         app, calls = _counting_app(_unlimited_limiter())
         with (
             patch.object(rl, "run_thread_work", autospec=True) as run_thread_work,
@@ -576,12 +484,7 @@ class TestDispatchFailsClosedOnEveryRejectionPath:
         assert not hasattr(record, "backend_failure_category")
 
     async def test_outstanding_capacity_exhaustion_rejects_a_concurrent_request(self):
-        """`_outstanding_capacity`'s `WouldBlock` (too many checks already in
-        flight) rejects the second of two concurrent requests with 503
-        while the first — genuinely still running in its worker thread —
-        is unaffected and eventually completes normally. Two independent
-        anyio capacity slots are exercised for real; nothing about
-        `anyio.CapacityLimiter` is mocked."""
+        """Check outstanding capacity exhaustion rejects a concurrent request."""
         limiter = _unlimited_limiter()
         app, calls = _counting_app(limiter, max_outstanding_checks=1)
         original_hit = limiter.limiter.hit
@@ -589,6 +492,7 @@ class TestDispatchFailsClosedOnEveryRejectionPath:
         release = threading.Event()
 
         def paused_hit(*args, **kwargs):
+            """Pause a limiter hit for at most two seconds before invoking the real backend."""
             entered.set()
             assert release.wait(2), "test never released the parked worker"
             return original_hit(*args, **kwargs)
@@ -611,10 +515,7 @@ class TestDispatchFailsClosedOnEveryRejectionPath:
         assert calls == ["default"]
 
     async def test_unexpected_evaluation_exception_returns_503_and_logs_it(self, caplog):
-        """Any exception from evaluation besides the recognised backend and
-        timeout errors is still fail-closed: 503, the endpoint never
-        runs, and the log record captures the exception class under the
-        ``unexpected`` category."""
+        """Check unexpected evaluation exception returns 503 and logs it."""
         app, calls = _counting_app(_unlimited_limiter())
         with (
             patch.object(rl, "run_thread_work", autospec=True) as run_thread_work,
@@ -662,6 +563,7 @@ class TestDispatchNeverCallsTheEndpointOnA429Decision:
     endpoint body either."""
 
     async def test_429_decision_skips_the_endpoint_body(self):
+        """Check 429 decision skips the endpoint body."""
         limiter = Limiter(
             key_func=lambda: "client",
             default_limits=["1/minute"],
@@ -680,8 +582,7 @@ class TestDispatchNeverCallsTheEndpointOnA429Decision:
         assert calls == ["default"]
 
     async def test_within_limit_requests_all_reach_the_endpoint_body(self):
-        """Positive control: while under the configured limit, every request
-        reaches the endpoint."""
+        """Check within limit requests all reach the endpoint body."""
         limiter = Limiter(
             key_func=lambda: "client",
             default_limits=["3/minute"],
@@ -699,19 +600,13 @@ class TestDispatchNeverCallsTheEndpointOnA429Decision:
 
 
 class TestUnnamedRouteAndResolverFailuresFailClosed:
-    """`_resolve_rate_limit_handler` failing, or a full match on an unnamed
-    ASGI mount, must fail closed rather than share the ordinary
-    unmatched-route sentinel bucket; ordinary 404/405 traffic keeps using
-    that sentinel and still reaches the router (the permitted case)."""
+    """Cover unnamed route and resolver failures fail closed."""
 
     async def test_an_unnamed_full_route_match_fails_closed(self):
-        """A full route match whose endpoint has no stable
-        ``__module__``/``__name__`` identity (an unnamed ASGI mount) raises
-        inside the resolver and must return 503, not the sentinel bucket,
-        and never call the endpoint."""
+        """Check an unnamed full route match fails closed (HTTP 503)."""
         limiter = _unlimited_limiter()
         app, calls = _counting_app(limiter)
-        app.mount("/mounted", Response("mounted"))  # a bare ASGI callable, no __name__
+        app.mount("/mounted", Response("mounted"))
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -722,9 +617,7 @@ class TestUnnamedRouteAndResolverFailuresFailClosed:
         assert calls == []
 
     async def test_ordinary_404_charges_the_sentinel_and_still_reaches_the_router(self):
-        """Positive control: an ordinary unmatched path is not a resolver
-        failure — it charges the shared sentinel bucket and still reaches
-        the router for its normal 404 response."""
+        """Check ordinary 404 charges the sentinel and still reaches the router."""
         app, calls = _counting_app(_unlimited_limiter())
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -735,9 +628,7 @@ class TestUnnamedRouteAndResolverFailuresFailClosed:
         assert calls == []
 
     async def test_ordinary_405_charges_the_sentinel_and_still_reaches_the_router(self):
-        """Positive control: a method mismatch on a real route is not a
-        resolver failure — it charges the shared sentinel bucket and still
-        reaches the router for its normal 405 response."""
+        """Check ordinary 405 charges the sentinel and still reaches the router."""
         app, calls = _counting_app(_unlimited_limiter())
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"

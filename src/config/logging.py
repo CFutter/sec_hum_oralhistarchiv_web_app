@@ -1,17 +1,9 @@
-"""
-Structured logging configuration.
+"""Configure stdout app/audit logging with bounded redaction and exception diagnostics.
 
-Provides:
-- JSON format for production (machine-parseable, suitable for log aggregation)
-- Human-readable format for development
-- Sensitive data redaction on all handlers
-- All logs go to stdout for systemd-journald to capture
-
-Multi-process safety: this module uses StreamHandler (which is multi-process
-safe) rather than file handlers. Earlier versions used TimedRotatingFileHandler,
-which is NOT safe across gunicorn workers — concurrent rotation can corrupt
-logs. journald handles rotation/retention via SystemMaxUse and
-MaxRetentionSec in /etc/systemd/journald.conf.
+App output uses JSON or text; audit output always uses JSON. Host logging
+owns rotation, retention and shipping. StreamHandler serializes threads per
+handler; separate worker processes may interleave stdout writes. Patterns
+are cached from settings on first use, so restart after secret changes.
 """
 
 import copy
@@ -24,10 +16,14 @@ import types
 import warnings
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
+from threading import RLock
 from typing import Any, TypedDict, Union, get_args, get_origin
+from weakref import WeakKeyDictionary
 
 from pydantic import SecretStr
 
+from app import escape_log_controls
+from app.bootstrap_logging import route_server_logs
 from config.settings import settings
 
 RedactionPattern = tuple[re.Pattern[str], str]
@@ -59,10 +55,133 @@ _STD_LOGRECORD_ATTRS = {
 }
 
 _MIN_REDACTION_VALUE_LENGTH = 8
+_LOG_FORMATTING_FAILED = "<log formatting failed>"
+_LOG_SANITIZATION_FAILED = "<log sanitization failed>"
+_MAX_LOG_CONTEXT_DEPTH = 16
+_MAX_LOG_CONTEXT_NODES = 512
+_LOG_CONTEXT_CYCLE = "<cycle>"
+_LOG_CONTEXT_TRUNCATED = "<truncated>"
+_LOG_CONTEXT_UNPRINTABLE = "<unprintable>"
 
-# One email pattern shared by the app channel's [REDACTED:email] rule and the
-# audit channel's hash-preserving AuditEmailAutoHash — a single definition so
-# the two channels can never disagree about what counts as an address.
+
+def _safe_log_message(record: logging.LogRecord) -> str:
+    """Return the formatted message or a fixed marker if interpolation raises Exception."""
+    try:
+        return record.getMessage()
+    except Exception:
+        return _LOG_FORMATTING_FAILED
+
+
+class _StructuredValueSanitizer:
+    """Copy JSON-like values within 16 container levels and 512 visited nodes.
+
+    Replace ancestor cycles, unprintable objects and exhausted traversal with
+    markers. Repeated sibling references are allowed. Instances carry mutable
+    traversal state and must not be shared concurrently.
+    """
+
+    def __init__(self, transform: Callable[[str], str], *, transform_keys: bool = True) -> None:
+        """Set string/key transforms and initialize one traversal budget."""
+        self._transform = transform
+        self._transform_keys = transform_keys
+        self._active: set[int] = set()
+        self._remaining_nodes = _MAX_LOG_CONTEXT_NODES
+
+    @property
+    def exhausted(self) -> bool:
+        """Return whether the shared visited-node budget is exhausted."""
+        return self._remaining_nodes <= 0
+
+    def _text(self, value: Any, *, transform: bool = True) -> str:
+        """Stringify or return an unprintable marker; optionally transform the text."""
+        try:
+            text = str(value)
+        except Exception:
+            return _LOG_CONTEXT_UNPRINTABLE
+        return self._transform(text) if transform else text
+
+    def sanitize(self, value: Any, *, depth: int = 0) -> Any:
+        """Return a bounded normalized copy, consuming this instance's shared traversal budget."""
+        if self.exhausted:
+            return _LOG_CONTEXT_TRUNCATED
+        self._remaining_nodes -= 1
+
+        if isinstance(value, (dict, list, tuple)):
+            if id(value) in self._active:
+                return _LOG_CONTEXT_CYCLE
+            if depth >= _MAX_LOG_CONTEXT_DEPTH:
+                return _LOG_CONTEXT_TRUNCATED
+            self._active.add(id(value))
+            try:
+                return self._container(value, depth=depth)
+            finally:
+                self._active.remove(id(value))
+
+        # Keep numeric JSON types while discarding subclass hooks that could
+        # otherwise run later during serialization or snapshot deepcopy.
+        if value is None or type(value) in (int, float, bool):
+            return value
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, float):
+            return float(value)
+        return self._text(value)
+
+    def _container(self, value: Any, *, depth: int) -> Any:
+        """Copy container children into a string-keyed dict/list within the remaining budget."""
+        if isinstance(value, dict):
+            result: dict[str, Any] = {}
+            for key, item in value.items():
+                if self.exhausted:
+                    result[_LOG_CONTEXT_TRUNCATED] = _LOG_CONTEXT_TRUNCATED
+                    break
+                safe_key = self._text(key, transform=self._transform_keys)
+                result[safe_key] = self.sanitize(item, depth=depth + 1)
+            return result
+
+        items: list[Any] = []
+        for item in value:
+            if self.exhausted:
+                items.append(_LOG_CONTEXT_TRUNCATED)
+                break
+            items.append(self.sanitize(item, depth=depth + 1))
+        return items
+
+
+def _replace_record_extras(record: logging.LogRecord, extras: dict[str, Any]) -> None:
+    """Replace every nonstandard LogRecord field in place with extras."""
+    for key in list(record.__dict__):
+        if key not in _STD_LOGRECORD_ATTRS:
+            del record.__dict__[key]
+    record.__dict__.update(extras)
+
+
+def _sanitize_record_extras(
+    record: logging.LogRecord, sanitizer: _StructuredValueSanitizer
+) -> None:
+    """Replace nonstandard record fields using one shared bounded traversal."""
+    extras: dict[str, Any] = {}
+    for key, value in record.__dict__.items():
+        if key in _STD_LOGRECORD_ATTRS:
+            continue
+        if sanitizer.exhausted:
+            extras["log_context_truncated"] = True
+            break
+        extras[key] = sanitizer.sanitize(value)
+    _replace_record_extras(record, extras)
+
+
+def _replace_failed_log_context(record: logging.LogRecord) -> None:
+    """Contain filter faults without logging again or exposing partial work."""
+    record.msg = _LOG_SANITIZATION_FAILED
+    record.args = ()
+    record.exc_info = None
+    record.exc_text = None
+    record.stack_info = None
+    _replace_record_extras(record, {"log_sanitization_failed": True})
+
+
+# Share email matching so application redaction and audit hashing cannot diverge.
 _EMAIL_PATTERN = re.compile(r"(?i)\b[\w.+-]+@[\w.-]+\.\w{2,}\b")
 
 _ACTION_TOKEN_PATH_PATTERN = re.compile(
@@ -86,13 +205,10 @@ _RUNTIME_SECRET_SHAPE_PATTERNS: tuple[RedactionPattern, ...] = (
 
 
 def _annotation_contains_secretstr(annotation: Any) -> bool:
-    """True if a field annotation is SecretStr or contains it.
+    """Return whether SecretStr occurs in the annotation or a supported union/container.
 
-    Recurses through Optional/Union (both ``Optional[SecretStr]`` and the
-    PEP-604 ``SecretStr | None`` spelling) and container generics
-    (list/tuple/set/frozenset/dict), so ``list[SecretStr]`` and
-    ``SecretStr | None`` count as secret-bearing. The type-side mirror of
-    ``_iter_secret_values`` — extend BOTH when adding a new shape.
+    Support Union, PEP 604 unions, list, tuple, set, frozenset and dict; keep this
+    in sync with _iter_secret_values when adding shapes.
     """
     if annotation is SecretStr:
         return True
@@ -103,14 +219,10 @@ def _annotation_contains_secretstr(annotation: Any) -> bool:
 
 
 def _iter_secret_values(value: Any) -> Iterator[str]:
-    """Yield the raw string leaves of a possibly wrapped/collection value.
+    """Yield raw SecretStr leaves or stringified values; skip None.
 
-    The runtime mirror of ``_annotation_contains_secretstr``: unwraps
-    SecretStr, walks list/tuple/set/frozenset elements and dict *values*,
-    and stringifies plain leaves (fields marked
-    ``json_schema_extra={"sensitive": True}`` without SecretStr typing).
-    ``None`` yields nothing, so an unset optional secret produces neither
-    a pattern nor a short-value warning.
+    Recurse through list/tuple/set/frozenset elements and dict values. This is
+    the runtime counterpart of _annotation_contains_secretstr.
     """
     if value is None:
         return
@@ -127,16 +239,11 @@ def _iter_secret_values(value: Any) -> Iterator[str]:
 
 
 def _build_sensitive_patterns(include_pii: bool = True) -> list[RedactionPattern]:
-    """Build redaction patterns from Settings field metadata.
+    """Return literal setting-secret and runtime credential redaction patterns.
 
-    Covers fields marked ``json_schema_extra={"sensitive": True}`` and every
-    field whose annotation CONTAINS SecretStr — plain, ``SecretStr | None``,
-    or inside a container such as ``list[SecretStr]``. Collection fields get
-    ONE PATTERN PER ELEMENT (all sharing the ``[REDACTED:<field_name>]``
-    marker), so during a MultiFernet rotation both the new and the old
-    TOTP_ENCRYPTION_KEYS entries are redacted. Values shorter than the
-    minimum supported redaction length are skipped with a RuntimeWarning
-    because they would over-match ordinary text.
+    Inspect SecretStr-containing/sensitive-marked fields; warn and skip nonempty
+    values shorter than eight characters. include_pii adds email redaction;
+    audit uses a separate hash filter. Snapshot current settings values.
     """
 
     patterns: list[RedactionPattern] = []
@@ -153,6 +260,8 @@ def _build_sensitive_patterns(include_pii: bool = True) -> list[RedactionPattern
             continue
 
         for row in _iter_secret_values(getattr(settings, field_name)):
+            if not row:
+                continue  # Optional unset credentials have nothing to redact.
             if len(row) < _MIN_REDACTION_VALUE_LENGTH:
                 warnings.warn(
                     f"Sensitive field '{field_name}' has a value shorter than "
@@ -186,29 +295,54 @@ def _build_sensitive_patterns(include_pii: bool = True) -> list[RedactionPattern
     )
     if include_pii:
         patterns.append((_EMAIL_PATTERN, "[REDACTED:email]"))  # PII — app logs only;
-        # the audit channel gets hash-preserving treatment via AuditEmailAutoHash instead
 
     return patterns
 
 
 class SensitiveDataFilter(logging.Filter):
-    """Redact secrets and PII from all log output.
+    """Redact configured/runtime secret patterns and optionally email in messages/extras.
 
-    Patterns are built from Settings field metadata:
-    - Fields whose annotation contains SecretStr (plain, Optional,
-    or inside a container — one pattern per element)
-    - Fields with json_schema_extra={"sensitive": True}
-
-    Plus static patterns for auth headers and other non-settings secrets.
+    Pattern matching is not a guarantee for arbitrary secrets or PII; formatters
+    handle exception diagnostics separately.
     """
 
     def __init__(self, include_pii: bool = True) -> None:
+        """Select email policy and initialize a lazy pattern cache plus locked record snapshots."""
         super().__init__()
         self._patterns: list[RedactionPattern] | None = None
         self._include_pii = include_pii
+        # Keep optimization state outside LogRecord's public structured fields.
+        # Weak keys retain it only while a handler/capture still owns the record.
+        self._sanitized_records: WeakKeyDictionary[logging.LogRecord, dict[str, Any]] = (
+            WeakKeyDictionary()
+        )
+        self._snapshot_lock = RLock()
+
+    def _remember_sanitization(self, record: logging.LogRecord) -> None:
+        """Deep-copy sanitized message/extras into a weak-key, lock-protected record snapshot."""
+        fields = {"msg": record.msg}
+        fields.update({k: v for k, v in record.__dict__.items() if k not in _STD_LOGRECORD_ATTRS})
+        # Sanitization has reduced values to JSON-like containers/scalars.
+        snapshot = copy.deepcopy(fields)
+        with self._snapshot_lock:
+            self._sanitized_records[record] = snapshot
+
+    def already_sanitized(self, record: logging.LogRecord | None, field: str, value: Any) -> bool:
+        """Return whether this field still matches its last sanitized snapshot."""
+        if record is None:
+            return False
+        with self._snapshot_lock:
+            snapshot = self._sanitized_records.get(record)
+        if snapshot is None or field not in snapshot:
+            return False
+        try:
+            return bool(snapshot[field] == value)
+        except Exception:
+            return False
 
     @property
     def patterns(self) -> list[RedactionPattern]:
+        """Build once and return the mutable patterns cached from current settings."""
         if self._patterns is None:
             self._patterns = _build_sensitive_patterns(include_pii=self._include_pii)
         return self._patterns
@@ -220,87 +354,62 @@ class SensitiveDataFilter(logging.Filter):
         return text
 
     def sanitize(self, value: Any) -> Any:
-        """Redact structured values before a formatter serializes them."""
-        if isinstance(value, str):
-            return self.apply(value)
-        if isinstance(value, dict):
-            return {self.apply(str(k)): self.sanitize(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [self.sanitize(v) for v in value]
-        if isinstance(value, (int, float, bool)) or value is None:
-            return value
-        return self.apply(str(value))
+        """Redact one structured value with cycle, depth, and node bounds."""
+        return _StructuredValueSanitizer(self.apply).sanitize(value)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        """Redact sensitive data in the message and in string-valued extra
-        fields, so redaction is formatter-independent (text and JSON alike)."""
-        record.msg = self.apply(record.getMessage())
-        record.args = ()
-        for key, value in list(record.__dict__.items()):
-            if key not in _STD_LOGRECORD_ATTRS:
-                record.__dict__[key] = self.sanitize(value)
+        """Redact message/extras; return True, replacing failed context with safe markers."""
+        try:
+            record.msg = self.apply(_safe_log_message(record))
+            record.args = ()
+            _sanitize_record_extras(record, _StructuredValueSanitizer(self.apply))
+            self._remember_sanitization(record)
+        except Exception:
+            _replace_failed_log_context(record)
         return True
 
 
-# Registered by app.services.crypto at import time. config cannot import app
-# (layering; and mypy resolves the resulting cycle by binding config.settings
-# to the submodule, breaking crypto's own types) — so the dependency is
-# inverted: the crypto layer hands its keyed hasher up via
-# set_audit_email_hasher(). Until registration, addresses fall back to the
-# non-correlatable [REDACTED:email] marker — fail-closed, never raw.
+# Crypto registers its hasher to avoid a config/app import cycle; unset means redacted.
 _audit_email_hasher: Callable[[str], str] | None = None
 
 
 def set_audit_email_hasher(hasher: Callable[[str], str]) -> None:
-    """Register the keyed hasher AuditEmailAutoHash rewrites addresses with."""
+    """Replace the process-wide audit email hasher; configure before concurrent logging."""
     global _audit_email_hasher  # noqa: PLW0603 - module-level singleton state is intentional here
     _audit_email_hasher = hasher
 
 
 class AuditEmailAutoHash(logging.Filter):
-    """Replace raw email addresses on the audit channel with their keyed hash.
+    """Replace email-pattern matches in audit messages/extras with [email:<hash>].
 
-    The audit channel deliberately skips the app channel's blanket
-    [REDACTED:email] regex (include_pii=False on _audit_redactor) because
-    audit events correlate actors via audit_email_hash(). That makes the
-    channel's safety purely conventional: every call site must remember to
-    hash. This filter is the mechanism behind that convention — any address
-    that reaches the channel raw (in the message or an extra value) is
-    swapped for "[email:<hash>]", so a forgotten hash degrades to a
-    correlatable marker instead of PII in the retained audit stream.
-
-    Value-shape based, NOT key-name based: only strings matching
-    _EMAIL_PATTERN are rewritten, so categorical fields that merely have
-    "email" in their key (email_type="password_reset",
-    email_was_registered=True) pass through unchanged, and *_hash fields
-    (bare hex) never match.
+    Without a registered hasher use [REDACTED:email]. Match values rather than
+    field names; categorical email fields and existing bare hashes remain intact.
     """
 
     def _hash_match(self, m: "re.Match[str]") -> str:
+        """Return the registered email hash marker, or a redacted marker before registration."""
         if _audit_email_hasher is None:
             return "[REDACTED:email]"
         return f"[email:{_audit_email_hasher(m.group(0))}]"
 
     def _apply(self, text: str) -> str:
+        """Replace all matching email substrings using the current audit hasher."""
         return _EMAIL_PATTERN.sub(self._hash_match, text)
 
     def _sanitize(self, value: Any) -> Any:
-        if isinstance(value, str):
-            return self._apply(value)
-        if isinstance(value, dict):
-            return {k: self._sanitize(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [self._sanitize(v) for v in value]
-        if isinstance(value, (int, float, bool)) or value is None:
-            return value
-        return self._apply(str(value))
+        """Hash email in bounded structured values while preserving mapping keys."""
+        return _StructuredValueSanitizer(self._apply, transform_keys=False).sanitize(value)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = self._apply(record.getMessage())
-        record.args = ()
-        for key, value in list(record.__dict__.items()):
-            if key not in _STD_LOGRECORD_ATTRS:
-                record.__dict__[key] = self._sanitize(value)
+        """Hash email in message/extras; return True, replacing failed context with safe markers."""
+        try:
+            record.msg = self._apply(_safe_log_message(record))
+            record.args = ()
+            _sanitize_record_extras(
+                record, _StructuredValueSanitizer(self._apply, transform_keys=False)
+            )
+        except Exception:
+            _replace_failed_log_context(record)
         return True
 
 
@@ -310,10 +419,13 @@ _audit_email_autohash = AuditEmailAutoHash()
 
 
 def _redact(text: str) -> str:
+    """Apply the process-wide application redaction patterns to text."""
     return _redactor.apply(text)
 
 
 class _ExceptionDiagnostic(TypedDict, total=False):
+    """Optional bounded exception-tree metadata; exception messages/arguments are omitted."""
+
     type: str
     frames: list[str]
     errno: int
@@ -335,6 +447,7 @@ _SQLSTATE_PATTERN = re.compile(r"[0-9A-Z]{5}\Z")
 
 
 def _truncated_exception(reason: str) -> _ExceptionDiagnostic:
+    """Return an exception-tree placeholder carrying the truncation reason."""
     return {
         "type": "<exception details truncated>",
         "truncated": reason,
@@ -344,6 +457,10 @@ def _truncated_exception(reason: str) -> _ExceptionDiagnostic:
 def _safe_traceback_frames(
     traceback_object: types.TracebackType | None,
 ) -> list[str]:
+    """Return up to 25 trailing formatted traceback frames, or an unavailable marker.
+
+    Frames may include source lines; exception values and locals are not rendered.
+    """
     try:
         return traceback.format_tb(
             traceback_object,
@@ -354,7 +471,7 @@ def _safe_traceback_frames(
 
 
 def _safe_sqlstate(exc: BaseException) -> str | None:
-    """Return only a valid, categorical database SQLSTATE."""
+    """Return an uppercase five-character SQLSTATE, or None for absent/invalid/failing values."""
     try:
         sqlstate = getattr(exc, "sqlstate", None)
     except Exception:
@@ -370,11 +487,11 @@ def _safe_exception_tree(
     *,
     root_traceback: types.TracebackType | None,
 ) -> _ExceptionDiagnostic:
-    """Render bounded exception metadata without values, messages, or arguments.
+    """Return exception type/frame/errno/SQLSTATE metadata without exception messages or arguments.
 
-    Every emitted diagnostic object, including a depth/cycle placeholder, consumes
-    one slot from the shared node budget. Exception-group traversal stops when the
-    budget is exhausted and records how many members were omitted.
+    Traverse causes/contexts and groups within depth 4 and 16 total nodes,
+    including placeholders. Keep at most 25 trailing frames per node; frames
+    may contain source text. Mark cycles and omitted members.
     """
     visited: set[int] = set()
     node_count = 0
@@ -385,6 +502,7 @@ def _safe_exception_tree(
         depth: int,
         traceback_override: types.TracebackType | None = None,
     ) -> _ExceptionDiagnostic | None:
+        """Consume one shared node slot and recursively render current; return None if exhausted."""
         nonlocal node_count
 
         # Claim the slot before testing depth or cycles: the placeholder emitted
@@ -455,6 +573,7 @@ def _render_exception_text(node: _ExceptionDiagnostic) -> str:
     lines: list[str] = []
 
     def render(current: _ExceptionDiagnostic, indent: str) -> None:
+        """Append this diagnostic and its nested causes/groups to the shared output lines."""
         exception_type = current.get("type", "<exception unavailable>")
         diagnostics: list[str] = []
 
@@ -501,7 +620,7 @@ class RedactingFormatter(logging.Formatter):
 
     _EXCEPTION_FORMATTING_FAILED = "<exception formatting failed>"
     _CACHED_EXCEPTION_OMITTED = "<cached exception text omitted>"
-    _LOG_FORMATTING_FAILED = "<log formatting failed>"
+    _LOG_FORMATTING_FAILED = _LOG_FORMATTING_FAILED
 
     @staticmethod
     def _exception_diagnostic(
@@ -510,6 +629,7 @@ class RedactingFormatter(logging.Formatter):
             | tuple[None, None, None]
         ),
     ) -> _ExceptionDiagnostic:
+        """Return bounded metadata for exc_info, or an unavailable-type marker if empty."""
         exc_type, exc_value, traceback_object = exc_info
         if exc_type is None or exc_value is None:
             return {"type": "<exception unavailable>"}
@@ -526,15 +646,22 @@ class RedactingFormatter(logging.Formatter):
             | tuple[None, None, None]
         ),
     ) -> str:
+        """Return redacted diagnostic text, or a fixed marker on formatting failure."""
         try:
             return _redact(_render_exception_text(self._exception_diagnostic(exc_info)))
         except Exception:
             return self._EXCEPTION_FORMATTING_FAILED
 
     def formatStack(self, stack_info: str) -> str:
+        """Format/redact supplied stack text; formatting errors propagate."""
         return _redact(super().formatStack(stack_info))
 
     def format(self, record: logging.LogRecord) -> str:
+        """Format a record copy with safe exceptions, redaction and one-line control escaping.
+
+        Discard untrusted cached exception text; return a fixed marker if final
+        formatting fails. The original record is not modified.
+        """
         safe_record = copy.copy(record)
 
         if safe_record.exc_info:
@@ -543,62 +670,81 @@ class RedactingFormatter(logging.Formatter):
             safe_record.exc_text = self._CACHED_EXCEPTION_OMITTED
 
         try:
-            return _redact(logging.Formatter.format(self, safe_record))
+            return escape_log_controls(_redact(logging.Formatter.format(self, safe_record)))
         except Exception:
             return self._LOG_FORMATTING_FAILED
 
 
 class JSONFormatter(RedactingFormatter):
-    """Structured JSON logging with bounded, message-free exception trees."""
+    """Policy-aware JSON logging with bounded, message-free exception trees.
+
+    Filters own sanitization of submitted messages/extras; the formatter
+    sanitizes generated diagnostics and metadata. A standalone formatter also
+    sanitizes submitted fields, using the same explicit app/audit policy.
+    """
+
+    def __init__(self, *, audit: bool = False) -> None:
+        """Select application or audit hashing/redaction policy."""
+        super().__init__()
+        self._audit = audit
+        self._redactor = _audit_redactor if audit else _redactor
+
+    def _sanitize(
+        self, value: Any, record: logging.LogRecord | None = None, field: str = ""
+    ) -> Any:
+        """Hash audit emails, then redact fields unless their sanitized snapshot is unchanged."""
+        if self._audit:
+            value = _audit_email_autohash._sanitize(value)
+        if not self._redactor.already_sanitized(record, field, value):
+            value = self._redactor.sanitize(value)
+        return value
 
     def format(self, record: logging.LogRecord) -> str:
+        """Return JSON or a fixed JSON message marker if any formatting step fails."""
         try:
             return self._format_json(record)
         except Exception:
             return json.dumps({"message": self._LOG_FORMATTING_FAILED})
 
     def _format_json(self, record: logging.LogRecord) -> str:
+        """Serialize UTC metadata, sanitized message/extras and bounded exception diagnostics."""
         log_entry: dict[str, object] = {
             "timestamp": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": self._sanitize(_safe_log_message(record), record, "msg"),
             "module": record.module,
             "function": record.funcName,
             "line": record.lineno,
         }
 
+        # These fields were generated here, rather than processed by a filter.
+        for key in ("level", "logger", "module", "function"):
+            log_entry[key] = self._sanitize(log_entry[key])
+
         for key, value in record.__dict__.items():
             if key not in _STD_LOGRECORD_ATTRS and key not in log_entry:
-                log_entry[key] = value
+                log_entry[self._sanitize(key)] = self._sanitize(value, record, key)
 
         if record.exc_info:
             try:
-                log_entry["exception"] = self._exception_diagnostic(record.exc_info)
+                log_entry["exception"] = self._sanitize(self._exception_diagnostic(record.exc_info))
             except Exception:
                 log_entry["exception"] = {
                     "type": self._EXCEPTION_FORMATTING_FAILED,
                 }
 
-        return json.dumps(_redactor.sanitize(log_entry))
+        return json.dumps(log_entry)
 
 
 def setup_logging(log_level: str = "INFO", log_format: str = "json") -> None:
-    """Configure application-wide logging.
+    """Replace root/audit handlers with redacting stdout handlers and reroute server logs.
 
-    All logs go to stdout for systemd-journald to capture. journald handles
-    rotation and retention (configured in /etc/systemd/journald.conf via
-    SystemMaxUse= and MaxRetentionSec=).
-
-    Logs are emitted to stdout for journald capture. Off-host shipping
-    (when required) is handled by a host-level agent (rsyslog over RELP/TLS)
-    reading from journald — not by the application. See Deployment.md.
-
-    Args:
-        log_level: Minimum level for application logs.
-        log_format: "json" for structured output, "text" for human-readable.
-
-    Call once during application startup (in lifespan handler).
+    log_level is case-insensitive; unknown names fall back to INFO. Only the
+    exact log_format="json" selects app JSON; other values select escaped text.
+    Audit remains JSON at INFO without propagation. Set uvicorn.access and
+    sqlalchemy.engine to WARNING. Call during startup, before concurrent logging;
+    host logging owns retention/rotation/shipping.
     """
     root_logger = logging.getLogger()
     root_logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
@@ -628,10 +774,13 @@ def setup_logging(log_level: str = "INFO", log_format: str = "json") -> None:
     console_handler.setFormatter(formatter)
     console_handler.addFilter(_redactor)
     root_logger.addHandler(console_handler)
+    # UvicornWorker installs Gunicorn's plain handlers with propagation off.
+    # Lifespan setup must take ownership after that worker-side wiring.
+    route_server_logs()
 
     audit_handler = logging.StreamHandler(sys.stdout)
     # Audit context must survive even when application logs use text display.
-    audit_handler.setFormatter(JSONFormatter())
+    audit_handler.setFormatter(JSONFormatter(audit=True))
     audit_handler.addFilter(_audit_redactor)
     audit_logger.addHandler(audit_handler)
 

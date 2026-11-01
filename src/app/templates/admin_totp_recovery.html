@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% set active_page = "admin" %}
-{% block title %}Authorize Authenticator Recovery — Oral History Archive{% endblock %}
+{% block title %}Authorize Authenticator Recovery — {{ site_name }}{% endblock %}
 
 {% block content %}
 <section class="container auth-page">
@@ -62,8 +62,8 @@
         id="admin_totp_code"
         name="admin_totp_code"
         required
-        maxlength="6"
-        pattern="[0-9]{6}"
+        maxlength="{{ totp_code_raw_max_chars }}"
+        pattern="[0-9\s]{6,{{ totp_code_raw_max_chars }}}"
         inputmode="numeric"
         autocomplete="one-time-code"
         placeholder="6-digit code"

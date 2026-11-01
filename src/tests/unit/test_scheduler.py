@@ -1,28 +1,9 @@
-"""Scheduler unit tests — mutual exclusion, job execution, and registration pins.
-
-Coverage notes:
-- `sync_and_invalidate` and `rebuild_and_invalidate` (app.services.scheduler)
-  call straight through to `run_sync`/`run_full_rebuild` (app.services.sync),
-  which hold the module-level `_sync_mutex` (asyncio.Lock) there. That lock is
-  the CROSS-JOB overlap guard (incremental sync vs. full rebuild must never
-  interleave, or a tombstoned uuid can be resurrected from the rebuild's stale
-  snapshot); `max_instances=1` on each job is the separate PER-JOB
-  self-overlap guard. Both layers are needed and both are pinned here.
-- An AsyncIOScheduler actually EXECUTES coroutine jobs. A BackgroundScheduler
-  in its place would call the async job on a worker thread, receive a
-  coroutine object, and discard it — the "looks healthy, does nothing"
-  failure (the lifecycle listener would even log EVENT_JOB_EXECUTED).
-- Registration pins: scheduler class, exact job-id set, max_instances=1.
-
-All DB-touching services (outbox delivery, synchronization, and session
-cleanup) are patched in the scheduler module's namespace — no database is
-needed.
-"""
+"""Scheduler unit tests — mutual exclusion, job execution, and registration pins."""
 
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, create_autospec
 
 import pytest
@@ -35,11 +16,18 @@ from apscheduler.events import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from psycopg_pool import AsyncConnectionPool
 
+import app.services.ingestion as sync_module
 import app.services.scheduler as scheduler_module
-import app.services.sync as sync_module
 from app.services.scheduler import RunningJobTracker, create_scheduler
-from config import settings
+from app.sources import (
+    ConfiguredSource,
+    FixtureConfig,
+    SourceDisplay,
+    SourceSchedule,
+    configure_sources,
+)
 from tests.fixtures import make_mock_catalogue_stats_cache
+from tests.source_fixtures import legacy_source
 
 _EXPECTED_INVALIDATION_COUNT = 2
 _EMAIL_OUTBOX_INTERVAL_SECONDS = 15
@@ -60,16 +48,10 @@ def _interval_seconds(job) -> float:
 
 
 async def _wait_until_registered_as_a_waiter(lock: asyncio.Lock) -> None:
-    """Bounded poll of a real external condition: a second task has
-    registered itself on `lock`'s own FIFO of pending acquirers.
-
-    `asyncio.Lock` exposes `_waiters` (None until first contended, then a
-    deque of pending-acquire futures). Polling this observes the blocked
-    state directly instead of a timed "sleep, then assert not done", which
-    proves nothing about why nothing happened yet.
-    """
+    """Wait for a real mutex waiter with a bounded poll rather than inferring contention from a delay."""
 
     async def _poll() -> None:
+        """Yield to the loop until the mutex has a registered waiter."""
         while not lock._waiters:
             await asyncio.sleep(0)
 
@@ -78,14 +60,7 @@ async def _wait_until_registered_as_a_waiter(lock: asyncio.Lock) -> None:
 
 @pytest.fixture
 def fresh_mutex(monkeypatch):
-    """Install fresh local and no-op cross-process locks for unit tests.
-
-    `_sync_mutex` and `_cross_process_sync_lock` live in `app.services.sync`;
-    `run_sync`/`run_full_rebuild` (which the scheduler's
-    `sync_and_invalidate`/`rebuild_and_invalidate` call unmodified) acquire
-    both. Patching them here, rather than on the scheduler module, exercises
-    the real serialization path.
-    """
+    """Install a fresh ingestion mutex and bypass the cross-process lock for this test."""
     lock = asyncio.Lock()
     monkeypatch.setattr(sync_module, "_sync_mutex", lock)
 
@@ -97,6 +72,7 @@ def fresh_mutex(monkeypatch):
 
     @asynccontextmanager
     async def no_op_cross_process_lock(pool):
+        """Yield the supplied pool without taking a cross-process lock."""
         yield pool
 
     monkeypatch.setattr(
@@ -109,12 +85,7 @@ def fresh_mutex(monkeypatch):
 
 @pytest.mark.usefixtures("fresh_mutex")
 class TestSyncMutexSerializesIncrementalAndFullRebuild:
-    """`_sync_mutex` (asyncio.Lock, app.services.sync) is the only thing that
-    stops an incremental sync's DELETE of a tombstoned uuid interleaving with
-    a full rebuild's re-insertion of that same uuid from its pre-deletion
-    snapshot — a resurrection window of up to 24h. `max_instances=1` alone
-    does not prevent this because the two jobs are different job ids.
-    """
+    """The shared in-process lock prevents incremental sync and rebuild overlap."""
 
     async def test_incremental_sync_blocks_while_full_rebuild_holds_the_lock(self, monkeypatch):
         """A full rebuild in progress must fully finish before a concurrently
@@ -124,15 +95,21 @@ class TestSyncMutexSerializesIncrementalAndFullRebuild:
         order = []
         rebuild_started = asyncio.Event()
         release = asyncio.Event()
+        selected_source = legacy_source()
+        incremental_source = legacy_source(name="other_archive")
         catalogue_stats_cache = make_mock_catalogue_stats_cache()
         pool = MagicMock()
 
-        async def fake_rebuild_body(_connection):
+        async def fake_rebuild_body(_connection, *, configured_source):
+            """Check the selected source, hold rebuild execution until released, and record completion."""
+            assert configured_source is selected_source
             rebuild_started.set()
             await release.wait()
             order.append("rebuild")
 
-        async def fake_sync_body(_connection):
+        async def fake_sync_body(_connection, *, configured_source):
+            """Require the incremental source and held mutex, then record sync execution."""
+            assert configured_source is incremental_source
             assert sync_module._sync_mutex.locked() is True
             order.append("sync")
 
@@ -144,19 +121,15 @@ class TestSyncMutexSerializesIncrementalAndFullRebuild:
         monkeypatch.setattr(sync_module, "_run_sync_on_locked_connection", fake_sync_body)
 
         rebuild_task = asyncio.create_task(
-            scheduler_module.rebuild_and_invalidate(pool, catalogue_stats_cache)
+            scheduler_module.rebuild_and_invalidate(pool, catalogue_stats_cache, selected_source)
         )
         await rebuild_started.wait()
 
         sync_task = asyncio.create_task(
-            scheduler_module.sync_and_invalidate(pool, catalogue_stats_cache)
+            scheduler_module.sync_and_invalidate(pool, catalogue_stats_cache, incremental_source)
         )
         await _wait_until_registered_as_a_waiter(sync_module._sync_mutex)
 
-        # The sync body must NOT have started: it is parked on the lock the
-        # rebuild still holds — observed directly above as a registered
-        # waiter, not inferred from a fixed delay. Without the shared lock,
-        # "sync" would already be in `order` here.
         assert "sync" not in order
         assert order == []
         assert sync_module._sync_mutex.locked() is True
@@ -164,48 +137,50 @@ class TestSyncMutexSerializesIncrementalAndFullRebuild:
         release.set()
         await asyncio.gather(rebuild_task, sync_task)
 
-        # Strict serialization: rebuild body finished before sync body began.
         assert order == ["rebuild", "sync"]
-        # Both wrappers invalidated the catalogue statistics cache (once each).
         assert catalogue_stats_cache.invalidate_cache.call_count == _EXPECTED_INVALIDATION_COUNT
-        # The mutex is released once both wrappers complete.
         assert sync_module._sync_mutex.locked() is False
 
     async def test_cache_invalidation_runs_after_the_lock_is_released(self, monkeypatch):
-        """The sync body runs WITH the lock held and with zero invalidations
-        recorded so far; invalidate_cache fires exactly once, after the
-        with-block — cache invalidation is never serialized under the sync
-        mutex, so moving it inside the lock would fail this test.
-        """
+        """Check cache invalidation runs after the lock is released."""
         catalogue_stats_cache = make_mock_catalogue_stats_cache()
+        selected_source = legacy_source()
         lock_held_in_body = []
         invalidate_count_in_body = []
 
-        async def fake_sync_body(_connection):
+        def invalidate_after_unlock():
+            """Require cache invalidation to occur after mutex release."""
+            assert sync_module._sync_mutex.locked() is False
+
+        catalogue_stats_cache.invalidate_cache.side_effect = invalidate_after_unlock
+
+        async def fake_sync_body(_connection, *, configured_source):
+            """Record mutex ownership and cache invalidation count inside the selected sync body."""
+            assert configured_source is selected_source
             lock_held_in_body.append(sync_module._sync_mutex.locked())
             invalidate_count_in_body.append(catalogue_stats_cache.invalidate_cache.call_count)
 
         monkeypatch.setattr(sync_module, "_run_sync_on_locked_connection", fake_sync_body)
 
-        await scheduler_module.sync_and_invalidate(MagicMock(), catalogue_stats_cache)
+        await scheduler_module.sync_and_invalidate(
+            MagicMock(),
+            catalogue_stats_cache,
+            selected_source,
+        )
 
         assert lock_held_in_body == [True]
-        # invalidate_cache had NOT yet been called when run_sync ran ...
         assert invalidate_count_in_body == [0]
-        # ... it happens after the with-block, exactly once, lock already free.
         catalogue_stats_cache.invalidate_cache.assert_called_once()
         assert sync_module._sync_mutex.locked() is False
 
     async def test_mutex_is_released_and_usable_after_a_failing_rebuild(self, monkeypatch):
-        """`async with` guarantees release on exception; a failing rebuild
-        must not leave the mutex held, or every future sync and rebuild would
-        deadlock forever (silent total sync outage). The wrapper must
-        propagate the error, leave the lock free afterwards, and let a
-        subsequent incremental sync run to completion.
-        """
+        """Check mutex is released and usable after a failing rebuild (RuntimeError)."""
         catalogue_stats_cache = make_mock_catalogue_stats_cache()
+        selected_source = legacy_source()
 
-        async def failing_rebuild_body(_connection):
+        async def failing_rebuild_body(_connection, *, configured_source):
+            """Check the selected source and raise an injected harvest failure."""
+            assert configured_source is selected_source
             raise RuntimeError("harvest exploded")
 
         monkeypatch.setattr(
@@ -213,35 +188,42 @@ class TestSyncMutexSerializesIncrementalAndFullRebuild:
         )
 
         with pytest.raises(RuntimeError, match="harvest exploded"):
-            await scheduler_module.rebuild_and_invalidate(MagicMock(), catalogue_stats_cache)
+            await scheduler_module.rebuild_and_invalidate(
+                MagicMock(),
+                catalogue_stats_cache,
+                selected_source,
+            )
 
         assert sync_module._sync_mutex.locked() is False
-        # The failure happened inside the with-block, before invalidation.
         catalogue_stats_cache.invalidate_cache.assert_called_once()
 
-        # A subsequent sync acquires the lock and completes normally.
         ran = []
 
-        async def ok_sync_body(_connection):
+        async def ok_sync_body(_connection, *, configured_source):
+            """Check the selected source and record successful sync execution."""
+            assert configured_source is selected_source
             ran.append("sync")
 
         monkeypatch.setattr(sync_module, "_run_sync_on_locked_connection", ok_sync_body)
-        await scheduler_module.sync_and_invalidate(MagicMock(), catalogue_stats_cache)
+        await scheduler_module.sync_and_invalidate(
+            MagicMock(),
+            catalogue_stats_cache,
+            selected_source,
+        )
         assert ran == ["sync"]
         assert catalogue_stats_cache.invalidate_cache.call_count == _EXPECTED_INVALIDATION_COUNT
         assert sync_module._sync_mutex.locked() is False
 
 
 class TestSyncAndInvalidateEscalatesTheTypedRecoverySignal:
-    """`sync_and_invalidate` escalates to an authoritative full rebuild
-    exactly once when (and only when) `run_sync` returns a typed outcome with
-    `requires_full_rebuild=True` — driven by that boolean field alone, never
-    by matching text in `.reason`."""
+    """Cover sync and invalidate escalates the typed recovery signal."""
 
     async def test_a_typed_recovery_outcome_escalates_to_exactly_one_full_rebuild(
         self, monkeypatch
     ):
+        """Check a typed recovery outcome escalates to exactly one full rebuild."""
         catalogue_stats_cache = make_mock_catalogue_stats_cache()
+        selected_source = legacy_source()
         pool = MagicMock()
         recovery_outcome = sync_module.SyncOutcome(
             "failed",
@@ -251,28 +233,39 @@ class TestSyncAndInvalidateEscalatesTheTypedRecoverySignal:
             requires_full_rebuild=True,
         )
         rebuild_outcome = sync_module.SyncOutcome("success", affected_count=5)
-        monkeypatch.setattr(
-            scheduler_module,
-            "run_sync",
-            create_autospec(sync_module.run_sync, return_value=recovery_outcome),
+        run_sync = create_autospec(
+            sync_module.run_sync,
+            return_value=recovery_outcome,
         )
+        monkeypatch.setattr(scheduler_module, "run_sync", run_sync)
         run_full_rebuild = create_autospec(
             sync_module.run_full_rebuild, return_value=rebuild_outcome
         )
         monkeypatch.setattr(scheduler_module, "run_full_rebuild", run_full_rebuild)
 
-        result = await scheduler_module.sync_and_invalidate(pool, catalogue_stats_cache)
+        result = await scheduler_module.sync_and_invalidate(
+            pool,
+            catalogue_stats_cache,
+            selected_source,
+        )
 
-        run_full_rebuild.assert_awaited_once_with(pool)
+        run_sync.assert_awaited_once_with(
+            pool,
+            configured_source=selected_source,
+        )
+        run_full_rebuild.assert_awaited_once_with(
+            pool,
+            configured_source=selected_source,
+        )
         assert result == rebuild_outcome
         catalogue_stats_cache.invalidate_cache.assert_called_once()
 
     async def test_an_ordinary_failure_without_the_recovery_flag_does_not_escalate(
         self, monkeypatch
     ):
-        """Positive control: a `failed` outcome with `requires_full_rebuild`
-        left at its default (False) is returned as-is."""
+        """Check an ordinary failure without the recovery flag does not escalate."""
         catalogue_stats_cache = make_mock_catalogue_stats_cache()
+        selected_source = legacy_source()
         pool = MagicMock()
         ordinary_failure = sync_module.SyncOutcome("failed", reason="fetch timed out")
         monkeypatch.setattr(
@@ -283,15 +276,20 @@ class TestSyncAndInvalidateEscalatesTheTypedRecoverySignal:
         run_full_rebuild = create_autospec(sync_module.run_full_rebuild)
         monkeypatch.setattr(scheduler_module, "run_full_rebuild", run_full_rebuild)
 
-        result = await scheduler_module.sync_and_invalidate(pool, catalogue_stats_cache)
+        result = await scheduler_module.sync_and_invalidate(
+            pool,
+            catalogue_stats_cache,
+            selected_source,
+        )
 
         run_full_rebuild.assert_not_awaited()
         assert result == ordinary_failure
         catalogue_stats_cache.invalidate_cache.assert_called_once()
 
     async def test_an_ordinary_success_does_not_escalate(self, monkeypatch):
-        """Positive control: an ordinary success never triggers a rebuild."""
+        """Check an ordinary success does not escalate."""
         catalogue_stats_cache = make_mock_catalogue_stats_cache()
+        selected_source = legacy_source()
         pool = MagicMock()
         ordinary_success = sync_module.SyncOutcome("success", affected_count=2)
         monkeypatch.setattr(
@@ -302,7 +300,11 @@ class TestSyncAndInvalidateEscalatesTheTypedRecoverySignal:
         run_full_rebuild = create_autospec(sync_module.run_full_rebuild)
         monkeypatch.setattr(scheduler_module, "run_full_rebuild", run_full_rebuild)
 
-        result = await scheduler_module.sync_and_invalidate(pool, catalogue_stats_cache)
+        result = await scheduler_module.sync_and_invalidate(
+            pool,
+            catalogue_stats_cache,
+            selected_source,
+        )
 
         run_full_rebuild.assert_not_awaited()
         assert result == ordinary_success
@@ -310,11 +312,7 @@ class TestSyncAndInvalidateEscalatesTheTypedRecoverySignal:
 
 
 class TestAsyncIOSchedulerExecutesCoroutineJobs:
-    """An AsyncIOScheduler must actually AWAIT coroutine jobs. Swapping in a
-    BackgroundScheduler would call the coroutine function on a worker thread
-    and discard the coroutine object, so the job would never run even though
-    the lifecycle listener still logs EVENT_JOB_EXECUTED.
-    """
+    """An AsyncIOScheduler must actually AWAIT coroutine jobs."""
 
     async def test_maintenance_and_delivery_jobs_run_almost_immediately(self, monkeypatch):
         """session_cleanup and email_outbox_delivery are registered with
@@ -323,11 +321,14 @@ class TestAsyncIOSchedulerExecutesCoroutineJobs:
         """
         cleanup_ran = asyncio.Event()
         delivery_ran = asyncio.Event()
+        selected_source = legacy_source()
 
         async def record_cleanup(*_args) -> None:
+            """Signal maintenance-job execution."""
             cleanup_ran.set()
 
         async def record_delivery(*_args) -> None:
+            """Signal delivery-job execution."""
             delivery_ran.set()
 
         cleanup_spy = create_autospec(
@@ -361,6 +362,7 @@ class TestAsyncIOSchedulerExecutesCoroutineJobs:
             _scheduler_pool_mock(),
             make_mock_catalogue_stats_cache(),
             running_jobs,
+            (selected_source,),
         )
         sched.start()
         try:
@@ -375,65 +377,91 @@ class TestAsyncIOSchedulerExecutesCoroutineJobs:
 
 
 class TestSchedulerJobRegistration:
-    """Registration pins: scheduler class, exact job ids, callables, args,
-    intervals, and the per-job self-overlap guard.
-    """
+    """Source-specific ingestion jobs share one tracker and global maintenance."""
+
+    @staticmethod
+    def _sources() -> tuple[ConfiguredSource, ...]:
+        """Build online and offline sources with distinct scheduling intervals."""
+        online = legacy_source(
+            schedule=SourceSchedule(
+                incremental_interval_seconds=17,
+                rebuild_interval_seconds=41,
+                write_timeout_seconds=119,
+            )
+        )
+        offline = configure_sources(
+            (
+                FixtureConfig(
+                    name="offline_archive",
+                    display=SourceDisplay(label="Offline archive"),
+                    schedule=SourceSchedule(
+                        incremental_interval_seconds=23,
+                        rebuild_interval_seconds=59,
+                        write_timeout_seconds=113,
+                    ),
+                ),
+            )
+        )[0]
+        return online, offline
 
     def test_registers_asyncio_scheduler_with_the_exact_job_id_set(self):
-        """AsyncIOScheduler is load-bearing: any other scheduler class
-        silently drops the coroutine jobs. The job-id set is exact: a
-        renamed or dropped job would break the lifecycle listener's log
-        correlation and ops runbooks silently. `max_instances=1` on EVERY
-        job is the per-job self-overlap guard, separate from the shared
-        `_sync_mutex` cross-job guard between incremental_sync and
-        full_rebuild.
-        """
-        # Never started, so no shutdown needed; get_jobs() returns pending jobs.
+        """Check registers asyncio scheduler with the exact job ID set."""
         running_jobs = RunningJobTracker()
-        sched = create_scheduler(
+        sources = self._sources()
+        scheduler = create_scheduler(
             _scheduler_pool_mock(),
             make_mock_catalogue_stats_cache(),
             running_jobs,
+            sources,
         )
-        assert isinstance(sched, AsyncIOScheduler)
+        assert isinstance(scheduler, AsyncIOScheduler)
 
-        jobs = sched.get_jobs()
+        jobs = scheduler.get_jobs()
+        assert len(jobs) == 8
         assert {job.id for job in jobs} == {
             "email_outbox_delivery",
             "outbox_retention",
-            "incremental_sync",
-            "full_rebuild",
+            f"incremental_sync:{sources[0].name}",
+            f"full_rebuild:{sources[0].name}",
+            "incremental_sync:offline_archive",
+            "full_rebuild:offline_archive",
             "session_cleanup",
             "reap_unverified",
         }
         for job in jobs:
             assert job.max_instances == 1, f"{job.id} lost its self-overlap guard"
 
-        # These three jobs fire immediately — the mechanism the coroutine
-        # execution test above relies on for the maintenance jobs.
         by_id = {job.id: job for job in jobs}
         assert by_id["email_outbox_delivery"].next_run_time is not None
         assert by_id["session_cleanup"].next_run_time is not None
-        assert by_id["incremental_sync"].next_run_time is not None
+
+        first_run = by_id[f"incremental_sync:{sources[0].name}"].next_run_time
+        assert first_run is not None
+        for position, source in enumerate(sources, start=1):
+            incremental = by_id[f"incremental_sync:{source.name}"]
+            rebuild = by_id[f"full_rebuild:{source.name}"]
+            assert incremental.next_run_time == first_run
+            assert rebuild.next_run_time - first_run == timedelta(minutes=5 * position)
+
+        ingestion_ids = [
+            job.id for job in jobs if job.id.startswith(("incremental_sync:", "full_rebuild:"))
+        ]
+        assert ingestion_ids == [
+            f"incremental_sync:{sources[0].name}",
+            f"full_rebuild:{sources[0].name}",
+            "incremental_sync:offline_archive",
+            "full_rebuild:offline_archive",
+        ]
 
     def test_binds_the_correct_callable_args_and_intervals_per_job(self):
-        """The job-id test above pins ids/max_instances but NOT the callable,
-        args, or intervals — so binding full_rebuild to sync_and_invalidate
-        (stale versions never purged, since the full rebuild is the only
-        purge mechanism) or swapping the two intervals (hammering upstream
-        hourly while incremental lags 24h) would ship green while the
-        lifecycle listener still logged "completed". This pins all three.
-        """
+        """Check binds the correct callable args and intervals per job."""
         pool = _scheduler_pool_mock()
         catalogue_stats_cache = make_mock_catalogue_stats_cache()
         running_jobs = RunningJobTracker()
-        jobs = {
-            job.id: job
-            for job in create_scheduler(pool, catalogue_stats_cache, running_jobs).get_jobs()
-        }
+        sources = self._sources()
+        scheduler = create_scheduler(pool, catalogue_stats_cache, running_jobs, sources)
+        jobs = {job.id: job for job in scheduler.get_jobs()}
 
-        # Every job must enter the same tracker. The underlying callable and
-        # its application arguments follow the tracker metadata in job.args.
         for job in jobs.values():
             assert job.func.__self__ is running_jobs
             assert job.func.__func__ is RunningJobTracker.run
@@ -445,21 +473,34 @@ class TestSchedulerJobRegistration:
         )
         assert _interval_seconds(jobs["email_outbox_delivery"]) == _EMAIL_OUTBOX_INTERVAL_SECONDS
         assert jobs["email_outbox_delivery"].next_run_time is not None
-        assert jobs["email_outbox_delivery"].max_instances == 1
         assert jobs["email_outbox_delivery"].coalesce is True
 
-        assert jobs["incremental_sync"].args == (
-            "incremental_sync",
-            scheduler_module.sync_and_invalidate,
-            pool,
-            catalogue_stats_cache,
-        )
-        assert jobs["full_rebuild"].args == (
-            "full_rebuild",
-            scheduler_module.rebuild_and_invalidate,
-            pool,
-            catalogue_stats_cache,
-        )
+        for source in sources:
+            incremental_id = f"incremental_sync:{source.name}"
+            rebuild_id = f"full_rebuild:{source.name}"
+            assert jobs[incremental_id].args == (
+                incremental_id,
+                scheduler_module.sync_and_invalidate,
+                pool,
+                catalogue_stats_cache,
+                source,
+            )
+            assert jobs[rebuild_id].args == (
+                rebuild_id,
+                scheduler_module.rebuild_and_invalidate,
+                pool,
+                catalogue_stats_cache,
+                source,
+            )
+            assert jobs[incremental_id].args[-1] is source
+            assert jobs[rebuild_id].args[-1] is source
+            assert _interval_seconds(jobs[incremental_id]) == (
+                source.schedule.incremental_interval_seconds
+            )
+            assert _interval_seconds(jobs[rebuild_id]) == source.schedule.rebuild_interval_seconds
+            assert jobs[incremental_id].name == f"{source.display.label} incremental sync"
+            assert jobs[rebuild_id].name == f"{source.display.label} full rebuild"
+
         assert jobs["session_cleanup"].args == (
             "session_cleanup",
             scheduler_module.cleanup_expired_sessions,
@@ -470,12 +511,54 @@ class TestSchedulerJobRegistration:
             scheduler_module.reap_unverified_accounts,
             pool,
         )
-
-        # Interval seconds — driven by settings, not swapped.
-        assert _interval_seconds(jobs["incremental_sync"]) == settings.sync_interval_seconds
-        assert _interval_seconds(jobs["full_rebuild"]) == settings.full_rebuild_interval_seconds
         assert _interval_seconds(jobs["session_cleanup"]) == _SESSION_CLEANUP_INTERVAL_SECONDS
         assert _interval_seconds(jobs["reap_unverified"]) == _UNVERIFIED_REAP_INTERVAL_SECONDS
+
+    @pytest.mark.parametrize("duplicate", [False, True], ids=["empty", "duplicate-name"])
+    def test_invalid_source_sets_fail_before_scheduler_construction(self, duplicate, monkeypatch):
+        """Check invalid source sets fail before scheduler construction (ValueError)."""
+        source = legacy_source()
+        sources = (source, source) if duplicate else ()
+        constructor = create_autospec(AsyncIOScheduler)
+        monkeypatch.setattr(scheduler_module, "AsyncIOScheduler", constructor)
+
+        with pytest.raises(ValueError):
+            create_scheduler(
+                _scheduler_pool_mock(),
+                make_mock_catalogue_stats_cache(),
+                RunningJobTracker(),
+                sources,
+            )
+
+        constructor.assert_not_called()
+
+    async def test_registered_ingestion_jobs_deliver_each_selected_snapshot(self, monkeypatch):
+        """Check registered ingestion jobs deliver each selected snapshot."""
+        sources = self._sources()
+        pool = _scheduler_pool_mock()
+        catalogue_stats_cache = make_mock_catalogue_stats_cache()
+        running_jobs = RunningJobTracker()
+        outcome = sync_module.SyncOutcome("success")
+        incremental = create_autospec(scheduler_module.sync_and_invalidate, return_value=outcome)
+        rebuild = create_autospec(scheduler_module.rebuild_and_invalidate, return_value=outcome)
+        monkeypatch.setattr(scheduler_module, "sync_and_invalidate", incremental)
+        monkeypatch.setattr(scheduler_module, "rebuild_and_invalidate", rebuild)
+        scheduler = create_scheduler(pool, catalogue_stats_cache, running_jobs, sources)
+
+        for source in sources:
+            for operation in ("incremental_sync", "full_rebuild"):
+                job = scheduler.get_job(f"{operation}:{source.name}")
+                assert job is not None
+                assert await job.func(*job.args, **job.kwargs) is outcome
+
+        assert incremental.await_count == 2
+        assert rebuild.await_count == 2
+        for index, source in enumerate(sources):
+            assert incremental.await_args_list[index].args == (pool, catalogue_stats_cache, source)
+            assert rebuild.await_args_list[index].args == (pool, catalogue_stats_cache, source)
+            assert incremental.await_args_list[index].args[-1] is source
+            assert rebuild.await_args_list[index].args[-1] is source
+        assert running_jobs.active_job_ids == ()
 
 
 def _job_event(code, *, exception=None, retval=None):
@@ -491,6 +574,7 @@ def _job_event(code, *, exception=None, retval=None):
 
 
 def _events_for_level(caplog, level):
+    """Select scheduler log records with the requested severity."""
     return [r for r in caplog.records if r.name == "app.services.scheduler" and r.levelno == level]
 
 
@@ -530,10 +614,7 @@ class TestSchedulerEventLogging:
         assert getattr(rec, "exception_type", None) == "ValueError"
 
     def test_missed_event_logs_a_warning(self, caplog):
-        """EVENT_JOB_MISSED -> WARNING with event_type 'scheduler_job_missed':
-        a scheduled run whose time passed without executing (overloaded loop
-        or downtime) must be visible as a warning, not silence.
-        """
+        """Check missed event logs a warning."""
         with caplog.at_level(logging.INFO, logger="app.services.scheduler"):
             scheduler_module._on_scheduler_event(_job_event(EVENT_JOB_MISSED))
 
@@ -542,12 +623,7 @@ class TestSchedulerEventLogging:
 
     @pytest.mark.parametrize("status", ["success", "partial", "failed"])
     def test_executed_event_with_a_sync_outcome_reports_the_ingestion_status(self, status, caplog):
-        """When the completed job's return value is a `SyncOutcome`,
-        EVENT_JOB_EXECUTED logs `event_type='ingestion_job_outcome'` carrying
-        the outcome's own status/affected/failed counts — not the generic
-        'scheduler_job_executed' event a plain successful coroutine gets —
-        so a job that ran to completion but partially or fully failed its
-        ingestion is distinguishable from one that actually succeeded."""
+        """Check executed event with a sync outcome reports the ingestion status."""
         outcome = sync_module.SyncOutcome(
             status, affected_count=2, failed_count=1, reason="safe reason"
         )
@@ -577,6 +653,7 @@ class TestRunningJobTracker:
         release = asyncio.Event()
 
         async def blocked(started: asyncio.Event) -> None:
+            """Signal job entry and wait for the test release event."""
             started.set()
             await release.wait()
 
@@ -602,6 +679,7 @@ class TestRunningJobTracker:
         tracker = RunningJobTracker()
 
         async def failing() -> None:
+            """Raise an injected scheduler-job failure."""
             raise RuntimeError("job failed")
 
         with pytest.raises(RuntimeError, match="job failed"):
@@ -617,6 +695,7 @@ class TestRunningJobTracker:
         never_release = asyncio.Event()
 
         async def blocked() -> None:
+            """Signal job entry and wait indefinitely for cancellation."""
             started.set()
             await never_release.wait()
 

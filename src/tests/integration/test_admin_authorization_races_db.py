@@ -11,6 +11,7 @@ from unittest.mock import create_autospec
 
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 from pydantic import SecretStr
 
 from app.services import email_change, federated_session_policy, session_revocation, sessions, users
@@ -30,6 +31,7 @@ _FEDERATED_SECRET = "kPQ9mV2xL7sN4cB8fH1jD5gR0aY3eU6iO9wQ2tM7zX4vC8b"
 
 @pytest.fixture
 async def admin_race_observer(db_pool):
+    """Yield an independent autocommit observer with a five-second statement timeout."""
     assert db_pool.max_size >= 2, "authorization races need at least two pooled connections"
     async with await psycopg.AsyncConnection.connect(
         TEST_DATABASE_URL,
@@ -41,10 +43,12 @@ async def admin_race_observer(db_pool):
 
 
 def _track_connections(monkeypatch):
+    """Patch cursor scopes to track each active task's PostgreSQL backend PID."""
     active: dict[asyncio.Task[Any], int] = {}
 
     @asynccontextmanager
     async def tracked_cursor(pool, *args, **kwargs) -> AsyncIterator[Any]:
+        """Yield a real cursor while tracking the current task's backend PID; remove it on exit."""
         async with get_db_cursor(pool, *args, **kwargs) as cur:
             task = asyncio.current_task()
             assert task is not None
@@ -91,6 +95,7 @@ async def _wait_for_database_block(observer, active, follower, leader_pid):
 
 
 def _user_state(sync_conn, user_id):
+    """Read user authority and pending-email state, then commit the observer transaction."""
     row = sync_conn.execute(
         """SELECT is_active, is_admin, access_tier, pending_email,
                   pending_email_token_hash, pending_email_created_at
@@ -103,6 +108,7 @@ def _user_state(sync_conn, user_id):
 
 
 def _outbox_count(sync_conn, user_id):
+    """Count the user's queued messages and commit the observer transaction."""
     row = sync_conn.execute(
         "SELECT count(*) FROM email_outbox WHERE user_id = %s",
         (user_id,),
@@ -113,6 +119,7 @@ def _outbox_count(sync_conn, user_id):
 
 
 def _federated_approval_state(sync_conn, user_id):
+    """Read federated approval and authority fields; commit the observer transaction."""
     row = sync_conn.execute(
         """SELECT federated_status, is_active, access_tier, is_admin,
                   email_verified, federated_approved_at, federated_approved_by,
@@ -126,6 +133,7 @@ def _federated_approval_state(sync_conn, user_id):
 
 
 async def _enable_federation_policy(db_pool, monkeypatch):
+    """Install the test's trusted federation settings and reconcile durable policy."""
     monkeypatch.setattr(users.settings, "shibboleth_enabled", True)
     monkeypatch.setattr(
         users.settings,
@@ -151,6 +159,7 @@ async def test_tier_write_requires_the_exact_current_full_session(
     sync_conn,
     session_state,
 ):
+    """Verify tier write requires the exact current full session."""
     actor = user_factory(is_admin=True)
     target = user_factory(access_tier="public")
     # A different valid session must not rescue the exact credential supplied
@@ -198,6 +207,7 @@ async def test_revoked_session_blocks_every_privileged_mutation_sink(
     operation,
     monkeypatch,
 ):
+    """Verify revoked session blocks every privileged mutation sink."""
     actor = user_factory(is_admin=True)
     revoked_session_id = session_factory(actor.id, purpose="full")
     session_factory(actor.id, purpose="full")  # another session remains valid
@@ -208,6 +218,15 @@ async def test_revoked_session_blocks_every_privileged_mutation_sink(
             shibboleth_issuer=_FEDERATED_ISSUER,
             shibboleth_subject_id="urn:test:subject:revoked-admin",
             federated_status="pending",
+            federated_review_revision=1,
+            federated_review=Jsonb(
+                {
+                    "issuer": _FEDERATED_ISSUER,
+                    "affiliation": None,
+                    "entitlement": None,
+                    "proposal": None,
+                }
+            ),
             is_active=False,
             access_tier="public",
         )
@@ -252,7 +271,7 @@ async def test_revoked_session_blocks_every_privileged_mutation_sink(
                 actor_id=actor.id,
                 actor_session_id=revoked_session_id,
                 target_user_id=target.id,
-                new_email="revoked-admin-change@uzh.ch",
+                new_email="revoked-admin-change@example.org",
             )
         else:
             await users.approve_federated_user(
@@ -260,6 +279,7 @@ async def test_revoked_session_blocks_every_privileged_mutation_sink(
                 target.id,
                 expected_issuer=_FEDERATED_ISSUER,
                 expected_subject_id="urn:test:subject:revoked-admin",
+                expected_review_revision=1,
                 access_tier="vetted",
                 actor_id=actor.id,
                 actor_session_id=revoked_session_id,
@@ -277,6 +297,7 @@ async def test_credential_revocation_blocks_a_queued_tier_grant(
     session_factory,
     sync_conn,
 ):
+    """Verify credential revocation blocks a queued tier grant."""
     actor = user_factory(is_admin=True)
     actor_session_id = session_factory(actor.id)
     target = user_factory(access_tier="public")
@@ -304,6 +325,7 @@ async def test_revocation_committing_first_rejects_waiting_federated_approval(
     admin_race_observer,
     revocation,
 ):
+    """Verify revocation committing first rejects waiting federated approval."""
     await _enable_federation_policy(db_pool, monkeypatch)
     actor = user_factory(is_admin=True)
     actor_session_id = session_factory(actor.id)
@@ -313,6 +335,15 @@ async def test_revocation_committing_first_rejects_waiting_federated_approval(
         shibboleth_issuer=_FEDERATED_ISSUER,
         shibboleth_subject_id=subject,
         federated_status="pending",
+        federated_review_revision=1,
+        federated_review=Jsonb(
+            {
+                "issuer": _FEDERATED_ISSUER,
+                "affiliation": None,
+                "entitlement": None,
+                "proposal": None,
+            }
+        ),
         is_active=False,
         access_tier="public",
     )
@@ -347,6 +378,7 @@ async def test_revocation_committing_first_rejects_waiting_federated_approval(
                     target.id,
                     expected_issuer=_FEDERATED_ISSUER,
                     expected_subject_id=subject,
+                    expected_review_revision=1,
                     access_tier="vetted",
                     actor_id=actor.id,
                     actor_session_id=actor_session_id,
@@ -383,6 +415,7 @@ async def test_revocation_committing_first_rejects_waiting_tier_grant(
     admin_race_observer,
     revocation,
 ):
+    """Verify revocation committing first rejects waiting tier grant."""
     actor = user_factory(is_admin=True)
     actor_session_id = session_factory(actor.id)
     target = user_factory(access_tier="public")
@@ -445,6 +478,8 @@ async def test_revocation_committing_first_rejects_waiting_tier_grant(
 
 @dataclass
 class _GuardGate:
+    """Administrator transaction gate bound to one actor and backend PID."""
+
     actor_id: int
     reached: asyncio.Event = field(default_factory=asyncio.Event)
     release: asyncio.Event = field(default_factory=asyncio.Event)
@@ -461,6 +496,7 @@ async def test_guarded_grant_commits_before_waiting_revocation(
     admin_race_observer,
     revocation,
 ):
+    """Verify guarded grant commits before waiting revocation."""
     actor = user_factory(is_admin=True)
     actor_session_id = session_factory(actor.id)
     revoker = user_factory(is_admin=True)
@@ -471,6 +507,7 @@ async def test_guarded_grant_commits_before_waiting_revocation(
     real_guard = users.guard_current_admin_session_cur
 
     async def paused_guard(cur, *, actor_id, actor_session_id):
+        """Run the real admin guard and hold the selected actor's transaction at the gate."""
         await real_guard(
             cur,
             actor_id=actor_id,
@@ -489,6 +526,7 @@ async def test_guarded_grant_commits_before_waiting_revocation(
     tasks: list[asyncio.Task[Any]] = []
 
     async def revoke():
+        """Demote, deactivate or log out the selected actor for the requested race case."""
         if revocation == "demote":
             return await users.set_user_admin(
                 db_pool,
@@ -554,6 +592,7 @@ async def test_guarded_federated_approval_commits_before_waiting_revocation(
     admin_race_observer,
     revocation,
 ):
+    """Verify guarded federated approval commits before waiting revocation."""
     await _enable_federation_policy(db_pool, monkeypatch)
     actor = user_factory(is_admin=True)
     actor_session_id = session_factory(actor.id)
@@ -565,6 +604,15 @@ async def test_guarded_federated_approval_commits_before_waiting_revocation(
         shibboleth_issuer=_FEDERATED_ISSUER,
         shibboleth_subject_id=subject,
         federated_status="pending",
+        federated_review_revision=1,
+        federated_review=Jsonb(
+            {
+                "issuer": _FEDERATED_ISSUER,
+                "affiliation": None,
+                "entitlement": None,
+                "proposal": None,
+            }
+        ),
         is_active=False,
         access_tier="public",
     )
@@ -574,6 +622,7 @@ async def test_guarded_federated_approval_commits_before_waiting_revocation(
     real_guard = users.guard_current_admin_session_cur
 
     async def paused_guard(cur, *, actor_id, actor_session_id):
+        """Run the real admin guard and hold the selected actor's transaction at the gate."""
         await real_guard(
             cur,
             actor_id=actor_id,
@@ -592,6 +641,7 @@ async def test_guarded_federated_approval_commits_before_waiting_revocation(
     tasks: list[asyncio.Task[Any]] = []
 
     async def revoke():
+        """Demote, deactivate or log out the selected actor for the requested race case."""
         if revocation == "demote":
             return await users.set_user_admin(
                 db_pool,
@@ -618,6 +668,7 @@ async def test_guarded_federated_approval_commits_before_waiting_revocation(
                     target.id,
                     expected_issuer=_FEDERATED_ISSUER,
                     expected_subject_id=subject,
+                    expected_review_revision=1,
                     access_tier="vetted",
                     actor_id=actor.id,
                     actor_session_id=actor_session_id,
@@ -645,14 +696,14 @@ async def test_guarded_federated_approval_commits_before_waiting_revocation(
         async with asyncio.timeout(_CLEANUP_TIMEOUT):
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    assert approved.federated_status == "approved"
+    assert approved.user.federated_status == "approved"
     assert _federated_approval_state(sync_conn, target.id) == (
         "approved",
         True,
         "vetted",
         False,
         False,
-        approved.federated_approved_at,
+        approved.user.federated_approved_at,
         actor.id,
         before_revision + 1,
     )

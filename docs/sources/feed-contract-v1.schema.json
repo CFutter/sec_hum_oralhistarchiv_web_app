@@ -1,0 +1,300 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "urn:oralhistarchiv:feed-contract:v1",
+    "title": "Oral History Archive Feed Contract v1",
+    "description": "Structural page contract only; authentication and reconciliation require runtime checks.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "feed_version",
+      "snapshot_id",
+      "generated_at",
+      "request",
+      "records",
+      "withdrawn",
+      "next_cursor",
+      "complete"
+    ],
+    "properties": {
+      "feed_version": {
+        "type": "integer",
+        "const": 1
+      },
+      "snapshot_id": {
+        "$ref": "#/$defs/uuid"
+      },
+      "generated_at": {
+        "$ref": "#/$defs/utcSecond"
+      },
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "nonce",
+          "since",
+          "cursor"
+        ],
+        "properties": {
+          "nonce": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$(?![\\s\\S])"
+          },
+          "since": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/utcSecond"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/cursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "records": {
+        "type": "array",
+        "maxItems": 10000,
+        "items": {
+          "$ref": "#/$defs/record"
+        }
+      },
+      "withdrawn": {
+        "type": "array",
+        "maxItems": 10000,
+        "uniqueItems": true,
+        "items": {
+          "$ref": "#/$defs/uuid"
+        }
+      },
+      "next_cursor": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/cursor"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "complete": {
+        "type": "boolean"
+      }
+    },
+    "if": {
+      "properties": {
+        "complete": {
+          "const": true
+        }
+      }
+    },
+    "then": {
+      "properties": {
+        "next_cursor": {
+          "type": "null"
+        }
+      }
+    },
+    "else": {
+      "properties": {
+        "next_cursor": {
+          "$ref": "#/$defs/cursor"
+        }
+      }
+    },
+    "$defs": {
+      "uuid": {
+        "type": "string",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$(?![\\s\\S])"
+      },
+      "utcSecond": {
+        "type": "string",
+        "minLength": 20,
+        "maxLength": 20,
+        "format": "date-time",
+        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-5][0-9]:[0-5][0-9]Z$(?![\\s\\S])"
+      },
+      "cursor": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": "^[A-Za-z0-9_-]+$(?![\\s\\S])"
+      },
+      "label": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^[^\\s\\u0000-\\u001f\\u007f](?:[^\\u0000-\\u001f\\u007f]*[^\\s\\u0000-\\u001f\\u007f])?$(?![\\s\\S])"
+      },
+      "labels": {
+        "type": "array",
+        "maxItems": 100,
+        "items": {
+          "$ref": "#/$defs/label"
+        }
+      },
+      "nullableText": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "maxLength": 16384
+      },
+      "nullableHttpUri": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "maxLength": 2048,
+        "format": "uri",
+        "pattern": "^https?://[^/?#\\s\\u0000-\\u001f\\u007f]+[^\\s\\u0000-\\u001f\\u007f]*$(?![\\s\\S])"
+      },
+      "record": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "uuid",
+          "title",
+          "project_title",
+          "description",
+          "resource_description",
+          "languages",
+          "project_description",
+          "authors",
+          "keywords",
+          "resource_proxies",
+          "license_val",
+          "license_url",
+          "version",
+          "doi",
+          "resource_type",
+          "institutions",
+          "main_disciplines",
+          "bibliographical_citation",
+          "modified_at",
+          "visibility_tier"
+        ],
+        "properties": {
+          "uuid": {
+            "$ref": "#/$defs/uuid"
+          },
+          "title": {
+            "$ref": "#/$defs/label"
+          },
+          "project_title": {
+            "description": "Runtime also enforces the source's max_project_title_chars (4096 by default; at most 16384).",
+            "$ref": "#/$defs/nullableText"
+          },
+          "description": {
+            "$ref": "#/$defs/nullableText"
+          },
+          "resource_description": {
+            "$ref": "#/$defs/nullableText"
+          },
+          "languages": {
+            "$ref": "#/$defs/labels"
+          },
+          "project_description": {
+            "$ref": "#/$defs/nullableText"
+          },
+          "authors": {
+            "$ref": "#/$defs/labels"
+          },
+          "keywords": {
+            "$ref": "#/$defs/labels"
+          },
+          "resource_proxies": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "type",
+                "ref"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "Resource",
+                    "LandingPage"
+                  ]
+                },
+                "ref": {
+                  "$ref": "#/$defs/nullableHttpUri"
+                }
+              }
+            }
+          },
+          "license_val": {
+            "enum": [
+              "Public access",
+              "Restricted access"
+            ]
+          },
+          "license_url": {
+            "$ref": "#/$defs/nullableHttpUri"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 20,
+            "pattern": "^[0-9]{1,6}(?:\\.[0-9]{1,6}){0,2}$(?![\\s\\S])"
+          },
+          "doi": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 512
+          },
+          "resource_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 256
+          },
+          "institutions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/$defs/label"
+            }
+          },
+          "main_disciplines": {
+            "$ref": "#/$defs/labels"
+          },
+          "bibliographical_citation": {
+            "$ref": "#/$defs/nullableText"
+          },
+          "modified_at": {
+            "$ref": "#/$defs/utcSecond"
+          },
+          "visibility_tier": {
+            "enum": [
+              "public",
+              "registered",
+              "vetted"
+            ]
+          }
+        }
+      }
+    }
+  }

@@ -2,14 +2,22 @@
 
 import hmac
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from functools import partial
+from typing import Any
 
+from anyio import CapacityLimiter
+from anyio.lowlevel import RunVar
 from fastapi import Request, Response, status
 from fastapi.responses import JSONResponse
 from psycopg import InterfaceError, OperationalError
 from psycopg.errors import QueryCanceled
 from psycopg_pool import PoolClosed, PoolTimeout, TooManyRequests
 
+from app.backup_status import BackupStatus, read_backup_status
+from app.sources import SourceMetadata
+from app.thread_work import ThreadWorkAdmissionTimeout, run_thread_work
 from config import settings
 
 from ..middleware import limiter
@@ -23,6 +31,7 @@ capability_router = SecureAPIRouter(access=RouteAccess.CAPABILITY)
 routers = (public_router, capability_router)
 
 _STALE_INTERVAL_MULTIPLIER = 2
+_BACKUP_READ_LIMITER: RunVar[CapacityLimiter] = RunVar("health_backup_read_limiter")
 
 
 def _is_health_detail_authorized(request: Request) -> bool:
@@ -46,24 +55,103 @@ def _is_health_detail_authorized(request: Request) -> bool:
     )
 
 
+async def _backup_diagnostics() -> BackupStatus:
+    """Read optional backup age in one of two loop-local blocking slots.
+
+    Return unknown if unset or admission exceeds 0.2 seconds. Cancellation
+    retains the slot until the read finishes; backup age does not change readiness.
+    """
+    path = settings.backup_status_file
+    if path is None:
+        return BackupStatus(status="unknown", age_seconds=None)
+    try:
+        capacity = _BACKUP_READ_LIMITER.get()
+    except LookupError:
+        capacity = CapacityLimiter(2)
+        _BACKUP_READ_LIMITER.set(capacity)
+    try:
+        return await run_thread_work(
+            partial(read_backup_status, path), capacity, admission_timeout_seconds=0.2
+        )
+    except ThreadWorkAdmissionTimeout:
+        return BackupStatus(status="unknown", age_seconds=None)
+
+
+def _source_diagnostics(
+    source: SourceMetadata,
+    row: Mapping[str, Any] | None,
+    now: datetime,
+) -> dict[str, object]:
+    """Return source status/ages/errors; missing or >2-interval-old history is degraded.
+
+    row supplies sync_status timestamps/error fields; now and stored timestamps
+    must be timezone-aware. Harvest and rebuild ages use their own schedules.
+    """
+    checks: dict[str, object] = {
+        "status": "healthy",
+        "harvest_age_seconds": None,
+        "rebuild_age_seconds": None,
+    }
+    if row is None:
+        checks["status"] = "degraded"
+        checks["sync"] = "no sync history"
+        checks["sync_status_missing"] = f"sync_status row for source {source.name!r} is missing"
+        return checks
+
+    harvested_at = row["last_harvest_date"]
+    if harvested_at is None:
+        checks["sync"] = "last harvest: never"
+        checks["sync_stale"] = "no successful harvest recorded"
+    else:
+        checks["sync"] = f"last harvest: {harvested_at}"
+        harvest_age = (now - harvested_at).total_seconds()
+        checks["harvest_age_seconds"] = harvest_age
+        if harvest_age > _STALE_INTERVAL_MULTIPLIER * source.schedule.incremental_interval_seconds:
+            checks["sync_stale"] = f"{int(harvest_age)}s since last successful harvest"
+
+    rebuilt_at = row["last_full_rebuild_date"]
+    if rebuilt_at is None:
+        checks["full_rebuild"] = "last rebuild: never"
+        checks["full_rebuild_stale"] = "no successful full rebuild recorded"
+    else:
+        checks["full_rebuild"] = f"last rebuild: {rebuilt_at}"
+        rebuild_age = (now - rebuilt_at).total_seconds()
+        checks["rebuild_age_seconds"] = rebuild_age
+        if rebuild_age > _STALE_INTERVAL_MULTIPLIER * source.schedule.rebuild_interval_seconds:
+            checks["full_rebuild_stale"] = f"{int(rebuild_age)}s since last successful rebuild"
+
+    if row["last_sync_error"]:
+        checks["sync_error"] = row["last_sync_error"]
+        checks["sync_error_at"] = str(row["last_sync_error_at"])
+
+    if row["last_rebuild_error"]:
+        checks["rebuild_error"] = row["last_rebuild_error"]
+        checks["rebuild_error_at"] = str(row["last_rebuild_error_at"])
+
+    if any(
+        key in checks for key in ("sync_stale", "full_rebuild_stale", "sync_error", "rebuild_error")
+    ):
+        checks["status"] = "degraded"
+    return checks
+
+
 @public_router.get("/health")
 @limiter.exempt
 async def health_check(request: Request) -> Response:
-    """Liveness — is the process up and serving? Does NOT check dependencies."""
+    """Return {"status": "alive"} without dependency checks."""
     return JSONResponse(content={"status": "alive"})
 
 
-# The endpoint intentionally aggregates independent diagnostic branches in
-# one response so the complete health policy remains visible in one place.
 @capability_router.get("/health/detail")
-async def health_check_detail(request: Request) -> Response:  # noqa: PLR0912, PLR0915
-    """Return authorized database/sync/outbox JSON, or 404 without diagnostics.
+async def health_check_detail(request: Request) -> Response:
+    """Return authorized database/source/outbox/backup JSON, or an opaque 404.
 
     A failed connection returns unhealthy/503. Reachable storage with missing,
-    failed, or >2-interval-old harvest/rebuild state, or degraded/unreadable
-    outbox diagnostics, returns degraded/200; otherwise healthy/200. Exceptions
-    are logged and mapped by diagnostic stage. Monitor JSON status as well as
-    HTTP status.
+    failed, unreadable or >2-interval-old source state, or degraded/unreadable
+    outbox diagnostics, returns degraded/200; otherwise healthy/200. Each source
+    uses its own intervals. Optional local backup age is informational: unknown
+    or old markers do not change these statuses. It does not establish off-host
+    custody or recovery readiness. Monitor JSON status and backup age separately.
     """
     if not _is_health_detail_authorized(request):
         return JSONResponse(
@@ -71,7 +159,20 @@ async def health_check_detail(request: Request) -> Response:  # noqa: PLR0912, P
             content={"detail": "Not found"},
         )
 
-    checks: dict[str, object] = {}
+    configured_sources: tuple[SourceMetadata, ...] = request.app.state.configured_sources
+    source_checks: dict[str, dict[str, object]] = {
+        source.name: {
+            "status": "degraded",
+            "sync": "error",
+            "harvest_age_seconds": None,
+            "rebuild_age_seconds": None,
+        }
+        for source in configured_sources
+    }
+    checks: dict[str, object] = {
+        "sources": source_checks,
+        "backup": await _backup_diagnostics(),
+    }
     diagnostic_stage = "database"
     pool = request.app.state.db_pool
 
@@ -80,52 +181,21 @@ async def health_check_detail(request: Request) -> Response:  # noqa: PLR0912, P
             await cur.execute("SELECT 1")
             checks["database"] = "ok"
             diagnostic_stage = "sync"
-            await cur.execute(
-                """SELECT last_harvest_date, last_full_rebuild_date,
-                          last_sync_error, last_sync_error_at,
-                          last_rebuild_error, last_rebuild_error_at
-                FROM sync_status WHERE id = 1"""
-            )
-
-            row = await cur.fetchone()
             now = datetime.now(UTC)
+            if configured_sources:
+                await cur.execute(
+                    """SELECT source, last_harvest_date, last_full_rebuild_date,
+                              last_sync_error, last_sync_error_at,
+                              last_rebuild_error, last_rebuild_error_at
+                       FROM sync_status WHERE source = ANY(%s::text[])""",
+                    ([source.name for source in configured_sources],),
+                )
+                rows_by_source = {row["source"]: row for row in await cur.fetchall()}
+                for source in configured_sources:
+                    source_checks[source.name] = _source_diagnostics(
+                        source, rows_by_source.get(source.name), now
+                    )
 
-            if row:
-                harvested_at = row["last_harvest_date"]
-                if harvested_at is None:
-                    checks["sync"] = "last harvest: never"
-                    checks["sync_stale"] = "no successful harvest recorded"
-                else:
-                    checks["sync"] = f"last harvest: {harvested_at}"
-                    harvest_age = (now - harvested_at).total_seconds()
-                    if harvest_age > _STALE_INTERVAL_MULTIPLIER * settings.sync_interval_seconds:
-                        checks["sync_stale"] = f"{int(harvest_age)}s since last successful harvest"
-
-                rebuilt_at = row["last_full_rebuild_date"]
-                if rebuilt_at is None:
-                    checks["full_rebuild"] = "last rebuild: never"
-                    checks["full_rebuild_stale"] = "no successful full rebuild recorded"
-                else:
-                    checks["full_rebuild"] = f"last rebuild: {rebuilt_at}"
-                    rebuild_age = (now - rebuilt_at).total_seconds()
-                    interval = settings.full_rebuild_interval_seconds
-                    if rebuild_age > _STALE_INTERVAL_MULTIPLIER * interval:
-                        checks["full_rebuild_stale"] = (
-                            f"{int(rebuild_age)}s since last successful rebuild"
-                        )
-
-                if row["last_sync_error"]:
-                    checks["sync_error"] = row["last_sync_error"]
-                    checks["sync_error_at"] = str(row["last_sync_error_at"])
-
-                if row["last_rebuild_error"]:
-                    checks["rebuild_error"] = row["last_rebuild_error"]
-                    checks["rebuild_error_at"] = str(row["last_rebuild_error_at"])
-            else:
-                # The migration always creates id=1. Its absence means the
-                # scheduler cannot read or update its watermark.
-                checks["sync"] = "no sync history"
-                checks["sync_status_missing"] = "sync_status row id=1 is missing"
             diagnostic_stage = "outbox"
             metrics = await get_outbox_metrics_cur(cur)
             checks["outbox"] = metrics
@@ -137,28 +207,18 @@ async def health_check_detail(request: Request) -> Response:  # noqa: PLR0912, P
         ) or (isinstance(exc, OperationalError) and not isinstance(exc, QueryCanceled))
         if disconnected:
             checks["database"] = "disconnected"
-            checks["sync"] = "error"
             logger.warning("Health check: database connection failed", exc_info=True)
         elif diagnostic_stage == "outbox":
             checks["outbox_error"] = "Outbox diagnostics unavailable"
             logger.warning("Health check: outbox read failed", exc_info=True)
         elif checks.get("database") == "ok":
-            checks["sync"] = "error"
             logger.warning("Health check: sync_status read failed", exc_info=True)
         else:
             checks["database"] = "disconnected"
-            checks["sync"] = "error"
             logger.warning("Health check: database connection failed", exc_info=True)
 
     service_ok = checks.get("database") == "ok"
-    sync_degraded = (
-        checks.get("sync") == "error"
-        or "sync_status_missing" in checks
-        or "sync_stale" in checks
-        or "sync_error" in checks
-        or "rebuild_error" in checks
-        or "full_rebuild_stale" in checks
-    )
+    sync_degraded = any(source["status"] != "healthy" for source in source_checks.values())
 
     if not service_ok:
         overall = "unhealthy"

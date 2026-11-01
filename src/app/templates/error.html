@@ -1,11 +1,11 @@
 {% extends "base.html" %}
 {% set active_page = "" %}
-{% block title %}{{ error_title | default("Not Found") }} — Oral History Archive{% endblock %}
+{% block title %}{{ error_title | default("Not Found") }} — {{ site_name }}{% endblock %}
 
 {% block content %}
 <section class="container error-page">
   <h1>{{ error_title | default("Page not found") }}</h1>
   <p class="error-message">{{ error_message | default("The page you're looking for doesn't exist or has been moved.") }}</p>
-  <a href="{{ path_for(request, 'home') }}" class="btn btn-primary">← Back to home</a>
+  <a href="{{ path_for(request, error_return_route | default('home')) }}" class="btn btn-primary">{{ error_return_label | default("← Back to home") }}</a>
 </section>
 {% endblock %}

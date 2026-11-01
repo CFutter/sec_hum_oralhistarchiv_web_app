@@ -19,7 +19,6 @@ def build_secure_headers(is_production: bool) -> Secure:
     Production adds one-year HSTS with subdomains and preload. Cache-Control
     and action-page referrer overrides are applied separately by main.py.
     """
-    # Explicit directives keep each allowed resource category reviewable.
     csp = (
         ContentSecurityPolicy()
         .default_src("'self'")
@@ -44,7 +43,6 @@ def build_secure_headers(is_production: bool) -> Secure:
     else:
         hsts = None
 
-    # Disable unused browser capabilities with empty allowlists.
     permissions = (
         PermissionsPolicy()
         .accelerometer()

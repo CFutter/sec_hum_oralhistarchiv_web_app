@@ -165,9 +165,7 @@ async def get_outbox_metrics_cur(cur: AsyncCursor[Any]) -> OutboxMetrics:
 
 
 def outbox_is_degraded(metrics: OutboxMetrics) -> bool:
-    """Flag overdue retention, a failure in 24 hours,
-    or an age at least OUTBOX_STALE_AFTER_SECONDS.
-    """
+    """Flag overdue retention, 24-hour failures or age >= OUTBOX_STALE_AFTER_SECONDS."""
     return (
         metrics["retention_overdue_count"] > 0
         or metrics["recent_failure_count"] > 0

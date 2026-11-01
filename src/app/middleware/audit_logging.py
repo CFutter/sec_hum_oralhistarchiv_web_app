@@ -1,7 +1,7 @@
-"""Request audit events with a 16-hex request ID, scrubbed URL, status, and elapsed time.
+"""Audit request IDs, scrubbed URLs, statuses and response-start durations.
 
-Skip responses below 400 for exact /health and /static/ paths; errors
-and /health/detail remain audited. Retention belongs to the host logger.
+Skip statuses below 400 for /health and paths beginning /static/; audit
+/health/detail and all errors. Host logging owns retention.
 """
 
 import logging
@@ -78,12 +78,7 @@ class AuditLoggingMiddleware(BaseHTTPMiddleware):
         else:
             log_level = logging.INFO
 
-        # Liveness probes (/health) and static assets are high-volume and
-        # carry no user action; auditing them floods the shared journald
-        # retention pool and evicts real audit signal early. Exempt ONLY on
-        # success — a 4xx/5xx on either path (a probe, a missing/blocked asset)
-        # is still audited. /health/detail (diagnostics, token-gated) is NOT
-        # exempt: it doesn't match the exact "/health" string.
+        # Successful probes/assets would crowd user actions out of host retention.
         if (
             (request.url.path == "/health" or request.url.path.startswith("/static/"))
             and status_code < 400  # noqa: PLR2004

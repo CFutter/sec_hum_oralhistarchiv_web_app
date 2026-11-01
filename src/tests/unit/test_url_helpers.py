@@ -1,18 +1,4 @@
-"""URL safety + template URL helpers (unit tier, no DB).
-
-Pins the behavior of:
-- app.routes.auth.helpers.safe_redirect_url — the open-redirect guard on the
-  post-login `next` parameter, including path-internal colons: a same-site
-  target such as '/search?q=time:1990' must be allowed, so the guard is
-  structural (no scheme, no netloc), not a blanket ':' ban.
-- app.url_safety.is_safe_http_url — the single-source http(s) scheme allowlist
-  shared by ingest and render.
-- app.template_setup.safe_url_filter — the render-time last-line XSS guard.
-- app.jinja_helpers.url_for_query — filter/pagination link builder, including
-  the reset-pagination contract (page=None drops the key).
-
-doi_url_filter is covered by test_templates.py and test_record_parsing.py, not here.
-"""
+"""URL safety + template URL helpers (unit tier, no DB)."""
 
 from types import SimpleNamespace
 from typing import Any
@@ -26,17 +12,9 @@ from app.routes.auth.helpers import safe_redirect_url
 from app.template_setup import safe_url_filter
 from app.url_safety import is_safe_http_url, parse_http_url
 
-# ---------------------------------------------------------------------------
-# Request builders
-# ---------------------------------------------------------------------------
-
 
 def _request(query_string: bytes = b"") -> Request:
-    """A real fastapi Request built from a minimal ASGI scope.
-
-    safe_redirect_url only touches request.query_params, which Starlette
-    parses lazily from scope['query_string'] — no app or client needed.
-    """
+    """Build a minimal request with lazy query-string parsing and no application."""
     scope = {
         "type": "http",
         "method": "GET",
@@ -57,11 +35,6 @@ def _page_request(path: str = "/search", params: dict[str, Any] | None = None):
     """Duck-typed request for url_for_query: only .url.path and .query_params
     (dict-convertible) are read by the helper."""
     return SimpleNamespace(url=SimpleNamespace(path=path), query_params=dict(params or {}))
-
-
-# ---------------------------------------------------------------------------
-# safe_redirect_url — open-redirect guard
-# ---------------------------------------------------------------------------
 
 
 def test_safe_redirect_allows_plain_relative_path():
@@ -108,10 +81,9 @@ def test_safe_redirect_blocks_crlf_and_null_injection(value):
 
 
 def test_safe_redirect_allows_path_internal_colon():
-    """A same-site target with a colon inside its path or query, such as
-    '/search?q=time:1990', must be ALLOWED. A blanket ':' ban would reject
-    legitimate same-site search links; the structural urlsplit check
-    (no scheme, no netloc) lets them through."""
+    """A same-site target with a colon inside its path or query, such as '/search?q=time:1990', must be
+    ALLOWED.
+    """
     target = "/search?q=time:1990"
     assert safe_redirect_url(_request_with_next(target)) == target
 
@@ -122,16 +94,7 @@ def test_safe_redirect_blocks_javascript_scheme():
 
 
 def test_safe_redirect_at_sign_in_path_passes_through():
-    """'/foo@evil.com' is RETURNED AS-IS by the code as written.
-
-    urlsplit('/foo@evil.com') yields no scheme and no netloc (netloc is only
-    parsed after a leading '//'), so the structural backstop does not fire.
-    NOTE: the docstring's "Rejects: URLs with embedded credentials
-    (/foo@evil.com)" claim does NOT hold — but the behavior is still safe:
-    a Location of '/foo@evil.com' is a same-origin path ('@' is a legal path
-    character), not a redirect to evil.com. This pins the actual (safe) code
-    behavior; the production docstring overstates what the guard rejects.
-    """
+    """Preserve /foo@evil.com as a same-origin path; @ alone does not make it an authority."""
     assert safe_redirect_url(_request_with_next("/foo@evil.com")) == "/foo@evil.com"
 
 
@@ -139,11 +102,6 @@ def test_safe_redirect_unsafe_value_returns_custom_fallback():
     """The caller-supplied fallback (not hardcoded '/') is used on rejection."""
     req = _request_with_next("https://evil.com")
     assert safe_redirect_url(req, fallback="/account") == "/account"
-
-
-# ---------------------------------------------------------------------------
-# is_safe_http_url — structural HTTP(S) validation
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -162,12 +120,30 @@ def test_safe_redirect_unsafe_value_returns_custom_fallback():
     ],
 )
 def test_is_safe_http_url_accepts_absolute_http_urls(value):
+    """Check is safe HTTP URL accepts absolute HTTP URLs."""
     assert is_safe_http_url(value) is True
 
 
 def test_is_safe_http_url_strips_padding_before_check():
     """Surrounding whitespace is ignored before structural parsing."""
     assert is_safe_http_url(" https://x ") is True
+
+
+@pytest.mark.parametrize("placement", ["leading", "embedded", "trailing"])
+def test_http_url_refuses_actual_controls_before_trimming_or_parsing(placement):
+    """Controls cannot become links or redirects after a parser silently drops them."""
+    for codepoint in (*range(32), 127):
+        control = chr(codepoint)
+        candidates = {
+            "leading": f"{control}https://example.org/resource",
+            "embedded": f"https://example.org/re{control}source",
+            "trailing": f"https://example.org/resource{control}",
+        }
+        value = candidates[placement]
+        with pytest.raises(ValueError, match="control characters"):
+            parse_http_url(value)
+        assert is_safe_http_url(value) is False
+        assert safe_url_filter(value) == ""
 
 
 @pytest.mark.parametrize(
@@ -206,10 +182,12 @@ def test_is_safe_http_url_strips_padding_before_check():
     ],
 )
 def test_is_safe_http_url_rejects_unusable_or_unsafe_urls(value):
+    """Check is safe HTTP URL rejects unusable or unsafe URLs."""
     assert is_safe_http_url(value) is False
 
 
 def test_parse_http_url_can_require_https():
+    """Check parse HTTP URL can require https (ValueError)."""
     with pytest.raises(ValueError):
         parse_http_url(
             "http://example.com",
@@ -223,11 +201,6 @@ def test_parse_http_url_can_require_https():
 
     assert parsed.hostname == "example.com"
     assert parsed.port == 8443
-
-
-# ---------------------------------------------------------------------------
-# safe_url_filter — render-time guard
-# ---------------------------------------------------------------------------
 
 
 def test_safe_url_filter_strips_and_returns_safe_url():
@@ -245,11 +218,6 @@ def test_safe_url_filter_returns_empty_for_unsafe(value):
     """Unsafe / empty values render as '' — the last-line XSS defense drops
     the href entirely instead of emitting an executable scheme."""
     assert safe_url_filter(value) == ""
-
-
-# ---------------------------------------------------------------------------
-# url_for_query — filter/pagination link builder
-# ---------------------------------------------------------------------------
 
 
 def test_url_for_query_preserves_existing_params():

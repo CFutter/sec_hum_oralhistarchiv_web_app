@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a reproducible application or repository defect.
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        For a possible vulnerability, follow SECURITY.md and use an approved
+        private channel. Do not include credentials, action codes, personal
+        information or restricted metadata here. Use synthetic examples.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and impact
+      description: What happened, and which workflow or boundary is affected?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: List the smallest repeatable steps using synthetic data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected_actual
+    attributes:
+      label: Expected and actual behavior
+      description: State the expected result and the result you observed.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Version and relevant environment
+      description: >-
+        Include the commit or release, Python/PostgreSQL versions and relevant
+        source-adapter/configuration details without secrets or private endpoints.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Tests or sanitized evidence
+      description: >-
+        Include commands, results, seed/worker count and synthetic captures where
+        applicable. Check logs and screenshots for sensitive data before sharing.

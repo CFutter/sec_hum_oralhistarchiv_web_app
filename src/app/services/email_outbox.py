@@ -7,6 +7,7 @@ OutboxLeaseLostError; state checks additionally require an unexpired
 lease and unchanged content.
 """
 
+import logging
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -26,6 +27,12 @@ from .tokens import (
     VERIFICATION_TOKEN_MAX_AGE_SECONDS,
     ActionEmailMetadata,
 )
+
+logger = logging.getLogger(__name__)
+
+# Refund pre-SMTP contention; queue-age limits prevent indefinite deferral.
+_MAX_CONTENDED_QUEUE_AGE = timedelta(hours=1)
+_CONTENTION_RETRY_DELAY = timedelta(seconds=30)
 
 _MAX_CLAIM_BATCH = 100
 _MAX_ERROR_LENGTH = 1000
@@ -78,8 +85,57 @@ _NOTICE_MESSAGE_TYPES = frozenset(
         "email_change_notice",
         "account_credential_fault_notice",
         "account_locked_notice",
+        "password_changed_notice",
+        "totp_enrolled_notice",
+        "totp_rotated_notice",
+        "totp_recovery_authorized_notice",
+        "totp_recovery_redeemed_notice",
+        "totp_recovery_completed_notice",
+        "admin_promotion_accepted_notice",
     }
 )
+
+
+async def requeue_retained_action_email_cur(
+    cur: AsyncCursor[Any],
+    *,
+    user_id: int,
+    recipient: str,
+    message_type: str,
+    token_hash: str,
+) -> bool:
+    """Copy one retained live action message without generating a capability.
+
+    The caller holds the user's row lock and the anonymous issuance lock after
+    mail admission. A pending/sending copy already has delivery retries and is
+    not duplicated. Sent or delivery-failed copies retain their original body,
+    hash and expiry; cancelled or unreadable messages cannot be resurrected.
+    No capability plaintext is recovered or exposed by this operation.
+    """
+    if message_type not in _ACTION_MESSAGE_TYPES:
+        raise ValueError("Retained resend requires an action message type")
+    await cur.execute(
+        """INSERT INTO email_outbox
+               (user_id, message_type, recipient, subject, body_ciphertext,
+                action_token_hash, expires_at)
+           SELECT user_id, message_type, recipient, subject, body_ciphertext,
+                  action_token_hash, expires_at
+           FROM email_outbox AS retained
+           WHERE user_id = %(user_id)s AND message_type = %(kind)s
+             AND LOWER(recipient) = LOWER(%(recipient)s)
+             AND action_token_hash = %(hash)s AND expires_at > clock_timestamp()
+             AND (status = 'sent' OR (status = 'dead' AND terminal_outcome = 'delivery_failed'))
+             AND NOT EXISTS (
+                 SELECT 1 FROM email_outbox AS live
+                 WHERE live.user_id = retained.user_id
+                   AND live.message_type = retained.message_type
+                   AND live.action_token_hash = retained.action_token_hash
+                   AND live.status IN ('pending', 'sending')
+             )
+           ORDER BY id DESC LIMIT 1 RETURNING id""",
+        {"user_id": user_id, "recipient": recipient, "kind": message_type, "hash": token_hash},
+    )
+    return await cur.fetchone() is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -656,25 +712,62 @@ async def mark_email_sent(
 
 async def defer_contended_email(
     pool: AsyncConnectionPool, message: ClaimedEmail, *, smtp_attempted: bool = False
-) -> None:
-    """Return a sending lease to pending for 30 seconds after a rolled-back lock wait.
+) -> Literal["retried", "dead"]:
+    """Defer a contended lease for 30 seconds, or terminate it at one hour of queue age.
 
-    Use a 250-ms lock timeout without locking the user. Decrement the claim
-    count unless smtp_attempted=True; raise OutboxLeaseLostError if replaced.
+    Use the database wall clock and only the outbox row, so a locked user cannot
+    prevent escalation. The cutoff includes the exact one-hour boundary. Refund
+    this claim unless SMTP was attempted; this queue-age policy is independent
+    of the seven SMTP attempts. Existing terminal retention/health rules apply.
+    Use a 250-ms lock timeout; raise OutboxLeaseLostError for a replaced lease.
     """
     async with get_db_cursor(pool) as cur:
         await cur.execute("SET LOCAL lock_timeout = '250ms'")
         await cur.execute(
-            """UPDATE email_outbox
-               SET status = 'pending', next_attempt_at = clock_timestamp() + INTERVAL '30 seconds',
-                   locked_at = NULL, lock_token = NULL, last_error = 'delivery_state_contended',
-                   attempt_count = GREATEST(0, attempt_count - %s)
-               WHERE id = %s AND status = 'sending' AND lock_token = %s
-               RETURNING id""",
-            (0 if smtp_attempted else 1, message.id, message.lock_token),
+            """WITH timing AS MATERIALIZED (
+                   SELECT clock_timestamp() AS now
+               )
+               UPDATE email_outbox AS outbox
+               SET status = CASE WHEN created_at <= timing.now - %(max_age)s
+                                 THEN 'dead' ELSE 'pending' END,
+                   next_attempt_at = timing.now + %(retry_delay)s,
+                   locked_at = NULL, lock_token = NULL,
+                   last_error = CASE WHEN created_at <= timing.now - %(max_age)s
+                                     THEN 'delivery_state_contention_exhausted'
+                                     ELSE 'delivery_state_contended' END,
+                   terminal_outcome = CASE WHEN created_at <= timing.now - %(max_age)s
+                                           THEN 'delivery_failed' ELSE NULL END,
+                   failed_at = CASE WHEN created_at <= timing.now - %(max_age)s
+                                    THEN timing.now ELSE NULL END,
+                   sent_at = NULL,
+                   attempt_count = GREATEST(0, attempt_count - %(refund)s)
+               FROM timing
+               WHERE outbox.id = %(id)s AND status = 'sending' AND lock_token = %(token)s
+               RETURNING status""",
+            {
+                "max_age": _MAX_CONTENDED_QUEUE_AGE,
+                "retry_delay": _CONTENTION_RETRY_DELAY,
+                "refund": 0 if smtp_attempted else 1,
+                "id": message.id,
+                "token": message.lock_token,
+            },
         )
-        if await cur.fetchone() is None:
+        row = await cur.fetchone()
+        if row is None:
             raise OutboxLeaseLostError(message.id)
+
+    if row["status"] == "dead":
+        logger.error(
+            "Email outbox message %d exhausted its lock-contention queue age",
+            message.id,
+            extra={
+                "event_type": "email_outbox_contention_exhausted",
+                "message_id": message.id,
+                "message_type": message.message_type,
+            },
+        )
+        return "dead"
+    return "retried"
 
 
 async def retry_email_later(
@@ -770,8 +863,8 @@ async def cancel_pending_action_emails_cur(
             sent_at = NULL,
             locked_at = NULL,
             lock_token = NULL,
-            last_error = 'superseded'
-            , terminal_outcome = 'cancelled'
+            last_error = 'superseded',
+            terminal_outcome = 'cancelled'
         WHERE user_id = %s
           AND message_type = %s
           AND status = 'pending'

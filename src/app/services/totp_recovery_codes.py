@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from string import hexdigits
 from typing import Any
 
-from psycopg import AsyncCursor
+from psycopg import AsyncCursor, sql
 
 from .tokens import hash_token
 
@@ -20,6 +20,24 @@ TOTP_RECOVERY_PASSWORD_ATTEMPT_LIMIT = 3
 
 _RECOVERY_CODE_BYTES = 10
 _RECOVERY_CODE_GROUP_CHARS = 5
+
+
+def recovery_code_candidate_sql(table_alias: str | None = None) -> sql.Composed:
+    """Render the common nonlocking candidate predicate using quoted identifiers.
+
+    Callers bind the code digest and password-attempt limit, in that order.
+    Owner/generation selection and later locking/revalidation remain caller-owned.
+    """
+
+    def column(name: str) -> sql.Identifier:
+        """Qualify a column with the optional table alias."""
+        return sql.Identifier(table_alias, name) if table_alias else sql.Identifier(name)
+
+    return sql.SQL("{digest} = %s AND {used} IS NULL AND {attempts} < %s").format(
+        digest=column("code_hash"),
+        used=column("used_at"),
+        attempts=column("password_attempt_count"),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,10 +255,10 @@ async def find_active_recovery_code_candidate_cur(
     active_generation: int,
     candidate_code: str,
 ) -> MatchedRecoveryCodeCandidate | None:
-    """Return an unused code match with fewer than three attempts, or None.
+    """Return an unused code with fewer than three attempts in the supplied generation, or None.
 
-    This is a nonlocking read of the supplied generation, not authentication or
-    proof it is still active. Reserve the candidate before password work.
+    This nonlocking read neither checks the current active generation nor
+    authenticates the caller. Reserve and commit the candidate before password work.
     """
     canonical = normalize_recovery_code(candidate_code)
     if canonical is None or active_generation <= 0:
@@ -248,15 +266,13 @@ async def find_active_recovery_code_candidate_cur(
 
     code_hash = hash_token(canonical)
     await cur.execute(
-        """
+        sql.SQL("""
         SELECT position
         FROM totp_recovery_codes
         WHERE user_id = %s
           AND generation = %s
-          AND code_hash = %s
-          AND used_at IS NULL
-          AND password_attempt_count < %s
-        """,
+          AND {candidate}
+        """).format(candidate=recovery_code_candidate_sql()),
         (
             user_id,
             active_generation,

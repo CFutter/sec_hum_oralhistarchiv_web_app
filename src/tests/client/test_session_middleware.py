@@ -1,15 +1,4 @@
-"""Session middleware over the real stack: cookies, CSRF, routing, audit.
-
-Covers `app.middleware.session.SessionResolutionMiddleware` end to end
-through a TestClient with the database pool doubled: exact session-lookup
-skips, flash consume/restore gating, passive cookie handling for
-invalid/expired/dead-session cookies, the SecureAPIRouter dependencies that
-enforce partial-session and enrollment boundaries after routing, explicit
-session cookie transitions (login/logout), and what the audit log records
-when session resolution succeeds or fails.
-
-All tests run against the mocked-pool client harness — no database required.
-"""
+"""Session middleware over the real stack: cookies, CSRF, routing, audit."""
 
 import http.cookies
 from contextlib import ExitStack, contextmanager
@@ -35,10 +24,6 @@ from tests.fixtures import (
     make_sample_user,
     sign_session_id,
 )
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
 
 
 def _deleted_cookie_names(response) -> set[str]:
@@ -67,16 +52,15 @@ class TestExactRouteSessionLookupSkip:
 
     @pytest.fixture(autouse=True)
     def _exact_route_rules_only(self, monkeypatch):
-        """Pin the exact (method, path) skip rules in isolation. With the
-        limiter enabled, every 404/405 below is also marked unmatched by rate
-        admission and skips the lookup for that reason; that skip is covered
-        by test_request_admission.py."""
+        """Disable limiter admission so route-specific session-lookup skip rules are tested in
+        isolation.
+        """
         monkeypatch.setattr(limiter, "enabled", False)
 
     def test_healthiness_collision_still_resolves_session(self, authenticated_client):
         """A lookalike health path must not inherit the exact probe exception."""
         response = authenticated_client.get("/healthiness")
-        assert response.status_code == 404  # no such route, but middleware ran
+        assert response.status_code == 404
         assert authenticated_client.session_spy.await_count >= 1
 
     def test_exact_health_gets_and_static_reads_skip_session_lookup(self, authenticated_client):
@@ -96,7 +80,7 @@ class TestExactRouteSessionLookupSkip:
     def test_a_query_string_does_not_change_the_exact_route_skip_decision(
         self, authenticated_client
     ):
-        """The skip key is (method, request.url.path) — a query string must
+        """The skip key is (method, request.url.path) â€” a query string must
         not turn an exempt path into a non-exempt one or vice versa."""
         authenticated_client.session_spy.reset_mock()
         response = authenticated_client.get("/health?x=1")
@@ -105,9 +89,7 @@ class TestExactRouteSessionLookupSkip:
 
     @pytest.mark.parametrize("path", ["/healthz", "/health/"])
     def test_lookalike_paths_do_not_inherit_the_exact_skip(self, authenticated_client, path):
-        """Positive control for the query-string case above: a path that is
-        merely similar to an exempt one (extra segment, trailing slash) is
-        not the same dict key and must still resolve the session."""
+        """Check lookalike paths do not inherit the exact skip."""
         authenticated_client.session_spy.reset_mock()
         authenticated_client.get(path)
         assert authenticated_client.session_spy.await_count >= 1
@@ -121,19 +103,18 @@ class TestExactRouteSessionLookupSkip:
 
     def test_head_robots_txt_skips_session_lookup(self, authenticated_client):
         """HEAD is exempted alongside GET for the exact-probe paths, not
-        just for /health — /robots.txt is one of the reviewed pairs."""
+        just for /health â€” /robots.txt is one of the reviewed pairs."""
         authenticated_client.session_spy.reset_mock()
         authenticated_client.request("HEAD", "/robots.txt")
         assert authenticated_client.session_spy.await_count == 0
 
 
 class TestAdminRecoveryCodeBackstop:
-    """require_admin (app/middleware/session.py) refuses a local administrator
-    whose active recovery-code generation is empty, even with an otherwise
-    complete full session; the check does not apply to federated admins."""
+    """Cover admin recovery code backstop."""
 
     @staticmethod
     def _admin_dashboard_service_patches():
+        """Return patches for an empty user dashboard with no pending invitations."""
         return (
             patch(
                 "app.routes.auth.admin.list_admin_promotion_states",
@@ -148,6 +129,7 @@ class TestAdminRecoveryCodeBackstop:
         )
 
     def test_local_admin_without_active_recovery_codes_is_refused(self, client_builder):
+        """Check local admin without active recovery codes is refused (HTTP 403)."""
         admin = make_sample_user(
             is_admin=True,
             totp_recovery_code_generation=0,
@@ -160,8 +142,7 @@ class TestAdminRecoveryCodeBackstop:
         assert response.status_code == 403
 
     def test_local_admin_with_active_recovery_codes_is_admitted(self, admin_client):
-        """Positive control: admin_client's default recovery-code state is
-        healthy (fixtures.make_sample_user), so the same route is admitted."""
+        """Check local admin with active recovery codes is admitted (HTTP 200)."""
         with ExitStack() as stack:
             for p in self._admin_dashboard_service_patches():
                 stack.enter_context(p)
@@ -170,9 +151,7 @@ class TestAdminRecoveryCodeBackstop:
         assert response.status_code == 200
 
     def test_federated_admin_is_not_subject_to_the_recovery_code_check(self, client_builder):
-        """A Shibboleth administrator has no local recovery-code generation
-        at all; require_admin's check is gated on auth_method == 'local' and
-        must not reject a federated admin on that basis."""
+        """Check federated admin is not subject to the recovery code check (HTTP 200)."""
         admin = make_sample_user(is_admin=True, auth_method="shibboleth")
         client = client_builder(session_user=admin)
 
@@ -185,13 +164,10 @@ class TestAdminRecoveryCodeBackstop:
 
 
 class TestFlashConsumptionGating:
-    """Flash is consumed in middleware BEFORE call_next, gated on flash_present.
-
-    The unit-level gate saves a round trip: when no flash is pending the
-    read-and-clear query must not run at all.
-    """
+    """Flash is consumed in middleware BEFORE call_next, gated on flash_present."""
 
     def test_flash_consumed_before_render_and_visible_in_page(self, client_builder):
+        """Check flash consumed before render and visible in page (HTTP 200)."""
         client = client_builder(
             session_user=make_sample_user(),
             flash=("Saved.", "success"),
@@ -241,18 +217,11 @@ class TestCookieSignatureAndLivenessHandling:
             if k == b"set-cookie" and v.decode().startswith(f"{CSRF_COOKIE_NAME}=")
         ]
         assert len(csrf_sets) == 1 and not csrf_sets[0].endswith('=""'), csrf_sets
-        # Bad signature never reaches the session lookup.
         assert client.session_spy.await_count == 0
 
     def test_valid_cookie_for_dead_session_is_only_an_anonymous_nonce(self, client_builder):
-        """A signed cookie with no DB session is retained as an anonymous nonce.
-
-        Authorization still requires a live database session. This is the
-        positive control for the unsigned-cookie case above: a validly signed
-        cookie DOES reach the session lookup, even though that lookup then
-        resolves to no user.
-        """
-        client = client_builder(session_user=None)  # get_session_user -> user=None
+        """Check valid cookie for dead session is only an anonymous nonce (HTTP 200)."""
+        client = client_builder(session_user=None)
         client.cookies.set(settings.session_cookie_name, sign_session_id(RAW_SESSION_ID))
         response = client.get("/about")
         assert response.status_code == 200
@@ -263,16 +232,10 @@ class TestCookieSignatureAndLivenessHandling:
         assert CSRF_COOKIE_NAME not in deleted
 
     def test_signature_expired_cookie_is_treated_as_guest(self, client_builder):
-        """A cookie whose SIGNATURE has expired (older than
-        session_max_age_seconds by the itsdangerous embedded timestamp) is
-        rejected by get_session_id_from_cookie's SignatureExpired branch: no
-        session lookup, guest page, cookie retained without authority. This is
-        the itsdangerous-timestamp layer, distinct from the DB expiry gate.
-        Forged with a genuinely back-dated clock so the token is validly
-        signed but old."""
+        """Check signature expired cookie is treated as guest (HTTP 200)."""
         # Sign the value with the real signer but a clock set far enough in the
         # past that max_age (session_max_age_seconds) has elapsed by now.
-        stale_epoch = 1_000_000_000  # 2001 — comfortably older than any max_age
+        stale_epoch = 1_000_000_000  # 2001 â€” comfortably older than any max_age
         with patch.object(itsdangerous.timed.time, "time", return_value=stale_epoch):
             stale_value = SESSION_SIGNER.dumps(RAW_SESSION_ID)
 
@@ -281,9 +244,7 @@ class TestCookieSignatureAndLivenessHandling:
         response = client.get("/about")
 
         assert response.status_code == 200
-        # Expired signature → the session lookup never ran (treated as guest)...
         assert client.session_spy.await_count == 0
-        # Passive responses cannot delete a concurrently replaced cookie.
         assert settings.session_cookie_name not in _deleted_cookie_names(response)
 
 
@@ -301,8 +262,8 @@ class TestSessionPurposeRouteAccess:
 
     def test_verify_email_capability_is_reachable_during_totp_setup(self, totp_setup_client):
         """The exact capability route remains independent of session purpose."""
-        response = totp_setup_client.get("/verify-email/sometoken", follow_redirects=False)
-        assert response.status_code == 400
+        response = totp_setup_client.get("/verify-email/" + "A" * 43, follow_redirects=False)
+        assert response.status_code == 200
 
     def test_logout_is_usable_during_totp_setup(self, totp_setup_client):
         """The exact open route lets a purpose-limited session end itself."""
@@ -323,7 +284,7 @@ class TestSessionPurposeRouteAccess:
         client = client_builder(session_user=user, session_purpose="totp_setup")
 
         with patch(
-            "app.routes.auth.register.get_user_by_email",
+            "app.routes.auth.register.resend_local_registration",
             autospec=True,
             return_value=None,  # keep the route off the tripwire mock pool
         ):
@@ -349,14 +310,7 @@ class TestSessionPurposeRouteAccess:
         assert response.headers["location"] == "/setup-totp"
 
     def test_policy_approved_shibboleth_session_does_not_require_local_totp(self, client_builder):
-        """The full-session dependency recognizes approved federation.
-
-        A full Shibboleth session can only be minted after the callback and
-        the finalizer independently require the exact REFEDS MFA context, so
-        reaching the route dependency already implies the external-MFA
-        contract was satisfied. This is the positive control for the
-        enrollment-redirect case above.
-        """
+        """Check policy approved Shibboleth session does not require local TOTP (HTTP 200)."""
         client = client_builder(
             session_user=make_sample_user(auth_method="shibboleth", totp_configured=False)
         )
@@ -372,11 +326,7 @@ class TestSessionCookieTransitionSafety:
     FRESH_SESSION_ID = "fresh-raw-id"
 
     def _plant_stale_session(self, client) -> str:
-        """Give the client a SIGNATURE-VALID cookie for a dead session (the
-        harness's patched get_session_user resolves it to SessionLookup(None,
-        None, False), so the middleware schedules a deletion) and rebind the
-        CSRF pair to that identifier (get_current_identifier prefers the
-        session id). Returns the CSRF token for the form field."""
+        """Install a signed dead-session cookie, rebind its CSRF pair, and return the form token."""
         client.cookies.set(settings.session_cookie_name, sign_session_id(self.STALE_SESSION_ID))
         token = csrf_token_for(self.STALE_SESSION_ID)
         client.cookies.set(CSRF_COOKIE_NAME, token)
@@ -412,7 +362,7 @@ class TestSessionCookieTransitionSafety:
             response = guest_client.post(
                 "/login",
                 data={
-                    "email": "alice@uzh.ch",
+                    "email": "alice@example.org",
                     "password": "correct-password",
                     "totp_code": "123456",
                     "csrf_token": token,
@@ -447,11 +397,7 @@ class TestSessionCookieTransitionSafety:
         assert headers == []
 
     def test_handler_side_deletion_counts_as_fresh_and_is_not_duplicated(self, guest_client):
-        """The middleware's freshness probe is a name-prefix check on
-        Set-Cookie, so a handler that itself DELETES the session cookie
-        (logout's clear_session_cookie) also counts as 'fresh'. Pins that
-        emergent property: exactly ONE deletion header — the handler's — with
-        no middleware duplicate appended."""
+        """Check handler side deletion counts as fresh and is not duplicated (HTTP 303)."""
         token = self._plant_stale_session(guest_client)
 
         with patch("app.routes.auth.login.delete_session", autospec=True) as delete_spy:
@@ -499,7 +445,12 @@ class TestSessionFailureAuditTrace:
 
     @pytest.mark.parametrize("phase", ["lookup", "flash"])
     def test_session_failure_has_correlated_500(self, authenticated_client, phase):
+        # This test covers failures in session resolution and request auditing.
+        # Keep admission independent of the shared Redis limiter, whose
+        # fail-closed 503 would correctly happen before either failure is reached.
+        """Check session failure has correlated 500."""
         with (
+            patch.object(authenticated_client.app.state.limiter, "enabled", False),
             patch(
                 "app.middleware.session.get_session_user",
                 new=create_autospec(
@@ -529,8 +480,7 @@ class TestSessionFailureAuditTrace:
         assert extra["user_id"] == (None if phase == "lookup" else 1)
 
     def test_success_still_audits_resolved_user(self, authenticated_client):
-        """Positive control for the failure case above: a successful request
-        is still audited with the resolved user id."""
+        """Check success still audits resolved user (HTTP 200)."""
         with patch("app.middleware.audit_logging.audit_logger") as audit:
             response = authenticated_client.get("/about", follow_redirects=False)
         assert response.status_code == 200
@@ -556,6 +506,7 @@ class TestSessionFailureAuditTrace:
         audit.exception.assert_not_called()
 
     def test_route_dependency_redirect_is_still_audited(self, totp_setup_client):
+        """Check route dependency redirect is still audited (HTTP 303)."""
         with patch("app.middleware.audit_logging.audit_logger") as audit:
             response = totp_setup_client.get("/", follow_redirects=False)
         assert response.status_code == 303

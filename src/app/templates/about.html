@@ -1,13 +1,13 @@
 {% extends "base.html" %}
 {% set active_page = "about" %}
-{% block title %}About — Oral History Archive{% endblock %}
+{% block title %}About — {{ site_name }}{% endblock %}
 
 {% block content %}
 <section class="container about-page">
 
   <h1>About the Archive</h1>
-  <p class="about-intro">The Digital Oral History Archive provides a unified search interface for interview metadata from oral history research collections at the University of Zurich.</p>
-
+  <p class="about-intro">{{ about_summary }}</p>
+  
   <div class="about-grid">
 
     <div class="about-card">
@@ -17,15 +17,18 @@
     </div>
 
     <div class="about-card">
-      <h2>Access Levels</h2>
+      <h2>Metadata access tiers</h2>
+      <p>Everyone can see titles and basic catalogue details for datasets listed in the catalogue. Datasets hidden by an administrator are excluded at every tier.</p>
+      <p>Other metadata is shown field by field. Where a dataset, a field and its source have different access requirements, the strictest applies. A public-tier dataset can therefore still contain restricted fields.</p>
       <dl class="access-list">
         <dt><span class="card-access public">public</span></dt>
-        <dd>Metadata visible to all visitors. No login required.</dd>
+        <dd>Metadata fields requiring public access are available without signing in.</dd>
         <dt><span class="card-access registered">registered</span></dt>
-        <dd>Extended metadata visible to registered academic users.</dd>
-        <dt><span class="card-access restricted">restricted</span></dt>
-        <dd>Full metadata available only to vetted researchers with approved access.</dd>
+        <dd>Users with registered access can view fields requiring public or registered access.</dd>
+        <dt><span class="card-access vetted">vetted</span></dt>
+        <dd>Users with vetted access can view fields requiring public, registered or vetted access in listed datasets.</dd>
       </dl>
+      <p>Registered and vetted access must be granted by an administrator. Access to recordings is governed by the originating repository.</p>
     </div>
 
     <div class="about-card">
@@ -33,15 +36,26 @@
       <table class="about-table">
         <thead><tr><th>Source</th><th>Sensitivity</th><th>Status</th></tr></thead>
         <tbody>
-          <tr><td>Source A</td><td>Non-sensitive</td><td><span class="status-badge active">Active</span></td></tr>
-          <tr><td>Source B</td><td>Highly sensitive</td><td><span class="status-badge planned">Phase 2</span></td></tr>
+          {% set status_labels = {
+            "active": "Active",
+            "pending": "Awaiting sync",
+            "degraded": "Needs attention"
+          } %}
+          {% for source in source_statuses %}
+          <tr>
+            <td>{{ source.label }}</td>
+            <td>{{ source.sensitivity_badge or "Not specified" }}</td>
+            <td><span class="status-badge {{ source.status }}">{{ status_labels[source.status] }}</span></td>
+          </tr>
+          {% endfor %}
         </tbody>
       </table>
+      <p>Status reflects recorded synchronization history. “Awaiting sync” means that successful synchronization history is incomplete; “Needs attention” means a recorded error or overdue synchronization.</p>
     </div>
 
     <div class="about-card">
       <h2>Contact</h2>
-      <p>This project is developed at the University of Zurich. For questions, access requests, or to report issues:</p>
+      <p>{{ institution_name }}. For questions, access requests, or to report issues:</p>
       <p><strong>Email:</strong> <a href="mailto:{{ contact_email }}">{{ contact_email }}</a></p>
     </div>
 

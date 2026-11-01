@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% set active_page = "admin" %}
+{% block title %}Dataset {{ record.dataset_id }} Administration — {{ site_name }}{% endblock %}
+{% block content %}
+<section class="container admin-page">
+  <h1>Dataset {{ record.dataset_id }}</h1>
+  {% if not record.state.hidden_at and not record.quarantined_at %}<p>{{ record.public_title or '(untitled)' }}</p>{% endif %}
+  <p><a href="{{ path_for(request, 'admin_datasets') }}">Dataset administration</a></p>
+  {% if notice %}<p class="auth-success" role="status">{{ notice }}</p>{% endif %}
+  <dl>
+    <dt>Source</dt><dd>{{ source_label }} (<code>{{ record.source }}</code>)</dd>
+    <dt>UUID</dt><dd><code>{{ record.uuid }}</code></dd>
+    <dt>Stored tier</dt><dd>{{ record.state.stored_tier }}</dd>
+    <dt>Administrator floor</dt><dd>{{ record.state.admin_tier or 'None' }}</dd>
+    <dt>Effective tier</dt><dd>{{ record.state.effective_tier }}</dd>
+    <dt>Status</dt><dd>{{ 'Awaiting upstream correction' if record.quarantined_at else ('Hidden' if record.state.hidden_at else 'Visible') }}</dd>
+    {% if record.quarantined_at %}<dt>Withheld since</dt><dd>{{ record.quarantined_at | utc_datetime }}</dd>{% endif %}
+    {% if record.state.hidden_at %}<dt>Hidden since</dt><dd>{{ record.state.hidden_at | utc_datetime }}</dd>{% endif %}
+  </dl>
+  {% if record.quarantined_at %}
+    <p class="auth-error" role="status">The latest incoming record could not be accepted. Its previous catalogue copy is withheld from all access tiers until a valid upstream correction is successfully ingested. Restoring an administrator-hidden dataset does not remove this restriction.</p>
+  {% endif %}
+  <h2>Visibility floor</h2>
+  <p>Raising the tier restricts full metadata. The public discovery envelope remains visible unless the dataset is hidden or awaiting an upstream correction.</p>
+  {% if raise_blocked %}
+    <p role="status">{{ raise_blocked }} Hide and restore remain available.</p>
+  {% else %}
+    <p>Current minimum: <strong>{{ record.required_tier }}</strong>. Saving the same effective tier can establish a durable administrator floor.</p>
+    <form action="{{ path_for(request, 'admin_dataset_state', dataset_id=record.dataset_id) }}" method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <input type="hidden" name="action" value="raise_tier">
+      <label for="dataset-tier">Administrator floor</label>
+      <select id="dataset-tier" name="new_tier">
+      {% for tier in record.allowed_raise_tiers %}<option value="{{ tier }}">{{ tier }}</option>{% endfor %}
+      </select>
+      <button type="submit" class="btn btn-primary">Save visibility floor</button>
+    </form>
+  {% endif %}
+  <h2>{{ 'Restore dataset' if record.state.hidden_at else 'Hide dataset' }}</h2>
+  <p>Hiding removes the dataset from every catalogue view and tier. Restoring keeps its visibility floor. Both restrictions survive synchronization and reintroduction of the same source and UUID.</p>
+  <form action="{{ path_for(request, 'admin_dataset_state', dataset_id=record.dataset_id) }}" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+    <input type="hidden" name="action" value="{{ 'restore' if record.state.hidden_at else 'hide' }}">
+    <button type="submit" class="btn {{ 'btn-primary' if record.state.hidden_at else 'btn-danger' }}">{{ 'Restore dataset' if record.state.hidden_at else 'Hide dataset' }}</button>
+  </form>
+  {% if not record.state.hidden_at and not record.quarantined_at %}
+    <p><a href="{{ path_for(request, 'detail', dataset_id=record.dataset_id) }}">View catalogue page at your access tier</a></p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,85 +1,114 @@
 # Emergency Dataset Withdrawal
 
-Use this runbook only when sensitive metadata must be removed from the public
-application before the authoritative source can publish its correction or
-withdrawal. Normal corrections belong in the source repository and flow through
-synchronization.
+Use this procedure when a dataset must disappear from every catalogue view
+before its authoritative source can publish a correction or withdrawal. Raising
+a tier leaves the public discovery envelope visible; hiding removes that
+envelope too. Hiding retains local metadata and does not erase database backups,
+logs, browser history or downstream copies.
 
-This procedure deletes the local row rather than raising its tier. A tier change
-would still expose the record's redacted title and identifiers to lower-tier
-viewers. It does not erase copies already present in database backups, remote
-logs, browser history, or downstream systems; handle those under the incident
-response and retention procedures.
+## Primary path: administrator UI
 
-## Preconditions
+1. Open an incident/change record with the reviewed source, UUID, reason,
+   approver and timestamps. Keep sensitive metadata out of the ticket.
+2. Sign in with an eligible full administrator session. Open **Admin → Dataset
+   administration**, filter by the exact UUID and source name, and open the
+   matching ID. Check both identity fields before acting. Hidden records and
+   records from unselected sources are included in this control view.
+3. Choose **Hide dataset**. A successful response confirms the committed change;
+   a timeout or error requires reloading the control page to check current state
+   before retrying. An already hidden dataset is a no-op.
+4. Verify the normal detail URL returns 404 for anonymous, registered and vetted
+   viewers. Verify the record is absent from search, recent cards, facets and
+   catalogue counts. No worker restart or Redis invalidation is required.
+5. Record the `admin_dataset_hidden` event's request, actor, dataset/source/UUID
+   and before/after state. A change appends durable evidence transactionally and
+   emits a local log after commit; no-ops append none. Follow
+   [security event delivery](security-event-delivery.md) if the local copy is missing.
+6. Arrange the authoritative correction with the source curator. Ingestion may
+   continue: the durable `(source, uuid)` hide survives incremental updates,
+   rebuilds, withdrawal and reintroduction. A new UUID is a different identity
+   and needs its own review.
+7. Once disclosure is approved, reopen the control page and choose **Restore
+   dataset**. Restore clears only hiding, preserves the administrator tier floor,
+   and emits `admin_dataset_restored` for a change. Verify the restored record
+   at all three tiers and record the outcome.
 
-- Open an incident/change record containing the source, UUID, reason, approver,
-  and timestamps. Do not put sensitive metadata itself in the ticket or shell
-  history.
-- Arrange the authoritative correction or withdrawal with the source curator.
-- Use the scheduler peer role, which can delete catalogue rows; do not broaden web grants.
+The control pages show identifiers, visibility state and the public catalogue
+title for nonhidden records. Hidden titles are withheld; use the reviewed source
+and UUID to identify them. The normal catalogue detail page also links to these
+controls with **Manage visibility** for administrators. Administrator status
+grants no extra catalogue metadata tier. Raising requires a valid selected
+source policy; hide and restore also work for retained unselected sources.
+If the source has removed the raw catalogue row, its durable restriction remains
+stored and applies if that identity returns; there is no current dataset ID to
+manage in the UI while the row is absent.
 
-## Procedure
+An **Awaiting upstream correction** note identifies an independent ingestion
+quarantine. A rejected update to a known identity withholds its previous copy
+from every catalogue tier, including its title and resource redirects. Keep the
+source/UUID for upstream correction and inspect the source's ingestion status.
+Administrator restore clears only the administrator's hide; it cannot override
+this quarantine. A fully validated correction from a later fresh harvest must
+commit before serving resumes. Do not delete quarantine rows or reset failures
+to force the previous copy back into service. Existing administrator floors and
+hiding still apply after the correction.
 
-1. Stop ingestion and any ad-hoc sync jobs. Stopping the scheduler also pauses mail delivery and maintenance jobs:
+## SQL fallback: web tier unavailable
 
-   ```console
-   sudo systemctl stop oralhistarchiv-scheduler
-   ```
+Use this only when the web tier cannot serve the UI. Use the existing web peer
+identity, which can write administrator state but cannot update raw catalogue
+metadata. Do not broaden grants or delete the catalogue row.
 
-2. Open a peer-authenticated SQL session:
+```console
+sudo -u oralhistarchiv /usr/bin/psql -X --no-password \
+  --host=/var/run/postgresql --dbname=oralhistarchiv \
+  --username=oralhistarchiv_web --set=ON_ERROR_STOP=1
+```
 
-   ```console
-   sudo -u oralhistarchiv-scheduler /usr/bin/psql -X --no-password \
-     --host=/var/run/postgresql --dbname=oralhistarchiv \
-     --username=oralhistarchiv_scheduler --set=ON_ERROR_STOP=1
-   ```
+Confirm the database and substitute the reviewed source/UUID in both statements.
+The advisory key is the same single-bigint key used by ingestion and the UI.
+The transaction serializes with those writers; use a finite timeout.
 
-   Confirm the database and substitute the reviewed source/UUID below.
-   Commit only if inspection and deletion each affect the one intended row.
+```sql
+BEGIN;
+SET LOCAL statement_timeout = '30s';
+SELECT pg_advisory_xact_lock(1330135379);
 
-   ```sql
-   BEGIN;
+SELECT stored.id, stored.source, stored.uuid, stored.visibility_tier,
+       admin_state.visibility_tier AS administrator_floor, admin_state.hidden_at
+FROM dataset_admin_catalogue AS stored
+LEFT JOIN dataset_admin_state AS admin_state
+  ON admin_state.source = stored.source AND admin_state.uuid = stored.uuid
+WHERE stored.source = 'SOURCE_NAME' AND stored.uuid = 'SOURCE_UUID';
 
-   SELECT id, source, uuid, visibility_tier
-   FROM oral_history_datasets
-   WHERE source = 'SOURCE_NAME' AND uuid = 'SOURCE_UUID'
-   FOR UPDATE;
+INSERT INTO dataset_admin_state (source, uuid, hidden_at)
+SELECT source, uuid, clock_timestamp()
+FROM dataset_admin_catalogue
+WHERE source = 'SOURCE_NAME' AND uuid = 'SOURCE_UUID'
+ON CONFLICT (source, uuid) DO UPDATE
+SET hidden_at = COALESCE(dataset_admin_state.hidden_at, EXCLUDED.hidden_at)
+RETURNING source, uuid, visibility_tier AS administrator_floor, hidden_at;
 
-   DELETE FROM oral_history_datasets
-   WHERE source = 'SOURCE_NAME' AND uuid = 'SOURCE_UUID';
+-- COMMIT only when inspection and RETURNING each identify the one intended row.
+-- Otherwise ROLLBACK and investigate.
+```
 
-   -- Expect exactly one row. ROLLBACK and investigate any other result.
-   COMMIT;
-   ```
+Execute `COMMIT;` or `ROLLBACK;` explicitly after inspection. A timeout aborts the
+transaction; roll back before any retry. The upsert preserves an existing floor
+and first hide timestamp. SQL emits no application administration event: record
+the operator identity, time, exact SQL result and reason in the incident record.
+After web recovery, perform the viewer checks above. Restore through the UI.
 
-3. Restart every web instance to clear cached catalogue statistics; facets are queried live:
+## Disposable-instance rehearsal
 
-   ```console
-   sudo systemctl restart oralhistarchiv
-   ```
+Rehearse the primary path on a disposable instance with a synthetic selected
+source and a record approved for testing. Record the
+revision, date, source/UUID, administrator ID, HTTP outcomes, all-tier viewer
+checks and three change events for raise/hide/restore. Include a rejected
+below-floor raise (4xx, no state change/event) and a repeated action (no-op).
+Do not use a production record or reset an application database for this drill.
 
-4. Verify as an anonymous, registered, and vetted viewer that the detail URL,
-   search results, counts, and facets no longer expose the record. Verify in SQL
-   that no row remains for the exact `(source, uuid)`; deletion removes the
-   normalized columns, data JSONB and trigger-maintained search text together.
-
-5. Record the database result and application verification in the incident
-   record. Complete any backup/log containment required by policy.
-
-6. Keep the scheduler stopped until the upstream correction is effective and
-   persisted incremental_harvest has been reviewed. Both incremental sync and
-   full rebuild drain staged work first, so either can recreate the removed row.
-   No withdrawal-specific staging-reconciliation command is supplied. Obtain a
-   reviewed reconciliation/discard plan and verify an authoritative rebuild
-   before resuming normal scheduling; do not merely request a rebuild.
-
-7. Confirm the record remains absent, or that a corrected record contains no
-   sensitive value in normalized columns, `data`, search results, or facets.
-
-## Failure rule
-
-If the source has not yet been corrected, leave the scheduler stopped and
-escalate the freshness impact. Do not maintain a silent permanent database edit:
-ordinary upserts treat the source as authoritative and can overwrite or recreate
-local state.
+`src/tests/integration/test_dataset_admin_routes_db.py::test_withdrawal_ui_rehearsal`
+automates the HTTP/service/database checks against the test harness's disposable
+database. It complements the operator's browser/runbook rehearsal; a passing
+automated test does not itself record that deployment exercise.

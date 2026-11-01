@@ -1,21 +1,10 @@
-"""Contract pins for the repository's own tooling: CI workflow, tier
-boundary, developer container/launcher and linter configuration.
-
-These assert raw text and TOML tables under `.github/`, `.devcontainer/`,
-`dev.sh` and `pyproject.toml` rather than behaviour reachable through an
-import, so a config drift that changes none of those files' *meaning* to
-Python still fails a test instead of shipping silently. Deliberately NOT
-YAML parsing: pyyaml is not a dependency and adding it would force a
-uv.lock regeneration (CI runs `uv sync --locked` and fails on a stale
-lock). The strings asserted here are exact enough that a reformat which
-changes them is itself a contract change worth a failing test.
-
-Pure unit tests: no DB, no app, no subprocess except where a scenario class
-says otherwise.
+"""Contract pins for the repository's own tooling: CI workflow, tier boundary, developer
+container/launcher and linter configuration.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -59,20 +48,18 @@ _GLOB_CHARS = set("*?[")
 
 
 def _workflow_text() -> str:
+    """Read the CI workflow, failing if it is absent."""
     assert CI_WORKFLOW.exists(), f"CI workflow not found at {CI_WORKFLOW}"
     return CI_WORKFLOW.read_text()
 
 
 def _mapping_keys(text: str) -> set[str]:
-    """Lines that are bare YAML mapping keys (e.g. a service name).
-
-    A whole-stripped-line match is what makes `redis:` here mean the
-    service block header and not the `redis://` scheme inside REDIS_URL.
-    """
+    """Extract complete bare YAML mapping-key lines, excluding URL scheme substrings."""
     return {line.strip() for line in text.splitlines()}
 
 
 def _workflow_files() -> list[Path]:
+    """List YAML workflow files in deterministic path order."""
     return sorted(
         path
         for path in WORKFLOW_DIRECTORY.iterdir()
@@ -112,6 +99,7 @@ def _fake_item(path: str) -> types.SimpleNamespace:
 
 
 def _ruff_lint() -> dict[str, Any]:
+    """Read the Ruff lint table from pyproject.toml, failing if the file is absent."""
     assert PYPROJECT.exists(), f"pyproject.toml not found at {PYPROJECT}"
     with PYPROJECT.open("rb") as f:
         return tomllib.load(f)["tool"]["ruff"]["lint"]
@@ -133,6 +121,7 @@ def _key_resolves(key: str) -> bool:
 
 
 def _wait_for(path: Path) -> None:
+    """Wait up to five seconds for a child-created file, then raise AssertionError."""
     deadline = time.monotonic() + 5
     while not path.exists():
         if time.monotonic() >= deadline:
@@ -143,23 +132,80 @@ def _wait_for(path: Path) -> None:
 class TestCIWorkflowGates:
     """The release/test workflow keeps the gates that stop a silent green run."""
 
+    def test_ci_test_mypy_is_blocking(self) -> None:
+        """Test typing failures must fail the required typecheck job."""
+        match = re.search(
+            r"(?ms)^  typecheck:\n(?P<job>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            _workflow_text(),
+        )
+        assert match is not None, "typecheck job missing from ci.yml"
+        job = match.group("job")
+
+        assert re.search(r"(?m)^        run: uv run mypy src/tests$", job), (
+            "typecheck must run test mypy directly, without masking its exit status"
+        )
+        assert not re.search(r"(?m)^[ \t]*(?:-[ \t]*)?continue-on-error[ \t]*:", job), (
+            "neither the typecheck job nor its steps may allow typing failures"
+        )
+
     def test_ci_test_job_requires_db_and_redis(self):
-        """Without REQUIRE_DB=1 a dead postgres service container ships a
-        green run that executed none of the integration tier — a workflow
-        edit that drops the env vars must fail a unit test, not pass review
-        as a cleanup."""
+        """Check ci test job requires database and Redis."""
         text = _workflow_text()
         assert 'REQUIRE_DB: "1"' in text
         assert 'REQUIRE_REDIS: "1"' in text
+        assert 'REQUIRE_NGINX: "1"' in text
+        assert 'REQUIRE_SYSTEMD: "1"' in text
         # The env vars are meaningless without the services they gate on.
         keys = _mapping_keys(text)
         assert "postgres:" in keys, "postgres service block missing from ci.yml"
         assert "redis:" in keys, "redis service block missing from ci.yml"
 
-    def test_ci_enforces_a_coverage_floor(self):
-        """A workflow edit that drops --cov-fail-under lets coverage rot
-        silently while every run stays green."""
-        assert "--cov-fail-under" in _workflow_text()
+    def test_action_links_require_no_script_runtime(self):
+        """Action forms and their CI checks work without an added script runtime."""
+        workflow = _workflow_text()
+        assert not re.search(r"(?m)^\s*sudo apt-get install [^\n]*\bnodejs\b", workflow)
+        assert "node --test src/tests/unit/action_token_frontend.cjs" not in workflow
+        assert not (PROJECT_ROOT / "src/app/static/action-token.js").exists()
+        assert not (PROJECT_ROOT / "src/tests/unit/action_token_frontend.cjs").exists()
+        for name in (
+            "reset_password.html",
+            "confirm_verify_email.html",
+            "confirm_email.html",
+            "action_token_fields.html",
+        ):
+            template = (PROJECT_ROOT / "src/app/templates" / name).read_text()
+            assert not re.search(r"<\s*script\b", template, flags=re.IGNORECASE)
+
+    def test_ci_enforces_a_coverage_floor(self) -> None:
+        """Keep the measured overall coverage floor and its pytest wiring."""
+        match = re.search(
+            r"(?ms)^  tests:\n(?P<job>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            _workflow_text(),
+        )
+        assert match is not None, "tests job missing from ci.yml"
+        job = match.group("job")
+
+        floor = re.search(
+            r'(?m)^      COVERAGE_FLOOR: "(?P<floor>\d+(?:\.\d+)?)"$',
+            job,
+        )
+        assert floor is not None, "overall coverage floor missing from the tests job"
+        assert 92.5 <= float(floor.group("floor")) <= 100.0, (
+            "the overall coverage floor must not drop below the reviewed 92.5% baseline"
+        )
+
+        command = re.search(
+            r"(?m)^          uv run pytest \$PYTEST_FLAGS \\\n"
+            r"(?P<options>(?:            [^\n]+\\\n)+)",
+            job,
+        )
+        assert command is not None, "the multiline pytest coverage command is missing"
+        options = {
+            line.strip().removesuffix("\\").strip()
+            for line in command.group("options").splitlines()
+        }
+        assert "--cov=src/app --cov=src/config --cov-branch" in options
+        assert '--cov-fail-under="$COVERAGE_FLOOR"' in options
 
     def test_all_remote_workflow_actions_use_immutable_digests(self):
         """Every remote action must be immutable before any repository code runs."""
@@ -231,15 +277,33 @@ class TestCIWorkflowGates:
             "every checkout step must set persist-credentials: false"
         )
 
-    def test_ci_runs_the_suite_in_fixed_random_and_parallel_order(self):
-        """One ordering hides order-dependent tests; the three legs together
-        do not. The random leg must print its seed, so `-q` is not used."""
+    def test_ci_runs_the_suite_in_fixed_random_and_parallel_order(self) -> None:
+        """Run fixed serial and randomized parallel legs with bounded workers.
+
+        Keep normal pytest output so the random seed remains visible.
+        """
         text = _workflow_text()
-        assert "pytest_flags: -p no:randomly" in text
-        assert "pytest_flags: -p randomly" in text
-        assert "pytest_flags: -n auto" in text
-        assert "-rs --no-fold-skipped" in text
-        assert " -q" not in text.split("uv run pytest", 1)[1].split("|", 1)[0]
+        match = re.search(
+            r"(?ms)^  tests:\n(?P<job>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            text,
+        )
+        assert match is not None, "tests job missing from ci.yml"
+        job = match.group("job")
+
+        assert re.findall(r"(?m)^          - order: (.+)$", job) == [
+            "fixed order",
+            "parallel workers",
+        ]
+        assert re.findall(r"(?m)^            pytest_flags: (.+)$", job) == [
+            "-p no:randomly",
+            "-p randomly -n auto --maxprocesses 15",
+        ]
+        assert 'TEST_RATE_LIMIT_REDIS_DB: "0"' in job
+        assert "-rs --no-fold-skipped" in job
+        command = job.split("uv run pytest", 1)[1].split("|", 1)[0]
+        assert " -q" not in command
+        assert "--quiet" not in command
+        assert "--no-header" not in command
 
     def test_ci_sets_ci_so_that_a_skipped_integration_test_fails_the_run(self):
         """The root conftest's session hook and the skip gate both key on CI."""
@@ -248,39 +312,129 @@ class TestCIWorkflowGates:
         assert "bash scripts/check-skips-are-expected.sh pytest-output.log" in text
         assert "tee pytest-output.log" in text
 
-    def test_ci_holds_the_security_modules_to_their_own_coverage_floor(self):
-        """A separate `coverage report` step over the security modules, so a
-        loss of coverage there cannot hide inside the application total."""
-        text = _workflow_text()
-        assert 'uv run coverage report --fail-under="$SECURITY_COVERAGE_FLOOR"' in text
-        for module in (
+    def test_ci_holds_the_security_modules_to_their_own_coverage_floor(self) -> None:
+        """Pin the actual aggregate security report and its complete file selection."""
+        match = re.search(
+            r"(?m)^      - name: Security modules meet their own coverage floor\n"
+            r"        run: >-\n"
+            r'          uv run coverage report --fail-under="\$SECURITY_COVERAGE_FLOOR"\n'
+            r"          --include='(?P<include>[^'\n]+)'$",
+            _workflow_text(),
+        )
+        assert match is not None, "the blocking security coverage report is missing or changed"
+        expected = (
+            "src/app/catalogue_runtime.py",
+            "src/app/catalogue_sql.py",
+            "src/app/cookie_contract.py",
+            "src/app/environment.py",
+            "src/app/log_text.py",
+            "src/app/credentials.py",
+            "src/app/doi.py",
+            "src/app/federation_contract.py",
+            "src/app/federated_tier_rules.py",
+            "src/app/field_visibility.py",
+            "src/app/main.py",
             "src/app/middleware/*",
+            "src/app/request_utils.py",
             "src/app/route_security.py",
-            "src/app/services/authentication.py",
-            "src/app/services/session*",
-            "src/app/services/totp*",
             "src/app/routes/auth/*",
+            "src/app/routes/health.py",
+            "src/app/routes/pages.py",
+            "src/app/runtime_preflight.py",
+            "src/app/search_mask_contract.py",
+            "src/app/search_projection_sql.py",
+            "src/app/services/_smtp_child.py",
+            "src/app/services/access_tiers.py",
+            "src/app/services/account_deletion.py",
+            "src/app/services/admin_promotion.py",
+            "src/app/services/audit.py",
+            "src/app/services/audit_outbox.py",
+            "src/app/services/disclosure_audit.py",
+            "src/app/services/mail_issuance.py",
+            "src/app/services/security_notifications.py",
+            "src/app/services/authentication.py",
+            "src/app/services/credential_attempts.py",
+            "src/app/services/crypto.py",
+            "src/app/services/catalogue_lock.py",
+            "src/app/services/catalogue_policy.py",
+            "src/app/services/database_privileges.py",
+            "src/app/services/dataset_admin.py",
+            "src/app/services/dataset_admin_queries.py",
+            "src/app/services/datasets.py",
+            "src/app/services/db.py",
+            "src/app/services/db_constraints.py",
+            "src/app/services/db_drift.py",
+            "src/app/services/db_schema_contract.py",
+            "src/app/services/email.py",
+            "src/app/services/email_change.py",
+            "src/app/services/email_delivery.py",
+            "src/app/services/email_outbox.py",
+            "src/app/services/email_verification.py",
+            "src/app/services/federated_*",
+            "src/app/services/harvest.py",
+            "src/app/services/outbox_maintenance.py",
+            "src/app/services/parsed_record.py",
+            "src/app/services/password_*",
+            "src/app/services/policy_digest.py",
+            "src/app/services/registration_setup.py",
+            "src/app/services/schema.py",
+            "src/app/services/schema_invariants.py",
+            "src/app/services/search_projection.py",
+            "src/app/services/search_work.py",
+            "src/app/services/seed_admin.py",
+            "src/app/services/session*",
+            "src/app/services/smtp_process.py",
+            "src/app/services/stored_harvest.py",
+            "src/app/services/ingestion.py",
+            "src/app/services/ingestion_audit.py",
+            "src/app/services/tokens.py",
+            "src/app/services/totp*",
+            "src/app/services/users.py",
+            "src/app/sources/*.py",
+            "src/app/template_setup.py",
+            "src/app/thread_work.py",
+            "src/app/url_safety.py",
+            "src/config/logging.py",
+            "src/config/redis_policy.py",
             "src/config/settings.py",
-        ):
-            assert module in text, f"{module} is not in the security-module set"
+        )
+        actual = tuple(match.group("include").split(","))
+        assert actual == expected, "review security coverage scope changes in both CI and this test"
+        for pattern in actual:
+            assert any(
+                path.is_file() and path.suffix == ".py" for path in PROJECT_ROOT.glob(pattern)
+            ), f"security coverage pattern matches no Python files: {pattern}"
 
 
 _EXPECTED_SKIP_LINES = (
     "SKIPPED src/tests/integration/test_deployed_preflight_db.py::"
     "test_runtime_preflight_with_actual_deployed_role_login_defaults - Skipped: "
     "Existing oralhistarchiv database must not be altered by a deployment probe\n"
+    "SKIPPED src/tests/integration/test_deployed_preflight_db.py::"
+    "test_runtime_preflight_with_actual_deployed_role_login_defaults - Skipped: "
+    "Existing deployment roles must not be altered by a deployment probe\n"
     "SKIPPED src/tests/unit/test_nginx_contract.py::test_ordinary_proxy_include_parses_with_nginx"
     " - Skipped: nginx is not installed in this development environment\n"
+    "SKIPPED src/tests/unit/test_nginx_contract.py::"
+    "test_throttled_capability_token_stays_out_of_access_log"
+    " - Skipped: nginx is not installed in this development environment\n"
+    "SKIPPED src/tests/unit/test_nginx_contract.py::"
+    "test_throttled_capability_token_stays_out_of_error_log"
+    " - Skipped: nginx is not installed in this development environment\n"
+    "SKIPPED src/tests/unit/test_deployment_units.py::TestProductionModeStartGuard::"
+    "test_the_units_pass_systemd_syntax_verification"
+    " - Skipped: systemd-analyze is not installed in this development environment\n"
 )
 _UNEXPECTED_SKIP_LINE = (
     "SKIPPED src/tests/unit/test_totp.py::test_a_code_verifies_once - Skipped: no authenticator\n"
 )
-_COUNT_LINE = "10 passed, 2 skipped in 1.00s\n"
+_COUNT_LINE = "10 passed, 6 skipped in 1.00s\n"
 
 
 def _run_skip_gate(
     log: Path, *, ci: bool, expected: str | None = None
 ) -> subprocess.CompletedProcess[str]:
+    """Run the skip gate with selected CI state and an optional written expected-skip list."""
     env = {k: v for k, v in os.environ.items() if k not in ("CI", "EXPECTED_SKIPS_FILE")}
     if ci:
         env["CI"] = "true"
@@ -293,20 +447,66 @@ def _run_skip_gate(
     )
 
 
-class TestEverySkipIsAnExpectedOne:
-    """`scripts/check-skips-are-expected.sh` compares a run's unfolded skip
-    summary with `scripts/expected-skips.txt`: the two local skips pass
-    without CI, nothing passes under CI, and a summary that hides its skips
-    is refused."""
+def _declares_skip_reason(path: Path, reason: str) -> bool:
+    """Match pytest.skip reasons in a module or its directly imported relative helpers."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    scopes: list[ast.AST] = [tree]
+    for statement in tree.body:
+        if not isinstance(statement, ast.ImportFrom) or not statement.level or not statement.module:
+            continue
+        imported_path = (
+            path.parents[statement.level - 1]
+            .joinpath(*statement.module.split("."))
+            .with_suffix(".py")
+        )
+        if imported_path.is_file():
+            imported = ast.parse(imported_path.read_text(encoding="utf-8"))
+            names = {alias.name for alias in statement.names}
+            scopes.extend(
+                definition
+                for definition in imported.body
+                if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and definition.name in names
+            )
+    for scope in scopes:
+        for node in ast.walk(scope):
+            if (
+                not isinstance(node, ast.Call)
+                or not isinstance(node.func, ast.Attribute)
+                or not isinstance(node.func.value, ast.Name)
+                or (node.func.value.id, node.func.attr) != ("pytest", "skip")
+                or not node.args
+            ):
+                continue
+            argument = node.args[0]
+            if isinstance(argument, ast.Constant) and argument.value == reason:
+                return True
+            if isinstance(argument, ast.JoinedStr):
+                fragments = []
+                for part in argument.values:
+                    if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                        fragments.append(re.escape(part.value))
+                    elif isinstance(part, ast.FormattedValue):
+                        fragments.append(".+")
+                if re.fullmatch("".join(fragments), reason):
+                    return True
+    return False
 
-    def test_the_two_local_skips_pass_without_ci(self, tmp_path):
+
+class TestEverySkipIsAnExpectedOne:
+    """The skip gate accepts listed local exceptions, rejects every skip
+    under CI, and refuses incomplete summaries or failed comparisons."""
+
+    def test_listed_local_skips_pass_without_ci(self, tmp_path):
+        """Check listed local skips pass without ci."""
         log = tmp_path / "pytest.log"
         log.write_text(_EXPECTED_SKIP_LINES + _COUNT_LINE, encoding="utf-8")
         result = _run_skip_gate(log, ci=False)
         assert result.returncode == 0, result.stdout + result.stderr
         assert "No unexpected skips." in result.stdout
 
-    def test_the_same_two_skips_fail_under_ci(self, tmp_path):
+    def test_listed_local_skips_fail_under_ci(self, tmp_path):
+        """Check listed local skips fail under ci."""
         log = tmp_path / "pytest.log"
         log.write_text(_EXPECTED_SKIP_LINES + _COUNT_LINE, encoding="utf-8")
         result = _run_skip_gate(log, ci=True)
@@ -317,8 +517,12 @@ class TestEverySkipIsAnExpectedOne:
         )
 
     def test_a_skip_that_is_not_listed_fails_and_is_named(self, tmp_path):
+        """Check a skip that is not listed fails and is named."""
         log = tmp_path / "pytest.log"
-        log.write_text(_EXPECTED_SKIP_LINES + _UNEXPECTED_SKIP_LINE + _COUNT_LINE, encoding="utf-8")
+        log.write_text(
+            _EXPECTED_SKIP_LINES + _UNEXPECTED_SKIP_LINE + "10 passed, 7 skipped in 1.00s\n",
+            encoding="utf-8",
+        )
         result = _run_skip_gate(log, ci=False)
         assert result.returncode == 1, result.stdout + result.stderr
         assert "test_totp.py::test_a_code_verifies_once - no authenticator" in result.stderr
@@ -335,14 +539,31 @@ class TestEverySkipIsAnExpectedOne:
         ids=["skips-folded-without-node-ids", "skips-counted-but-not-listed", "no-count-line"],
     )
     def test_a_summary_that_hides_its_skips_is_refused(self, tmp_path, log_text):
+        """Check a summary that hides its skips is refused."""
         log = tmp_path / "pytest.log"
         log.write_text(log_text, encoding="utf-8")
         result = _run_skip_gate(log, ci=False)
         assert result.returncode == 1, result.stdout + result.stderr
 
+    def test_a_failed_skip_comparison_cannot_report_success(self, tmp_path, monkeypatch):
+        """Check a failed skip comparison cannot report success."""
+        log = tmp_path / "pytest.log"
+        log.write_text(_EXPECTED_SKIP_LINES + _COUNT_LINE, encoding="utf-8")
+        binary_dir = tmp_path / "bin"
+        binary_dir.mkdir()
+        comm = binary_dir / "comm"
+        comm.write_text("#!/bin/sh\necho 'comparison unavailable' >&2\nexit 2\n", encoding="utf-8")
+        comm.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{binary_dir}{os.pathsep}{os.environ['PATH']}")
+
+        result = _run_skip_gate(log, ci=False)
+
+        assert result.returncode != 0
+        assert "comparison unavailable" in result.stderr
+        assert "No unexpected skips." not in result.stdout
+
     def test_every_listed_skip_names_a_test_that_exists(self):
-        """A renamed or deleted test leaves a stale entry that would let a new
-        skip under the old name through; the list must track the suite."""
+        """Resolve each listed test and its local or directly imported skip reason."""
         entries = [
             line
             for line in EXPECTED_SKIPS.read_text(encoding="utf-8").splitlines()
@@ -351,12 +572,59 @@ class TestEverySkipIsAnExpectedOne:
 
         for entry in entries:
             node_id, _, reason = entry.partition(" - ")
-            path, _, function = node_id.partition("::")
+            path, *qualifiers = node_id.split("::")
             source = (PROJECT_ROOT / path).read_text(encoding="utf-8")
-            assert f"def {function}(" in source, f"{node_id} does not exist"
-            # The first word may be interpolated (the missing binary's name).
-            static_part = reason.split(" ", 1)[1]
-            assert static_part in source, f"{reason!r} is not the reason the test gives"
+            scope = ast.parse(source).body
+            for index, qualifier in enumerate(qualifiers):
+                expected_types = (
+                    (ast.FunctionDef, ast.AsyncFunctionDef)
+                    if index == len(qualifiers) - 1
+                    else (ast.ClassDef,)
+                )
+                definition = next(
+                    (
+                        node
+                        for node in scope
+                        if isinstance(node, expected_types) and node.name == qualifier
+                    ),
+                    None,
+                )
+                assert definition is not None, f"{node_id} does not exist"
+                scope = definition.body
+            assert _declares_skip_reason(PROJECT_ROOT / path, reason), (
+                f"{reason!r} is not the reason the test gives"
+            )
+
+    @pytest.mark.parametrize(
+        ("source", "reason", "expected"),
+        [
+            ("from .helper import required as gate\n", "nginx is unavailable", True),
+            ("from .helper import required\n", "nginx has a different reason", False),
+            ("from .helper import required\n", "an unimported reason", False),
+            ('# pytest.skip("nginx is unavailable")\n', "nginx is unavailable", False),
+            ('pytest.skip("literal reason")\n', "literal reason", True),
+        ],
+    )
+    def test_skip_reasons_require_a_real_local_or_imported_declaration(
+        self, tmp_path, source, reason, expected
+    ):
+        """Accept shared-helper templates, rejecting unrelated helpers, comments and drift."""
+        (tmp_path / "helper.py").write_text(
+            "'''Provide one imported and one unrelated skip helper.'''\n"
+            "def required(name):\n"
+            "    '''Skip for an unavailable executable.'''\n"
+            "    pytest.skip(f'{name} is unavailable')\n"
+            "def unrelated():\n"
+            "    '''Skip for a reason outside the imported helper.'''\n"
+            "    pytest.skip('an unimported reason')\n",
+            encoding="utf-8",
+        )
+        module = tmp_path / "test_sample.py"
+        module.write_text(
+            "'''Provide a local or shared skip declaration for the provenance check.'''\n" + source,
+            encoding="utf-8",
+        )
+        assert _declares_skip_reason(module, reason) is expected
 
 
 class TestIntegrationTierMarking:
@@ -390,6 +658,7 @@ class TestDevelopmentWorkflow:
         ids=["scheduler_crash_propagates_exit_code", "graceful_shutdown_reaps_both_children"],
     )
     def test_dev_launcher_propagates_failure_and_reaps_children(self, tmp_path, failure):
+        """Check dev launcher propagates failure and reaps children."""
         launcher = tmp_path / "dev.sh"
         launcher.write_text((PROJECT_ROOT / "dev.sh").read_text())
         dispatcher = tmp_path / "python3"
@@ -397,11 +666,13 @@ class TestDevelopmentWorkflow:
             f'#!/bin/bash\nif [[ "$1" == "-m" ]]; then exit 0; fi\nexec "{sys.executable}" "$@"\n'
         )
         dispatcher.chmod(0o755)
-        child = """import signal, time
+        child = """'''Create launcher lifecycle markers and handle SIGTERM in synthetic children.'''
+import signal, time
 from pathlib import Path
 name = Path(__file__).stem
 Path(name + '.started').touch()
 def stop(*_args):
+    '''Wait 150 ms, write the stopped marker and raise SystemExit(0).'''
     time.sleep(0.15)
     Path(name + '.stopped').touch()
     raise SystemExit(0)
@@ -417,7 +688,12 @@ signal.signal(signal.SIGTERM, stop)
         process = subprocess.Popen(
             ["bash", str(launcher)],
             cwd=tmp_path,
-            env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+            env={
+                **os.environ,
+                "PATH": f"{tmp_path}:{os.environ['PATH']}",
+                "PYTHONPATH": str(PROJECT_ROOT / "src"),
+                "ENV_STATE": "dev",
+            },
             start_new_session=True,
         )
         try:
@@ -435,6 +711,7 @@ signal.signal(signal.SIGTERM, stop)
                 process.wait(timeout=5)
 
     def test_devcontainer_setup_installs_uv_without_cargo_and_preserves_env(self, tmp_path):
+        """Check devcontainer setup installs uv without cargo and preserves env."""
         config = json.loads((PROJECT_ROOT / ".devcontainer/devcontainer.json").read_text())
         assert config["workspaceFolder"] == "/workspaces"
         assert (
@@ -482,16 +759,7 @@ INSTALLER
 
 
 class TestRuffLintConfiguration:
-    """`[tool.ruff.lint]` keeps a non-empty, internally-consistent rule selection.
-
-    `select` vanishing was an observed defect: CI enforces the SELECTED
-    rules, but nothing guards the selection itself. Two more dead-config
-    shapes are pinned alongside it: per-file-ignores values referencing
-    rules that were never enabled (an ignore that ignores nothing), and
-    per-file-ignores keys pointing at files that don't exist (a draft
-    carried ignores for a path with the `app/` segment missing, which
-    silently un-exempted 18 E501s).
-    """
+    """`[tool.ruff.lint]` keeps a non-empty, internally-consistent rule selection."""
 
     def test_ruff_select_is_nonempty_and_keeps_core_rule_families(self):
         """An empty select list makes ruff revert to its tiny default rule

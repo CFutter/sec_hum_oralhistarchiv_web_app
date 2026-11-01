@@ -61,7 +61,6 @@ _FRAMEWORK_ROUTE_SIGNATURES = frozenset(
 _CSRF_EXEMPT_ROUTE_KEYS = frozenset(
     {
         ("POST", "/account/confirm-email"),
-        ("POST", "/verify-email"),
     }
 )
 
@@ -83,6 +82,7 @@ _PUBLIC_ALLOWLIST = frozenset(
         ("GET", "/"),
         ("GET", "/about"),
         ("GET", "/dataset/{dataset_id}"),
+        ("GET", "/dataset/{dataset_id}/resource/{proxy_index}"),
         ("GET", "/forgot-password"),
         ("POST", "/forgot-password"),
         ("GET", "/health"),
@@ -106,16 +106,18 @@ _OPEN_DURING_ENROLLMENT_ALLOWLIST = frozenset(
 
 _CAPABILITY_ALLOWLIST = frozenset(
     {
-        ("GET", "/account/confirm-email/{token}"),
+        ("POST", "/unlock-account"),
+        ("GET", "/account/confirm-email/{public_id}"),
         ("POST", "/account/confirm-email"),
         ("GET", "/auth/shibboleth/callback"),
         ("GET", "/health/detail"),
-        ("GET", "/reset-password/{token}"),
+        ("GET", "/reset-password/{public_id}"),
         ("POST", "/reset-password"),
-        ("GET", "/verify-email/{token}"),
+        ("GET", "/verify-email/{public_id}"),
         ("POST", "/verify-email"),
     }
 )
+
 
 _TOTP_ENROLLMENT_ALLOWLIST = frozenset(
     {
@@ -190,8 +192,8 @@ class SecureAPIRouter(APIRouter):
         """Register a route with policy metadata, access guards and mutation validation.
 
         Missing/empty methods means GET. Non-GET/HEAD/OPTIONS methods require form
-        content type and CSRF except the two exact reviewed capability POSTs. Admin
-        guards run first; extra dependencies follow automatic guards. Raises
+        content type; CSRF exceptions are the exact entries in _CSRF_EXEMPT_ROUTE_KEYS.
+        Admin guards run first; extra dependencies follow automatic guards. Raises
         RuntimeError if openapi_extra supplies the owned policy key; FastAPI errors propagate.
         """
         normalized_methods = {method.upper() for method in (methods or {"GET"})}

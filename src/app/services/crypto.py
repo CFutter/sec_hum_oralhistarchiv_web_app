@@ -1,11 +1,10 @@
-"""Encrypt TOTP secrets/outbox bodies and hash audit email addresses.
+"""Encrypt outbox bodies and hash audit emails without loading TOTP keys.
 
-TOTP_ENCRYPTION_KEYS and OUTBOX_ENCRYPTION_KEYS are independent HKDF/Fernet
-key rings: the first encrypts, all decrypt. Retain old keys until dependent
-ciphertext is retired. Rings and the SECRET_KEY-derived audit HMAC key are
-cached at import; restart processes after configuration changes. SECRET_KEY
-rotation invalidates signed links and changes audit hashes, not ciphertext.
-Import also registers the audit-email hasher with config.logging.
+OUTBOX_ENCRYPTION_KEYS uses HKDF/Fernet: first encrypts, all decrypt. Import
+caches the ring and SECRET_KEY-derived HMAC key, and registers the audit
+hasher with config.logging; restart after configuration changes. SECRET_KEY
+rotation changes audit hashes and invalidates action codes/bookmarks, not
+TOTP/outbox ciphertext.
 """
 
 import base64
@@ -35,22 +34,6 @@ def _derive_fernet(key_material: str, *, context: bytes) -> Fernet:
         info=context,
     ).derive(key_material.encode())
     return Fernet(base64.urlsafe_b64encode(derived))
-
-
-def _get_fernet() -> MultiFernet:
-    """Build the TOTP key ring from TOTP_ENCRYPTION_KEYS in priority order."""
-    return MultiFernet(
-        [
-            _derive_fernet(
-                key.get_secret_value(),
-                context=b"oralhistarchiv-totp-encryption-v1",
-            )
-            for key in settings.totp_encryption_keys
-        ]
-    )
-
-
-_fernet_instance = _get_fernet()
 
 
 def _get_outbox_body_fernet() -> MultiFernet:
@@ -97,28 +80,6 @@ def _get_audit_hash_key() -> bytes:
 
 
 _audit_hash_key = _get_audit_hash_key()
-
-
-def get_primary_totp_decryptor() -> Fernet:
-    """Build a decryptor using only the primary configured TOTP key."""
-    return _derive_fernet(
-        settings.totp_encryption_keys[0].get_secret_value(),
-        context=b"oralhistarchiv-totp-encryption-v1",
-    )
-
-
-def encrypt_value(plaintext: str) -> str:
-    """Return randomized URL-safe Fernet ciphertext using the TOTP key ring."""
-    return _fernet_instance.encrypt(plaintext.encode()).decode()
-
-
-def decrypt_value(ciphertext: str) -> str | None:
-    """Decrypt with the TOTP key ring; log and return None on invalid data."""
-    try:
-        return _fernet_instance.decrypt(ciphertext.encode()).decode()
-    except (InvalidToken, UnicodeDecodeError):
-        logger.warning("Failed to decrypt value — possible key mismatch or data corruption.")
-        return None
 
 
 def audit_email_hash(email: str, length: int = 16) -> str:

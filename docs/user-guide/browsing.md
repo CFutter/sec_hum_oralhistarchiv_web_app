@@ -2,7 +2,10 @@
 
 ## The home page
 
-The home page shows the size of the collection (number of datasets, languages, and indexed keywords), the date the catalogue was last fully reconciled with the source, and the three most recently added or updated datasets. From here you can either jump straight into a search or click any of the recent datasets to open its detail page.
+Home shows the live dataset total, up to three recent records and the oldest
+successful rebuild among selected sources. Freshness stays unknown until every
+selected source has rebuilt and may be cached for an hour. Open a recent record
+or use the search box to continue.
 
 Two prominent entry points sit at the top of the page:
 
@@ -15,9 +18,9 @@ The search page has two parts: a sidebar of filters and a results list.
 
 ### Free-text search
 
-The search box at the top matches your query against the title, description, project title, project description, keywords, and author names of every dataset in one go. Matching is case-insensitive substring search — typing `kassel` will find "Kassel" and "kasseler" alike. You don't need quotes, wildcards, or boolean operators. Special characters in your query are taken literally; you cannot accidentally write a SQL pattern.
+Search matches visible titles, descriptions, project text, keywords and author names. Plain words use full-text search plus case-insensitive substring fallback: `beispiel` can match “Beispielstadt”. Quotes, `OR` between terms and a leading/separated minus select web-search operators. Other punctuation is literal; `%`, `_` and backslash always stay literal.
 
-For datasets above your tier, only title and access level match free text; hidden descriptions, authors, and keywords do not.
+Each searched field must be visible at your tier under its record, field and source requirements. Restricted values never contribute matches.
 
 ### Filters
 
@@ -27,7 +30,7 @@ Three exact-match filters live in the sidebar:
 |---|---|
 | **Keyword** | Restrict to datasets tagged with one specific keyword |
 | **Language** | Restrict to datasets containing interviews in a specific language |
-| **Access level** | Restrict to *public* (downloadable) or *restricted* (request required) datasets |
+| **Access level** | Match the source's *public* or *restricted* material label; the source decides download permission |
 
 Filters combine with AND. If you set the language to *German* and the keyword to *Migration*, you only see German-language datasets tagged with Migration. Any free-text query you also typed continues to apply on top.
 
@@ -35,9 +38,9 @@ Keyword suggestions require at least two occurrences among sampled recent visibl
 
 ### Results and pagination
 
-Visible results show title, authors, a description snippet, keywords, languages, and access level. Above-tier results show title, access level, and a restricted notice; open the detail page to see the required tier.
+Results show public title/access level and each permitted author, description, keyword and language field. Restricted fields show their required tiers.
 
-The results are paginated. The page size is configured by the operator (default: 20 per page). Pagination links appear at the bottom of the list when there is more than one page.
+The operator sets page size (default 20). Use numbered pages 1–100, then previous/next continuation links. Bookmarks can expire after catalogue, policy or account changes; restart the search when prompted.
 
 ## The detail page
 
@@ -51,9 +54,15 @@ Clicking a result opens the detail page for one dataset. You'll see:
 - The resource type and version
 - The license and license URL (where present)
 - The DOI and bibliographical citation (where present)
-- A SWISSUbase resource/landing-page link when available, otherwise a contact address
+- A resource or source-record link when available, otherwise a contact address
 
-If the dataset is restricted to a tier above yours, the detail page shows only the title and the access level, with a note explaining why other fields are hidden and how to request access.
+The detail page shows each field permitted by the strictest dataset, field and source requirement. Restricted fields explain the required tier and how to request access. Public discovery details remain visible unless the record is hidden or withheld.
+
+Some source links recheck your current metadata access and record an access
+event before redirecting. A previously obtained link can stop working after a
+dataset is hidden or its required tier rises. The originating repository still
+controls access to recordings and other materials; following a link does not
+guarantee permission to download them.
 
 ## Why a result might disappear
 
@@ -67,5 +76,5 @@ A few reasons a dataset you saw last week might not show up today:
 
 Each filter suggests up to 50 values from the 200 most recently modified records, limited to the first 100 keywords/languages per record. Hidden fields above your tier are excluded. You can type an exact value outside the suggestions; filtering searches the full catalogue.
 
-Search exposes at most 10,000 numbered pages. If more matches exist, narrow the search; pagination does not link beyond that window.
+Administrator-hidden records and records awaiting a valid upstream correction are excluded at every tier.
 

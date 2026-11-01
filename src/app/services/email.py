@@ -86,14 +86,20 @@ def _build_tls_context() -> ssl.SSLContext:
 
 
 def _maybe_login(server: smtplib.SMTP) -> None:
-    """Authenticate when SMTP_USER is set; require its validated SMTP_PASSWORD and propagate SMTP errors."""
+    """Authenticate when SMTP_USER is set; reject a missing password.
+
+    Runtime configuration errors and SMTP errors propagate to the caller.
+    """
     if settings.smtp_user:
-        assert settings.smtp_password is not None  # nosec B101  # mypy type-narrowing; non-None guaranteed by validate_smtp_auth_pair, safe to strip under -O
-        server.login(settings.smtp_user, settings.smtp_password.get_secret_value())
+        password = settings.smtp_password
+        if password is None:
+            raise RuntimeError("SMTP_PASSWORD is required when SMTP_USER is set")
+        server.login(settings.smtp_user, password.get_secret_value())
 
 
 _TLS_CONTEXT = _build_tls_context()
 _SMTP_SEND_TIMEOUT = 15
+_SMTP_REPLY_FIRST = 100
 _SMTP_PERMANENT_FAILURE_FIRST = 500
 _SMTP_PERMANENT_FAILURE_LAST = 599
 
@@ -164,13 +170,22 @@ def _recipient_refusal_result(exc: smtplib.SMTPRecipientsRefused) -> DeliveryRes
     )
 
 
+def _diagnostic_smtp_code(value: object) -> int | None:
+    """Retain only categorical three-digit SMTP reply codes in diagnostics."""
+    return (
+        value
+        if type(value) is int and _SMTP_REPLY_FIRST <= value <= _SMTP_PERMANENT_FAILURE_LAST
+        else None
+    )
+
+
 def send_email(to: str, subject: str, body: str) -> DeliveryResult:
     """Synchronously deliver plain text using SMTP_* settings.
 
     Use STARTTLS when enabled, optional login, and a 15-second socket
     timeout, not a whole-operation deadline. Disabled SMTP saves to the
-    private dev mailbox only in dev. Return DeliveryResult: recipient 5xx
-    refusals may be permanent; other caught Exceptions are temporary.
+    private dev mailbox only in dev. Return DeliveryResult: recipient and DATA
+    5xx refusals may be permanent; other caught Exceptions are temporary.
     BaseException subclasses propagate. Messages and failures are logged.
     """
     if not settings.smtp_enabled:
@@ -211,8 +226,9 @@ def send_email(to: str, subject: str, body: str) -> DeliveryResult:
             "smtp_auth_failed",
             extra={
                 "event_type": "smtp_auth_failed",
+                "exception_type": type(exc).__name__,
                 "smtp_user": settings.smtp_user,
-                "smtp_code": exc.smtp_code,
+                "smtp_code": _diagnostic_smtp_code(exc.smtp_code),
             },
         )
         return DeliveryResult(
@@ -221,41 +237,52 @@ def send_email(to: str, subject: str, body: str) -> DeliveryResult:
             smtp_code=exc.smtp_code,
         )
     except smtplib.SMTPRecipientsRefused as exc:
+        result = _recipient_refusal_result(exc)
         logger.exception(
             "smtp_recipient_refused",
-            extra={"event_type": "smtp_recipient_refused", "error": str(exc)[:200]},
+            extra={
+                "event_type": "smtp_recipient_refused",
+                "exception_type": type(exc).__name__,
+                "smtp_code": _diagnostic_smtp_code(result.smtp_code),
+            },
         )
-        return _recipient_refusal_result(exc)
+        return result
     except smtplib.SMTPResponseException as exc:
         logger.exception(
             "smtp_response_error",
             extra={
                 "event_type": "smtp_response_error",
-                "smtp_code": exc.smtp_code,
-                "error": str(exc)[:200],
+                "smtp_code": _diagnostic_smtp_code(exc.smtp_code),
+                "exception_type": type(exc).__name__,
             },
         )
         return DeliveryResult(
-            status="temporary_failure",
+            status=(
+                "permanent_failure"
+                if isinstance(exc, smtplib.SMTPDataError)
+                and type(exc.smtp_code) is int
+                and _SMTP_PERMANENT_FAILURE_FIRST <= exc.smtp_code <= _SMTP_PERMANENT_FAILURE_LAST
+                else "temporary_failure"
+            ),
             reason="smtp_response_error",
             smtp_code=exc.smtp_code,
         )
     except smtplib.SMTPException as exc:
         logger.exception(
             "smtp_send_error",
-            extra={"event_type": "smtp_send_error", "error": str(exc)[:200]},
+            extra={"event_type": "smtp_send_error", "exception_type": type(exc).__name__},
         )
         return DeliveryResult(status="temporary_failure", reason="smtp_protocol_error")
     except OSError as exc:
         logger.exception(
             "smtp_transport_error",
-            extra={"event_type": "smtp_transport_error", "error": str(exc)[:200]},
+            extra={"event_type": "smtp_transport_error", "exception_type": type(exc).__name__},
         )
         return DeliveryResult(status="temporary_failure", reason="smtp_transport_error")
     except Exception as exc:
         logger.exception(
             "email_unexpected_error",
-            extra={"event_type": "email_unexpected_error", "error": str(exc)[:200]},
+            extra={"event_type": "email_unexpected_error", "exception_type": type(exc).__name__},
         )
         return DeliveryResult(status="temporary_failure", reason="email_unexpected_error")
 
@@ -282,29 +309,43 @@ def send_outbound_email(email: OutboundEmail) -> DeliveryResult:
     )
 
 
+def _action_security_code(security_code: str) -> str:
+    """Format the separate form-entry code; raise ValueError for a non-string or blank code."""
+    if not isinstance(security_code, str) or not security_code.strip():
+        raise ValueError("Action email requires a nonempty security code")
+    return (
+        f"\n\nSecurity code:\n\n{security_code}"
+        "\n\nOpen the link, copy this code into the form, then submit."
+    )
+
+
 def build_password_reset_email(
     to: str,
     reset_link: str,
     *,
     expires_at: datetime,
+    security_code: str,
 ) -> OutboundEmail:
-    """Build a reset message without sending; naive expires_at raises ValueError."""
-    expiry = _format_action_expiry(expires_at)
-    subject = "Password Reset — Oral History Archive"
+    """Build a reset message without sending.
 
-    body = f"""You requested a password reset for your Oral History Archive account.
+    Raise ValueError for a naive expiry or blank/non-string security code.
+    """
+    expiry = _format_action_expiry(expires_at)
+    subject = f"Password Reset — {settings.site_name}"
+
+    body = f"""You requested a password reset for your {settings.site_name} account.
 
 Click the link below to set a new password:
 
-{reset_link}
+{reset_link}{_action_security_code(security_code)}
 
 This link expires at {expiry} and can only be used once.
 
 If you did not request this, you can safely ignore this email.
-Your password will not be changed unless you click the link above.
+Your password will not be changed unless you submit the form.
 
-— Oral History Archive
-University of Zurich"""
+— {settings.site_name}
+{settings.institution_name}"""
 
     return OutboundEmail(
         message_type="password_reset",
@@ -319,17 +360,21 @@ def build_verification_email(
     verification_link: str,
     *,
     expires_at: datetime,
+    security_code: str,
 ) -> OutboundEmail:
-    """Build a verification message without sending; naive expires_at raises ValueError."""
+    """Build a verification message without sending.
+
+    Raise ValueError for a naive expiry or blank/non-string security code.
+    """
     expiry = _format_action_expiry(expires_at)
-    subject = "Verify your email — Oral History Archive"
+    subject = f"Verify your email — {settings.site_name}"
 
-    body = f"""Welcome to the Oral History Archive.
+    body = f"""Welcome to the {settings.site_name}.
 
-To complete your registration and set up two-factor authentication,
-please verify your email address by clicking the link below:
+Open the link below to choose your password and profile and complete
+registration. Opening it alone does not finish setup:
 
-{verification_link}
+{verification_link}{_action_security_code(security_code)}
 
 This link expires at {expiry}. If you need
 a new link after that, you can request one from the login page.
@@ -340,8 +385,8 @@ automatically removed.
 If you did not register for this account, you can safely ignore
 this email.
 
-— Oral History Archive
-University of Zurich"""
+— {settings.site_name}
+{settings.institution_name}"""
 
     return OutboundEmail(
         message_type="email_verification",
@@ -357,12 +402,18 @@ def build_duplicate_registration_notice(
     """Build an existing-account notice without sending or checking account existence."""
     login_url = f"{settings.public_base_url}/login"
     reset_url = f"{settings.public_base_url}/forgot-password"
-    subject = "You already have an account — Oral History Archive"
-    body = f"""Someone just tried to register a new Oral History Archive account using this email address.
+    setup_url = f"{settings.public_base_url}/send_verification"
+    subject = f"You already have an account — {settings.site_name}"
+    body = f"""Someone just tried to register a new {settings.site_name} account using this email address.
 
-You already have an account with us, so no new account was created and nothing has changed.
+An account or pending setup already exists, so no new account was created.
+Your password and current setup link have not changed.
 
-If this was you — perhaps you forgot you'd already signed up — you can log in as usual:
+If you have not finished setup, request a new setup email here:
+
+  {setup_url}
+
+If setup is complete, you can log in here:
 
   {login_url}
 
@@ -373,8 +424,8 @@ If you don't remember your password, you can reset it here:
 If this wasn't you, no action is needed. Your existing account is unaffected, and whoever
 entered your address cannot access it. If you have any concerns, contact us at {settings.contact_email}.
 
-— Oral History Archive
-University of Zurich"""
+— {settings.site_name}
+{settings.institution_name}"""
     return OutboundEmail(
         message_type="duplicate_registration_notice",
         recipient=to,
@@ -388,23 +439,27 @@ def build_email_change_verification(
     confirm_link: str,
     *,
     expires_at: datetime,
+    security_code: str,
 ) -> OutboundEmail:
-    """Build a new-address confirmation without sending; naive expires_at raises ValueError."""
+    """Build a new-address confirmation message without sending.
+
+    Raise ValueError for a naive expiry or blank/non-string security code.
+    """
     expiry = _format_action_expiry(expires_at)
-    subject = "Confirm your new email — Oral History Archive"
-    body = f"""You requested to change the email address on your Oral History Archive account to this one.
+    subject = f"Confirm your new email — {settings.site_name}"
+    body = f"""You requested to change the email address on your {settings.site_name} account to this one.
 
 Click the link below to confirm the change:
 
-{confirm_link}
+{confirm_link}{_action_security_code(security_code)}
 
 This link expires at {expiry} and can only be used once.
 
 If you did not request this, you can safely ignore this email.
-No change will be made unless you click the link above.
+No change will be made unless you submit the confirmation form.
 
-— Oral History Archive
-University of Zurich"""
+— {settings.site_name}
+{settings.institution_name}"""
 
     return OutboundEmail(
         message_type="email_change_verification",
@@ -419,8 +474,8 @@ def build_email_change_notice(
     new_email: str,
 ) -> OutboundEmail:
     """Build the membership-neutral notice sent to the current address."""
-    subject = "Email change requested — Oral History Archive"
-    body = f"""A request was received to change the email address on your Oral History Archive account to:
+    subject = f"Email change requested — {settings.site_name}"
+    body = f"""A request was received to change the email address on your {settings.site_name} account to:
 
 {new_email}
 
@@ -431,8 +486,8 @@ For privacy, this notice does not say whether the requested address can be used.
 If this was NOT you, your account may be compromised. Change your password and
 contact us at {settings.contact_email}.
 
-— Oral History Archive
-University of Zurich"""
+— {settings.site_name}
+{settings.institution_name}"""
 
     return OutboundEmail(
         message_type="email_change_notice",
@@ -442,13 +497,67 @@ University of Zurich"""
     )
 
 
+def build_password_changed_email(to: str) -> OutboundEmail:
+    """Build a credential-change notification without including credentials."""
+    return OutboundEmail(
+        message_type="password_changed_notice",
+        recipient=to,
+        subject=f"Password changed — {settings.site_name}",
+        body=f"""Your password for {settings.site_name} was changed.
+
+All application sessions were signed out. Your authenticator and saved recovery
+codes remain configured. Sign in again using your new password and a fresh
+authenticator code:
+
+{settings.public_base_url}/login
+
+If you did not make this change, contact {settings.contact_email} immediately.
+
+— {settings.site_name}
+{settings.institution_name}""",
+    )
+
+
+_SECURITY_CHANGE_DESCRIPTIONS = {
+    "totp_enrolled": "An authenticator was configured for your account.",
+    "totp_rotated": "Your account's authenticator was replaced.",
+    "totp_recovery_authorized": "An administrator authorized recovery of your authenticator.",
+    "totp_recovery_redeemed": "A saved recovery code was used to start authenticator setup.",
+    "totp_recovery_completed": "Recovery of your authenticator was completed.",
+    "admin_promotion_accepted": "Your account accepted administrator privileges.",
+}
+
+
+def build_security_change_notice(to: str, *, change: str) -> OutboundEmail:
+    """Build a fixed owner notice; raise ValueError for unsupported change names.
+
+    Supported names are the keys of _SECURITY_CHANGE_DESCRIPTIONS.
+    """
+    try:
+        description = _SECURITY_CHANGE_DESCRIPTIONS[change]
+    except KeyError:
+        raise ValueError("Unsupported security change notification") from None
+    return OutboundEmail(
+        message_type=f"{change}_notice",
+        recipient=to,
+        subject=f"Account security changed — {settings.site_name}",
+        body=f"""{description}
+
+If you did not authorize this change, contact {settings.contact_email} immediately.
+Do not send passwords, authenticator secrets or saved recovery codes by email.
+
+— {settings.site_name}
+{settings.institution_name}""",
+    )
+
+
 def build_account_credential_fault_notice(
     to: str,
 ) -> OutboundEmail:
     """Build a stored-credential failure notice without delivering it."""
     reset_url = f"{settings.public_base_url}/forgot-password"
-    subject = "Action needed to access your account — Oral History Archive"
-    body = f"""We could not verify the sign-in credentials stored for your Oral History Archive account.
+    subject = f"Action needed to access your account — {settings.site_name}"
+    body = f"""We could not verify the sign-in credentials stored for your {settings.site_name} account.
 
 This is a problem on our side, not something you did wrong, and waiting will not resolve it.
 
@@ -460,8 +569,8 @@ That link issues you fresh credentials and restores access immediately.
 
 If you did not attempt to sign in, or you have any concerns, contact us at {settings.contact_email}.
 
-— Oral History Archive
-University of Zurich"""
+— {settings.site_name}
+{settings.institution_name}"""
 
     return OutboundEmail(
         message_type="account_credential_fault_notice",
@@ -474,8 +583,8 @@ University of Zurich"""
 def build_account_locked_notice(to: str) -> OutboundEmail:
     """Build an account-lockout notice without delivering it."""
     reset_url = f"{settings.public_base_url}/forgot-password"
-    subject = "Your account was locked — Oral History Archive"
-    body = f"""Your Oral History Archive account was just locked after too many failed login attempts.
+    subject = f"Your account was locked — {settings.site_name}"
+    body = f"""Your {settings.site_name} account was just locked after too many failed login attempts.
 
 It will unlock automatically in {settings.login_lockout_minutes} minutes — you don't need to do anything to restore access.
 
@@ -485,8 +594,8 @@ If this was you and you've forgotten your password, you can reset it here (reset
 
 If this wasn't you, someone may be trying to access your account. The attempts failed and your password still works, but we recommend resetting it as a precaution — and contact us at {settings.contact_email} if you have concerns.
 
-— Oral History Archive
-University of Zurich"""
+— {settings.site_name}
+{settings.institution_name}"""
     return OutboundEmail(
         message_type="account_locked_notice",
         recipient=to,

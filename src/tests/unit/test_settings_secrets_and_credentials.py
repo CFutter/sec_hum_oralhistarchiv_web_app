@@ -1,15 +1,4 @@
-"""Fail-closed pins for the Settings validators that guard secret material.
-
-Every test constructs ``Settings(_env_file=None, **kwargs)`` so no ``.env``
-file leaks in. Real OS environment variables still apply to *unset* fields,
-so the kwargs helpers below pass an explicit value for every field a test
-asserts on.
-
-Each validator here moved an invariant from caller discipline to the config
-boundary, so a bad deployment fails loudly at construction instead of
-silently at runtime. The tests therefore assert the boundary REJECTS the bad
-input, not just that the happy path constructs.
-"""
+"""Fail-closed pins for the Settings validators that guard secret material."""
 
 from datetime import UTC, datetime, timedelta
 
@@ -56,6 +45,7 @@ class TestCredentialAttemptBudgets:
         field_name: str,
         valid_value: int,
     ) -> None:
+        """Check credential attempt budget accepts documented bounds."""
         configured = make_settings(**base_kwargs(**{field_name: valid_value}))
 
         assert getattr(configured, field_name) == valid_value
@@ -111,9 +101,7 @@ class TestSmtpAuthPairing:
         assert s.smtp_password is None
 
     def test_smtp_required_in_staging(self):
-        """Is_hardened (staging included) requires SMTP — send_email()
-        fail-opens to True when disabled, so a staging deploy without SMTP would
-        'send' every verification/reset/security notice while delivering nothing."""
+        """Staging requires SMTP delivery; the private mailbox is dev-only."""
         with pytest.raises(ValidationError, match="SMTP_ENABLED"):
             make_settings(**staging_kwargs(smtp_enabled=False))
 
@@ -150,12 +138,8 @@ class TestSmtpHardening:
         assert s.smtp_from_address == "archive@example.org"
 
     def test_smtp_use_tls_false_rejected_in_staging(self):
-        """SMTP_USE_TLS=false with SMTP enabled must fail in hardened envs —
-        plaintext SMTP would expose password-reset tokens and relay
-        credentials.
-
-        (The error text says 'in production' but the validator gates on
-        is_hardened, so staging is covered too — the code is the pin.)
+        """SMTP_USE_TLS=false with SMTP enabled must fail in hardened envs — plaintext SMTP would
+        expose password-reset tokens and relay credentials.
         """
         kwargs = staging_kwargs(
             smtp_enabled=True,
@@ -169,9 +153,7 @@ class TestSmtpHardening:
 
 
 def _self_signed_ca_pem() -> bytes:
-    """Minimal self-signed CA cert generated in-process (cryptography is a
-    runtime dependency), so no binary fixture is checked in and the PEM is
-    always parseable by the running OpenSSL build."""
+    """Generate a parseable self-signed CA certificate in memory."""
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "unit-test smtp ca")])
     now = datetime.now(UTC)
@@ -193,10 +175,7 @@ class TestSmtpCaBundle:
     """SMTP_CA_BUNDLE must name a real, parseable PEM file, or be unset."""
 
     def test_smtp_ca_bundle_nonexistent_path_rejected(self, tmp_path):
-        """Fail-open startup control — services/email.py loads this
-        file unconditionally at import time, so a bad path must fail Settings
-        construction on the friendly path, naming the env var and the path (not
-        crash email.py's import with a raw traceback)."""
+        """Check SMTP CA bundle nonexistent path rejected (ValidationError)."""
         missing = tmp_path / "does-not-exist.pem"
         with pytest.raises(ValidationError) as excinfo:
             make_settings(**base_kwargs(smtp_ca_bundle=str(missing)))
@@ -205,10 +184,7 @@ class TestSmtpCaBundle:
         assert str(missing) in message
 
     def test_smtp_ca_bundle_unparseable_pem_rejected(self, tmp_path):
-        """The validator must LOAD the file, not merely stat it — a
-        present-but-garbage bundle passes any existence check and only detonates
-        in email.py's import-time SSLContext, the exact deferred failure this
-        boundary exists to prevent."""
+        """Check SMTP CA bundle unparseable PEM rejected (ValidationError)."""
         bundle = tmp_path / "garbage.pem"
         bundle.write_text("this is not a PEM certificate\n")
         with pytest.raises(ValidationError) as excinfo:
@@ -218,19 +194,13 @@ class TestSmtpCaBundle:
         assert str(bundle) in message
 
     def test_smtp_ca_bundle_empty_string_normalized_to_none(self):
-        """Empty str '' normalizes to None so the config value's truthiness
-        matches the consumer's `if settings.smtp_ca_bundle:` check — an
-        un-normalized empty string would flip email.py onto the custom-bundle
-        path with no bundle to load."""
+        """Check SMTP CA bundle empty string normalized to none."""
         s = make_settings(**base_kwargs(smtp_ca_bundle=""))
         assert s.smtp_ca_bundle is None
 
     def test_smtp_ca_bundle_valid_pem_round_trips(self, tmp_path):
-        """A real PEM CA bundle passes the boundary and round-trips unchanged,
-        so the rejection tests above cannot pass by rejecting every bundle.
-
-        (A permissions-based unreadable-file case is deliberately omitted:
-        chmod 000 is a no-op when CI runs as root, so it is flaky by design.)
+        """A real PEM CA bundle passes the boundary and round-trips unchanged, so the rejection tests
+        above cannot pass by rejecting every bundle.
         """
         bundle = tmp_path / "ca.pem"
         bundle.write_bytes(_self_signed_ca_pem())
@@ -299,6 +269,9 @@ class TestShibbolethActivationBoundary:
     def test_enabled_shibboleth_rejects_weak_callback_secret_in_every_environment(
         self, env, weak_secret
     ):
+        """Check enabled Shibboleth rejects weak callback secret in every environment
+        (ValidationError).
+        """
         kwargs = KWARGS_FOR_ENV[env](
             shibboleth_enabled=True,
             shibboleth_internal_secret=weak_secret,
@@ -310,6 +283,7 @@ class TestShibbolethActivationBoundary:
 
     @pytest.mark.parametrize("env", ["dev", "staging", "production"])
     def test_enabled_shibboleth_requires_an_exact_issuer_allowlist(self, env):
+        """Check enabled Shibboleth requires an exact issuer allowlist (ValidationError)."""
         kwargs = KWARGS_FOR_ENV[env](
             shibboleth_enabled=True,
             shibboleth_internal_secret=SHIBBOLETH_TEST_SECRET,
@@ -353,10 +327,12 @@ class TestShibbolethActivationBoundary:
         ],
     )
     def test_shibboleth_issuer_allowlist_rejects_unsafe_values(self, issuer):
+        """Check Shibboleth issuer allowlist rejects unsafe values (ValidationError)."""
         with pytest.raises(ValidationError, match="SHIBBOLETH_TRUSTED_ISSUERS"):
             make_settings(**base_kwargs(shibboleth_trusted_issuers=[issuer]))
 
     def test_shibboleth_issuer_allowlist_rejects_exact_duplicates(self):
+        """Check Shibboleth issuer allowlist rejects exact duplicates (ValidationError)."""
         with pytest.raises(ValidationError, match="duplicate"):
             make_settings(
                 **base_kwargs(
@@ -369,6 +345,7 @@ class TestShibbolethActivationBoundary:
 
     @pytest.mark.parametrize("env", ["dev", "staging", "production"])
     def test_enabled_shibboleth_accepts_strong_independent_secret_and_exact_issuer(self, env):
+        """Check enabled Shibboleth accepts strong independent secret and exact issuer."""
         transport = {"public_base_url": "https://archive.example.org"} if env == "dev" else {}
         configured = make_settings(
             **KWARGS_FOR_ENV[env](
@@ -405,9 +382,10 @@ class TestShibbolethActivationBoundary:
             ({"public_base_url": "https://%31%32%37.0.0.1"}, "HTTPS PUBLIC_BASE_URL"),
             ({"public_base_url": "https://%6cocalhost"}, "HTTPS PUBLIC_BASE_URL"),
             ({"public_base_url": "https://127%2e0%2e0%2e1"}, "HTTPS PUBLIC_BASE_URL"),
-            ({"public_base_url": "https://localhost\x01"}, "HTTPS PUBLIC_BASE_URL"),
-            ({"public_base_url": "https://127.0.0.1\x01"}, "HTTPS PUBLIC_BASE_URL"),
-            ({"public_base_url": "https://localhost\x00"}, "HTTPS PUBLIC_BASE_URL"),
+            # Common URL validation rejects controls before the Shibboleth HTTPS gate.
+            ({"public_base_url": "https://localhost\x01"}, "PUBLIC_BASE_URL"),
+            ({"public_base_url": "https://127.0.0.1\x01"}, "PUBLIC_BASE_URL"),
+            ({"public_base_url": "https://localhost\x00"}, "PUBLIC_BASE_URL"),
             ({"public_base_url": "https://[::ffff:127.0.0.1]"}, "HTTPS PUBLIC_BASE_URL"),
             ({"public_base_url": "https://[::ffff:7f00:1]"}, "HTTPS PUBLIC_BASE_URL"),
             ({"public_base_url": "https://[0:0:0:0:0:0:0:1]"}, "HTTPS PUBLIC_BASE_URL"),
@@ -468,13 +446,7 @@ class TestShibbolethActivationBoundary:
     )
     @pytest.mark.filterwarnings("ignore:ALLOWED_HOSTS WARNING:RuntimeWarning")
     def test_enabled_shibboleth_requires_hardened_transport_even_in_dev(self, overrides, message):
-        """Enabling federation closes the relaxed dev transport defaults.
-
-        Staging and production are already pinned by their general hardened-host,
-        HTTPS-origin, and secure-cookie validator tests; this test proves that the
-        same boundary becomes mandatory in otherwise permissive development/demo
-        settings as soon as the Shibboleth callback is enabled.
-        """
+        """Enabling federation closes the relaxed dev transport defaults."""
         kwargs = base_kwargs(
             shibboleth_enabled=True,
             shibboleth_internal_secret=SHIBBOLETH_TEST_SECRET,
@@ -499,6 +471,7 @@ class TestShibbolethActivationBoundary:
         ],
     )
     def test_shibboleth_callback_secret_cannot_reuse_another_security_secret(self, reused_field):
+        """Check Shibboleth callback secret cannot reuse another security secret (ValidationError)."""
         overrides = {
             "shibboleth_enabled": True,
             "shibboleth_internal_secret": SHIBBOLETH_TEST_SECRET,
@@ -518,6 +491,7 @@ _LIMITER_REUSE_PROBE = "SharedLimiterProbePassword-0123456789abcdef"
 
 
 def _redis_url_with_password(password: str) -> str:
+    """Build the Redis URL with the selected password in the user-info component."""
     return f"redis://:{password}@limiter.internal.example.org:6379/0"
 
 
@@ -544,12 +518,10 @@ def _redis_url_with_password(password: str) -> str:
     ],
 )
 class TestRateLimitRedisUrlCredentialIsolation:
-    """The dedicated rate-limit Redis credential is an independent secret:
-    reusing another configured secret's value as its password would mean
-    exposing the limiter store (a lower-value target) also exposes a
-    signing, encryption, database, or general-cache credential."""
+    """Cover rate limit Redis URL credential isolation."""
 
     def test_rejects_a_limiter_password_that_reuses_another_configured_secret(self, overrides):
+        """Check rejects a limiter password that reuses another configured secret (ValidationError)."""
         kwargs = base_kwargs(**overrides)
         kwargs["rate_limit_redis_url"] = _redis_url_with_password(_LIMITER_REUSE_PROBE)
 
@@ -557,6 +529,7 @@ class TestRateLimitRedisUrlCredentialIsolation:
             make_settings(**kwargs)
 
     def test_a_distinct_limiter_password_constructs(self, overrides):
+        """Check a distinct limiter password constructs."""
         distinct = _redis_url_with_password("Distinct-Limiter-Only-Password-42")
         kwargs = base_kwargs(**overrides)
         kwargs["rate_limit_redis_url"] = distinct
@@ -564,26 +537,6 @@ class TestRateLimitRedisUrlCredentialIsolation:
         configured = make_settings(**kwargs)
 
         assert configured.rate_limit_redis_url.get_secret_value() == distinct
-
-
-class TestSeedMockData:
-    """SEED_MOCK_DATA is a demo-environment toggle, never a production one."""
-
-    def test_seed_mock_data_rejected_in_production(self):
-        """Fail-open deploy toggle — mock rows in the production
-        archive would surface fake datasets to real researchers, so the boundary
-        must refuse to start rather than trust deploy discipline."""
-        with pytest.raises(ValidationError, match="SEED_MOCK_DATA=true is not permitted"):
-            make_settings(**prod_kwargs(seed_mock_data=True))
-
-    @pytest.mark.parametrize("env", ["dev", "staging"])
-    def test_seed_mock_data_allowed_outside_production(self, env):
-        """Dev AND staging construct with the flag on. Staging-allowed is
-        deliberate product behavior (demo/presentation environments seed on
-        purpose): the validator gates on is_production, so a sweep that flips
-        it to is_hardened must fail here."""
-        s = make_settings(**KWARGS_FOR_ENV[env](seed_mock_data=True))
-        assert s.seed_mock_data is True
 
 
 class TestSettingsRepr:
@@ -605,6 +558,7 @@ class TestOutboxEncryptionKeys:
     """OUTBOX_ENCRYPTION_KEYS is mandatory, non-empty key material."""
 
     def test_outbox_encryption_keys_are_required(self, monkeypatch):
+        """Check outbox encryption keys are required (ValidationError)."""
         monkeypatch.delenv("OUTBOX_ENCRYPTION_KEYS", raising=False)
         monkeypatch.delenv("outbox_encryption_keys", raising=False)
         kwargs = base_kwargs()
@@ -619,6 +573,7 @@ class TestOutboxEncryptionKeys:
         )
 
     def test_outbox_encryption_keys_cannot_be_empty(self):
+        """Check outbox encryption keys cannot be empty (ValidationError)."""
         with pytest.raises(ValidationError) as excinfo:
             make_settings(**base_kwargs(outbox_encryption_keys=[]))
 

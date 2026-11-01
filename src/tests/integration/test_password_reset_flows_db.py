@@ -1,21 +1,12 @@
-"""Password-reset integration tests — real PostgreSQL, real services, real routes.
+"""Password-reset integration tests — real PostgreSQL, real services, real routes."""
 
-Covers `app.services.password_reset`: session invalidation on reset, the
-password-change rules (anti-reuse, strength policy), token validity (wrong
-hash, expiry, single-use), the `/reset-password` and `/forgot-password`
-routes, lockout clearing, and the actual emailed link driven end-to-end.
-
-These guard the awaits that mypy cannot see are missing (`coroutine is
-not None` / `if coroutine:` shapes) and that only a real database exercise
-catches: an un-awaited coroutine is truthy even on a ZERO-row UPDATE, so
-mocked cursors would happily "pass."
-"""
-
-from datetime import UTC, datetime, timedelta
+import asyncio
+import time
 from unittest.mock import create_autospec
+from urllib.parse import urlsplit
 
+import pyotp
 import pytest
-import time_machine
 from lxml import html
 
 from app.services import password_reset
@@ -23,13 +14,17 @@ from app.services.authentication import verify_password
 from app.services.crypto import decrypt_outbox_body
 from app.services.db import get_db_cursor
 from app.services.password_reset import (
+    InvalidResetToken,
+    InvalidResetTotp,
     generate_reset_token,
     store_reset_token_hash,
     update_password_with_token,
 )
 from app.services.sessions import get_session_user
-from app.services.tokens import hash_token
+from app.services.tokens import action_token_public_id, hash_token
+from app.services.totp_crypto import encrypt_value
 from config import settings
+from tests.action_links import action_path, token_from_action_email
 from tests.integration.conftest import DEFAULT_PASSWORD, do_login
 
 # Strong passwords used across tests. None contain the factory users'
@@ -37,6 +32,31 @@ from tests.integration.conftest import DEFAULT_PASSWORD, do_login
 # so validate_password_strength never trips on them incidentally.
 NEW_PASSWORD = "Fresh-N3w-Passw0rd!"
 THIRD_PASSWORD = "An0ther-G00d-Pw!x"
+
+_RESET_SECRET = "JBSWY3DPEHPK3PXP"
+
+
+def _reset_code():
+    """Generate the reset factor's current TOTP code."""
+    return pyotp.TOTP(_RESET_SECRET).now()
+
+
+def _login_code():
+    # Reset consumed the current step; the adjacent next step is fresh.
+    """Generate a code one TOTP step ahead of the current wall clock."""
+    return pyotp.TOTP(_RESET_SECRET).at(time.time() + 30)
+
+
+@pytest.fixture
+def reset_user_factory(user_factory):
+    """Return a user factory defaulting to the shared encrypted reset factor."""
+
+    def make(**overrides):
+        """Create a user defaulting to the shared encrypted reset factor."""
+        overrides.setdefault("totp_secret", encrypt_value(_RESET_SECRET))
+        return user_factory(**overrides)
+
+    return make
 
 
 def _store_reset_hash_sync(sync_conn, user_id: int, token: str) -> None:
@@ -52,25 +72,47 @@ def _store_reset_hash_sync(sync_conn, user_id: int, token: str) -> None:
 
 
 def _path_of(url: str) -> str:
+    """Require an emailed URL under PUBLIC_BASE_URL and return its path."""
     assert url.startswith(settings.public_base_url + "/"), (
         f"emailed URL {url!r} does not use settings.public_base_url — "
         "Host-header-derived links are poisonable"
     )
-    return url[len(settings.public_base_url) :]
+    return urlsplit(url).path
+
+
+def _assert_both_recovery_forms_have_the_checked_envelope(response, token, *, include_secret=False):
+    """Both recovery choices use the same public locator and body-only security code."""
+    document = html.fromstring(response.text)
+    forms = document.xpath('//form[@action="/reset-password" or @action="/unlock-account"]')
+    assert len(forms) == 2
+    assert {form.get("action") for form in forms} == {"/reset-password", "/unlock-account"}
+    token_fields = []
+    for form in forms:
+        assert form.get("method") == "post"
+        assert form.xpath('./input[@name="public_id"]/@value') == [action_token_public_id(token)]
+        fields = form.xpath('.//input[@name="token"]')
+        assert len(fields) == 1
+        field = fields[0]
+        assert field.get("value") == (token if include_secret else "")
+        assert field.get("type") == ("hidden" if include_secret else "text")
+        assert "required" in field.attrib
+        assert token not in form.get("action")
+        token_fields.append(field)
+    assert len({field.get("id") for field in token_fields}) == 2
 
 
 class TestPasswordResetSessionInvalidation:
     """A password reset must not leave a stolen session alive."""
 
     async def test_password_reset_invalidates_existing_sessions(
-        self, db_pool, user_factory, session_factory, sync_conn
+        self, db_pool, reset_user_factory, session_factory, sync_conn
     ):
         """A stolen session must NOT survive a password reset.
 
         delete_user_sessions must be awaited inside update_password_with_token
         — an un-awaited call creates the coroutine, never runs it, and leaves
         the sessions silently alive."""
-        u = user_factory()
+        u = reset_user_factory()
         raw_session = session_factory(u.id)
         token = generate_reset_token(u.id, u.email)
         await store_reset_token_hash(
@@ -81,7 +123,7 @@ class TestPasswordResetSessionInvalidation:
         )
 
         await update_password_with_token(
-            db_pool, u.id, hash_token(token), NEW_PASSWORD, expected_email=u.email
+            db_pool, u.id, token, NEW_PASSWORD, expected_email=u.email, totp_code=_reset_code()
         )
 
         row = sync_conn.execute(
@@ -97,14 +139,11 @@ class TestPasswordResetPasswordRequirements:
     """`update_password_with_token` enforces the same password policy as
     registration, plus its own anti-reuse rule."""
 
-    async def test_password_reset_with_different_password_succeeds(self, db_pool, user_factory):
-        """Resetting to a DIFFERENT password succeeds; afterwards the new
-        password verifies and the old one does not.
-
-        `_is_same_as_current_password(...)` must be awaited in the check —
-        an un-awaited coroutine is always truthy, so EVERY reset would be
-        rejected with 'choose a different password'."""
-        u = user_factory()
+    async def test_password_reset_with_different_password_succeeds(
+        self, db_pool, reset_user_factory
+    ):
+        """Verify password reset with different password succeeds."""
+        u = reset_user_factory()
         token = generate_reset_token(u.id, u.email)
         await store_reset_token_hash(
             db_pool,
@@ -114,7 +153,7 @@ class TestPasswordResetPasswordRequirements:
         )
 
         await update_password_with_token(
-            db_pool, u.id, hash_token(token), NEW_PASSWORD, expected_email=u.email
+            db_pool, u.id, token, NEW_PASSWORD, expected_email=u.email, totp_code=_reset_code()
         )
 
         new_check = await verify_password(db_pool, u.email, NEW_PASSWORD)
@@ -127,14 +166,9 @@ class TestPasswordResetPasswordRequirements:
 
         assert old_check.password_ok is False
 
-    async def test_password_reset_same_password_is_rejected(self, db_pool, user_factory):
-        """Resetting to the CURRENT password raises ValueError ('different
-        password') — the anti-reuse check still fires when it should.
-
-        display_name is overridden because the factory default 'Test User'
-        makes DEFAULT_PASSWORD ('...-for-tests') trip the strength check's
-        contains-name rule BEFORE the same-password check we want to reach."""
-        u = user_factory(display_name="Alice Wonder")
+    async def test_password_reset_same_password_is_rejected(self, db_pool, reset_user_factory):
+        """Verify password reset same password is rejected."""
+        u = reset_user_factory(display_name="Alice Wonder")
         token = generate_reset_token(u.id, u.email)
         await store_reset_token_hash(
             db_pool,
@@ -145,15 +179,20 @@ class TestPasswordResetPasswordRequirements:
 
         with pytest.raises(ValueError, match="different password"):
             await update_password_with_token(
-                db_pool, u.id, hash_token(token), DEFAULT_PASSWORD, expected_email=u.email
+                db_pool,
+                u.id,
+                token,
+                DEFAULT_PASSWORD,
+                expected_email=u.email,
+                totp_code=_reset_code(),
             )
 
-    async def test_password_reset_rejects_weak_password(self, db_pool, user_factory):
+    async def test_password_reset_rejects_weak_password(self, db_pool, reset_user_factory):
         """Removing validate_password_strength from update_password_with_token
         would let anyone set 'a' as their password via recovery — a policy
         bypass on an auth-critical path. Positive control: a strong password
         succeeds through the exact same call."""
-        u = user_factory(display_name="Alice Wonder")
+        u = reset_user_factory(display_name="Alice Wonder")
         token = generate_reset_token(u.id, u.email)
         await store_reset_token_hash(
             db_pool,
@@ -164,12 +203,12 @@ class TestPasswordResetPasswordRequirements:
 
         with pytest.raises(ValueError, match="Password validation failed"):
             await update_password_with_token(
-                db_pool, u.id, hash_token(token), "a", expected_email=u.email
+                db_pool, u.id, token, "a", expected_email=u.email, totp_code=_reset_code()
             )
 
         # The failed attempt must not have consumed the token.
         await update_password_with_token(
-            db_pool, u.id, hash_token(token), NEW_PASSWORD, expected_email=u.email
+            db_pool, u.id, token, NEW_PASSWORD, expected_email=u.email, totp_code=_reset_code()
         )
         check = await verify_password(db_pool, u.email, NEW_PASSWORD)
 
@@ -180,10 +219,10 @@ class TestPasswordResetTokenValidity:
     """`update_password_with_token` rejects a hash that doesn't match, one
     that has expired, and reuse of an already-consumed token."""
 
-    async def test_password_reset_wrong_token_hash_rejected(self, db_pool, user_factory):
+    async def test_password_reset_wrong_token_hash_rejected(self, db_pool, reset_user_factory):
         """A hash that doesn't match the stored one → zero-row UPDATE →
         ValueError (not a silent 'success')."""
-        u = user_factory()
+        u = reset_user_factory()
         token = generate_reset_token(u.id, u.email)
         await store_reset_token_hash(
             db_pool,
@@ -196,15 +235,18 @@ class TestPasswordResetTokenValidity:
             await update_password_with_token(
                 db_pool,
                 u.id,
-                hash_token("not-the-real-token"),
+                generate_reset_token(u.id, u.email),
                 NEW_PASSWORD,
                 expected_email=u.email,
+                totp_code=_reset_code(),
             )
 
-    async def test_password_reset_expired_token_rejected(self, db_pool, user_factory, sync_conn):
+    async def test_password_reset_expired_token_rejected(
+        self, db_pool, reset_user_factory, sync_conn
+    ):
         """A token older than the 30-minute window fails the DB-level
         created_at check even with a matching hash."""
-        u = user_factory()
+        u = reset_user_factory()
         token = generate_reset_token(u.id, u.email)
         await store_reset_token_hash(
             db_pool,
@@ -223,13 +265,13 @@ class TestPasswordResetTokenValidity:
 
         with pytest.raises(ValueError, match="Invalid, expired, or already-used"):
             await update_password_with_token(
-                db_pool, u.id, hash_token(token), NEW_PASSWORD, expected_email=u.email
+                db_pool, u.id, token, NEW_PASSWORD, expected_email=u.email, totp_code=_reset_code()
             )
 
-    async def test_password_reset_token_is_single_use(self, db_pool, user_factory):
+    async def test_password_reset_token_is_single_use(self, db_pool, reset_user_factory):
         """A successful reset clears the stored hash, so reusing the same
         token (with yet another password) raises ValueError."""
-        u = user_factory()
+        u = reset_user_factory()
         token = generate_reset_token(u.id, u.email)
         await store_reset_token_hash(
             db_pool,
@@ -239,12 +281,17 @@ class TestPasswordResetTokenValidity:
         )
 
         await update_password_with_token(
-            db_pool, u.id, hash_token(token), NEW_PASSWORD, expected_email=u.email
+            db_pool, u.id, token, NEW_PASSWORD, expected_email=u.email, totp_code=_reset_code()
         )
 
         with pytest.raises(ValueError, match="Invalid, expired, or already-used"):
             await update_password_with_token(
-                db_pool, u.id, hash_token(token), THIRD_PASSWORD, expected_email=u.email
+                db_pool,
+                u.id,
+                token,
+                THIRD_PASSWORD,
+                expected_email=u.email,
+                totp_code=_reset_code(),
             )
 
     @pytest.mark.parametrize(
@@ -259,14 +306,10 @@ class TestPasswordResetTokenValidity:
         ],
     )
     async def test_stale_reset_is_rejected_before_any_password_work(
-        self, db_pool, sync_conn, user_factory, monkeypatch, state
+        self, db_pool, sync_conn, reset_user_factory, monkeypatch, state
     ):
-        """A stale token predicate (already consumed, replaced by a newer
-        hash, expired, an inactive account, or an email changed since
-        issuance) must reject the reset BEFORE any Argon2 work runs — the
-        final UPDATE ... WHERE predicate is the single source of truth, and
-        it never spends CPU hashing a password it's about to discard."""
-        u = user_factory()
+        """Verify stale reset is rejected before any password work."""
+        u = reset_user_factory()
         token = generate_reset_token(u.id, u.email)
         await store_reset_token_hash(db_pool, u.id, hash_token(token), expected_email=u.email)
         updates = {
@@ -288,26 +331,28 @@ class TestPasswordResetTokenValidity:
             await update_password_with_token(
                 db_pool,
                 u.id,
-                hash_token(token),
+                token,
                 "new-password-Strong-2356!",
                 expected_email=u.email,
+                totp_code=_reset_code(),
             )
         work.assert_not_awaited()
 
     async def test_reset_final_predicate_still_rejects_concurrent_token_replacement(
-        self, db_pool, user_factory, monkeypatch
+        self, db_pool, reset_user_factory, monkeypatch
     ):
         """A concurrent reset that replaces the stored hash WHILE this
         request's password hash is being computed must still be caught: the
         UPDATE's WHERE predicate is re-evaluated against the CURRENT stored
         hash at commit time, not the hash this request read at the start."""
-        u = user_factory()
+        u = reset_user_factory()
         token = generate_reset_token(u.id, u.email)
         await store_reset_token_hash(db_pool, u.id, hash_token(token), expected_email=u.email)
         real_work = password_reset.run_password_work
         once = False
 
         async def replace_during_hash(*args, **kwargs):
+            """Replace the reset-token hash once before real password work."""
             nonlocal once
             if not once:
                 once = True
@@ -327,9 +372,10 @@ class TestPasswordResetTokenValidity:
             await update_password_with_token(
                 db_pool,
                 u.id,
-                hash_token(token),
+                token,
                 "New-password-Strong-987654!",
                 expected_email=u.email,
+                totp_code=_reset_code(),
             )
 
 
@@ -349,18 +395,26 @@ class TestPasswordResetFormRejection:
         ],
     )
     def test_reset_password_route_rerenders_form_on_rejection(
-        self, e2e_client, user_factory, sync_conn, password, password_confirm, expected_message
+        self,
+        e2e_client,
+        reset_user_factory,
+        sync_conn,
+        password,
+        password_confirm,
+        expected_message,
     ):
-        u = user_factory()
+        """Verify reset password route rerenders form on rejection."""
+        u = reset_user_factory()
         token = generate_reset_token(u.id, u.email)
         _store_reset_hash_sync(sync_conn, u.id, token)
 
-        page = e2e_client.get(f"/reset-password/{token}")
+        page = e2e_client.get(action_path("/reset-password", token))
         assert page.status_code == 200
         assert html.fromstring(page.text).xpath(
             './/form[@action="/reset-password" and @method="post"]'
         )
-        assert f'<input type="hidden" name="token" value="{token}">' in page.text
+        assert token not in page.text
+        _assert_both_recovery_forms_have_the_checked_envelope(page, token)
         assert f'action="/reset-password/{token}"' not in page.text
         csrf = e2e_client.cookies.get("csrf_token")
 
@@ -368,8 +422,10 @@ class TestPasswordResetFormRejection:
             "/reset-password",
             data={
                 "token": token,
+                "public_id": action_token_public_id(token),
                 "password": password,
                 "password_confirm": password_confirm,
+                "totp_code": _reset_code(),
                 "csrf_token": csrf,
             },
             follow_redirects=False,
@@ -379,7 +435,7 @@ class TestPasswordResetFormRejection:
         assert html.fromstring(resp.text).xpath(
             './/form[@action="/reset-password" and @method="post"]'
         )
-        assert f'<input type="hidden" name="token" value="{token}">' in resp.text
+        _assert_both_recovery_forms_have_the_checked_envelope(resp, token, include_secret=True)
         assert f'action="/reset-password/{token}"' not in resp.text
 
         # Token not consumed and password unchanged: the stored hash survives.
@@ -389,16 +445,16 @@ class TestPasswordResetFormRejection:
         assert row[0] == hash_token(token)
 
     def test_reset_password_route_accepts_a_valid_submission(
-        self, e2e_client, user_factory, sync_conn
+        self, e2e_client, reset_user_factory, sync_conn
     ):
         """Positive control for the rejections above, in this same class: a
         matching, sufficiently strong password on the same route redirects
         to /login and consumes the token, instead of re-rendering the form."""
-        u = user_factory()
+        u = reset_user_factory()
         token = generate_reset_token(u.id, u.email)
         _store_reset_hash_sync(sync_conn, u.id, token)
 
-        page = e2e_client.get(f"/reset-password/{token}")
+        page = e2e_client.get(action_path("/reset-password", token))
         assert page.status_code == 200
         csrf = e2e_client.cookies.get("csrf_token")
 
@@ -406,8 +462,10 @@ class TestPasswordResetFormRejection:
             "/reset-password",
             data={
                 "token": token,
+                "public_id": action_token_public_id(token),
                 "password": NEW_PASSWORD,
                 "password_confirm": NEW_PASSWORD,
+                "totp_code": _reset_code(),
                 "csrf_token": csrf,
             },
             follow_redirects=False,
@@ -419,7 +477,9 @@ class TestPasswordResetFormRejection:
             "SELECT password_reset_token_hash FROM users WHERE id = %s", (u.id,)
         ).fetchone()
         assert row[0] is None
-        assert do_login(e2e_client, u.email, NEW_PASSWORD).status_code == 303
+        assert (
+            do_login(e2e_client, u.email, NEW_PASSWORD, totp_code=_login_code()).status_code == 303
+        )
 
 
 class TestForgotPasswordRequest:
@@ -429,7 +489,7 @@ class TestForgotPasswordRequest:
     def test_forgot_password_is_enumeration_neutral_and_stores_token(
         self,
         e2e_client,
-        user_factory,
+        reset_user_factory,
         sync_conn,
     ):
         """Known and unknown addresses receive byte-identical responses.
@@ -437,8 +497,8 @@ class TestForgotPasswordRequest:
         A known eligible account gets a reset-token hash and one durable
         outbox message. An unknown address gets neither.
         """
-        known = user_factory()
-        unknown_email = "nobody@uzh.ch"
+        known = reset_user_factory()
+        unknown_email = "nobody@example.org"
 
         e2e_client.get("/forgot-password")
         csrf = e2e_client.cookies.get("csrf_token")
@@ -462,7 +522,7 @@ class TestForgotPasswordRequest:
 
         assert r_known.status_code == r_unknown.status_code == 200
         assert r_known.text == r_unknown.text
-        assert "password reset link shortly" in r_known.text
+        assert "existing code stays valid" in r_known.text.lower()
 
         token_row = sync_conn.execute(
             """
@@ -515,7 +575,7 @@ class TestForgotPasswordRequest:
     def test_forgot_password_issues_nothing_for_inactive_or_shibboleth(
         self,
         e2e_client,
-        user_factory,
+        reset_user_factory,
         sync_conn,
     ):
         """Inactive and federated accounts receive no reset capability.
@@ -523,8 +583,8 @@ class TestForgotPasswordRequest:
         Both requests get the same neutral response, but neither a token hash
         nor a password-reset outbox message is created.
         """
-        inactive = user_factory(is_active=False)
-        shib = user_factory(auth_method="shibboleth")
+        inactive = reset_user_factory(is_active=False)
+        shib = reset_user_factory(auth_method="shibboleth")
 
         e2e_client.get("/forgot-password")
         csrf = e2e_client.cookies.get("csrf_token")
@@ -542,7 +602,7 @@ class TestForgotPasswordRequest:
             responses.append(response)
 
             assert response.status_code == 200
-            assert "password reset link shortly" in response.text
+            assert "existing code stays valid" in response.text.lower()
 
         assert responses[0].text == responses[1].text
 
@@ -581,13 +641,11 @@ class TestForgotPasswordRequest:
 class TestPasswordResetClearsLockout:
     """Resetting a password also lifts a failed-login lockout."""
 
-    async def test_password_reset_clears_lockout_state(self, db_pool, user_factory, sync_conn):
-        """The lockout email promises 'resetting your password also unlocks
-        the account'. Dropping failed_login_count=0 / locked_until=NULL from
-        the reset UPDATE leaves the user with a working new password but a
-        still-locked account — this pins both columns AND a subsequent
-        login."""
-        u = user_factory()
+    async def test_password_reset_clears_lockout_state(
+        self, db_pool, reset_user_factory, sync_conn
+    ):
+        """Verify password reset clears lockout state."""
+        u = reset_user_factory()
         sync_conn.execute(
             """UPDATE users
                SET failed_login_count = 7,
@@ -605,7 +663,7 @@ class TestPasswordResetClearsLockout:
         )
 
         await update_password_with_token(
-            db_pool, u.id, hash_token(token), NEW_PASSWORD, expected_email=u.email
+            db_pool, u.id, token, NEW_PASSWORD, expected_email=u.email, totp_code=_reset_code()
         )
 
         row = sync_conn.execute(
@@ -624,70 +682,88 @@ class TestPasswordResetClearsLockout:
 
 
 class TestPasswordResetFormTokenGate:
-    """`GET /reset-password/{token}` consults verify_reset_token_hash before
-    rendering the form."""
+    """Public landing pages disclose no capability; the POST checks current state."""
 
     def test_reset_form_get_rejects_replaced_token_but_accepts_current(
-        self, e2e_client, user_factory, sync_conn
+        self, e2e_client, reset_user_factory, sync_conn
     ):
-        """After a NEWER token replaces the stored hash, the old link renders
-        the 422 'invalid or expired' page — while the current link still
-        renders the form (positive control; an inverted comparison would fail
-        it)."""
-        u = user_factory()
-        # itsdangerous timestamps have 1s granularity — force distinct tokens
-        # by minting them two seconds apart, then hold the clock there so the
-        # later validation still sees both signatures as issued in the past.
-        with time_machine.travel(datetime.now(UTC), tick=False) as traveler:
-            token_a = generate_reset_token(u.id, u.email)
-            _store_reset_hash_sync(sync_conn, u.id, token_a)
-            traveler.shift(timedelta(seconds=2))
-            token_b = generate_reset_token(u.id, u.email)
-            assert token_b != token_a
-            _store_reset_hash_sync(sync_conn, u.id, token_b)
-
-            stale = e2e_client.get(f"/reset-password/{token_a}")
-            assert stale.status_code == 422
-            assert "invalid or has expired" in stale.text
-
-            current = e2e_client.get(f"/reset-password/{token_b}")
-        assert current.status_code == 200
-        assert "Reset Password" in current.text
-        assert html.fromstring(current.text).xpath(
-            './/form[@action="/reset-password" and @method="post"]'
+        """Both identifiers give generic forms, but only the current body proof works."""
+        user = reset_user_factory()
+        token_a = generate_reset_token(user.id, user.email)
+        _store_reset_hash_sync(sync_conn, user.id, token_a)
+        token_b = generate_reset_token(user.id, user.email)
+        assert token_b != token_a
+        _store_reset_hash_sync(sync_conn, user.id, token_b)
+        for token in (token_a, token_b):
+            page = e2e_client.get(action_path("/reset-password", token))
+            assert page.status_code == 200
+            assert token not in page.text and user.email not in page.text
+            assert html.fromstring(page.text).xpath(
+                './/form[@action="/reset-password" and @method="post"]'
+            )
+        rejected = e2e_client.post(
+            "/reset-password",
+            data={
+                "public_id": action_token_public_id(token_a),
+                "token": token_a,
+                "password": NEW_PASSWORD,
+                "password_confirm": NEW_PASSWORD,
+                "totp_code": _reset_code(),
+                "csrf_token": e2e_client.cookies.get("csrf_token"),
+            },
+            follow_redirects=False,
         )
-        assert f'<input type="hidden" name="token" value="{token_b}">' in current.text
-        assert f'action="/reset-password/{token_b}"' not in current.text
+        assert rejected.status_code == 422
+        assert sync_conn.execute(
+            "SELECT password_reset_token_hash FROM users WHERE id=%s", (user.id,)
+        ).fetchone() == (hash_token(token_b),)
+        accepted = e2e_client.post(
+            "/reset-password",
+            data={
+                "public_id": action_token_public_id(token_b),
+                "token": token_b,
+                "password": NEW_PASSWORD,
+                "password_confirm": NEW_PASSWORD,
+                "totp_code": _reset_code(),
+                "csrf_token": e2e_client.cookies.get("csrf_token"),
+            },
+            follow_redirects=False,
+        )
+        assert accepted.status_code == 303 and accepted.headers["location"] == "/login"
+        assert sync_conn.execute(
+            "SELECT password_reset_token_hash FROM users WHERE id=%s", (user.id,)
+        ).fetchone() == (None,)
 
     def test_reset_form_get_rejects_token_after_account_email_changes(
-        self,
-        e2e_client,
-        user_factory,
-        sync_conn,
+        self, e2e_client, reset_user_factory, sync_conn
     ):
-        """A reset token is bound to the email address it was issued to.
-
-        Even when its hash remains stored and unexpired, changing the account
-        email makes the old-address reset link invalid.
-        """
-        user = user_factory(email="old-address@uzh.ch")
+        """The public form stays generic; old-address proof cannot reset the account."""
+        user = reset_user_factory(email="old-address@example.org")
         token = generate_reset_token(user.id, user.email)
         _store_reset_hash_sync(sync_conn, user.id, token)
-
         sync_conn.execute(
-            """
-            UPDATE users
-            SET email = %s
-            WHERE id = %s
-            """,
-            ("new-address@uzh.ch", user.id),
+            "UPDATE users SET email=%s WHERE id=%s", ("new-address@example.org", user.id)
         )
         sync_conn.commit()
-
-        response = e2e_client.get(f"/reset-password/{token}")
-
+        page = e2e_client.get(action_path("/reset-password", token))
+        assert page.status_code == 200
+        assert token not in page.text and user.email not in page.text
+        response = e2e_client.post(
+            "/reset-password",
+            data={
+                "public_id": action_token_public_id(token),
+                "token": token,
+                "password": NEW_PASSWORD,
+                "password_confirm": NEW_PASSWORD,
+                "totp_code": _reset_code(),
+                "csrf_token": e2e_client.cookies.get("csrf_token"),
+            },
+            follow_redirects=False,
+        )
         assert response.status_code == 422
-        assert "invalid or has expired" in response.text
+        assert sync_conn.execute(
+            "SELECT email, password_reset_token_hash FROM users WHERE id=%s", (user.id,)
+        ).fetchone() == ("new-address@example.org", hash_token(token))
 
 
 class TestPasswordResetEmailedLink:
@@ -698,7 +774,7 @@ class TestPasswordResetEmailedLink:
     def test_forgot_password_emailed_link_completes_a_real_reset(
         self,
         e2e_client,
-        user_factory,
+        reset_user_factory,
         sync_conn,
     ):
         """The reset URL from the real outbox message completes recovery.
@@ -707,7 +783,7 @@ class TestPasswordResetEmailedLink:
         update, and subsequent login using the same generated token — the
         route-level positive control for `TestPasswordResetFormRejection`.
         """
-        user = user_factory()
+        user = reset_user_factory()
 
         e2e_client.get("/forgot-password")
         csrf = e2e_client.cookies.get("csrf_token")
@@ -751,11 +827,12 @@ class TestPasswordResetEmailedLink:
         form = e2e_client.get(path)
         assert form.status_code == 200
         assert "Reset Password" in form.text
-        token = path.removeprefix("/reset-password/")
+        token = token_from_action_email(body, reset_url)
         assert html.fromstring(form.text).xpath(
             './/form[@action="/reset-password" and @method="post"]'
         )
-        assert f'<input type="hidden" name="token" value="{token}">' in form.text
+        assert token not in form.text
+        _assert_both_recovery_forms_have_the_checked_envelope(form, token)
         assert f'action="{path}"' not in form.text
 
         csrf = e2e_client.cookies.get("csrf_token")
@@ -763,8 +840,10 @@ class TestPasswordResetEmailedLink:
             "/reset-password",
             data={
                 "token": token,
+                "public_id": action_token_public_id(token),
                 "password": NEW_PASSWORD,
                 "password_confirm": NEW_PASSWORD,
+                "totp_code": _reset_code(),
                 "csrf_token": csrf,
             },
             follow_redirects=False,
@@ -773,9 +852,323 @@ class TestPasswordResetEmailedLink:
         assert done.status_code == 303
         assert done.headers["location"] == "/login"
 
-        login = do_login(
-            e2e_client,
-            user.email,
-            NEW_PASSWORD,
-        )
+        login = do_login(e2e_client, user.email, NEW_PASSWORD, totp_code=_login_code())
         assert login.status_code == 303
+
+
+class TestPasswordResetAuthenticatorProof:
+    """Email proof alone cannot replace a password or replenish proof attempts."""
+
+    @pytest.mark.parametrize("code", ["", "not-a-code", "\uff11\uff12\uff13\uff14\uff15\uff16"])
+    async def test_invalid_code_preserves_password_token_and_authenticator(
+        self, db_pool, reset_user_factory, sync_conn, code
+    ):
+        """Verify invalid code preserves password token and authenticator."""
+        user = reset_user_factory()
+        token = generate_reset_token(user.id, user.email)
+        await store_reset_token_hash(db_pool, user.id, hash_token(token), expected_email=user.email)
+        original = sync_conn.execute(
+            "SELECT password_hash, totp_secret, last_totp_step FROM users WHERE id=%s",
+            (user.id,),
+        ).fetchone()
+
+        with pytest.raises(InvalidResetTotp):
+            await update_password_with_token(
+                db_pool, user.id, token, NEW_PASSWORD, expected_email=user.email, totp_code=code
+            )
+
+        assert (
+            sync_conn.execute(
+                "SELECT password_hash, totp_secret, last_totp_step FROM users WHERE id=%s",
+                (user.id,),
+            ).fetchone()
+            == original
+        )
+        assert sync_conn.execute(
+            "SELECT password_reset_token_hash, password_reset_attempt_count FROM users WHERE id=%s",
+            (user.id,),
+        ).fetchone() == (hash_token(token), 1)
+
+    async def test_replayed_code_is_rejected_without_consuming_reset(
+        self, db_pool, reset_user_factory, sync_conn
+    ):
+        """Verify replayed code is rejected without consuming reset."""
+        user = reset_user_factory()
+        token = generate_reset_token(user.id, user.email)
+        await store_reset_token_hash(db_pool, user.id, hash_token(token), expected_email=user.email)
+        code = _reset_code()
+        async with get_db_cursor(db_pool) as cur:
+            assert await password_reset.verify_and_consume_totp_cur(cur, user.id, code)
+
+        with pytest.raises(InvalidResetTotp):
+            await update_password_with_token(
+                db_pool, user.id, token, NEW_PASSWORD, expected_email=user.email, totp_code=code
+            )
+        assert sync_conn.execute(
+            "SELECT password_reset_token_hash FROM users WHERE id=%s", (user.id,)
+        ).fetchone() == (hash_token(token),)
+
+    async def test_replacement_tokens_do_not_replenish_account_budget(
+        self, db_pool, reset_user_factory, sync_conn
+    ):
+        """Verify replacement tokens do not replenish account budget."""
+        user = reset_user_factory()
+        for _ in range(password_reset.RESET_TOTP_ATTEMPT_LIMIT):
+            token = generate_reset_token(user.id, user.email)
+            await store_reset_token_hash(
+                db_pool, user.id, hash_token(token), expected_email=user.email
+            )
+            with pytest.raises(InvalidResetTotp):
+                await update_password_with_token(
+                    db_pool,
+                    user.id,
+                    token,
+                    NEW_PASSWORD,
+                    expected_email=user.email,
+                    totp_code="malformed",
+                )
+        replacement = generate_reset_token(user.id, user.email)
+        await store_reset_token_hash(
+            db_pool, user.id, hash_token(replacement), expected_email=user.email
+        )
+        with pytest.raises(InvalidResetToken):
+            await update_password_with_token(
+                db_pool,
+                user.id,
+                replacement,
+                NEW_PASSWORD,
+                expected_email=user.email,
+                totp_code=_reset_code(),
+            )
+        assert sync_conn.execute(
+            "SELECT password_reset_attempt_count, failed_login_count, locked_until "
+            "FROM users WHERE id=%s",
+            (user.id,),
+        ).fetchone() == (password_reset.RESET_TOTP_ATTEMPT_LIMIT, 0, None)
+
+    async def test_expired_proof_window_starts_new_budget(
+        self, db_pool, reset_user_factory, sync_conn
+    ):
+        """Verify expired proof window starts new budget."""
+        user = reset_user_factory()
+        token = generate_reset_token(user.id, user.email)
+        await store_reset_token_hash(db_pool, user.id, hash_token(token), expected_email=user.email)
+        sync_conn.execute(
+            "UPDATE users SET password_reset_attempt_count=5, "
+            "password_reset_attempt_window_started_at=clock_timestamp()-INTERVAL '31 minutes' "
+            "WHERE id=%s",
+            (user.id,),
+        )
+        sync_conn.commit()
+        await update_password_with_token(
+            db_pool,
+            user.id,
+            token,
+            NEW_PASSWORD,
+            expected_email=user.email,
+            totp_code=_reset_code(),
+        )
+        assert sync_conn.execute(
+            "SELECT password_reset_attempt_count FROM users WHERE id=%s", (user.id,)
+        ).fetchone() == (1,)
+
+    @pytest.mark.parametrize("state", ["no_authenticator", "recovery_required"])
+    async def test_missing_active_authenticator_requires_operator_recovery(
+        self, db_pool, reset_user_factory, sync_conn, state
+    ):
+        """Verify missing active authenticator requires operator recovery."""
+        overrides = (
+            {"totp_secret": None}
+            if state == "no_authenticator"
+            else {"totp_secret": None, "totp_recovery_required": True}
+        )
+        user = reset_user_factory(**overrides)
+        token = generate_reset_token(user.id, user.email)
+        await store_reset_token_hash(db_pool, user.id, hash_token(token), expected_email=user.email)
+        with pytest.raises(InvalidResetToken):
+            await update_password_with_token(
+                db_pool,
+                user.id,
+                token,
+                NEW_PASSWORD,
+                expected_email=user.email,
+                totp_code=_reset_code(),
+            )
+        assert sync_conn.execute(
+            "SELECT password_reset_token_hash, password_reset_attempt_count FROM users WHERE id=%s",
+            (user.id,),
+        ).fetchone() == (hash_token(token), 0)
+
+    async def test_notice_queue_failure_rolls_back_password_and_totp_but_keeps_attempt(
+        self, db_pool, reset_user_factory, sync_conn, monkeypatch
+    ):
+        """Verify notice queue failure rolls back password and TOTP but keeps attempt."""
+        user = reset_user_factory()
+        token = generate_reset_token(user.id, user.email)
+        await store_reset_token_hash(db_pool, user.id, hash_token(token), expected_email=user.email)
+        original = sync_conn.execute(
+            "SELECT password_hash, auth_revision FROM users WHERE id=%s", (user.id,)
+        ).fetchone()
+        monkeypatch.setattr(
+            password_reset,
+            "enqueue_outbound_email_cur",
+            create_autospec(
+                password_reset.enqueue_outbound_email_cur, side_effect=RuntimeError("queue")
+            ),
+        )
+        with pytest.raises(RuntimeError, match="queue"):
+            await update_password_with_token(
+                db_pool,
+                user.id,
+                token,
+                NEW_PASSWORD,
+                expected_email=user.email,
+                totp_code=_reset_code(),
+            )
+        assert (
+            sync_conn.execute(
+                "SELECT password_hash, auth_revision FROM users WHERE id=%s", (user.id,)
+            ).fetchone()
+            == original
+        )
+        assert sync_conn.execute(
+            "SELECT last_totp_step, password_reset_token_hash, password_reset_attempt_count "
+            "FROM users WHERE id=%s",
+            (user.id,),
+        ).fetchone() == (None, hash_token(token), 1)
+
+    async def test_success_preserves_authenticator_and_queues_change_notification(
+        self, db_pool, reset_user_factory, sync_conn
+    ):
+        """Verify success preserves authenticator and queues change notification."""
+        user = reset_user_factory()
+        token = generate_reset_token(user.id, user.email)
+        await store_reset_token_hash(db_pool, user.id, hash_token(token), expected_email=user.email)
+        original_secret = sync_conn.execute(
+            "SELECT totp_secret FROM users WHERE id=%s", (user.id,)
+        ).fetchone()[0]
+        await update_password_with_token(
+            db_pool,
+            user.id,
+            token,
+            NEW_PASSWORD,
+            expected_email=user.email,
+            totp_code=_reset_code(),
+        )
+        row = sync_conn.execute(
+            "SELECT totp_secret, last_totp_step, password_reset_attempt_count "
+            "FROM users WHERE id=%s",
+            (user.id,),
+        ).fetchone()
+        assert row[0] == original_secret and row[1] is not None and row[2] == 1
+        notices = sync_conn.execute(
+            "SELECT recipient, body_ciphertext FROM email_outbox "
+            "WHERE user_id=%s AND message_type='password_changed_notice'",
+            (user.id,),
+        ).fetchall()
+        assert len(notices) == 1 and notices[0][0] == user.email
+        body = decrypt_outbox_body(notices[0][1])
+        assert body and NEW_PASSWORD not in body and token not in body
+
+    async def test_changed_revision_during_hashing_rejects_stale_proof(
+        self, db_pool, reset_user_factory, sync_conn, monkeypatch
+    ):
+        """Verify changed revision during hashing rejects stale proof."""
+        user = reset_user_factory()
+        token = generate_reset_token(user.id, user.email)
+        await store_reset_token_hash(db_pool, user.id, hash_token(token), expected_email=user.email)
+        real_work = password_reset.run_password_work
+
+        async def change_revision(function, *args, **kwargs):
+            """Increment the stored authentication revision before real password work."""
+            async with get_db_cursor(db_pool) as cur:
+                await cur.execute(
+                    "UPDATE users SET auth_revision=auth_revision+1 WHERE id=%s", (user.id,)
+                )
+            return await real_work(function, *args, **kwargs)
+
+        monkeypatch.setattr(
+            password_reset,
+            "run_password_work",
+            create_autospec(real_work, side_effect=change_revision),
+        )
+        with pytest.raises(InvalidResetToken):
+            await update_password_with_token(
+                db_pool,
+                user.id,
+                token,
+                NEW_PASSWORD,
+                expected_email=user.email,
+                totp_code=_reset_code(),
+            )
+        assert sync_conn.execute(
+            "SELECT last_totp_step, password_reset_token_hash, password_reset_attempt_count "
+            "FROM users WHERE id=%s",
+            (user.id,),
+        ).fetchone() == (None, hash_token(token), 1)
+
+    async def test_concurrent_completions_cannot_reuse_capability_or_totp(
+        self, db_pool, reset_user_factory, sync_conn
+    ):
+        """Verify concurrent completions cannot reuse capability or TOTP."""
+        user = reset_user_factory()
+        token = generate_reset_token(user.id, user.email)
+        await store_reset_token_hash(db_pool, user.id, hash_token(token), expected_email=user.email)
+        code = _reset_code()
+        results = await asyncio.gather(
+            *(
+                update_password_with_token(
+                    db_pool,
+                    user.id,
+                    token,
+                    password,
+                    expected_email=user.email,
+                    totp_code=code,
+                )
+                for password in (NEW_PASSWORD, THIRD_PASSWORD)
+            ),
+            return_exceptions=True,
+        )
+        assert sum(result is None for result in results) == 1
+        rejected = [result for result in results if isinstance(result, Exception)]
+        assert len(rejected) == 1 and isinstance(rejected[0], InvalidResetToken)
+        assert sync_conn.execute(
+            "SELECT COUNT(*) FROM email_outbox WHERE user_id=%s "
+            "AND message_type='password_changed_notice'",
+            (user.id,),
+        ).fetchone() == (1,)
+
+    async def test_changed_profile_during_hashing_rechecks_password_policy(
+        self, db_pool, reset_user_factory, sync_conn, monkeypatch
+    ):
+        """Verify changed profile during hashing rechecks password policy."""
+        user = reset_user_factory()
+        token = generate_reset_token(user.id, user.email)
+        await store_reset_token_hash(db_pool, user.id, hash_token(token), expected_email=user.email)
+        real_work = password_reset.run_password_work
+
+        async def change_profile(function, *args, **kwargs):
+            """Change the stored display name before performing real password work."""
+            async with get_db_cursor(db_pool) as cur:
+                await cur.execute("UPDATE users SET display_name='Fresh' WHERE id=%s", (user.id,))
+            return await real_work(function, *args, **kwargs)
+
+        monkeypatch.setattr(
+            password_reset,
+            "run_password_work",
+            create_autospec(real_work, side_effect=change_profile),
+        )
+        with pytest.raises(ValueError, match="Password validation failed"):
+            await update_password_with_token(
+                db_pool,
+                user.id,
+                token,
+                NEW_PASSWORD,
+                expected_email=user.email,
+                totp_code=_reset_code(),
+            )
+        assert sync_conn.execute(
+            "SELECT last_totp_step, password_reset_token_hash, password_reset_attempt_count "
+            "FROM users WHERE id=%s",
+            (user.id,),
+        ).fetchone() == (None, hash_token(token), 1)

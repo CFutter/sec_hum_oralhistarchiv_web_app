@@ -1,28 +1,23 @@
-"""Unit tests for the failed-login counter and the lockout-notice claim.
-
-`record_login_failure_cur` reports a database transition (unlocked -> locked)
-rather than merely a counter crossing a threshold. A live lock is never
-extended by further failures, and once a lock expires the next failure opens
-a new streak counted from one, so an attacker cannot keep an account locked
-with one request per lockout window. `queue_lockout_notice_cur` claims the
-one durable notice allowed per streak with a compare-and-set UPDATE. Every
-writer that clears lockout state on recovery (a successful login, a password
-reset, an administrator reactivation, a federated approval, TOTP recovery
-redemption, and TOTP-recovery re-enrollment) must clear the failure counter,
-the lock expiry, and the notice marker together in one statement, so a
-recovered account can be locked again by a fresh failure streak.
-"""
+"""Login-failure streaks, lockout-notice claims and atomic recovery resets."""
 
 import re
 from datetime import UTC, datetime, timedelta
 from unittest.mock import create_autospec, patch
 
-from app.services import authentication, password_reset, totp, totp_recover, users
+from app.services import (
+    authentication,
+    password_reset,
+    password_verification,
+    totp,
+    totp_recover,
+    users,
+)
 from app.services.authentication import (
     queue_lockout_notice_cur,
     record_login_failure_cur,
 )
 from app.services.email_outbox import OutboundEmail
+from app.services.session_ids import hash_session_id
 from app.services.totp_recover import _RecoveryPasswordAttempt
 from app.services.totp_recovery_codes import ReservedRecoveryCodePasswordAttempt
 from config import settings
@@ -33,13 +28,7 @@ AUTH_REVISION = 3
 
 
 def _assert_placeholders_match_params(statement: str, params) -> None:
-    """Named placeholders may repeat a key; positional ones may not repeat.
-
-    For a dict of params, every %(name)s in the statement must name a
-    supplied key (repeats are legitimate psycopg re-use of one bound value).
-    For a sequence of params, the number of positional %s placeholders must
-    equal the number of supplied values.
-    """
+    """Require named placeholders to exist in the mapping and positional counts to match."""
     named = set(re.findall(r"%\(([a-zA-Z_]+)\)s", statement))
     remaining = re.sub(r"%\([a-zA-Z_]+\)s", "", statement)
     positional = re.findall(r"%s", remaining)
@@ -55,24 +44,11 @@ def _assert_placeholders_match_params(statement: str, params) -> None:
 
 
 class TestRecordLoginFailureTransitions:
-    """A live lock is never extended, and an expired one starts over.
-
-    `record_login_failure_cur` reads the database clock only after it holds
-    the user row, so the three outcomes below are decided against the same
-    serialized instant: a failure that arrives while a lock is still live
-    changes nothing, a failure that arrives once the lock has expired is
-    failure number one of a new streak, and that new streak locks the
-    account again only when it reaches the configured threshold.
-    """
+    """Keep live locks unchanged and restart expired streaks at one."""
 
     @staticmethod
     def _cursor(*, failed_login_count, locked_until, database_now, updated=None):
-        """A cursor answering the three reads the helper performs in order.
-
-        The reads are: the locked user row, the database clock, and the row
-        returned by the counter UPDATE. `updated` is left out for the
-        active-lock case, where the helper returns before updating anything.
-        """
+        """Answer locked-user, database-clock and optional UPDATE reads in order."""
         rows = [
             {"failed_login_count": failed_login_count, "locked_until": locked_until},
             {"database_now": database_now},
@@ -91,9 +67,7 @@ class TestRecordLoginFailureTransitions:
         return None
 
     async def test_failure_after_an_expired_lock_is_the_first_of_a_new_streak(self, monkeypatch):
-        """The account was locked once and the lock has run out. The next
-        wrong password counts as one, not as "one more" on top of the old
-        streak, so the account is not locked again on the spot."""
+        """Restart the failure count at one after lock expiry."""
         monkeypatch.setattr(settings, "login_failure_threshold", 3)
         monkeypatch.setattr(settings, "login_lockout_minutes", 15)
         database_now = datetime(2031, 1, 1, tzinfo=UTC)
@@ -115,9 +89,7 @@ class TestRecordLoginFailureTransitions:
         _assert_placeholders_match_params(statement, params)
 
     async def test_failure_at_the_exact_expiry_instant_is_treated_as_expired(self, monkeypatch):
-        """The boundary case: a lock whose expiry equals the database clock
-        is over. Treating it as still live would let the lock outlive its own
-        configured duration."""
+        """Treat expiry equal to the locked-row database clock as expired."""
         monkeypatch.setattr(settings, "login_failure_threshold", 3)
         monkeypatch.setattr(settings, "login_lockout_minutes", 15)
         database_now = datetime(2031, 1, 1, tzinfo=UTC)
@@ -136,9 +108,7 @@ class TestRecordLoginFailureTransitions:
         assert entered_lockout is False
 
     async def test_the_fresh_streak_locks_again_when_it_reaches_the_threshold(self, monkeypatch):
-        """Positive control for the two cases above: the new streak still
-        locks the account, but only once it has collected as many failures as
-        the configured threshold."""
+        """The fresh streak locks again when it reaches the threshold."""
         monkeypatch.setattr(settings, "login_failure_threshold", 3)
         monkeypatch.setattr(settings, "login_lockout_minutes", 15)
         database_now = datetime(2031, 1, 1, tzinfo=UTC)
@@ -162,9 +132,7 @@ class TestRecordLoginFailureTransitions:
     async def test_a_threshold_of_one_locks_on_the_first_failure_of_the_new_streak(
         self, monkeypatch
     ):
-        """With the threshold configured to one, restarting the streak at one
-        must still arm a lock immediately — the fresh budget is allowed to be
-        a single attempt."""
+        """Immediately lock a restarted streak when the threshold is one."""
         monkeypatch.setattr(settings, "login_failure_threshold", 1)
         monkeypatch.setattr(settings, "login_lockout_minutes", 15)
         database_now = datetime(2031, 1, 1, tzinfo=UTC)
@@ -186,9 +154,7 @@ class TestRecordLoginFailureTransitions:
         assert params[:2] == (1, new_locked_until)
 
     async def test_failure_arriving_during_a_live_lock_writes_nothing(self, monkeypatch):
-        """A second request whose password check overlapped the one that
-        locked the account must not touch the row: no counter increment and,
-        above all, no new expiry that would push the unlock time out."""
+        """Failure arriving during a live lock writes nothing."""
         monkeypatch.setattr(settings, "login_failure_threshold", 3)
         monkeypatch.setattr(settings, "login_lockout_minutes", 15)
         database_now = datetime(2031, 1, 1, tzinfo=UTC)
@@ -207,9 +173,7 @@ class TestRecordLoginFailureTransitions:
         assert self._counter_update(cur) is None, "an active lock must not be written to at all"
 
     async def test_the_database_clock_is_read_only_after_the_user_row_is_locked(self, monkeypatch):
-        """Reading the clock first would let a request that waited on another
-        transaction decide "still locked" from a timestamp taken before the
-        wait. The row lock has to come first."""
+        """Read database time after acquiring the user-row lock."""
         monkeypatch.setattr(settings, "login_failure_threshold", 3)
         database_now = datetime(2031, 1, 1, tzinfo=UTC)
         cur = self._cursor(
@@ -226,8 +190,7 @@ class TestRecordLoginFailureTransitions:
         assert "clock_timestamp()" in statements[1]
 
     async def test_an_expired_streak_clears_the_previous_lockout_notice_marker(self, monkeypatch):
-        """The notice marker allows one lockout email per streak. Starting a
-        new streak has to release it, or the new lockout would be silent."""
+        """Clear the old notice marker when starting a new failure streak."""
         monkeypatch.setattr(settings, "login_failure_threshold", 3)
         database_now = datetime(2031, 1, 1, tzinfo=UTC)
         cur = self._cursor(
@@ -244,9 +207,7 @@ class TestRecordLoginFailureTransitions:
         assert params[2] is True, "the expired-streak flag must request the marker reset"
 
     async def test_a_continuing_streak_keeps_its_lockout_notice_marker(self, monkeypatch):
-        """Positive control for the marker reset: an ordinary increment
-        inside one streak must leave the marker alone, so a streak still
-        sends at most one notice."""
+        """A continuing streak keeps its lockout notice marker."""
         monkeypatch.setattr(settings, "login_failure_threshold", 3)
         database_now = datetime(2031, 1, 1, tzinfo=UTC)
         cur = self._cursor(
@@ -266,11 +227,11 @@ class TestQueueLockoutNoticeClaim:
     """queue_lockout_notice_cur claims the notice with a compare-and-set UPDATE."""
 
     def _email(self) -> OutboundEmail:
-        return OutboundEmail("account_locked_notice", "alice@uzh.ch", "Subject", "Body")
+        """Return a fixed account-lockout notice for enqueue assertions."""
+        return OutboundEmail("account_locked_notice", "alice@example.org", "Subject", "Body")
 
     async def test_claim_succeeds_and_enqueues_exactly_once_when_marker_is_null(self):
-        """A NULL marker lets the UPDATE claim the row (one row returned);
-        the claim then enqueues exactly one outbox email in the same call."""
+        """Claim a NULL notice marker and enqueue exactly one email."""
         cur = make_async_cursor(fetchone={"id": USER_ID}, rowcount=1)
         enqueue = create_autospec(authentication.enqueue_outbound_email_cur, spec_set=True)
 
@@ -293,9 +254,7 @@ class TestQueueLockoutNoticeClaim:
         _assert_placeholders_match_params(statement, update.args[1])
 
     async def test_claim_fails_and_skips_enqueue_when_marker_already_set(self):
-        """Positive control's inverse: an already-set marker means the
-        compare-and-set UPDATE matches no row, so the claim reports False and
-        no email is enqueued for this failure streak."""
+        """Claim fails and skips enqueue when marker already set."""
         cur = make_async_cursor(fetchone=None, rowcount=0)
         enqueue = create_autospec(authentication.enqueue_outbound_email_cur, spec_set=True)
 
@@ -321,6 +280,7 @@ def _clears_lockout_state_call(cur):
 
 
 def _assert_single_statement_clears_lockout_state(cur):
+    """Require one statement to clear the notice, failure count and lock expiry."""
     found = _clears_lockout_state_call(cur)
     assert found is not None, "no statement cleared lockout_notice_enqueued_at"
     statement, params = found
@@ -334,6 +294,7 @@ class TestLockoutStateResetWriters:
     marker together in the single statement that ends the failure streak."""
 
     async def test_successful_login_finalization_clears_lockout_state(self):
+        """Successful login finalization clears lockout state."""
         row = {
             **make_sample_user_row(totp_configured=False, totp_secret=None),
             "auth_revision": AUTH_REVISION,
@@ -366,14 +327,17 @@ class TestLockoutStateResetWriters:
         _assert_single_statement_clears_lockout_state(cur)
 
     async def test_password_reset_completion_clears_lockout_state(self):
+        """Password reset completion clears lockout state."""
         snapshot = {
-            "email": "alice@uzh.ch",
+            "email": "alice@example.org",
             "display_name": "Alice Müller",
             "password_hash": "argon2-existing-hash",
+            "auth_revision": 0,
         }
-        cur = make_async_cursor(fetchone=[snapshot, {"id": USER_ID}])
+        cur = make_async_cursor(fetchone=[snapshot, {**snapshot, "id": USER_ID}, {"id": USER_ID}])
 
         async def fake_hash(_func, *_args, **_kwargs):
+            """Return a fixed replacement password hash."""
             return "argon2-new-hash"
 
         with (
@@ -402,18 +366,24 @@ class TestLockoutStateResetWriters:
                     password_reset.invalidate_pending_authentication_state_cur, spec_set=True
                 ),
             ),
+            patch.object(
+                password_reset, "verify_and_consume_totp_cur", autospec=True, return_value=True
+            ),
+            patch.object(password_reset, "enqueue_outbound_email_cur", autospec=True),
         ):
             await password_reset.update_password_with_token(
                 make_mock_pool(),
                 USER_ID,
-                "token-hash",
+                password_reset.generate_reset_token(USER_ID, "alice@example.org"),
                 "Fresh-Password-Without-Common-Words-824!",
-                expected_email="alice@uzh.ch",
+                expected_email="alice@example.org",
+                totp_code="123456",
             )
 
         _assert_single_statement_clears_lockout_state(cur)
 
     async def test_admin_reactivation_clears_lockout_state(self):
+        """Admin reactivation clears lockout state."""
         target = {"is_active": False, "is_admin": False, "auth_method": "local"}
         row = {"old_value": False, "new_value": True, "lock_cleared": True}
         cur = make_async_cursor(fetchone=row)
@@ -447,10 +417,14 @@ class TestLockoutStateResetWriters:
         _assert_single_statement_clears_lockout_state(cur)
 
     async def test_federated_approval_clears_lockout_state(self, monkeypatch):
+        """Federated approval clears lockout state."""
         monkeypatch.setattr(settings, "shibboleth_enabled", True)
         monkeypatch.setattr(settings, "shibboleth_trusted_issuers", ["https://idp.example"])
         row = make_sample_user_row(
-            auth_method="shibboleth", federated_status="approved", is_active=True
+            auth_method="shibboleth",
+            federated_status="approved",
+            is_active=True,
+            reviewed_proposal=None,
         )
         cur = make_async_cursor(fetchone=row)
 
@@ -479,6 +453,7 @@ class TestLockoutStateResetWriters:
                 USER_ID,
                 expected_issuer="https://idp.example",
                 expected_subject_id="urn:subject:7",
+                expected_review_revision=1,
                 access_tier="registered",
                 actor_id=99,
                 actor_session_id="admin-session",
@@ -487,6 +462,7 @@ class TestLockoutStateResetWriters:
         _assert_single_statement_clears_lockout_state(cur)
 
     async def test_totp_recovery_redemption_clears_lockout_state(self):
+        """TOTP recovery redemption clears lockout state."""
         reservation = ReservedRecoveryCodePasswordAttempt(
             user_id=USER_ID, generation=1, position=1, code_hash="code-hash"
         )
@@ -504,14 +480,21 @@ class TestLockoutStateResetWriters:
             "totp_recovery_code_generation": 1,
             "totp_recovery_authorized_at": datetime(2031, 1, 1, tzinfo=UTC),
             "totp_recovery_auth_revision": AUTH_REVISION,
-            "recovery_unexpired": True,
+            "totp_recovery_expires_at": datetime(2032, 1, 1, tzinfo=UTC),
         }
-        cur = make_async_cursor(fetchone=row)
+        cur = make_async_cursor(
+            fetchone=[
+                row,
+                {"position": 1},
+                {"database_now": datetime(2031, 2, 1, tzinfo=UTC)},
+            ]
+        )
 
         with (
             patch.object(
                 totp_recover, "get_db_cursor", autospec=True, return_value=FakeCursorCtx(cur)
             ),
+            patch.object(totp_recover, "queue_security_change_notice_cur", autospec=True),
             patch.object(
                 totp_recover,
                 "_reserve_recovery_password_attempt",
@@ -521,7 +504,9 @@ class TestLockoutStateResetWriters:
                     return_value=attempt,
                 ),
             ),
-            patch.object(totp_recover, "run_password_work", autospec=True, return_value=None),
+            patch.object(
+                password_verification, "run_password_work", autospec=True, return_value=None
+            ),
             patch.object(
                 totp_recover,
                 "consume_reserved_recovery_code_cur",
@@ -546,7 +531,7 @@ class TestLockoutStateResetWriters:
         ):
             result = await totp_recover.redeem_totp_recovery(
                 make_mock_pool(),
-                email="alice@uzh.ch",
+                email="alice@example.org",
                 password="whatever-password",
                 recovery_code="AAAAA-BBBBB-CCCCC-DDDDD",
                 ip_address="127.0.0.1",
@@ -556,6 +541,7 @@ class TestLockoutStateResetWriters:
         _assert_single_statement_clears_lockout_state(cur)
 
     async def test_totp_recovery_reenrollment_clears_lockout_state(self):
+        """TOTP recovery reenrollment clears lockout state."""
         row = {
             "is_active": True,
             "auth_method": "local",
@@ -563,17 +549,21 @@ class TestLockoutStateResetWriters:
             "totp_secret": None,
             "pending_totp_secret": "encrypted-pending-secret",
             "pending_totp_created_at": datetime.now(UTC),
+            "pending_totp_session_hash": hash_session_id("session-id"),
             "totp_recovery_required": True,
         }
         cur = make_async_cursor(fetchone=row)
 
         with (
             patch.object(totp, "get_db_cursor", autospec=True, return_value=FakeCursorCtx(cur)),
+            patch.object(totp, "queue_security_change_notice_cur", autospec=True),
             patch.object(
                 totp,
                 "_lock_authorizing_session_cur",
                 new=create_autospec(
-                    totp._lock_authorizing_session_cur, spec_set=True, return_value=True
+                    totp._lock_authorizing_session_cur,
+                    spec_set=True,
+                    return_value=datetime.now(UTC),
                 ),
             ),
             patch.object(totp, "decrypt_value", autospec=True, return_value="decrypted-secret"),

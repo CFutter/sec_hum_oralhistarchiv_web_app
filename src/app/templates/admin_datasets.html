@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% set active_page = "admin" %}
+{% block title %}Dataset Administration — {{ site_name }}{% endblock %}
+{% block content %}
+<section class="container admin-page">
+  <h1>Dataset Administration</h1>
+  <p><a href="{{ path_for(request, 'admin_dashboard') }}">User management</a></p>
+  <p>Find a dataset by its exact UUID and optional source name. Hidden records and records awaiting upstream correction are included.</p>
+  <form method="get" action="{{ path_for(request, 'admin_datasets') }}">
+    <label for="dataset-source">Source name</label>
+    <input id="dataset-source" name="source" value="{{ source }}" maxlength="32"
+           pattern="[a-z0-9_]{1,32}">
+    <label for="dataset-uuid">Exact UUID</label>
+    <input id="dataset-uuid" name="uuid" value="{{ uuid }}" maxlength="{{ uuid_max_chars }}">
+    <button type="submit" class="btn btn-primary">Find datasets</button>
+    <a href="{{ path_for(request, 'admin_datasets') }}">Clear filters</a>
+  </form>
+  <p>Public catalogue titles help identify visible datasets. Titles are withheld for hidden records and records awaiting upstream correction. Other catalogue metadata follows your own access tier.</p>
+  <div class="admin-table-wrap">
+    <table class="admin-table">
+      <thead><tr><th>ID</th><th>Title</th><th>Source</th><th>UUID</th><th>Effective tier</th><th>Status</th></tr></thead>
+      <tbody>
+      {% for record in records %}
+        <tr>
+          <td><a href="{{ path_for(request, 'admin_dataset_detail', dataset_id=record.dataset_id) }}">{{ record.dataset_id }}</a></td>
+          <td>{% if record.quarantined_at %}Awaiting upstream correction — title withheld{% elif record.state.hidden_at %}Hidden — title withheld{% else %}<a href="{{ path_for(request, 'detail', dataset_id=record.dataset_id) }}">{{ record.public_title or '(untitled)' }}</a>{% endif %}</td>
+          <td>{{ source_labels.get(record.source, record.source) }} <code>{{ record.source }}</code></td>
+          <td><code>{{ record.uuid }}</code></td>
+          <td>{{ record.state.effective_tier }}</td>
+          <td>{{ 'Awaiting upstream correction' if record.quarantined_at else ('Hidden' if record.state.hidden_at else 'Visible') }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6">No matching datasets in the current catalogue.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p>Showing up to {{ page_size }} identities. Exact totals are omitted to keep these controls responsive.</p>
+  <nav class="pagination" aria-label="Dataset administration pages">
+    {% if newer_id is not none %}<a href="{{ url_for_query(request, after_id=none, before_id=newer_id, page=none) }}">Previous</a>{% endif %}
+    <a href="{{ url_for_query(request, after_id=none, before_id=none, page=none) }}">First page</a>
+    {% if older_id is not none %}<a href="{{ url_for_query(request, after_id=older_id, before_id=none, page=none) }}">Next</a>{% endif %}
+  </nav>
+</section>
+{% endblock %}

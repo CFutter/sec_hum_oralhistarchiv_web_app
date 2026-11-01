@@ -1,23 +1,4 @@
-"""Full-rebuild orchestration for app.services.sync (unit tier).
-
-Covers the worker-payload discard before reconciliation, the absence-inferred
-contraction guard (`_delete_stale_source_records`) both as a pure function
-against a fake cursor and as a step ordered before/after its neighbours in
-`_apply_full_harvest`, and the atomic publication of the rebuild's cursor and
-source fingerprint — including every outcome that must leave the prior
-binding untouched.
-
-No DB, no network, no threads: `app.services.sync.get_db_cursor` is patched
-with a factory producing FakeCursorCtx objects around ONE shared mock cursor,
-and `app.services.sync.run_in_threadpool` is autospecced against the real
-starlette.concurrency.run_in_threadpool.
-
-Incremental staging, cursor fencing and progress recovery are covered
-separately in `src/tests/unit/test_sync_incremental.py` and
-`src/tests/unit/test_sync_source_binding.py`. The full-rebuild acceptance
-threshold lives in
-`test_sync_incremental.py::TestFullRebuildSuccessThreshold`.
-"""
+"""Full-rebuild orchestration for app.services.ingestion (unit tier)."""
 
 import logging
 from datetime import UTC, datetime
@@ -26,11 +7,15 @@ from unittest.mock import create_autospec, patch
 import pytest
 from psycopg import OperationalError
 
-from app.services import sync
-from app.services.oai_client import HarvestResult
+from app.services import ingestion
+from app.services.harvest import HarvestResult
 from app.services.stored_harvest import encode_stored_harvest
+from app.sources import oai_client
+from app.sources.oai_pmh_cmdi import OaiPmhCmdiAdapter
 from tests.fixtures import FakeCursorCtx, make_async_cursor, make_mock_pool
+from tests.ingestion_doubles import add_dataset_returning
 from tests.oai_fixtures import SOURCE_CURSOR, parsed_record
+from tests.source_fixtures import legacy_source
 
 
 def _harvest(
@@ -51,19 +36,21 @@ def _harvest(
 
 def _patch_db(cur):
     """Patch the sync module's get_db_cursor with a FakeCursorCtx factory."""
+    add_dataset_returning(cur)
     return patch(
-        "app.services.sync.get_db_cursor",
+        "app.services.ingestion.get_db_cursor",
         autospec=True,
         side_effect=lambda _pool: FakeCursorCtx(cur),
     )
 
 
 def _threadpool_double(**kwargs):
-    """An autospecced stand-in for app.services.sync.run_in_threadpool."""
-    return create_autospec(sync.run_in_threadpool, **kwargs)
+    """An autospecced stand-in for app.services.ingestion.run_source_fetch."""
+    return create_autospec(ingestion.run_source_fetch, **kwargs)
 
 
 def _execute_texts(cur):
+    """Return SQL text from each awaited cursor execute call."""
     return [str(c.args[0]) for c in cur.execute.await_args_list]
 
 
@@ -74,10 +61,10 @@ def _publish_calls(cur):
 
 
 def _status_row(**overrides):
-    """A `sync_status` row shaped for `_sync_source_a`'s cursor-fencing SELECT."""
+    """A `sync_status` row shaped for `_sync_source`'s cursor-fencing SELECT."""
     row = {
         "source_cursor": SOURCE_CURSOR,
-        "source_fingerprint": sync._source_a_fingerprint(),
+        "source_fingerprint": legacy_source().adapter.config_fingerprint(),
         "incremental_harvest": None,
         "incremental_started_at": None,
     }
@@ -86,6 +73,7 @@ def _status_row(**overrides):
 
 
 def _recovery_log_records(caplog):
+    """Select full-recovery audit records by their structured event type."""
     return [
         record
         for record in caplog.records
@@ -93,82 +81,137 @@ def _recovery_log_records(caplog):
     ]
 
 
-class TestFullRebuildDiscardsTheWorkerPayload:
-    """`_full_rebuild_source_a` discards any attached worker payload before
-    handing the harvest to reconciliation — the rebuild never restages worker
-    bytes the way the incremental path does."""
+class TestFullRebuildUsesCurrentHarvestState:
+    """Rebuild reconciliation receives the validated current harvest state."""
 
-    async def test_attached_worker_payload_is_gone_by_the_time_reconciliation_runs(self):
-        """A worker payload attached to the fetched harvest is discarded
-        before `_apply_full_harvest` (reconciliation) is even called."""
+    async def test_worker_decoded_harvest_mutation_reaches_reconciliation(self):
+        """Changes after worker decoding reach the full rebuild without stale data."""
         cur = make_async_cursor(fetchone={"incremental_harvest": None})
         harvest = _harvest(parsed_record("live-1"))
-        harvest._attach_serialized_worker_payload(b"worker-bytes")
+        harvest = oai_client._decode_worker_harvest_result(
+            oai_client.encode_harvest_result(harvest)
+        )
+        harvest.matching_records[0]["title"] = "Corrected before rebuild"
         threadpool = _threadpool_double(return_value=harvest)
         captured = {}
 
         async def _spy_apply_full_harvest(_pool, harvest_arg, *_args, **_kwargs):
-            captured["payload_at_reconciliation"] = harvest_arg.take_serialized_worker_payload()
-            return sync.SyncOutcome("success")
+            """Capture and validate the applied harvest before returning a successful sync outcome."""
+            captured["harvest"] = harvest_arg
+            captured["cursor"] = harvest_arg.validate()
+            return ingestion.SyncOutcome("success")
 
         with (
             _patch_db(cur),
-            patch("app.services.sync.run_in_threadpool", new=threadpool),
+            patch("app.services.ingestion.run_source_fetch", new=threadpool),
             patch.object(
-                sync, "_apply_full_harvest", autospec=True, side_effect=_spy_apply_full_harvest
+                ingestion, "_apply_full_harvest", autospec=True, side_effect=_spy_apply_full_harvest
             ),
         ):
-            await sync._full_rebuild_source_a(make_mock_pool())
+            await ingestion._full_rebuild_source(
+                make_mock_pool(),
+                configured_source=legacy_source(),
+            )
 
-        assert captured["payload_at_reconciliation"] is None
+        assert captured["harvest"] is harvest
+        assert captured["cursor"] == harvest.source_cursor
+        assert harvest.matching_records[0]["title"] == "Corrected before rebuild"
 
-    async def test_full_rebuild_without_an_attached_payload_reconciles_normally(self):
-        """Positive control: a harvest with nothing attached (the ordinary
-        case — full rebuilds fetch synchronously, not through the isolated
-        worker) reconciles exactly the same way; the discard call does not
-        require a payload to have been attached."""
+    async def test_directly_constructed_harvest_reconciles_normally(self):
+        """Direct adapter results follow the same validation and reconciliation path."""
         cur = make_async_cursor(fetchone={"incremental_harvest": None})
         harvest = _harvest(parsed_record("live-1"))
         threadpool = _threadpool_double(return_value=harvest)
 
         with (
             _patch_db(cur),
-            patch("app.services.sync.run_in_threadpool", new=threadpool),
+            patch("app.services.ingestion.run_source_fetch", new=threadpool),
             patch.object(
-                sync,
+                ingestion,
                 "_apply_full_harvest",
                 autospec=True,
-                return_value=sync.SyncOutcome("success"),
+                return_value=ingestion.SyncOutcome("success"),
             ) as apply_full_harvest,
         ):
-            outcome = await sync._full_rebuild_source_a(make_mock_pool())
+            outcome = await ingestion._full_rebuild_source(
+                make_mock_pool(),
+                configured_source=legacy_source(),
+            )
 
         apply_full_harvest.assert_awaited_once()
         assert outcome.status == "success"
 
 
 class TestContractionGuardBoundaries:
-    """`_delete_stale_source_records` against a fake cursor: it aborts before
-    issuing the DELETE whenever the absence-inferred count crosses either
-    limit, and executes exactly one DELETE otherwise."""
+    """Cover contraction guard boundaries."""
+
+    @pytest.mark.parametrize(
+        "existing,deleted,count_limit,ratio_limit,allowed",
+        [
+            (3, 1, 1, 34, True),
+            (3, 1, 1, 33, False),
+            (10, 1, 0, 100, False),
+            (10, 1, 1, 0, False),
+            (10, 0, 0, 0, True),
+            (1000, 101, 101, 11, True),
+        ],
+    )
+    async def test_selected_limits_control_each_boundary_and_appear_in_errors(
+        self, existing, deleted, count_limit, ratio_limit, allowed
+    ):
+        """Check selected limits control each boundary and appear in errors."""
+        cur = make_async_cursor(
+            fetchone={"existing_count": existing, "inferred_delete_count": deleted}
+        )
+        if allowed:
+            await ingestion._delete_stale_source_records(
+                cur,
+                "swissubase",
+                ["offered"],
+                max_inferred_delete_count=count_limit,
+                max_inferred_delete_ratio_percent=ratio_limit,
+            )
+            assert any(text.strip().startswith("DELETE") for text in _execute_texts(cur))
+        else:
+            with pytest.raises(ingestion._RebuildContractionAborted) as caught:
+                await ingestion._delete_stale_source_records(
+                    cur,
+                    "swissubase",
+                    ["offered"],
+                    max_inferred_delete_count=count_limit,
+                    max_inferred_delete_ratio_percent=ratio_limit,
+                )
+            assert f"{count_limit} records and {ratio_limit}%" in str(caught.value)
+            assert not any(text.strip().startswith("DELETE") for text in _execute_texts(cur))
 
     async def test_1000_existing_rows_with_1_offered_aborts_before_the_delete(self):
+        """Check 1000 existing rows with 1 offered aborts before the delete."""
         cur = make_async_cursor(fetchone={"existing_count": 1000, "inferred_delete_count": 999})
 
-        with pytest.raises(sync._RebuildContractionAborted) as exc_info:
-            await sync._delete_stale_source_records(cur, "swissubase", ["only-offered"])
+        with pytest.raises(ingestion._RebuildContractionAborted) as exc_info:
+            await ingestion._delete_stale_source_records(
+                cur,
+                "swissubase",
+                ["only-offered"],
+                max_inferred_delete_count=100,
+                max_inferred_delete_ratio_percent=25,
+            )
 
         assert exc_info.value.existing_count == 1000
         assert exc_info.value.inferred_delete_count == 999
         assert not any(text.strip().startswith("DELETE") for text in _execute_texts(cur))
 
     async def test_a_small_contraction_executes_exactly_one_stale_delete(self):
-        """Positive control for the abort above: a deletion count below both
-        limits is not aborted and issues exactly one DELETE with the exact
-        keep-list."""
+        """Check a small contraction executes exactly one stale delete."""
         cur = make_async_cursor(fetchone={"existing_count": 10, "inferred_delete_count": 1})
 
-        await sync._delete_stale_source_records(cur, "swissubase", ["keep-1", "keep-2"])
+        await ingestion._delete_stale_source_records(
+            cur,
+            "swissubase",
+            ["keep-1", "keep-2"],
+            max_inferred_delete_count=100,
+            max_inferred_delete_ratio_percent=25,
+        )
 
         delete_calls = [
             c for c in cur.execute.await_args_list if str(c.args[0]).strip().startswith("DELETE")
@@ -188,6 +231,7 @@ class TestContractionGuardBoundaries:
     async def test_contraction_limits_allow_equality_and_abort_one_over(
         self, existing_count, inferred_delete_count, aborts
     ):
+        """Check contraction limits allow equality and abort one over."""
         cur = make_async_cursor(
             fetchone={
                 "existing_count": existing_count,
@@ -196,11 +240,23 @@ class TestContractionGuardBoundaries:
         )
 
         if aborts:
-            with pytest.raises(sync._RebuildContractionAborted):
-                await sync._delete_stale_source_records(cur, "swissubase", ["offered"])
+            with pytest.raises(ingestion._RebuildContractionAborted):
+                await ingestion._delete_stale_source_records(
+                    cur,
+                    "swissubase",
+                    ["offered"],
+                    max_inferred_delete_count=100,
+                    max_inferred_delete_ratio_percent=25,
+                )
             assert not any(text.strip().startswith("DELETE") for text in _execute_texts(cur))
         else:
-            await sync._delete_stale_source_records(cur, "swissubase", ["offered"])
+            await ingestion._delete_stale_source_records(
+                cur,
+                "swissubase",
+                ["offered"],
+                max_inferred_delete_count=100,
+                max_inferred_delete_ratio_percent=25,
+            )
             delete_calls = [
                 c
                 for c in cur.execute.await_args_list
@@ -210,12 +266,10 @@ class TestContractionGuardBoundaries:
 
 
 class TestExplicitRemovalsPrecedeTheContractionGuard:
-    """`_apply_full_harvest` deletes explicit upstream withdrawals before it
-    ever asks `_delete_stale_source_records` to evaluate absence, so an
-    explicit tombstone can never itself be miscounted as an inferred,
-    absence-based deletion."""
+    """Cover explicit removals precede the contraction guard."""
 
     async def test_explicit_deletion_runs_before_the_stale_delete_call(self):
+        """Check explicit deletion runs before the stale delete call."""
         cur = make_async_cursor()
         harvest = _harvest(
             parsed_record("live-1"),
@@ -224,81 +278,116 @@ class TestExplicitRemovalsPrecedeTheContractionGuard:
         )
         order = []
 
-        async def _track_explicit(_cur, _source, uuids):
+        async def _track_explicit(_cur, _source, uuids, *, audit=None):
+            """Require no audit helper, record explicit deletions, and return their count."""
+            assert audit is None
             order.append(("explicit", tuple(uuids)))
+            return len(uuids)
 
-        async def _track_stale(_cur, _source, protected_uuids):
+        async def _track_stale(
+            _cur,
+            _source,
+            protected_uuids,
+            *,
+            max_inferred_delete_count,
+            max_inferred_delete_ratio_percent,
+            quarantined_uuids,
+        ):
+            """Check the deletion budgets and quarantine set before recording inferred deletion inputs."""
+            assert (max_inferred_delete_count, max_inferred_delete_ratio_percent) == (100, 25)
+            assert quarantined_uuids == ["nonmatching-1"]
             order.append(("stale", tuple(protected_uuids)))
 
         with (
             _patch_db(cur),
             patch.object(
-                sync, "_delete_explicit_source_records", autospec=True, side_effect=_track_explicit
+                ingestion,
+                "_delete_explicit_source_records",
+                autospec=True,
+                side_effect=_track_explicit,
             ),
             patch.object(
-                sync, "_delete_stale_source_records", autospec=True, side_effect=_track_stale
+                ingestion, "_delete_stale_source_records", autospec=True, side_effect=_track_stale
             ),
-            patch.object(sync, "_reconcile_rebuild_records", autospec=True, return_value=(1, [])),
-            patch.object(sync, "_update_full_rebuild_timestamp", autospec=True),
-            patch.object(sync, "_clear_sync_error", autospec=True),
+            patch.object(
+                ingestion, "_reconcile_rebuild_records", autospec=True, return_value=(1, [])
+            ),
+            patch.object(ingestion, "_update_full_rebuild_timestamp", autospec=True),
+            patch.object(ingestion, "_clear_sync_error", autospec=True),
         ):
-            await sync._apply_full_harvest(make_mock_pool(), harvest, SOURCE_CURSOR)
+            configured_source = legacy_source()
+            await ingestion._apply_full_harvest(
+                make_mock_pool(),
+                harvest,
+                SOURCE_CURSOR,
+                configured_source=configured_source,
+                source_fingerprint=configured_source.adapter.config_fingerprint(),
+            )
 
         assert order == [
-            ("explicit", ("nonmatching-1", "tombstoned-1")),
-            ("stale", ("live-1",)),
+            ("explicit", ("tombstoned-1",)),
+            ("stale", ("live-1", "nonmatching-1")),
         ]
 
 
 class TestAtomicPublicationOfCursorAndFingerprint:
-    """A successful full rebuild publishes its new cursor and source
-    fingerprint together, in the same UPDATE as its authoritative success;
-    every other outcome leaves the prior binding exactly as it was."""
+    """Cover atomic publication of cursor and fingerprint."""
 
     async def test_successful_rebuild_publishes_cursor_and_fingerprint_in_one_statement(self):
+        """Check successful rebuild publishes cursor and fingerprint in one statement."""
         cur = make_async_cursor(fetchone=[{"had_failures": False}])
         harvest = _harvest(parsed_record("live-1"))
 
         with (
             _patch_db(cur),
-            patch.object(sync, "_delete_stale_source_records", autospec=True),
-            patch.object(sync, "_reconcile_rebuild_records", autospec=True, return_value=(1, [])),
+            patch.object(ingestion, "_delete_stale_source_records", autospec=True),
+            patch.object(
+                ingestion, "_reconcile_rebuild_records", autospec=True, return_value=(1, [])
+            ),
         ):
-            outcome = await sync._apply_full_harvest(
+            outcome = await ingestion._apply_full_harvest(
                 make_mock_pool(),
                 harvest,
                 SOURCE_CURSOR,
-                source_fingerprint=sync._source_a_fingerprint(),
+                configured_source=legacy_source(),
+                source_fingerprint=legacy_source().adapter.config_fingerprint(),
             )
 
         assert outcome.status == "success"
         publish_calls = _publish_calls(cur)
         assert len(publish_calls) == 1
         sql_text, params = publish_calls[0].args
-        assert str(sql_text).count("%s") == len(params) == 4
-        harvest_started_at, full_rebuild_started_at, source_cursor, source_fingerprint = params
+        assert str(sql_text).count("%s") == len(params) == 5
+        (
+            harvest_started_at,
+            full_rebuild_started_at,
+            source_cursor,
+            source_fingerprint,
+            source,
+        ) = params
+        assert source == legacy_source().policy.name
         assert harvest_started_at == full_rebuild_started_at == SOURCE_CURSOR
         assert source_cursor == harvest.source_cursor
-        assert source_fingerprint == sync._source_a_fingerprint()
+        assert source_fingerprint == legacy_source().adapter.config_fingerprint()
 
     async def test_a_partial_rebuild_with_uncertain_records_leaves_the_prior_binding(self):
-        """A rebuild with unresolved records (uncertain metadata here; a
-        per-record write failure takes the identical branch) never reaches
-        the publish statement at all — `_update_full_rebuild_timestamp`
-        returns after recording the failures."""
+        """Check a partial rebuild with uncertain records leaves the prior binding."""
         cur = make_async_cursor()
         harvest = _harvest(parsed_record("live-1"), uncertain={"uncertain-1": "bad metadata"})
 
         with (
             _patch_db(cur),
-            patch.object(sync, "_delete_stale_source_records", autospec=True),
-            patch.object(sync, "_reconcile_rebuild_records", autospec=True, return_value=(1, [])),
+            patch.object(ingestion, "_delete_stale_source_records", autospec=True),
+            patch.object(
+                ingestion, "_reconcile_rebuild_records", autospec=True, return_value=(1, [])
+            ),
         ):
-            outcome = await sync._apply_full_harvest(
+            outcome = await ingestion._apply_full_harvest(
                 make_mock_pool(),
                 harvest,
                 SOURCE_CURSOR,
-                source_fingerprint=sync._source_a_fingerprint(),
+                configured_source=legacy_source(),
+                source_fingerprint=legacy_source().adapter.config_fingerprint(),
             )
 
         assert outcome.status == "partial"
@@ -307,32 +396,35 @@ class TestAtomicPublicationOfCursorAndFingerprint:
     async def test_an_empty_rebuild_leaves_the_prior_binding(self):
         """No matching records at all: only explicit removals apply, and the
         cursor/fingerprint UPDATE is never reached."""
-        cur = make_async_cursor()
-        harvest = _harvest()  # no matching_records at all
+        cur = make_async_cursor(fetchone={"failed_count": 0})
+        harvest = _harvest()
 
         with _patch_db(cur):
-            outcome = await sync._apply_full_harvest(
+            outcome = await ingestion._apply_full_harvest(
                 make_mock_pool(),
                 harvest,
                 SOURCE_CURSOR,
-                source_fingerprint=sync._source_a_fingerprint(),
+                configured_source=legacy_source(),
+                source_fingerprint=legacy_source().adapter.config_fingerprint(),
             )
 
         assert outcome.status == "failed"
         assert _publish_calls(cur) == []
 
     async def test_a_contraction_aborted_rebuild_leaves_the_prior_binding(self):
+        """Check a contraction aborted rebuild leaves the prior binding."""
         cur = make_async_cursor(
             fetchone={"existing_count": 1000, "inferred_delete_count": 999},
         )
         harvest = _harvest(parsed_record("live-1"))
 
         with _patch_db(cur):
-            outcome = await sync._apply_full_harvest(
+            outcome = await ingestion._apply_full_harvest(
                 make_mock_pool(),
                 harvest,
                 SOURCE_CURSOR,
-                source_fingerprint=sync._source_a_fingerprint(),
+                configured_source=legacy_source(),
+                source_fingerprint=legacy_source().adapter.config_fingerprint(),
             )
 
         assert outcome.status == "failed"
@@ -344,27 +436,28 @@ class TestAtomicPublicationOfCursorAndFingerprint:
         ids=["non_staged_recovery_path", "staged_recovery_path"],
     )
     async def test_a_successful_rebuild_clears_a_stale_incremental_error(self, staged):
-        """Whether or not this success came from clearing a staged payload
-        that could not be replayed, a clean rebuild always clears the
-        incremental error channel — not only its own rebuild channel."""
+        """Check a successful rebuild clears a stale incremental error."""
         fetchone_sequence = []
         if staged:
-            fetchone_sequence.append({"id": 1})  # confirms the guarded staged clear
+            fetchone_sequence.append({"source": "swissubase"})
         fetchone_sequence.append({"had_failures": False})
         cur = make_async_cursor(fetchone=fetchone_sequence)
         harvest = _harvest(parsed_record("live-1"))
 
         with (
             _patch_db(cur),
-            patch.object(sync, "_delete_stale_source_records", autospec=True),
-            patch.object(sync, "_reconcile_rebuild_records", autospec=True, return_value=(1, [])),
+            patch.object(ingestion, "_delete_stale_source_records", autospec=True),
+            patch.object(
+                ingestion, "_reconcile_rebuild_records", autospec=True, return_value=(1, [])
+            ),
         ):
-            outcome = await sync._apply_full_harvest(
+            outcome = await ingestion._apply_full_harvest(
                 make_mock_pool(),
                 harvest,
                 SOURCE_CURSOR,
+                configured_source=legacy_source(),
                 staged_payload_to_clear=b"staged-bytes" if staged else None,
-                source_fingerprint=sync._source_a_fingerprint(),
+                source_fingerprint=legacy_source().adapter.config_fingerprint(),
             )
 
         assert outcome.status == "success"
@@ -375,18 +468,12 @@ class TestAtomicPublicationOfCursorAndFingerprint:
 
 
 class TestFullRebuildRecoversFromAnUnreplayableStagedPayload:
-    """`_full_rebuild_source_a` opportunistically replays a pending staged
-    harvest before its own authoritative fetch. When that replay cannot be
-    trusted (corrupt durable progress, or a staged row committed without a
-    start time), the rebuild does not fail outright: it proceeds to its own
-    epoch fetch and hands the exact pending bytes to `_apply_full_harvest` as
-    the guarded-clear argument, so the stale staged row is only cleared if it
-    is still exactly what was diagnosed as unreplayable. A genuine database
-    exception while replaying is a different thing entirely — it is reported
-    as an infrastructure failure and propagates, never treated as a recovery
-    signal."""
+    """`_full_rebuild_source` opportunistically replays a pending staged harvest before its own
+    authoritative fetch.
+    """
 
     def _pending_and_status_rows(self, pending_payload, **status_overrides):
+        """Build pending-payload and status rows for staged-harvest recovery."""
         return [
             {"incremental_harvest": pending_payload},
             _status_row(incremental_harvest=pending_payload, **status_overrides),
@@ -395,13 +482,11 @@ class TestFullRebuildRecoversFromAnUnreplayableStagedPayload:
     async def test_corrupt_staged_progress_forces_the_epoch_fetch_and_guards_the_pending_payload_for_clearing(
         self,
     ):
-        """A staged payload whose durable position no longer belongs to its
-        own work list (position=99 against a 1-item list) makes the replay
-        raise the full-reharvest signal from deep inside
-        `_apply_incremental_harvest`; the rebuild still proceeds to fetch
-        since the epoch and passes the pending bytes through for a guarded
-        clear."""
-        fingerprint = sync._source_a_fingerprint()
+        """Check corrupt staged progress forces the epoch fetch and guards the pending payload for
+        clearing.
+        """
+        configured_source = legacy_source()
+        fingerprint = configured_source.adapter.config_fingerprint()
         started_at = datetime(2026, 1, 1, tzinfo=UTC)
         pending_payload = encode_stored_harvest(
             _harvest(parsed_record("staged-1")), source_fingerprint=fingerprint
@@ -417,30 +502,38 @@ class TestFullRebuildRecoversFromAnUnreplayableStagedPayload:
 
         with (
             _patch_db(cur),
-            patch("app.services.sync.run_in_threadpool", new=threadpool),
+            patch("app.services.ingestion.run_source_fetch", new=threadpool),
             patch.object(
-                sync,
+                ingestion,
                 "_apply_full_harvest",
                 autospec=True,
-                return_value=sync.SyncOutcome("success"),
+                return_value=ingestion.SyncOutcome("success"),
             ) as apply_full_harvest,
         ):
-            outcome = await sync._full_rebuild_source_a(make_mock_pool())
+            outcome = await ingestion._full_rebuild_source(
+                make_mock_pool(),
+                configured_source=configured_source,
+            )
 
         threadpool.assert_awaited_once()
-        assert threadpool.call_args.args[0] is sync.fetch_updates_isolated
-        assert threadpool.call_args.kwargs["since"] == "1900-01-01"
+        fetch = threadpool.call_args.args[0]
+        assert fetch.__func__ is OaiPmhCmdiAdapter.fetch
+        assert isinstance(fetch.__self__, OaiPmhCmdiAdapter)
+        assert fetch.__self__ is configured_source.adapter
+        assert fetch.__self__.max_pages == configured_source.config.model_dump()["max_pages"]
+        assert threadpool.call_args.kwargs["since"] is None
         apply_full_harvest.assert_awaited_once()
+        assert apply_full_harvest.await_args.kwargs["configured_source"] is configured_source
         assert apply_full_harvest.await_args.kwargs["staged_payload_to_clear"] == pending_payload
         assert outcome.status == "success"
 
     async def test_missing_incremental_started_at_forces_the_epoch_fetch_and_guards_the_pending_payload_for_clearing(
         self,
     ):
-        """The same orchestration as above, reached instead through a staged
-        row committed without `incremental_started_at` — the signal fires
-        immediately after decoding, before any work-list check runs."""
-        fingerprint = sync._source_a_fingerprint()
+        """Check missing incremental started at forces the epoch fetch and guards the pending payload
+        for clearing.
+        """
+        fingerprint = legacy_source().adapter.config_fingerprint()
         pending_payload = encode_stored_harvest(
             _harvest(parsed_record("staged-1")), source_fingerprint=fingerprint
         )
@@ -452,18 +545,21 @@ class TestFullRebuildRecoversFromAnUnreplayableStagedPayload:
 
         with (
             _patch_db(cur),
-            patch("app.services.sync.run_in_threadpool", new=threadpool),
+            patch("app.services.ingestion.run_source_fetch", new=threadpool),
             patch.object(
-                sync,
+                ingestion,
                 "_apply_full_harvest",
                 autospec=True,
-                return_value=sync.SyncOutcome("success"),
+                return_value=ingestion.SyncOutcome("success"),
             ) as apply_full_harvest,
         ):
-            outcome = await sync._full_rebuild_source_a(make_mock_pool())
+            outcome = await ingestion._full_rebuild_source(
+                make_mock_pool(),
+                configured_source=legacy_source(),
+            )
 
         threadpool.assert_awaited_once()
-        assert threadpool.call_args.kwargs["since"] == "1900-01-01"
+        assert threadpool.call_args.kwargs["since"] is None
         apply_full_harvest.assert_awaited_once()
         assert apply_full_harvest.await_args.kwargs["staged_payload_to_clear"] == pending_payload
         assert outcome.status == "success"
@@ -471,11 +567,8 @@ class TestFullRebuildRecoversFromAnUnreplayableStagedPayload:
     async def test_recovery_log_record_carries_the_event_type_action_and_diagnosed_reason(
         self, caplog
     ):
-        """The warning logged when a pending replay is abandoned carries
-        structured fields a reader can act on without parsing the message:
-        the event type, the recovery action taken, and the exact diagnosed
-        reason — here the missing `incremental_started_at`."""
-        fingerprint = sync._source_a_fingerprint()
+        """Check recovery log record carries the event type action and diagnosed reason."""
+        fingerprint = legacy_source().adapter.config_fingerprint()
         pending_payload = encode_stored_harvest(
             _harvest(parsed_record("staged-1")), source_fingerprint=fingerprint
         )
@@ -486,16 +579,19 @@ class TestFullRebuildRecoversFromAnUnreplayableStagedPayload:
 
         with (
             _patch_db(cur),
-            patch("app.services.sync.run_in_threadpool", new=threadpool),
+            patch("app.services.ingestion.run_source_fetch", new=threadpool),
             patch.object(
-                sync,
+                ingestion,
                 "_apply_full_harvest",
                 autospec=True,
-                return_value=sync.SyncOutcome("success"),
+                return_value=ingestion.SyncOutcome("success"),
             ),
-            caplog.at_level(logging.WARNING, logger="app.services.sync"),
+            caplog.at_level(logging.WARNING, logger="app.services.ingestion"),
         ):
-            await sync._full_rebuild_source_a(make_mock_pool())
+            await ingestion._full_rebuild_source(
+                make_mock_pool(),
+                configured_source=legacy_source(),
+            )
 
         records = _recovery_log_records(caplog)
         assert len(records) == 1
@@ -504,11 +600,7 @@ class TestFullRebuildRecoversFromAnUnreplayableStagedPayload:
         assert record.reason == "staged harvest exists without incremental_started_at"
 
     async def test_a_database_exception_during_the_replay_is_not_treated_as_recovery(self):
-        """An exception that is not the typed full-reharvest signal (a real
-        database failure here) never reaches the recovery branch: no epoch
-        fetch runs, `_apply_full_harvest` is never called, the failure is
-        reported through the still-owned rebuild error channel, and the
-        exception still propagates to the caller."""
+        """Check a database exception during the replay is not treated as recovery (OperationalError)."""
         pending_payload = b"opaque-pending-bytes"
         cur = make_async_cursor(fetchone={"incremental_harvest": pending_payload})
         db_error = OperationalError("connection reset by peer")
@@ -516,13 +608,16 @@ class TestFullRebuildRecoversFromAnUnreplayableStagedPayload:
 
         with (
             _patch_db(cur),
-            patch("app.services.sync.run_in_threadpool", new=threadpool),
-            patch.object(sync, "_sync_source_a", autospec=True, side_effect=db_error),
-            patch.object(sync, "_apply_full_harvest", autospec=True) as apply_full_harvest,
-            patch.object(sync, "_report_write_failure", autospec=True) as report_write_failure,
+            patch("app.services.ingestion.run_source_fetch", new=threadpool),
+            patch.object(ingestion, "_sync_source", autospec=True, side_effect=db_error),
+            patch.object(ingestion, "_apply_full_harvest", autospec=True) as apply_full_harvest,
+            patch.object(ingestion, "_report_write_failure", autospec=True) as report_write_failure,
             pytest.raises(OperationalError, match="connection reset by peer"),
         ):
-            await sync._full_rebuild_source_a(make_mock_pool())
+            await ingestion._full_rebuild_source(
+                make_mock_pool(),
+                configured_source=legacy_source(),
+            )
 
         threadpool.assert_not_awaited()
         apply_full_harvest.assert_not_awaited()
@@ -533,11 +628,8 @@ class TestFullRebuildRecoversFromAnUnreplayableStagedPayload:
     async def test_a_valid_staged_replay_passes_no_guarded_payload_and_logs_no_recovery(
         self, caplog
     ):
-        """Positive control: when the pending replay actually succeeds (valid
-        fingerprint, start time and progress), nothing is diagnosed as
-        unreplayable — `_apply_full_harvest` is told there is no staged
-        payload to guard-clear, and no recovery warning is logged."""
-        fingerprint = sync._source_a_fingerprint()
+        """Check a valid staged replay passes no guarded payload and logs no recovery."""
+        fingerprint = legacy_source().adapter.config_fingerprint()
         started_at = datetime(2026, 1, 1, tzinfo=UTC)
         pending_payload = encode_stored_harvest(
             _harvest(parsed_record("staged-1")), source_fingerprint=fingerprint
@@ -553,16 +645,19 @@ class TestFullRebuildRecoversFromAnUnreplayableStagedPayload:
 
         with (
             _patch_db(cur),
-            patch("app.services.sync.run_in_threadpool", new=threadpool),
+            patch("app.services.ingestion.run_source_fetch", new=threadpool),
             patch.object(
-                sync,
+                ingestion,
                 "_apply_full_harvest",
                 autospec=True,
-                return_value=sync.SyncOutcome("success"),
+                return_value=ingestion.SyncOutcome("success"),
             ) as apply_full_harvest,
-            caplog.at_level(logging.WARNING, logger="app.services.sync"),
+            caplog.at_level(logging.WARNING, logger="app.services.ingestion"),
         ):
-            outcome = await sync._full_rebuild_source_a(make_mock_pool())
+            outcome = await ingestion._full_rebuild_source(
+                make_mock_pool(),
+                configured_source=legacy_source(),
+            )
 
         apply_full_harvest.assert_awaited_once()
         assert apply_full_harvest.await_args.kwargs["staged_payload_to_clear"] is None

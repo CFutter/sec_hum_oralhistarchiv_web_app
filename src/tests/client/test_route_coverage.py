@@ -1,14 +1,4 @@
-"""Every live HTTP route has a registered client-tier witness and pinned guards.
-
-The registry below is the single place that says, per (method, path) of the
-running application, which client-tier test exercises the route through the
-real middleware stack and which guards the route must carry: its access
-policy, whether mutation bodies must be form-encoded, whether the CSRF pair
-is verified, and the rate limits registered on the endpoint. The tests read
-the live route table from the application object, so a route that is added
-without a registry row, a row whose guards drift from the wired dependencies,
-or a witness that no longer collects each fails here.
-"""
+"""Every live HTTP route has a registered client-tier witness and pinned guards."""
 
 import importlib
 import re
@@ -60,6 +50,13 @@ ROUTE_COVERAGE: dict[tuple[str, str], RouteCoverage] = {
         False,
         _DEFAULT,
         "src/tests/client/test_page_routes.py::TestDatasetKeywordLinks::test_generated_long_keyword_link_round_trips_through_router",
+    ),
+    ("GET", "/dataset/{dataset_id}/resource/{proxy_index}"): RouteCoverage(
+        "public",
+        False,
+        False,
+        _DEFAULT,
+        "src/tests/client/test_resource_access.py::test_redirect_requires_the_effective_metadata_tier",
     ),
     ("GET", "/about"): RouteCoverage(
         "public",
@@ -164,7 +161,7 @@ ROUTE_COVERAGE: dict[tuple[str, str], RouteCoverage] = {
         True,
         True,
         _STEP_UP_LIMITS,
-        "src/tests/client/test_totp_enrollment_routes.py::TestSetupTotpSubmit::test_setup_totp_valid_code_persists_db_secret_and_upgrades_purpose",
+        "src/tests/client/test_totp_enrollment_routes.py::TestSetupTotpSubmit::test_setup_totp_success_clears_the_old_cookie_and_requires_fresh_login",
     ),
     ("GET", "/account/reset-totp"): RouteCoverage(
         "full_session",
@@ -201,7 +198,7 @@ ROUTE_COVERAGE: dict[tuple[str, str], RouteCoverage] = {
         _PUBLIC_POST_LIMITS,
         "src/tests/client/test_auth_routes.py::TestForgotPasswordRoute::test_valid_pair_reaches_the_lookup_service_and_renders_the_neutral_page",
     ),
-    ("GET", "/reset-password/{token}"): RouteCoverage(
+    ("GET", "/reset-password/{public_id}"): RouteCoverage(
         "capability",
         False,
         False,
@@ -215,12 +212,61 @@ ROUTE_COVERAGE: dict[tuple[str, str], RouteCoverage] = {
         _STEP_UP_LIMITS,
         "src/tests/client/test_auth_routes.py::TestResetPasswordRoute::test_valid_submission_redirects_and_commits_exactly_once",
     ),
+    ("POST", "/unlock-account"): RouteCoverage(
+        "capability",
+        True,
+        True,
+        _STEP_UP_LIMITS,
+        "src/tests/client/test_mailbox_unlock.py::test_mailbox_unlock_sets_new_cookie_after_service_commit",
+    ),
     ("GET", "/account"): RouteCoverage(
         "full_session",
         False,
         False,
         _DEFAULT,
         "src/tests/client/test_error_handling.py::test_authenticated_page_gets_no_store",
+    ),
+    ("GET", "/account/change-password"): RouteCoverage(
+        "local_full_session",
+        False,
+        False,
+        _DEFAULT,
+        "src/tests/client/test_password_change_routes.py::test_change_form_is_read_only_and_does_not_cache_credentials",
+    ),
+    ("POST", "/account/change-password"): RouteCoverage(
+        "local_full_session",
+        True,
+        True,
+        _STEP_UP_LIMITS,
+        "src/tests/client/test_password_change_routes.py::test_success_uses_resolved_identity_revokes_browser_and_audits_once",
+    ),
+    ("GET", "/account/delete"): RouteCoverage(
+        "local_full_session",
+        False,
+        False,
+        _DEFAULT,
+        "src/tests/client/test_account_deletion_routes.py::test_local_account_confirmation_is_read_only_and_not_cached",
+    ),
+    ("POST", "/account/delete"): RouteCoverage(
+        "local_full_session",
+        True,
+        True,
+        _PUBLIC_POST_LIMITS,
+        "src/tests/client/test_account_deletion_routes.py::test_self_deletion_delegates_current_session_and_audits_one_pseudonym",
+    ),
+    ("GET", "/admin/users/{user_id}/delete"): RouteCoverage(
+        "admin",
+        False,
+        False,
+        _DEFAULT,
+        "src/tests/client/test_account_deletion_routes.py::test_admin_confirmation_escapes_target_and_does_not_remove_it",
+    ),
+    ("POST", "/admin/users/{user_id}/delete"): RouteCoverage(
+        "admin",
+        True,
+        True,
+        _PUBLIC_POST_LIMITS,
+        "src/tests/client/test_account_deletion_routes.py::test_admin_deletion_uses_resolved_actor_and_audits_committed_pseudonym",
     ),
     ("POST", "/account/change-name"): RouteCoverage(
         "local_full_session",
@@ -263,6 +309,27 @@ ROUTE_COVERAGE: dict[tuple[str, str], RouteCoverage] = {
         False,
         _DEFAULT,
         "src/tests/client/test_admin_membership_routes.py::TestAdminDashboardAccess::test_admin_dashboard_renders_for_admin",
+    ),
+    ("GET", "/admin/datasets"): RouteCoverage(
+        "admin",
+        False,
+        False,
+        _DEFAULT,
+        "src/tests/client/test_dataset_admin_routes.py::test_admin_list_renders_hidden_identity",
+    ),
+    ("GET", "/admin/datasets/{dataset_id}"): RouteCoverage(
+        "admin",
+        False,
+        False,
+        _DEFAULT,
+        "src/tests/client/test_dataset_admin_routes.py::test_admin_detail_renders_controls",
+    ),
+    ("POST", "/admin/datasets/{dataset_id}/state"): RouteCoverage(
+        "admin",
+        True,
+        True,
+        _DEFAULT,
+        "src/tests/client/test_dataset_admin_routes.py::test_state_change_uses_resolved_authority",
     ),
     ("GET", "/admin/users/{user_id}/totp-recovery"): RouteCoverage(
         "admin",
@@ -320,19 +387,19 @@ ROUTE_COVERAGE: dict[tuple[str, str], RouteCoverage] = {
         _DEFAULT,
         "src/tests/client/test_admin_email_change_routes.py::TestAdminChangeEmail::test_admin_email_change_delegates_resolved_authority",
     ),
-    ("GET", "/verify-email/{token}"): RouteCoverage(
+    ("GET", "/verify-email/{public_id}"): RouteCoverage(
         "capability",
         False,
         False,
         _READ_LIMITS,
-        "src/tests/client/test_session_middleware.py::TestSessionPurposeRouteAccess::test_verify_email_capability_is_reachable_during_totp_setup",
+        "src/tests/client/test_registration_routes.py::TestVerifyEmailCapabilityRoute::test_get_page_does_not_consume_the_token",
     ),
     ("POST", "/verify-email"): RouteCoverage(
         "capability",
         True,
-        False,
+        True,
         _READ_LIMITS,
-        "src/tests/client/test_registration_routes.py::TestVerifyEmailCapabilityRoute::test_post_without_csrf_pair_still_reaches_the_service",
+        "src/tests/client/test_registration_routes.py::TestVerifyEmailCapabilityRoute::test_completion_uses_mailbox_identity_and_does_not_log_in",
     ),
     ("GET", "/account/change-email"): RouteCoverage(
         "local_full_session",
@@ -348,7 +415,7 @@ ROUTE_COVERAGE: dict[tuple[str, str], RouteCoverage] = {
         _STEP_UP_LIMITS,
         "src/tests/client/test_credential_budget_route_outcomes.py::test_email_change_session_rejection_clears_session_before_follow_up",
     ),
-    ("GET", "/account/confirm-email/{token}"): RouteCoverage(
+    ("GET", "/account/confirm-email/{public_id}"): RouteCoverage(
         "capability",
         False,
         False,
@@ -398,6 +465,7 @@ def live_routes() -> dict[tuple[str, str], LiveRoute]:
 def routes_without_coverage(
     live: dict[tuple[str, str], LiveRoute], registry: dict[tuple[str, str], RouteCoverage]
 ) -> set[tuple[str, str]]:
+    """Find live routes with no registry entry or no coverage witness."""
     return {key for key in live if key not in registry or not registry[key].witness}
 
 
@@ -412,6 +480,7 @@ def resolve_node(node_id: str) -> object:
 
 
 def _route_id(key: tuple[str, str]) -> str:
+    """Format a method/path key for parametrized test identification."""
     return f"{key[0]} {key[1]}"
 
 
@@ -419,17 +488,19 @@ class TestEveryRouteIsCovered:
     """The registry and the live route table describe the same set of routes."""
 
     def test_every_live_route_has_a_registered_witness(self):
+        """Check every live route has a registered witness."""
         missing = routes_without_coverage(live_routes(), ROUTE_COVERAGE)
         assert missing == set(), (
             f"routes without a client-tier witness: {sorted(missing)}; add a RouteCoverage row"
         )
 
     def test_every_registry_row_names_a_live_route(self):
+        """Check every registry row names a live route."""
         stale = set(ROUTE_COVERAGE) - set(live_routes())
         assert stale == set(), f"registry rows for routes that no longer exist: {sorted(stale)}"
 
     def test_a_route_missing_from_the_registry_is_reported(self):
-        """Positive control for the coverage check: drop one row and it is named."""
+        """Check a route missing from the registry is reported."""
         live = live_routes()
         key = ("GET", "/about")
         assert key in live
@@ -438,6 +509,7 @@ class TestEveryRouteIsCovered:
         assert key in routes_without_coverage(live, registry)
 
     def test_a_row_without_a_witness_is_reported(self):
+        """Check a row without a witness is reported."""
         live = live_routes()
         key = ("GET", "/about")
         registry = dict(ROUTE_COVERAGE)
@@ -452,6 +524,7 @@ class TestRegisteredGuardsMatchTheLiveRoute:
 
     @pytest.mark.parametrize("key", sorted(ROUTE_COVERAGE), ids=_route_id)
     def test_registered_guards_match_the_wired_dependencies(self, key):
+        """Check registered guards match the wired dependencies."""
         expected = ROUTE_COVERAGE[key]
         actual = live_routes()[key]
         assert (actual.access, actual.form_body, actual.csrf, actual.limits) == (
@@ -462,8 +535,8 @@ class TestRegisteredGuardsMatchTheLiveRoute:
         )
 
     def test_a_dropped_guard_is_detected(self):
-        """Positive control: a registry row promising CSRF on a CSRF-exempt route mismatches."""
-        actual = live_routes()[("POST", "/verify-email")]
+        """Check a dropped guard is detected."""
+        actual = live_routes()[("POST", "/account/confirm-email")]
         assert actual.csrf is False
         promised = RouteCoverage("capability", True, True, _READ_LIMITS, "x")
         assert (actual.access, actual.form_body, actual.csrf) != (
@@ -478,6 +551,7 @@ class TestEveryWitnessCollects:
 
     @pytest.mark.parametrize("key", sorted(ROUTE_COVERAGE), ids=_route_id)
     def test_witness_resolves_to_a_client_tier_test(self, key):
+        """Check witness resolves to a client tier test."""
         witness = ROUTE_COVERAGE[key].witness
         assert witness.startswith("src/tests/client/"), witness
         target = resolve_node(witness)
@@ -485,6 +559,7 @@ class TestEveryWitnessCollects:
         assert target.__name__.startswith("test_")
 
     def test_an_unknown_witness_is_rejected(self):
+        """Check an unknown witness is rejected (AttributeError)."""
         with pytest.raises(AttributeError):
             resolve_node(
                 "src/tests/client/test_route_coverage.py::TestEveryWitnessCollects::test_does_not_exist"

@@ -6,13 +6,13 @@
 
 ## When this runbook applies
 
-Use only for an active, verified local administrator who lost their authenticator and cannot use normal recovery. Normal recovery needs another local administrator with a full session and working TOTP plus a usable code saved by the target. A code exhausted by three password attempts is unusable even if unused. The target must know their current password; otherwise complete the separately approved password-reset process first.
+Use only for an active, verified local administrator who lost their authenticator and cannot use normal recovery. Normal recovery needs another local administrator with a full session and working TOTP plus a usable code saved by the target. A code exhausted by three password attempts is unusable even if unused. The target must know their current password. Password reset now also requires a fresh authenticator code, so it cannot precede this procedure when the authenticator is lost. If the password is also lost, stop and use a separately approved combined recovery procedure with independent identity verification; this runbook does not authorize password replacement. See [credential recovery](credential-recovery.md).
 
 Record this database intervention as an incident/change: it bypasses the online two-person recovery policy and returns the account to initial TOTP enrollment.
 
 ## Why the application cannot self-reset today
 
-`authorize_totp_recovery` rejects self-authorization; `finalize_local_login` refuses ordinary login while recovery is required. Changing seed-admin settings cannot repair an existing administrator: seeding stops when any administrator exists. This procedure creates no recovery session; it restores ordinary password login followed by initial TOTP enrollment.
+`authorize_totp_recovery` rejects self-authorization; `finalize_local_login` refuses ordinary login during recovery. Bootstrap refuses existing administrators, and runtime services reject seed credentials. This procedure restores password login followed by initial TOTP enrollment; it creates no recovery session.
 
 ## Preconditions and safety controls
 
@@ -209,8 +209,8 @@ Exiting releases the deployment lock. Discard every saved copy of the old recove
    sudo journalctl -u oralhistarchiv.service -n 50 --no-pager
    ```
 
-2. In a clean browser, submit email/password at `/login` with TOTP blank. Expect a restricted `totp_setup` session and redirect to `/setup-totp`, not a full session. Its lifetime uses `SESSION_MAX_AGE_SECONDS` (default eight hours).
-3. Scan the new QR and save all ten recovery codes separately from the authenticator. Within the pending seed's ten-minute lifetime, submit a new TOTP code and one displayed recovery code. The confirmation code remains usable; refreshing or rerendering setup replaces the displayed recovery-code set. Completion upgrades this session to full access.
+2. In a clean browser, submit email/password at `/login` with TOTP blank. Expect `/setup-totp` and a restricted session capped at ten minutes.
+3. Scan the QR and save all ten recovery codes separately. Within ten minutes, submit a fresh TOTP code and one displayed recovery code. That recovery code remains usable; rerendering setup replaces the displayed set. Completion revokes all account sessions and returns to login.
 4. Explicitly log out, then log in with password and a fresh TOTP code; a just-used TOTP time step cannot be reused. Confirm `/admin` loads and run the verification below. Do not change another account to test recovery.
 5. Restart remaining writers and check status/logs before reopening traffic:
 

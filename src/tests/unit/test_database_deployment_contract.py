@@ -1,7 +1,11 @@
 """Deployed systemd units, SQL role scripts, and the runtime privilege
 contract those roles are checked against at startup."""
 
+import fcntl
 import re
+import shlex
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import create_autospec
@@ -10,6 +14,7 @@ import pytest
 
 from app.paths import PROJECT_ROOT
 from app.services import database_privileges
+from app.services.db_schema_contract import VIEW_CONTRACTS
 from config import settings
 
 WEB = PROJECT_ROOT / "oralhistarchiv.service"
@@ -21,6 +26,7 @@ ACCESS_VERIFY = PROJECT_ROOT / "deploy/verify-runtime-database-access.sql"
 
 
 def _directives(path: Path, name: str):
+    """Return matching systemd directive values after stripping comments."""
     text = "\n".join(line.split("#", 1)[0] for line in path.read_text().splitlines())
     return re.findall(rf"(?m)^\s*{re.escape(name)}=(.*?)\s*$", text)
 
@@ -30,9 +36,7 @@ class TestServiceUnitDeployment:
     process loads only the environment overlay for its own role."""
 
     def test_runtime_units_never_run_alembic(self):
-        """Migrations are a reviewed release step of their own. The runtime
-        units may run start checks (they gate on the deployment mode), but
-        none of their commands may touch the migration tooling."""
+        """Keep Alembic migration commands out of runtime systemd units."""
         for unit in (WEB, SCHEDULER):
             text = unit.read_text()
             commands = _directives(unit, "ExecStartPre") + _directives(unit, "ExecStart")
@@ -43,6 +47,7 @@ class TestServiceUnitDeployment:
             assert "alembic" not in text.lower()
 
     def test_runtime_units_load_distinct_database_overlays(self):
+        """Runtime units load distinct database overlays."""
         assert _directives(WEB, "EnvironmentFile") == [
             "/etc/oralhistarchiv/common.env",
             "/etc/oralhistarchiv/web.env",
@@ -54,6 +59,7 @@ class TestServiceUnitDeployment:
         ]
 
     def test_migration_unit_is_manual_quiescing_and_owner_only(self):
+        """Migration unit is manual quiescing and owner only."""
         text = MIGRATE.read_text()
         assert "[Install]" not in text
         assert _directives(MIGRATE, "Type") == ["oneshot"]
@@ -68,7 +74,8 @@ class TestServiceUnitDeployment:
         ]
         assert _directives(MIGRATE, "RestrictAddressFamilies") == ["AF_UNIX"]
         assert _directives(MIGRATE, "ExecStart") == [
-            "/usr/bin/flock --exclusive --no-fork /run/lock/oralhistarchiv-deploy.lock "
+            "/usr/bin/flock --exclusive --timeout 60 --conflict-exit-code 75 --no-fork "
+            "/run/lock/oralhistarchiv-deploy.lock "
             "/opt/oralhistarchiv/.venv/bin/python -I /opt/oralhistarchiv/deploy/migrate_release.py"
         ]
         assert _directives(MIGRATE, "ExecStartPost") == []
@@ -83,6 +90,7 @@ class TestRoleBootstrapAndGrantScripts:
     enumerate every effective public object before granting anything back."""
 
     def test_role_bootstrap_and_grants_are_deny_first(self):
+        """Role bootstrap and grants are deny first."""
         bootstrap = BOOTSTRAP.read_text()
         grants = GRANTS.read_text()
         normalized_grants = " ".join(grants.split())
@@ -134,16 +142,42 @@ class TestRoleBootstrapAndGrantScripts:
             "REVOKE EXECUTE ON FUNCTION public.update_search_text() FROM PUBLIC, "
             f"{runtime_roles};" in normalized_grants
         )
+        catalogue_functions = (
+            "public.catalogue_scan_ceiling(), "
+            "public.catalogue_page_ids(integer, integer, boolean, integer, integer, jsonb)"
+        )
         assert (
-            "ALTER DEFAULT PRIVILEGES FOR ROLE oralhistarchiv IN SCHEMA public "
+            f"REVOKE EXECUTE ON FUNCTION {catalogue_functions} FROM PUBLIC, "
+            f"{runtime_roles};" in normalized_grants
+        )
+        assert (
+            f"GRANT EXECUTE ON FUNCTION {catalogue_functions} TO oralhistarchiv_web;"
+            in normalized_grants
+        )
+        assert (
+            "ALTER DEFAULT PRIVILEGES FOR ROLE oralhistarchiv "
             "REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC, "
             f"{runtime_roles};" in normalized_grants
         )
         assert normalized_grants.index("DO $column_revoke$") < normalized_grants.index(
             "GRANT SELECT ON ALL TABLES IN SCHEMA public TO oralhistarchiv_backup"
         )
+        assert "GRANT DELETE ON TABLE users TO oralhistarchiv_scheduler;" in normalized_grants
+        scheduler_select = re.search(
+            r"GRANT SELECT \(([^)]+)\) ON TABLE users TO oralhistarchiv_scheduler;",
+            normalized_grants,
+        )
+        assert scheduler_select is not None
+        assert set(scheduler_select.group(1).split(", ")) == set(
+            database_privileges.USER_COLUMN_PRIVILEGES["scheduler"]["SELECT"]
+        )
+        assert database_privileges.TABLE_PRIVILEGES["scheduler"]["users"] == frozenset({"DELETE"})
+        assert {"password_hash", "totp_secret", "pending_totp_secret"}.isdisjoint(
+            database_privileges.USER_COLUMN_PRIVILEGES["scheduler"]["SELECT"]
+        )
         assert (
-            "GRANT SELECT, DELETE ON TABLE users TO oralhistarchiv_scheduler;" in normalized_grants
+            "GRANT SELECT, DELETE ON TABLE users TO oralhistarchiv_scheduler;"
+            not in normalized_grants
         )
         assert (
             "GRANT UPDATE (last_login) ON TABLE users TO oralhistarchiv_scheduler;"
@@ -157,8 +191,30 @@ class TestRoleBootstrapAndGrantScripts:
             "GRANT UPDATE (flash_category) ON TABLE sessions TO oralhistarchiv_scheduler;"
             in normalized_grants
         )
+        assert (
+            "GRANT SELECT, INSERT, UPDATE ON TABLE sync_status "
+            "TO oralhistarchiv_scheduler;" in normalized_grants
+        )
+        assert database_privileges.TABLE_PRIVILEGES["scheduler"]["sync_status"] == frozenset(
+            {"SELECT", "INSERT", "UPDATE"}
+        )
+        assert database_privileges.TABLE_PRIVILEGES["web"]["sync_status"] == frozenset({"SELECT"})
+        catalogue_views = {
+            "catalogue_discovery",
+            "catalogue_search_candidates",
+            "dataset_admin_catalogue",
+        }
+        web_select = re.search(
+            r"GRANT SELECT ON TABLE ([^;]+) TO oralhistarchiv_web;", normalized_grants
+        )
+        assert web_select is not None
+        assert catalogue_views <= set(web_select.group(1).split(", "))
+        for view in catalogue_views:
+            assert database_privileges.TABLE_PRIVILEGES["web"][view] == frozenset({"SELECT"})
+            assert database_privileges.TABLE_PRIVILEGES["scheduler"][view] == frozenset()
 
     def test_live_access_verifier_enumerates_every_effective_public_object(self):
+        """Live access verifier enumerates every effective public object."""
         verifier = ACCESS_VERIFY.read_text()
         normalized = " ".join(verifier.split())
 
@@ -173,25 +229,45 @@ class TestRoleBootstrapAndGrantScripts:
         assert "public.oral_history_datasets_id_seq" in verifier
         assert "actual_relations IS DISTINCT FROM expected_relations" in normalized
         assert "actual_sequences IS DISTINCT FROM expected_sequences" in normalized
+        assert "DO $catalogue_function_access_contract$" in verifier
+        assert "has_function_privilege(" in verifier
+        assert "pg_get_function_identity_arguments(" in verifier
+        assert "actual_functions IS DISTINCT FROM expected_functions" in normalized
+        for signature in database_privileges.EXECUTABLE_APPLICATION_FUNCTIONS["web"]:
+            assert f"'{signature}'" in verifier
         assert "DO $session_cleanup_lock_contract$" in verifier
         assert "ARRAY['flash_category']::text[]" in verifier
+        assert "DO $scheduler_user_column_contract$" in verifier
+        for process, role in database_privileges.ROLE_BY_PROCESS.items():
+            inventory = re.search(
+                rf"WHEN '{role}' THEN\s+expected_relations := ARRAY\[(.*?)\];",
+                verifier,
+                re.DOTALL,
+            )
+            assert inventory is not None
+            assert set(re.findall(r"'([^']+)'", inventory.group(1))) == set(
+                _inventory(process)["accessible_relations"]
+            )
 
 
 class _Cursor:
     """Fake async cursor answering the exact query shapes the validator issues."""
 
     def __init__(self, role, privilege_answers, inventory):
+        """Store role, privilege answers and inventory for query-dependent responses."""
         self.role = role
         self.privilege_answers = iter(privilege_answers)
         self.inventory = inventory
         self.last_query = ""
 
     async def execute(self, query, params=None):
+        """Capture the latest query and parameters and increment the query count."""
         self.last_query = str(query)
         self.params = params
         self.query_count = getattr(self, "query_count", 0) + 1
 
     async def fetchone(self):
+        """Return role/inventory data or consume the next privilege answer."""
         if "FROM pg_roles AS r" in self.last_query:
             return self.role
         if "AS accessible_relations" in self.last_query:
@@ -199,7 +275,14 @@ class _Cursor:
         return {"allowed": next(self.privilege_answers)}
 
     async def fetchall(self):
-        names, privileges = self.params
+        """Validate requested column names and consume one privilege answer per pair."""
+        if len(self.params) == 3:
+            relation, names, privileges = self.params
+            assert names == [
+                name for name, _ in VIEW_CONTRACTS[relation.removeprefix("public.")].columns
+            ]
+        else:
+            names, privileges = self.params
         pairs = (
             [(name, privilege) for privilege in privileges for name in names]
             if "has_column_privilege" in self.last_query
@@ -212,6 +295,7 @@ class _Cursor:
 
 
 def _role(name):
+    """Return a runtime-role row without dangerous attributes or unexpected ownership."""
     return {
         "current_user": name,
         "session_user": name,
@@ -225,11 +309,16 @@ def _role(name):
         "schema_create": False,
         "memberships": [],
         "unexpected_owners": [],
-        "executable_application_functions": [],
+        "executable_application_functions": sorted(
+            database_privileges.EXECUTABLE_APPLICATION_FUNCTIONS["web"]
+            if name == "oralhistarchiv_web"
+            else database_privileges.EXECUTABLE_APPLICATION_FUNCTIONS["scheduler"]
+        ),
     }
 
 
 def _answers(process):
+    """Expand the expected runtime privilege contract into ordered boolean answers."""
     answers = []
     for expected in database_privileges.TABLE_PRIVILEGES[process].values():
         answers.extend(
@@ -248,10 +337,17 @@ def _answers(process):
             answers.extend(
                 column in expected_columns for column in database_privileges.SESSION_COLUMN_CONTRACT
             )
+    for view_name, view in VIEW_CONTRACTS.items():
+        for privilege in ("SELECT", "INSERT", "UPDATE", "REFERENCES"):
+            answers.extend(
+                privilege in database_privileges.TABLE_PRIVILEGES[process][view_name]
+                for _column in view.columns
+            )
     return answers
 
 
 def _inventory(process):
+    """Return accessible relations and sequences implied by the process grants."""
     relation_names = {
         f"public.{name}"
         for name, privileges in database_privileges.TABLE_PRIVILEGES[process].items()
@@ -270,8 +366,11 @@ def _inventory(process):
 
 
 def _install_cursor(monkeypatch, cursor):
+    """Patch privilege-check database access to yield the configured cursor."""
+
     @asynccontextmanager
     async def fake_get_db_cursor(_pool):
+        """Yield the configured cursor without opening PostgreSQL."""
         yield cursor
 
     spy = create_autospec(database_privileges.get_db_cursor, spec_set=True)
@@ -280,26 +379,25 @@ def _install_cursor(monkeypatch, cursor):
 
 
 class TestRuntimeDatabaseRoleContract:
-    """The role a hardened process connects as must match its declared
-    privilege footprint exactly: right role name, no dangerous attributes,
-    no extra accessible object, no missing or excess privilege. Anything
-    off fails startup closed; in a non-hardened environment the check
-    never runs at all."""
+    """Reject hardened runtime roles whose identity or privileges differ from the exact contract."""
 
     @pytest.mark.parametrize("process", ("web", "scheduler"))
     async def test_exact_runtime_role_and_privileges_pass(self, monkeypatch, process):
+        """Exact runtime role and privileges pass."""
         monkeypatch.setattr(settings, "env_state", "production")
         role_name = database_privileges.ROLE_BY_PROCESS[process]
         cursor = _Cursor(_role(role_name), _answers(process), _inventory(process))
         _install_cursor(monkeypatch, cursor)
 
         await database_privileges.validate_runtime_database_role(object(), process)
-        assert cursor.query_count == (6 if process == "scheduler" else 5)
+        assert cursor.query_count == (9 if process == "scheduler" else 8)
 
     async def test_development_skips_production_role_contract(self, monkeypatch):
+        """Development skips production role contract."""
         monkeypatch.setattr(settings, "env_state", "dev")
 
         async def must_not_open(_pool):
+            """Fail if development role validation opens PostgreSQL."""
             raise AssertionError("development role validation opened PostgreSQL")
 
         spy = create_autospec(database_privileges.get_db_cursor, spec_set=True)
@@ -308,6 +406,7 @@ class TestRuntimeDatabaseRoleContract:
         await database_privileges.validate_runtime_database_role(object(), "web")
 
     async def test_wrong_runtime_role_fails_startup(self, monkeypatch):
+        """Wrong runtime role fails startup."""
         monkeypatch.setattr(settings, "env_state", "production")
         _install_cursor(
             monkeypatch,
@@ -345,6 +444,7 @@ class TestRuntimeDatabaseRoleContract:
         ],
     )
     async def test_dangerous_role_state_fails_startup(self, monkeypatch, field, value):
+        """Dangerous role state fails startup."""
         monkeypatch.setattr(settings, "env_state", "production")
         role = _role("oralhistarchiv_web")
         role[field] = value
@@ -353,7 +453,25 @@ class TestRuntimeDatabaseRoleContract:
         with pytest.raises(RuntimeError, match="Unsafe PostgreSQL role for web"):
             await database_privileges.validate_runtime_database_role(object(), "web")
 
+    @pytest.mark.parametrize("process", ["web", "scheduler"])
+    @pytest.mark.parametrize(
+        "function", sorted(database_privileges.EXECUTABLE_APPLICATION_FUNCTIONS["web"])
+    )
+    async def test_catalogue_execute_grants_match_the_process(self, monkeypatch, process, function):
+        """Catalogue execute grants match the process."""
+        monkeypatch.setattr(settings, "env_state", "production")
+        role = _role(database_privileges.ROLE_BY_PROCESS[process])
+        functions = role["executable_application_functions"]
+        if process == "web":
+            functions.remove(function)
+        else:
+            functions.append(function)
+        _install_cursor(monkeypatch, _Cursor(role, _answers(process), _inventory(process)))
+        with pytest.raises(RuntimeError, match="application-function EXECUTE set"):
+            await database_privileges.validate_runtime_database_role(object(), process)
+
     async def test_unexpected_accessible_relation_fails_startup(self, monkeypatch):
+        """Unexpected accessible relation fails startup."""
         monkeypatch.setattr(settings, "env_state", "production")
         inventory = _inventory("web")
         inventory["accessible_relations"].append("public.unexpected_sensitive_table")
@@ -371,6 +489,7 @@ class TestRuntimeDatabaseRoleContract:
             await database_privileges.validate_runtime_database_role(object(), "web")
 
     async def test_missing_or_excess_table_privilege_fails_startup(self, monkeypatch):
+        """Missing or excess table privilege fails startup."""
         monkeypatch.setattr(settings, "env_state", "production")
         answers = _answers("scheduler")
         answers[0] = not answers[0]
@@ -386,7 +505,32 @@ class TestRuntimeDatabaseRoleContract:
         with pytest.raises(RuntimeError, match=r"actual=.*expected="):
             await database_privileges.validate_runtime_database_role(object(), "scheduler")
 
+    @pytest.mark.parametrize("process", ("web", "scheduler"))
+    async def test_maintenance_authority_fails_startup(self, monkeypatch, process):
+        """Reject PostgreSQL 18 maintenance grants even on an otherwise allowed table."""
+        monkeypatch.setattr(settings, "env_state", "production")
+        answers = _answers(process)
+        tables = list(database_privileges.TABLE_PRIVILEGES[process])
+        privileges = database_privileges._ALL_TABLE_PRIVILEGES
+        answers[
+            tables.index("oral_history_datasets") * len(privileges) + privileges.index("MAINTAIN")
+        ] = True
+        _install_cursor(
+            monkeypatch,
+            _Cursor(
+                _role(database_privileges.ROLE_BY_PROCESS[process]),
+                answers,
+                _inventory(process),
+            ),
+        )
+
+        with pytest.raises(
+            RuntimeError, match="oral_history_datasets MAINTAIN: actual=True, expected=False"
+        ):
+            await database_privileges.validate_runtime_database_role(object(), process)
+
     async def test_scheduler_has_no_table_wide_users_update(self, monkeypatch):
+        """Scheduler has no table wide users update."""
         monkeypatch.setattr(settings, "env_state", "production")
         answers = _answers("scheduler")
         tables = list(database_privileges.TABLE_PRIVILEGES["scheduler"])
@@ -426,6 +570,7 @@ class TestRuntimeDatabaseRoleContract:
         column,
         allowed,
     ):
+        """Scheduler user column privileges are exact."""
         monkeypatch.setattr(settings, "env_state", "production")
         answers = _answers("scheduler")
         table_answer_count = len(database_privileges.TABLE_PRIVILEGES["scheduler"]) * len(
@@ -467,6 +612,7 @@ class TestRuntimeDatabaseRoleContract:
     async def test_scheduler_session_lock_grant_is_exact(
         self, monkeypatch, privilege, column, allowed
     ):
+        """Scheduler session lock grant is exact."""
         monkeypatch.setattr(settings, "env_state", "production")
         answers = _answers("scheduler")
         table_count = len(database_privileges.TABLE_PRIVILEGES["scheduler"]) * len(
@@ -498,11 +644,10 @@ class TestRuntimeDatabaseRoleContract:
 
 
 class TestTotpRotationChallengeTableOwnership:
-    """`pending_totp_rotations` (the TOTP-rotation challenge table) is DML for
-    web only; the scheduler never touches it, matching the design that
-    rotation challenges are a web-request-lifecycle concern."""
+    """Grant TOTP-rotation challenge DML to web only."""
 
     def test_web_role_has_full_dml_on_pending_totp_rotations(self):
+        """Web role has full dml on pending TOTP rotations."""
         assert database_privileges.TABLE_PRIVILEGES["web"]["pending_totp_rotations"] == {
             "SELECT",
             "INSERT",
@@ -511,6 +656,7 @@ class TestTotpRotationChallengeTableOwnership:
         }
 
     def test_scheduler_role_has_no_privilege_on_pending_totp_rotations(self):
+        """Scheduler role has no privilege on pending TOTP rotations."""
         assert (
             database_privileges.TABLE_PRIVILEGES["scheduler"]["pending_totp_rotations"]
             == frozenset()
@@ -518,15 +664,90 @@ class TestTotpRotationChallengeTableOwnership:
 
 
 class TestLoginAttemptCounterColumnOwnership:
-    """The atomic login-lockout budget (`users.failed_login_count`) is
-    mutated only by the web process; the scheduler's own `UPDATE` grant is
-    exactly the outbox-locking column, never the counter itself."""
+    """Grant login-failure counter mutation to web only."""
 
     def test_web_role_can_update_the_login_attempt_counter(self):
+        """Web role can update the login attempt counter."""
         assert "failed_login_count" in database_privileges.USER_COLUMN_PRIVILEGES["web"]["UPDATE"]
 
     def test_scheduler_role_cannot_update_the_login_attempt_counter(self):
+        """Scheduler role cannot update the login attempt counter."""
         assert (
             "failed_login_count"
             not in database_privileges.USER_COLUMN_PRIVILEGES["scheduler"]["UPDATE"]
         )
+
+
+@pytest.mark.parametrize("process", ["web", "scheduler"])
+def test_admin_state_privileges_match_process_ownership(process):
+    """Web may administer restrictions; ingestion can only read them."""
+    expected = {"SELECT", "INSERT", "UPDATE"} if process == "web" else {"SELECT"}
+    assert database_privileges.TABLE_PRIVILEGES[process]["dataset_admin_state"] == expected
+    grants = " ".join(GRANTS.read_text().split())
+    statement = (
+        "GRANT SELECT, INSERT, UPDATE ON TABLE dataset_admin_state TO oralhistarchiv_web;"
+        if process == "web"
+        else "GRANT SELECT ON TABLE alembic_version, dataset_admin_state "
+        "TO oralhistarchiv_scheduler;"
+    )
+    assert statement in grants
+    assert database_privileges.TABLE_PRIVILEGES["web"]["oral_history_datasets"] == {"SELECT"}
+
+
+@pytest.mark.parametrize("unit", [WEB, SCHEDULER, MIGRATE])
+def test_service_lock_conflicts_have_a_bounded_retryable_outcome(tmp_path, unit):
+    """Execute each shipped flock prefix with an accelerated test deadline."""
+    command = shlex.split(_directives(unit, "ExecStart")[0])
+    lock_index = command.index("/run/lock/oralhistarchiv-deploy.lock")
+    prefix = command[:lock_index]
+    assert prefix[0] == "/usr/bin/flock"
+    assert prefix[prefix.index("--timeout") + 1] == "60"
+    assert prefix[prefix.index("--conflict-exit-code") + 1] == "75"
+    assert "--no-fork" in prefix
+    assert ("--exclusive" if unit == MIGRATE else "--shared") in prefix
+    prefix[prefix.index("--timeout") + 1] = "0.05"
+    lock_path = tmp_path / "deployment.lock"
+    lock_path.touch()
+    marker = tmp_path / "started"
+    child = [
+        *prefix,
+        str(lock_path),
+        sys.executable,
+        "-I",
+        "-c",
+        "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+        str(marker),
+    ]
+    with lock_path.open("rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rejected = subprocess.run(child, check=False, capture_output=True, timeout=5)
+    assert rejected.returncode == 75
+    assert not marker.exists()
+    accepted = subprocess.run(child, check=False, capture_output=True, timeout=5)
+    assert accepted.returncode == 0, accepted.stderr
+    assert marker.exists()
+
+
+def test_lock_access_is_limited_to_runtime_and_maintenance_participants():
+    """All legitimate service identities receive read access; parser jobs do not."""
+    tmpfiles = (PROJECT_ROOT / "deploy/oralhistarchiv-tmpfiles.conf").read_text()
+    active = [line.split() for line in tmpfiles.splitlines() if line and not line.startswith("#")]
+    assert active == [
+        [
+            "f",
+            "/run/lock/oralhistarchiv-deploy.lock",
+            "0640",
+            "root",
+            "oralhistarchiv-deploy-lock",
+            "-",
+        ]
+    ]
+    for unit in (WEB, SCHEDULER, MIGRATE, PROJECT_ROOT / "deploy/oralhistarchiv-backup.service"):
+        assert (
+            "oralhistarchiv-deploy-lock"
+            in " ".join(_directives(unit, "SupplementaryGroups")).split()
+        )
+    assert (
+        "oralhistarchiv-deploy-lock"
+        not in (PROJECT_ROOT / "oralhistarchiv-parser@.service").read_text()
+    )

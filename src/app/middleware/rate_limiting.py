@@ -1,15 +1,15 @@
 """Fail-closed SlowAPI admission before session/database work.
 
-Use dedicated shared Redis in hardened environments; development may
-select memory storage. There is no runtime memory fallback. HTTP checks
-run in one serialized worker, with bounded queue/admission and 0.5-second
-Redis connect/read timeouts, no retries. Evaluation budgets only warn.
+Hardened modes require dedicated shared Redis; dev may use memory. There
+is no runtime fallback. Serialize checks in a bounded worker queue; Redis
+connect/read timeouts are 0.5 seconds with no retries. Evaluation budgets
+only warn. Static GET/HEAD bypasses admission; GET /search still consumes
+the global start budget when per-client limiting is disabled or exempt.
 
-GET/HEAD static assets and decorated exemptions bypass checks. Other
-requests use endpoint buckets; unmatched paths/methods share one bucket
-and skip session lookup. Keys HMAC canonical IPv4 or IPv6 /64 identities
-using an import-time SECRET_KEY-derived key. Successful response headers
-are disabled; rejected checks capture 429 statistics in the worker.
+Other requests use endpoint buckets; unmatched paths/methods share one
+bucket and skip session lookup when limiting is enabled. Keys HMAC
+canonical IPv4 or IPv6 /64 identities with an import-time SECRET_KEY-derived
+key. Only rejected checks capture window statistics for response headers.
 """
 
 import hashlib
@@ -22,15 +22,13 @@ import threading
 import time
 from collections.abc import Callable
 from functools import partial
-from typing import Any, cast
+from typing import Any
 
 from anyio import CapacityLimiter, WouldBlock
 from fastapi import FastAPI, Request, Response
 from limits.errors import ConcurrentUpdateError, ConfigurationError, StorageError
 from limits.storage import Storage
-from limits.storage.memory import MemoryStorage
 from limits.storage.redis import RedisStorage
-from limits.strategies import FixedWindowRateLimiter
 from redis.backoff import NoBackoff
 from redis.exceptions import (
     AuthenticationError,
@@ -54,11 +52,32 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.routing import Match
 from starlette.types import ASGIApp
 
-from config import settings
+from config import redis_url_policy_issues, settings
 
+from ..request_log_contract import RATE_LIMIT_LOG_PATH_STATE
 from ..request_utils import get_client_ip, safe_request_path
 from ..thread_work import ThreadWorkAdmissionTimeout, run_thread_work
+from .bounded_rate_limit_storage import (
+    BoundedRedisStorage,
+    CounterCapacityError,
+    SearchStartGate,
+    bounded_redis_uri,
+)
 from .security_headers import build_secure_headers
+from .slowapi_compat import (
+    REDIS_OPERATION_TIMEOUT_SECONDS as _REDIS_OPERATION_TIMEOUT_SECONDS,
+)
+from .slowapi_compat import (
+    check_request_limit,
+    configured_storage_uri,
+    core_configuration_issues,
+    is_memory_storage,
+    route_is_exempt,
+    validate_dependency_shape,
+)
+from .slowapi_compat import (
+    redis_configuration_issues as _redis_configuration_issues,
+)
 
 logger = logging.getLogger(__name__)
 _storage_lock = threading.Lock()
@@ -68,23 +87,11 @@ _DEFAULT_MAX_OUTSTANDING_CHECKS = 8
 _DEFAULT_BUSY_RETRY_AFTER_SECONDS = 1
 _DEFAULT_EVALUATION_BUDGET_SECONDS = 1.0
 _BACKEND_STARTUP_ADMISSION_TIMEOUT_SECONDS = 1.0
-_REDIS_OPERATION_TIMEOUT_SECONDS = 0.5
 _BACKEND_PROBE_TTL_SECONDS = 5
 _RATE_LIMIT_KEY_PREFIX = "oralhistarchiv-security-v1"
 _RATE_LIMIT_CLIENT_ID_CONTEXT = b"oralhistarchiv-rate-limit-client-id-v1"
-_REDIS_STORAGE_OPTION_KEYS = frozenset(
-    {
-        "retry",
-        "retry_on_timeout",
-        "socket_connect_timeout",
-        "socket_timeout",
-        "wrap_exceptions",
-    }
-)
-
 _STATIC_ASSET_PREFIX = "/static/"
 _RATE_LIMIT_ROUTE_UNMATCHED_STATE = "rate_limit_route_unmatched"
-_RATE_LIMIT_LOG_PATH_STATE = "rate_limit_log_path"
 _UNMATCHED_LOG_PATH = "/<unmatched>"
 _UNRESOLVED_LOG_PATH = "/<unresolved>"
 _RATE_LIMIT_BACKEND_ERRORS = (
@@ -137,9 +144,7 @@ def get_rate_limit_client_id(request: Request) -> str:
 
 
 def _backend_failure_category(error: BaseException) -> tuple[str, str]:
-    """Return (bounded category, exception class name),
-    unwrapping at most four StorageError causes.
-    """
+    """Return category and class name after unwrapping at most four StorageError causes."""
     current = error
     for _ in range(4):
         if not isinstance(current, StorageError):
@@ -149,7 +154,7 @@ def _backend_failure_category(error: BaseException) -> tuple[str, str]:
             break
         current = cause
 
-    if isinstance(current, (OutOfMemoryError, MaxConnectionsError)):
+    if isinstance(current, (OutOfMemoryError, MaxConnectionsError, CounterCapacityError)):
         category = "capacity"
     elif isinstance(current, AuthenticationError):
         category = "authentication"
@@ -192,10 +197,7 @@ def _resolve_rate_limit_handler(request: Request) -> tuple[Callable[..., Any], b
     request.app.routes must expose callable identities for full matches or
     RuntimeError is raised. The eventual router still determines the response.
     """
-    # Read-only static traffic was returned by the exact exemption in
-    # dispatch. Other methods still match Starlette's Mount as FULL, but are
-    # semantically method mismatches; charge the stable sentinel and skip the
-    # session lookup before StaticFiles returns its authoritative response.
+    # Mounts match unsupported methods as FULL; charge them as 405s before DB lookup.
     if _is_static_path(request):
         return _coarse_unmatched_route_bucket, True, _UNMATCHED_LOG_PATH
 
@@ -213,18 +215,13 @@ def _resolve_rate_limit_handler(request: Request) -> tuple[Callable[..., Any], b
                     route_path = "/<route>"
                 return endpoint, False, route_path
 
-            # The only mounted ASGI application is StaticFiles, which is
-            # handled by the exact exemption before this resolver. A future
-            # unnamed mount might require authentication, so it must fail
-            # closed instead of receiving the 404/405 session-skip marker.
+            # Unknown mounts may require authentication; never mark them session-free.
             logger.error(
                 "Full route has no stable rate-limit endpoint identity",
                 extra={"event_type": "rate_limit_endpoint_identity_missing"},
             )
             raise RuntimeError("Full route has no stable rate-limit endpoint identity")
 
-    # Match.PARTIAL (405) and an all-NONE result (404) deliberately share the
-    # same stable identity and session-skip behavior.
     return _coarse_unmatched_route_bucket, True, _UNMATCHED_LOG_PATH
 
 
@@ -239,12 +236,20 @@ def redis_storage_options() -> dict[str, Any]:
     }
 
 
-def _build_limiter() -> Limiter:
-    """Build an endpoint-keyed fixed-window limiter from settings
-    without headers or memory fallback.
+def bounded_storage_options() -> dict[str, Any]:
+    """Return fresh Redis connection options and configured counter/cleanup bounds."""
+    return {
+        **redis_storage_options(),
+        "counter_capacity": settings.limiter_counter_capacity,
+        "cleanup_batch_size": settings.limiter_cleanup_batch_size,
+    }
 
-    Use configured minute/hour/day defaults and enabled state; unresolved
-    storage selects memory. Construction errors propagate.
+
+def _build_limiter() -> Limiter:
+    """Build the settings-driven fixed-window limiter without headers or fallback.
+
+    Use minute/hour/day defaults, endpoint keys and enabled state; absent
+    RATE_LIMIT_STORAGE_URI selects memory. Construction errors propagate.
     """
     storage_uri = settings.rate_limit_storage_uri
     return Limiter(
@@ -255,8 +260,8 @@ def _build_limiter() -> Limiter:
             f"{settings.rate_limit_per_day}/day",
         ],
         strategy="fixed-window",
-        storage_uri=storage_uri or "memory://",
-        storage_options=redis_storage_options() if storage_uri is not None else {},
+        storage_uri=bounded_redis_uri(storage_uri) if storage_uri else "memory://",
+        storage_options=bounded_storage_options() if storage_uri is not None else {},
         enabled=settings.rate_limit_enabled,
         headers_enabled=False,
         key_prefix=_RATE_LIMIT_KEY_PREFIX,
@@ -268,92 +273,85 @@ def _build_limiter() -> Limiter:
 
 limiter = _build_limiter()
 
+_search_start_gate = SearchStartGate(
+    limiter.limiter.storage if isinstance(limiter.limiter.storage, BoundedRedisStorage) else None,
+    rate=settings.search_global_rate_per_second,
+    burst=settings.search_global_burst,
+)
 
-def _core_configuration_issues(active_limiter: Limiter) -> list[str]:
-    """Return deviations from the required identity, enabled, strategy,
-    key, fallback, and header policies.
+
+def get_search_start_gate() -> SearchStartGate:
+    """Return the shared search gate, independent of per-client limiting."""
+    return _search_start_gate
+
+
+async def validate_search_start_gate() -> None:
+    """Probe/initialize shared search admission; raise RuntimeError if unsafe or unavailable.
+
+    Require Redis in hardened modes and rate/burst matching settings. Perform
+    blocking checks in a capacity-limited thread; cancellation propagates.
     """
-    issues: list[str] = []
-    if active_limiter._key_func is not get_rate_limit_client_id:
-        issues.append("limiter client identity function differs from the reviewed HMAC policy")
-    if active_limiter._application_limits:
-        issues.append("cross-route application limits are configured outside the edge policy")
-    if active_limiter.enabled != settings.rate_limit_enabled:
-        issues.append("enabled state differs from RATE_LIMIT_ENABLED")
-    if active_limiter._swallow_errors:
-        issues.append("storage errors are configured to be swallowed")
-    if active_limiter._in_memory_fallback_enabled:
-        issues.append("process-local fallback is enabled")
-    if active_limiter._headers_enabled:
-        issues.append("SlowAPI response-header I/O is enabled")
-    if active_limiter._strategy != "fixed-window" or not isinstance(
-        active_limiter.limiter, FixedWindowRateLimiter
-    ):
-        issues.append("limiter strategy is not fixed-window")
-    if active_limiter._key_style != "endpoint":
-        issues.append("limiter key style is not endpoint")
-    if active_limiter._key_prefix != _RATE_LIMIT_KEY_PREFIX:
-        issues.append("limiter key prefix differs from the reviewed namespace")
-    return issues
-
-
-def _redis_configuration_issues(
-    active_limiter: Limiter,
-    storage: Storage,
-) -> list[str]:
-    """Return deviations from Redis storage and the exact timeout/retry/wrapping option contract."""
-    issues: list[str] = []
-    if not isinstance(storage, RedisStorage):
-        issues.append("rate-limit Redis URL did not construct Redis storage")
-    if not getattr(storage, "wrap_exceptions", False):
-        issues.append("Redis storage exceptions are not wrapped")
-
-    # SlowAPI annotates this boundary as ``dict[str, str]`` even though
-    # limits/redis explicitly accepts numeric, boolean and Retry values.
-    options = cast(dict[str, Any], active_limiter._storage_options)
-    if set(options) != _REDIS_STORAGE_OPTION_KEYS:
-        issues.append("Redis storage options differ from the reviewed exact set")
-    for option_name in ("socket_connect_timeout", "socket_timeout"):
-        option_value = options.get(option_name)
-        if (
-            isinstance(option_value, bool)
-            or not isinstance(option_value, (int, float))
-            or not 0 < option_value <= _REDIS_OPERATION_TIMEOUT_SECONDS
-        ):
-            issues.append(f"{option_name} is absent or exceeds 0.5 seconds")
-    retry = options.get("retry")
+    gate = get_search_start_gate()
+    if settings.is_hardened and gate.storage is None:
+        raise RuntimeError("Shared search admission requires dedicated Redis")
     if (
-        not isinstance(retry, Retry)
-        or retry._retries != 0
-        or not isinstance(retry._backoff, NoBackoff)
+        gate.rate != settings.search_global_rate_per_second
+        or gate.burst != settings.search_global_burst
     ):
-        issues.append("Redis retries are not disabled")
-    if options.get("retry_on_timeout") is not False:
-        issues.append("Redis retry_on_timeout is not disabled")
-    if options.get("wrap_exceptions") is not True:
-        issues.append("Redis wrap_exceptions option is not enabled")
-    return issues
+        raise RuntimeError("Search admission configuration differs from settings")
+    try:
+        ready = await run_thread_work(
+            gate.check,
+            CapacityLimiter(1),
+            admission_timeout_seconds=_BACKEND_STARTUP_ADMISSION_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        raise RuntimeError("Required search admission backend is unavailable") from None
+    if not ready:
+        raise RuntimeError("Required search admission backend is unavailable")
 
 
-def validate_rate_limit_configuration(active_limiter: Limiter = limiter) -> None:
+def validate_rate_limit_configuration(active_limiter: Limiter) -> None:
     """Raise RuntimeError for unsafe effective SlowAPI settings, including hidden overrides.
 
     Require configured storage/identity/strategy/key policy, no swallowed
     errors or fallback, and bounded Redis options. Hardened mode requires
     a configured Redis URI; development alone permits MemoryStorage.
     """
-    issues = _core_configuration_issues(active_limiter)
+    validate_dependency_shape(active_limiter)
+    issues = core_configuration_issues(
+        active_limiter,
+        key_func=get_rate_limit_client_id,
+        enabled=settings.rate_limit_enabled,
+        key_prefix=_RATE_LIMIT_KEY_PREFIX,
+    )
     storage = active_limiter.limiter.storage
     resolved_storage_uri = settings.rate_limit_storage_uri
-    expected_storage_uri = resolved_storage_uri or "memory://"
-    if active_limiter._storage_uri != expected_storage_uri:
+    expected_storage_uri = (
+        bounded_redis_uri(resolved_storage_uri) if resolved_storage_uri else "memory://"
+    )
+    if configured_storage_uri(active_limiter) != expected_storage_uri:
         issues.append("constructed storage URI differs from resolved limiter settings")
     if settings.is_hardened and resolved_storage_uri is None:
         issues.append("hardened environment has no dedicated rate-limit Redis URL")
+    if settings.is_hardened and (not settings.rate_limit_enabled or not active_limiter.enabled):
+        issues.append("hardened web admission must be enabled")
 
     if resolved_storage_uri is not None:
+        issues.extend(
+            redis_url_policy_issues(
+                resolved_storage_uri, hardened=settings.is_hardened, dedicated=True
+            )
+        )
         issues.extend(_redis_configuration_issues(active_limiter, storage))
-    elif not isinstance(storage, MemoryStorage):
+        if not isinstance(storage, BoundedRedisStorage):
+            issues.append("Redis storage does not enforce bounded counter allocation")
+        elif (
+            storage.counter_capacity != settings.limiter_counter_capacity
+            or storage.cleanup_batch_size != settings.limiter_cleanup_batch_size
+        ):
+            issues.append("effective counter allocation bounds differ from settings")
+    elif not is_memory_storage(storage):
         issues.append("development memory mode constructed unexpected storage")
 
     if issues:
@@ -361,20 +359,21 @@ def validate_rate_limit_configuration(active_limiter: Limiter = limiter) -> None
 
 
 def _probe_rate_limit_backend(storage: Storage) -> bool:
-    """Check backend ping, increment/read, five-second expiry, and deletion with a random key.
+    """Probe bounded Redis readiness, or test a random five-second counter on other storage.
 
-    Return False for unexpected values; storage errors propagate. After a
-    successful increment, always clear and verify removal; residual state
-    raises RuntimeError. A lost increment response can leave a TTL-bound key.
+    Bounded Redis validates its namespace and set/read/TTL/deletes a fixed
+    readiness key. Other backends ping/check, increment/read and verify expiry;
+    after successful increment always clear and verify deletion. Return False
+    for invalid results; storage/cleanup errors propagate. A lost increment
+    response may leave a TTL-bound key.
     """
+    if isinstance(storage, BoundedRedisStorage):
+        return storage.probe()
     probe_key = f"startup-readiness-{secrets.token_hex(16)}"
     increment_completed = False
 
     try:
-        # RedisStorage.check() deliberately swallows every connection error
-        # into False, which would erase the safe failure category needed for
-        # operations. Call the pinned client's PING directly so typed failures
-        # propagate through the scrubbed startup telemetry below.
+        # Bypass check(), which hides typed connection errors needed by startup telemetry.
         if isinstance(storage, RedisStorage):
             backend_ready = bool(storage.get_connection().ping())
         else:
@@ -396,20 +395,20 @@ def _probe_rate_limit_backend(storage: Storage) -> bool:
                 raise RuntimeError("Rate-limit backend readiness probe cleanup failed")
 
 
-async def validate_rate_limit_backend() -> None:
+async def validate_rate_limit_backend(active_limiter: Limiter) -> None:
     """Validate configuration, then probe enabled non-memory storage in a bounded worker.
 
     Raise RuntimeError and log safe categories on probe failure. Disabled
     limiting/development memory skips the probe; cancellation propagates.
     """
-    validate_rate_limit_configuration()
+    validate_rate_limit_configuration(active_limiter)
     if not settings.rate_limit_enabled or settings.rate_limit_storage_uri is None:
         return
 
     capacity = CapacityLimiter(1)
     try:
         healthy = await run_thread_work(
-            partial(_probe_rate_limit_backend, limiter.limiter.storage),
+            partial(_probe_rate_limit_backend, active_limiter.limiter.storage),
             capacity,
             admission_timeout_seconds=_BACKEND_STARTUP_ADMISSION_TIMEOUT_SECONDS,
         )
@@ -455,29 +454,35 @@ def _evaluate_limits(
     active_limiter: Limiter,
     *,
     evaluation_budget_seconds: float,
-) -> RateLimitExceeded | None:
-    """Check registered/default limits under the process-wide storage lock.
+    search_start: bool = False,
+) -> RateLimitExceeded | bool | None:
+    """Check per-client limits and optional search admission under the process-wide lock.
 
-    Run only in a worker. Return a caught RateLimitExceeded with window
-    stats in request.state, or None; storage errors propagate. Mark the
-    check complete even on failure and record elapsed seconds. Exceeding
-    evaluation_budget_seconds only logs a warning; it does not stop work.
+    Run only in a worker. Return RateLimitExceeded with captured window stats,
+    False for an exhausted search start budget, or None when admitted; storage
+    errors propagate. Mark enabled checks complete and record elapsed seconds
+    on request.state. evaluation_budget_seconds only triggers a warning.
     """
     started_at = time.monotonic()
     try:
         with _storage_lock:
-            try:
-                active_limiter._check_request_limit(request, handler, False)
-            except RateLimitExceeded as exc:
-                current = getattr(request.state, "view_rate_limit", None)
-                if current is not None:
-                    item, identifiers = current
-                    request.state.rate_limit_stats = active_limiter.limiter.get_window_stats(
-                        item, *identifiers
-                    )
-                return exc
-            finally:
-                request.state._rate_limiting_complete = True
+            if active_limiter.enabled:
+                try:
+                    check_request_limit(active_limiter, request, handler)
+                except RateLimitExceeded as exc:
+                    current = getattr(request.state, "view_rate_limit", None)
+                    if current is not None:
+                        item, identifiers = current
+                        request.state.rate_limit_stats = active_limiter.limiter.get_window_stats(
+                            item, *identifiers
+                        )
+                    return exc
+                finally:
+                    request.state._rate_limiting_complete = True
+            # An already exhausted client must not consume the shared budget.
+            # Both decisions still happen before downstream session/database work.
+            if search_start and not get_search_start_gate().acquire():
+                return False
         return None
     finally:
         elapsed = time.monotonic() - started_at
@@ -510,12 +515,15 @@ class BoundedRateLimitMiddleware(BaseHTTPMiddleware):
         max_outstanding_checks: int = _DEFAULT_MAX_OUTSTANDING_CHECKS,
         busy_retry_after_seconds: int = _DEFAULT_BUSY_RETRY_AFTER_SECONDS,
         evaluation_budget_seconds: float = _DEFAULT_EVALUATION_BUDGET_SECONDS,
+        search_busy_response: Callable[[Request], Response] | None = None,
     ) -> None:
         """Configure positive admission/evaluation seconds and positive queue/retry values.
 
         max_outstanding_checks includes running and waiting requests; invalid
         values raise ValueError. evaluation_budget_seconds is a warning threshold.
-        Async capacities are created lazily in the owning event loop.
+        Async capacities are created lazily in the owning event loop. An optional
+        search-busy renderer must not resolve sessions, access the database or
+        write cookies; it runs before downstream admission.
         """
         super().__init__(app)
         if admission_timeout_seconds <= 0:
@@ -531,6 +539,7 @@ class BoundedRateLimitMiddleware(BaseHTTPMiddleware):
         self._max_outstanding_checks = max_outstanding_checks
         self._busy_retry_after_seconds = busy_retry_after_seconds
         self._evaluation_budget_seconds = evaluation_budget_seconds
+        self._search_busy_response = search_busy_response
 
         # AnyIO limiters need an active async backend, so construct them on the
         # first request rather than during FastAPI's synchronous app setup.
@@ -538,33 +547,13 @@ class BoundedRateLimitMiddleware(BaseHTTPMiddleware):
         self._outstanding_capacity: CapacityLimiter | None = None
 
     def _capacities(self) -> tuple[CapacityLimiter, CapacityLimiter]:
-        """Return lazily created worker/outstanding limiters;
-        inconsistent initialization raises RuntimeError.
-        """
+        """Return lazy worker/queue limiters; raise RuntimeError for inconsistent initialization."""
         if self._worker_capacity is None:
             self._worker_capacity = CapacityLimiter(1)
             self._outstanding_capacity = CapacityLimiter(self._max_outstanding_checks)
         if self._outstanding_capacity is None:
             raise RuntimeError("Rate-limit capacity initialization failed")
         return self._worker_capacity, self._outstanding_capacity
-
-    async def _harden_early_response(self, request: Request, response: Response) -> Response:
-        """Mutate and return response using the app hardener, or security headers plus no-store.
-
-        Support synchronous or awaitable hardeners; errors propagate.
-        """
-        hardener = getattr(request.app.state, "harden_early_response", None)
-        if hardener is not None:
-            result = hardener(request, response)
-            if inspect.isawaitable(result):
-                await result
-        else:
-            # Standalone applications can install this middleware directly.
-            # Preserve the essential header contract even without main.py's
-            # path-aware response hardener.
-            await _early_response_secure_headers.set_headers_async(response)  # type: ignore[arg-type]
-            response.headers["Cache-Control"] = "no-store"
-        return response
 
     async def _unavailable_response(
         self,
@@ -574,9 +563,12 @@ class BoundedRateLimitMiddleware(BaseHTTPMiddleware):
         backend_error: BaseException | None = None,
         unexpected_error: BaseException | None = None,
     ) -> Response:
-        """Log safe admission/backend diagnostics and return a hardened 503
-        with the configured Retry-After.
+        """Log safe admission/backend diagnostics and return a hardened 503.
+
+        Distinguish a consumed search start budget from unavailable admission
+        storage in the public wording and text logs; retain Retry-After.
         """
+        search_busy = event_type == "search_start_budget_exhausted"
         log_context = {
             "event_type": event_type,
             "request_id": getattr(request.state, "request_id", "unknown"),
@@ -594,7 +586,9 @@ class BoundedRateLimitMiddleware(BaseHTTPMiddleware):
             )
         elif unexpected_error is None:
             logger.warning(
-                "Rate-limit admission unavailable",
+                "Search start budget exhausted"
+                if search_busy
+                else "Rate-limit admission unavailable",
                 extra=log_context,
             )
         else:
@@ -607,44 +601,45 @@ class BoundedRateLimitMiddleware(BaseHTTPMiddleware):
                 },
             )
 
-        response = Response(
-            "Rate-limit service temporarily unavailable.",
-            status_code=503,
-            media_type="text/plain",
-            headers={
-                "Retry-After": str(self._busy_retry_after_seconds),
-                "Cache-Control": "no-store",
-            },
-        )
-        return await self._harden_early_response(request, response)
+        if search_busy and self._search_busy_response is not None:
+            response = self._search_busy_response(request)
+        else:
+            response = Response(
+                (
+                    "Search is temporarily busy. Please wait briefly and try again."
+                    if search_busy
+                    else "Rate-limit service temporarily unavailable."
+                ),
+                media_type="text/plain",
+            )
+        response.status_code = 503
+        response.headers["Retry-After"] = str(self._busy_retry_after_seconds)
+        response.headers["Cache-Control"] = "no-store"
+        # Early refusals bypass the downstream security-header middleware.
+        await _early_response_secure_headers.set_headers_async(response)  # type: ignore[arg-type]
+        return response
 
     async def dispatch(  # noqa: PLR0911 - each rejection path must fail closed before call_next
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
         """Admit through bounded serialized checks before calling downstream.
 
-        Bypass disabled/static/exempt requests. Route, capacity, timeout, and
-        backend/evaluation failures return hardened 503; exceeded limits call
+        Static GET/HEAD bypasses admission. Disabled/exempt per-client checks still
+        apply the global budget to GET /search. Route, queue, timeout and backend
+        failures return secured no-store 503 responses; exceeded client limits use
         the registered RateLimitExceeded handler. Release capacity on exit;
         cancellation and downstream/handler failures propagate.
         """
         active_limiter = request.app.state.limiter
-        if not active_limiter.enabled:
-            return await call_next(request)
-
-        # Static files are served by nginx in deployment and by a DB-free
-        # StaticFiles mount in development. Preserve that deliberate exact
-        # exemption without trying to treat an ASGI object as a function.
+        # StaticFiles is ASGI, so exempt it before resolving callable handler identities.
         if _is_static_asset_request(request):
             return await call_next(request)
 
-        # Store a bounded route label before attempting route resolution.
-        setattr(request.state, _RATE_LIMIT_LOG_PATH_STATE, _UNRESOLVED_LOG_PATH)
+        setattr(request.state, RATE_LIMIT_LOG_PATH_STATE, _UNRESOLVED_LOG_PATH)
         try:
             handler, route_unmatched, log_path = _resolve_rate_limit_handler(request)
-            setattr(request.state, _RATE_LIMIT_LOG_PATH_STATE, log_path)
-            name = f"{handler.__module__}.{handler.__name__}"
-            route_exempt = name in active_limiter._exempt_routes
+            setattr(request.state, RATE_LIMIT_LOG_PATH_STATE, log_path)
+            route_exempt = route_is_exempt(active_limiter, handler)
         except Exception as exc:
             return await self._unavailable_response(
                 request,
@@ -652,10 +647,11 @@ class BoundedRateLimitMiddleware(BaseHTTPMiddleware):
                 unexpected_error=exc,
             )
 
-        if route_unmatched:
+        if route_unmatched and active_limiter.enabled:
             setattr(request.state, _RATE_LIMIT_ROUTE_UNMATCHED_STATE, True)
 
-        if route_exempt:
+        search_start = request.method == "GET" and not route_unmatched and log_path == "/search"
+        if not search_start and (route_exempt or not active_limiter.enabled):
             return await call_next(request)
         worker_capacity, outstanding_capacity = self._capacities()
         try:
@@ -675,6 +671,7 @@ class BoundedRateLimitMiddleware(BaseHTTPMiddleware):
                         handler,
                         active_limiter,
                         evaluation_budget_seconds=self._evaluation_budget_seconds,
+                        search_start=search_start,
                     ),
                     worker_capacity,
                     admission_timeout_seconds=self._admission_timeout_seconds,
@@ -699,6 +696,11 @@ class BoundedRateLimitMiddleware(BaseHTTPMiddleware):
         finally:
             outstanding_capacity.release()
 
+        if error is False:
+            return await self._unavailable_response(
+                request,
+                event_type="search_start_budget_exhausted",
+            )
         if error is not None:
             result = request.app.exception_handlers[RateLimitExceeded](request, error)
             response: Response = await result if inspect.isawaitable(result) else result
@@ -706,14 +708,19 @@ class BoundedRateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def setup_rate_limiting(app: FastAPI) -> None:
-    """Validate and register the global limiter and middleware when enabled; otherwise do nothing.
+def setup_rate_limiting(
+    app: FastAPI,
+    active_limiter: Limiter,
+    *,
+    search_busy_response: Callable[[Request], Response] | None = None,
+) -> None:
+    """Register admission before session resolution, including when limits are disabled.
 
-    Callers must install the RateLimitExceeded exception handler and run
-    backend readiness validation separately.
+    Readiness must validate this same app.state.limiter. Applications using
+    decorated routes must pass the instance that owns those declarations. The
+    optional renderer customizes only exhausted search budgets, retaining the
+    early refusal's status and response-security headers.
     """
-    if not settings.rate_limit_enabled:
-        return
-    validate_rate_limit_configuration()
-    app.state.limiter = limiter
-    app.add_middleware(BoundedRateLimitMiddleware)
+    app.state.limiter = active_limiter
+    validate_rate_limit_configuration(active_limiter)
+    app.add_middleware(BoundedRateLimitMiddleware, search_busy_response=search_busy_response)

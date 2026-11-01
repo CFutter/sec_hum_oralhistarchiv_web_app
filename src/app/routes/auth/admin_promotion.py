@@ -5,13 +5,15 @@ import logging
 from fastapi import Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from ...credentials import LOCAL_PASSWORD_MAX_CHARS
+from ...credentials import LOCAL_PASSWORD_MAX_CHARS, TOTP_CODE_RAW_MAX_CHARS
 from ...middleware import clear_session_cookie, limiter
+from ...reason_contracts import require_reason_coverage
 from ...route_security import RouteAccess, SecureAPIRouter
 from ...services import (
     TOTP_RECOVERY_CODE_MAX_CHARS,
     AdminPromotion,
     AdminPromotionRejected,
+    TotpDecryptionError,
     accept_admin_promotion,
     audit_user_event,
     decline_admin_promotion,
@@ -19,6 +21,7 @@ from ...services import (
     prepare_admin_promotion,
     set_flash_if_exists,
 )
+from ...services.admin_promotion import AdminPromotionRejectionReason
 from ...template_setup import templates
 
 logger = logging.getLogger(__name__)
@@ -51,11 +54,14 @@ _PROMOTION_ERRORS = {
 }
 
 
+require_reason_coverage(AdminPromotionRejectionReason, _PROMOTION_ERRORS)
+
+
 def _no_store(response: Response) -> Response:
-    """Set no-store/no-cache/no-referrer headers and return the same response."""
+    """Keep responses uncached and limit referrers to the origin."""
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Referrer-Policy"] = "strict-origin"
     return response
 
 
@@ -66,7 +72,7 @@ def _render_promotion(
     error: str | None = None,
     status_code: int = 200,
 ) -> Response:
-    """Render invitation state/errors without caching or exposing referrers."""
+    """Render uncached invitation feedback with referrers restricted to the origin."""
     return _no_store(
         templates.TemplateResponse(
             request,
@@ -129,14 +135,15 @@ async def admin_promotion_page(request: Request) -> Response:
 async def admin_promotion_prepare(
     request: Request,
     current_password: str = Form(..., max_length=LOCAL_PASSWORD_MAX_CHARS),
-    totp_code: str = Form(..., max_length=16),
+    totp_code: str = Form(..., max_length=TOTP_CODE_RAW_MAX_CHARS),
 ) -> Response:
-    """Prove password/TOTP and render freshly committed plaintext recovery codes.
+    """Prove password/TOTP and render committed plaintext recovery codes.
 
-    Use prepare_admin_promotion's durable attempt and expiry rules. Audit
-    success/rejection; invalid/exhausted sessions clear cookies and redirect to
-    login, locked/missing-request outcomes redirect to account, other policy
-    failures render 422. Code responses disable caching/referrers.
+    Use the service's durable attempt/expiry rules and audit success/refusal.
+    Invalid/exhausted sessions clear cookies and redirect to login; locked or
+    missing invitations redirect to account; other refusals render 422. TOTP
+    decryption failure renders 503. Code/error pages are no-store with origin-only
+    referrers. Missing resolved session state raises RuntimeError.
     """
     session_id = request.state.session_id
     if session_id is None:
@@ -149,6 +156,28 @@ async def admin_promotion_prepare(
             session_id=session_id,
             password=current_password,
             totp_code=totp_code,
+        )
+    except TotpDecryptionError:
+        audit_user_event(
+            level=logging.ERROR,
+            request=request,
+            event_type="totp_secret_undecryptable",
+            user_id=request.state.user.id,
+            operation="admin_promotion_prepare",
+        )
+        return _no_store(
+            templates.TemplateResponse(
+                request,
+                "error.html",
+                {
+                    "error_title": "Two-factor temporarily unavailable",
+                    "error_message": (
+                        "We can't access your authenticator settings right now. "
+                        "Please contact support."
+                    ),
+                },
+                status_code=503,
+            )
         )
     except AdminPromotionRejected as exc:
         audit_user_event(
@@ -248,7 +277,7 @@ async def admin_promotion_accept(
         user_id=accepted.user_id,
         requested_by=accepted.requested_by,
     )
-    response = RedirectResponse(url="/login?error=admin_promotion_completed", status_code=303)
+    response = RedirectResponse(url="/login?notice=admin_promotion_completed", status_code=303)
     clear_session_cookie(response)
     return response
 

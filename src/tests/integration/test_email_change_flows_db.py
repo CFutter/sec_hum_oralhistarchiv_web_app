@@ -1,38 +1,31 @@
-"""Self-service email-change staging — real PostgreSQL, real routes, real services.
-
-Covers POST /account/change-email (src/app/routes/auth/email_change.py) and
-the staging half of src/app/services/email_change.py: who receives which
-mail, the account-membership secrecy shape, the re-auth gate, and the
-row-lock release/recheck around the slow password-verification work.
-
-Self-service confirmation (GET/POST /account/confirm-email) lives in
-test_email_change_confirmation_db.py, the administrator-initiated variant in
-test_admin_email_change_flows_db.py, and delivery to SMTP plus
-enqueue-failure rollback in test_email_change_delivery_db.py.
-"""
+"""Self-service email-change staging — real PostgreSQL, real routes, real services."""
 
 import asyncio
 import logging
+import time
+from urllib.parse import urlsplit
 
 import pyotp
 import pytest
+import time_machine
 from fastapi import status
 from pydantic import SecretStr
 
-from app.services import email_change, federated_session_policy
-from app.services.crypto import decrypt_outbox_body, encrypt_value
+from app.services import email_change, federated_session_policy, password_verification
+from app.services.crypto import decrypt_outbox_body
 from app.services.session_ids import hash_session_id
+from app.services.tokens import action_token_public_id
+from app.services.totp_crypto import encrypt_value
 from config import settings
+from tests.action_links import token_from_action_email
 from tests.fixtures import sign_session_id
 from tests.integration.conftest import DEFAULT_PASSWORD, do_login
 
-NEW_EMAIL = "new@uzh.ch"
+NEW_EMAIL = "new@example.org"
 _EMAIL_CHANGE_MESSAGE_COUNT = 2
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_totp_user(user_factory, **overrides):
@@ -43,8 +36,9 @@ def _make_totp_user(user_factory, **overrides):
 
 
 def _login(client, u, secret):
-    """Real login (password + current TOTP code) → full session in the jar."""
-    resp = do_login(client, u.email, DEFAULT_PASSWORD, pyotp.TOTP(secret).now())
+    """Keep the prior step valid throughout login, leaving a fresh code for staging."""
+    with time_machine.travel(time.time(), tick=False):
+        resp = do_login(client, u.email, DEFAULT_PASSWORD, pyotp.TOTP(secret).at(time.time() - 30))
     assert resp.status_code == status.HTTP_303_SEE_OTHER, "login must succeed to a full session"
     return resp
 
@@ -101,6 +95,7 @@ def _confirmation_url(body):
 
 
 def _audit_events(caplog, event_type):
+    """Select the requested audit event from captured log records."""
     return [
         r
         for r in caplog.records
@@ -108,12 +103,12 @@ def _audit_events(caplog, event_type):
     ]
 
 
-# ---------------------------------------------------------------------------
 # Staging (POST /account/change-email through the real route)
-# ---------------------------------------------------------------------------
 
 
 class TestStagingRequest:
+    """Check staging Request."""
+
     async def test_change_email_post_stages_pending_change(
         self, e2e_client, user_factory, sync_conn
     ):
@@ -127,6 +122,7 @@ class TestStagingRequest:
             data={
                 "new_email": NEW_EMAIL,
                 "current_password": DEFAULT_PASSWORD,
+                "totp_code": pyotp.TOTP(secret).now(),
                 "csrf_token": csrf,
             },
             follow_redirects=False,
@@ -177,6 +173,7 @@ class TestStagingRequest:
             data={
                 "new_email": u.email,
                 "current_password": DEFAULT_PASSWORD,
+                "totp_code": pyotp.TOTP(secret).now(),
                 "csrf_token": csrf,
             },
             follow_redirects=False,
@@ -195,7 +192,7 @@ class TestStagingRequest:
         caplog,
     ):
         """Membership is absent from HTTP, audit, flash, and actor mail."""
-        occupied = user_factory(email="occupied@uzh.ch")
+        occupied = user_factory(email="occupied@example.org")
         actor, secret = _make_totp_user(user_factory)
         _login(e2e_client, actor, secret)
         csrf = _csrf_for_session(e2e_client)
@@ -206,6 +203,7 @@ class TestStagingRequest:
                 data={
                     "new_email": occupied.email,
                     "current_password": DEFAULT_PASSWORD,
+                    "totp_code": pyotp.TOTP(secret).now(),
                     "csrf_token": csrf,
                 },
                 follow_redirects=False,
@@ -258,6 +256,7 @@ class TestStagingRequest:
                 data={
                     "new_email": occupied.email,
                     "current_password": DEFAULT_PASSWORD,
+                    "totp_code": pyotp.TOTP(secret).at(time.time() + 30),
                     "csrf_token": csrf,
                 },
                 follow_redirects=False,
@@ -338,7 +337,7 @@ class TestStagingRequest:
         sync_conn,
     ):
         """An occupied probe cannot preserve an older usable change token."""
-        occupied = user_factory(email="occupied@uzh.ch")
+        occupied = user_factory(email="occupied@example.org")
         actor, secret = _make_totp_user(user_factory)
         _login(e2e_client, actor, secret)
         csrf = _csrf_for_session(e2e_client)
@@ -346,8 +345,9 @@ class TestStagingRequest:
         first = e2e_client.post(
             "/account/change-email",
             data={
-                "new_email": "first-unused@uzh.ch",
+                "new_email": "first-unused@example.org",
                 "current_password": DEFAULT_PASSWORD,
+                "totp_code": pyotp.TOTP(secret).now(),
                 "csrf_token": csrf,
             },
             follow_redirects=False,
@@ -366,6 +366,7 @@ class TestStagingRequest:
             data={
                 "new_email": occupied.email,
                 "current_password": DEFAULT_PASSWORD,
+                "totp_code": pyotp.TOTP(secret).at(time.time() + 30),
                 "csrf_token": csrf,
             },
             follow_redirects=False,
@@ -387,14 +388,22 @@ class TestStagingRequest:
             if message["message_type"] == "email_change_verification"
         ]
         assert len(verification_messages) == 2
-        assert verification_messages[0]["recipient"] == "first-unused@uzh.ch"
+        assert verification_messages[0]["recipient"] == "first-unused@example.org"
         assert verification_messages[0]["status"] == "dead"
         assert verification_messages[1]["recipient"] == occupied.email
         assert verification_messages[1]["status"] == "pending"
 
-        old_page = e2e_client.get(first_url.removeprefix(settings.public_base_url))
-        assert old_page.status_code == status.HTTP_400_BAD_REQUEST
-        assert "Link no longer valid" in old_page.text
+        old_page = e2e_client.get(urlsplit(first_url).path)
+        assert old_page.status_code == status.HTTP_200_OK
+        old_token = token_from_action_email(_decrypt_body(first_verification), first_url)
+        assert old_token not in old_page.text
+        rejected = e2e_client.post(
+            "/account/confirm-email",
+            data={"public_id": action_token_public_id(old_token), "token": old_token},
+            follow_redirects=False,
+        )
+        assert rejected.status_code == status.HTTP_400_BAD_REQUEST
+        assert _pending_state(sync_conn, actor.id)[1] == occupied.email
 
     async def test_staging_rejected_with_wrong_current_password(
         self, e2e_client, user_factory, sync_conn, caplog
@@ -413,6 +422,7 @@ class TestStagingRequest:
                 data={
                     "new_email": NEW_EMAIL,
                     "current_password": "definitely-wrong-Pw1!",
+                    "totp_code": pyotp.TOTP(secret).now(),
                     "csrf_token": csrf,
                 },
             )
@@ -453,12 +463,7 @@ class TestStagingRequest:
     async def test_change_email_recipient_wiring_and_emailed_link_works(
         self, e2e_client, user_factory, sync_conn
     ):
-        """The staged flow's entire security value is WHO gets WHICH
-        email: the confirmation capability link goes to the NEW address (proving
-        control of it before commit) and the heads-up notice to the OLD address
-        (so a hijack victim is alarmed). An argument swap inverts both and ships
-        green without this test. The captured link is then driven end-to-end: the
-        URL persisted in the durable outbox is the URL that works."""
+        """Verify change email recipient wiring and emailed link works."""
         u, secret = _make_totp_user(user_factory)
         _login(e2e_client, u, secret)
         csrf = _csrf_for_session(e2e_client)
@@ -468,6 +473,7 @@ class TestStagingRequest:
             data={
                 "new_email": NEW_EMAIL,
                 "current_password": DEFAULT_PASSWORD,
+                "totp_code": pyotp.TOTP(secret).now(),
                 "csrf_token": csrf,
             },
             follow_redirects=False,
@@ -490,23 +496,23 @@ class TestStagingRequest:
         assert all(message["status"] == "pending" for message in messages)
 
         # The emailed link is live: GET renders the confirm page, POST commits.
-        path = confirm_url[len(settings.public_base_url) :]
+        path = urlsplit(confirm_url).path
         page = e2e_client.get(path)
         assert page.status_code == status.HTTP_200_OK
-        assert NEW_EMAIL in page.text
+        assert NEW_EMAIL not in page.text
 
-        token = path.removeprefix("/account/confirm-email/")
+        token = token_from_action_email(verification_body, confirm_url)
         done = e2e_client.post(
-            "/account/confirm-email", data={"token": token}, follow_redirects=False
+            "/account/confirm-email",
+            data={"token": token, "public_id": action_token_public_id(token)},
+            follow_redirects=False,
         )
         assert done.status_code == status.HTTP_303_SEE_OTHER
         email, pending, _, _ = _pending_state(sync_conn, u.id)
         assert email == NEW_EMAIL and pending is None
 
 
-# ---------------------------------------------------------------------------
 # Lock release around the slow password-verification work in staging
-# ---------------------------------------------------------------------------
 
 
 class TestPasswordWorkLockRelease:
@@ -519,44 +525,44 @@ class TestPasswordWorkLockRelease:
 
     @pytest.mark.parametrize(
         "change",
-        ["hash", "revision", "session", "expiry", "inactive"],
+        ["hash", "revision", "session", "expiry", "inactive", "unverified", "recovery"],
         ids=[
             "password_changed_during_verification",
             "auth_revision_bumped_during_verification",
             "presenting_session_deleted_during_verification",
             "presenting_session_expired_during_verification",
             "account_deactivated_during_verification",
+            "email_unverified_during_verification",
+            "authenticator_recovery_required_during_verification",
         ],
     )
     async def test_email_change_releases_locks_during_password_work_and_rechecks_snapshot(
         self, db_pool, sync_conn, user_factory, session_factory, monkeypatch, change
     ):
-        """While the CPU-bound password verification runs (off the row
-        locks), a concurrent write lands on the user or session row using
-        `FOR UPDATE NOWAIT` — which only succeeds if staging is genuinely not
-        holding either lock during that work. Once the concurrent write
-        commits, staging must reject with SelfEmailChangeRejected on its
-        post-verification recheck and must queue no pending email change or
-        outbox message."""
-        user = user_factory()
+        """Verify email change releases locks during password work and rechecks snapshot."""
+        user, secret = _make_totp_user(user_factory)
         session_id = session_factory(user.id, purpose="full")
         password_started = asyncio.Event()
         release_password = asyncio.Event()
-        real_work = email_change.run_password_work
+        real_work = password_verification.run_password_work
 
         async def delayed_password_work(function, *args):
+            """Signal password-work readiness and wait for release before running the real
+            operation.
+            """
             password_started.set()
             await release_password.wait()
             return await real_work(function, *args)
 
-        monkeypatch.setattr(email_change, "run_password_work", delayed_password_work)
+        monkeypatch.setattr(password_verification, "run_password_work", delayed_password_work)
         task = asyncio.create_task(
             email_change.stage_self_email_change(
                 db_pool,
                 user_id=user.id,
                 session_id=session_id,
                 current_password=user.password,
-                new_email="new-address@uzh.ch",
+                new_email="new-address@example.org",
+                totp_code=pyotp.TOTP(secret).now(),
             )
         )
         try:
@@ -577,6 +583,16 @@ class TestPasswordWorkLockRelease:
                 )
             elif change == "inactive":
                 sync_conn.execute("UPDATE users SET is_active = false WHERE id = %s", (user.id,))
+            elif change == "unverified":
+                sync_conn.execute(
+                    "UPDATE users SET email_verified = false WHERE id = %s", (user.id,)
+                )
+            elif change == "recovery":
+                sync_conn.execute(
+                    "UPDATE users SET totp_recovery_required = true, totp_secret = NULL, "
+                    "last_totp_step = NULL WHERE id = %s",
+                    (user.id,),
+                )
             elif change == "expiry":
                 sync_conn.execute(
                     "UPDATE sessions SET expires_at = clock_timestamp() - interval '1 second'"

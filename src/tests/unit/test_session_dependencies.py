@@ -1,14 +1,4 @@
-"""FastAPI session dependencies in app.middleware.session against test doubles.
-
-Covers the dependencies that admit or refuse a request by session purpose,
-account tier and admin state (``app.middleware.session``), the lock order
-the paired session/challenge revocation callers take before this module's
-dependencies can trust that a superseded session is gone, the post-commit
-session feedback (flash) helpers in ``app.services.sessions`` that those
-dependencies' callers rely on, and the concurrency contract
-``SessionResolutionMiddleware`` keeps between a slow response and a login
-that completes while that response is still in flight.
-"""
+"""FastAPI session dependencies in app.middleware.session against test doubles."""
 
 import asyncio
 import http.cookies
@@ -65,6 +55,7 @@ def _user(
     totp_recovery_code_generation: int = 1,
     totp_recovery_codes_available: bool = True,
 ) -> SimpleNamespace:
+    """Build session user state; unspecified federated status defaults to approved for Shibboleth."""
     if auth_method == "shibboleth" and federated_status is None:
         federated_status = "approved"
     return SimpleNamespace(
@@ -88,6 +79,7 @@ def _request(
     path: str = "/account",
     query: bytes = b"",
 ) -> Request:
+    """Build a request with resolved user, session purpose, and a conditional resolved session ID."""
     request = Request(
         {
             "type": "http",
@@ -99,7 +91,7 @@ def _request(
             "query_string": query,
             "headers": [],
             "client": ("127.0.0.1", 1234),
-            "server": ("archive.example.uzh.ch", 443),
+            "server": ("archive.example.org", 443),
         }
     )
     request.state.user = user
@@ -114,6 +106,7 @@ def _assert_http_exception(
     status_code: int,
     location: str | None = None,
 ) -> None:
+    """Require the dependency to raise the selected HTTP status and optional redirect location."""
     with pytest.raises(HTTPException) as caught:
         dependency(request)
     assert caught.value.status_code == status_code
@@ -125,6 +118,7 @@ class TestFullSessionDependency:
     """require_full_session admits only a completed session for the caller's account."""
 
     def test_full_session_accepts_only_completed_local_or_approved_federated_state(self):
+        """Check full session accepts only completed local or approved federated state."""
         require_full_session(_request(user=_user(), purpose="full"))
         require_full_session(
             _request(
@@ -138,6 +132,7 @@ class TestFullSessionDependency:
         )
 
     def test_full_session_routes_each_recoverable_local_state_without_a_loop(self):
+        """Check full session routes each recoverable local state without a loop."""
         _assert_http_exception(
             require_full_session,
             _request(user=_user(totp_configured=False), purpose="totp_setup"),
@@ -158,6 +153,7 @@ class TestFullSessionDependency:
         )
 
     def test_full_session_redirects_guest_to_login_with_original_target(self):
+        """Check full session redirects guest to login with original target."""
         _assert_http_exception(
             require_full_session,
             _request(
@@ -190,6 +186,7 @@ class TestFullSessionDependency:
         ),
     )
     def test_full_session_fails_closed_for_impossible_or_ineligible_state(self, user, purpose):
+        """Check full session fails closed for impossible or ineligible state."""
         _assert_http_exception(
             require_full_session,
             _request(user=user, purpose=purpose),
@@ -201,6 +198,7 @@ class TestPublicOrFullSessionDependency:
     """require_public_or_full_session admits guests but never a partial session's authority."""
 
     def test_public_route_accepts_guest_and_full_session_but_not_partial_session(self):
+        """Check public route accepts guest and full session but not partial session."""
         require_public_or_full_session(_request(user=None, purpose=None, path="/search"))
         require_public_or_full_session(_request(user=_user(), purpose="full", path="/search"))
 
@@ -221,6 +219,7 @@ class TestTotpEnrollmentSessionDependency:
 
     @pytest.mark.parametrize("email_verified", [False, True])
     def test_totp_enrollment_accepts_active_local_setup_session(self, email_verified):
+        """Check TOTP enrollment accepts active local setup session."""
         require_totp_enrollment_session(
             _request(
                 user=_user(
@@ -233,6 +232,7 @@ class TestTotpEnrollmentSessionDependency:
         )
 
     def test_totp_enrollment_accepts_full_local_session_for_recovery_and_races(self):
+        """Check TOTP enrollment accepts full local session for recovery and races."""
         require_totp_enrollment_session(
             _request(
                 user=_user(totp_configured=False),
@@ -262,6 +262,7 @@ class TestTotpEnrollmentSessionDependency:
         ids=("guest", "inactive", "federated", "missing-purpose", "unknown-purpose"),
     )
     def test_totp_enrollment_rejects_every_other_principal(self, user, purpose, expected_status):
+        """Check TOTP enrollment rejects every other principal."""
         _assert_http_exception(
             require_totp_enrollment_session,
             _request(user=user, purpose=purpose, path="/setup-totp"),
@@ -273,6 +274,7 @@ class TestAdminDependency:
     """require_admin cloaks the admin surface and still requires a full session."""
 
     def test_admin_dependency_preserves_cloak_and_requires_full_session(self):
+        """Check admin dependency preserves cloak and requires full session."""
         _assert_http_exception(
             require_admin,
             _request(user=None, purpose=None, path="/admin"),
@@ -300,6 +302,9 @@ class TestLocalAuthDependency:
     """require_local_auth restricts local-account-only actions to local sessions."""
 
     def test_local_auth_dependency_cannot_be_used_without_a_full_local_session(self):
+        """Check local auth dependency cannot be used without a full local session
+        (UserFacingForbidden).
+        """
         _assert_http_exception(
             require_local_auth,
             _request(
@@ -325,13 +330,7 @@ class TestLocalAuthDependency:
 
 
 class TestRevocationLockOrder:
-    """Paired session/challenge revocation callers keep dependency-visible state in order.
-
-    Every caller that revokes a user's authority deletes their sessions
-    before it invalidates their pending authentication challenges, so a
-    concurrent request resolved by the dependencies above never observes a
-    still-valid session alongside a cleared challenge.
-    """
+    """Paired session/challenge revocation callers keep dependency-visible state in order."""
 
     @pytest.mark.parametrize(
         "mutation",
@@ -357,6 +356,7 @@ class TestRevocationLockOrder:
         ],
     )
     def test_paired_revocation_deletes_sessions_before_pending_challenges(self, mutation):
+        """Check paired revocation deletes sessions before pending challenges."""
         source = inspect.getsource(mutation)
         session_delete = source.index("delete_user_sessions_cur(")
         pending_invalidation = source.index("invalidate_pending_authentication_state_cur(")
@@ -365,15 +365,7 @@ class TestRevocationLockOrder:
 
 
 class TestPostCommitSessionFeedback:
-    """set_flash_if_exists / restore_flash_if_empty tolerate a database that
-    is unavailable, or a session already gone, without turning an already-
-    committed mutation into a failed response.
-
-    Both dependencies write feedback strictly after the triggering mutation
-    has committed, so a session revoked or a database made unavailable in
-    that window must never surface as a 500 to the caller — but an invalid
-    `category` is a coding bug, not a race, and must still raise.
-    """
+    """Cover POST commit session feedback."""
 
     @pytest.mark.parametrize(
         "operation",
@@ -388,8 +380,11 @@ class TestPostCommitSessionFeedback:
     async def test_database_unavailability_is_tolerated_but_invalid_category_still_raises(
         self, monkeypatch, operation, error
     ):
+        """Check database unavailability is tolerated but invalid category still raises (ValueError)."""
+
         @asynccontextmanager
         async def unavailable(_pool):
+            """Raise the selected unavailable-database exception before yielding a cursor."""
             raise error("unavailable")
             yield  # pragma: no cover
 
@@ -408,6 +403,7 @@ class TestPostCommitSessionFeedback:
 
         @asynccontextmanager
         async def broken(_pool):
+            """Raise ProgrammingError before yielding a cursor."""
             raise ProgrammingError("wrong SQL")
             yield  # pragma: no cover
 
@@ -427,6 +423,7 @@ class TestConcurrentLoginDuringStaleResponse:
     """
 
     async def test_stale_response_preserves_a_concurrently_issued_login_cookie(self):
+        """Check stale response preserves a concurrently issued login cookie."""
         entered, release = asyncio.Event(), asyncio.Event()
         app = MagicMock()
         request = Request(
@@ -445,6 +442,7 @@ class TestConcurrentLoginDuringStaleResponse:
         )
 
         async def delayed(_request):
+            """Delay an empty response until the concurrent login test releases it."""
             entered.set()
             await release.wait()
             return Response()

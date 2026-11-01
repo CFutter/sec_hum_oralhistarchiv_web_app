@@ -1,0 +1,55 @@
+[Unit]
+Description=Oral History Archive — Isolated Feed Parser
+After=network-online.target
+Wants=network-online.target
+CollectMode=inactive-or-failed
+
+[Service]
+Type=exec
+# Derive a distinct dynamic identity from each accepted connection's unit name.
+# A fixed User= would allow simultaneous parser jobs to share an identity.
+DynamicUser=yes
+WorkingDirectory=/opt/oralhistarchiv
+# This process receives one bounded job through its inherited socket. It must
+# never load the web or scheduler environment files. Start Python with a new
+# minimal environment so its original process environment contains no secrets.
+ExecStart=/usr/bin/env -i LANG=C.UTF-8 PATH=/usr/bin:/bin HOME=/nonexistent /opt/oralhistarchiv/.venv/bin/python -I /opt/oralhistarchiv/run_parser.py
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oralhistarchiv-parser
+UnsetEnvironment=PYTHONPATH PYTHONHOME VIRTUAL_ENV SECRET_KEY SESSION_SECRET TOTP_ENCRYPTION_KEYS OUTBOX_ENCRYPTION_KEYS DATABASE_URL REDIS_URL RATE_LIMIT_REDIS_URL RATE_LIMIT_MONITOR_REDIS_URL SMTP_PASSWORD ADMIN_SEED_PASSWORD SHIBBOLETH_INTERNAL_SECRET
+UMask=0077
+
+RuntimeMaxSec=250s
+TimeoutStartSec=15s
+TimeoutStopSec=2s
+KillMode=control-group
+SendSIGKILL=yes
+MemoryMax=512M
+TasksMax=16
+OOMPolicy=kill
+LimitCORE=0
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+# Outbound HTTPS remains available. The inherited client socket remains usable,
+# but workers cannot create PostgreSQL peer-authenticated Unix connections.
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=localhost
+# Use upstream DNS rather than the loopback systemd-resolved stub when present.
+BindReadOnlyPaths=-/run/systemd/resolve/resolv.conf:/etc/resolv.conf
+InaccessiblePaths=-/etc/oralhistarchiv -/run/postgresql -/run/oralhistarchiv -/run/user

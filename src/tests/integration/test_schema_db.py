@@ -1,20 +1,4 @@
-"""Integration tests for the live schema contract and the startup guards
-that enforce it.
-
-The declared schema in ``app.services.db_schema_contract`` is the contract;
-``app.services.db_drift`` verifies the live PostgreSQL catalogs against it
-column by column, constraint by constraint, index by index, and trigger by
-trigger. ``TestSchemaDriftDetection`` proves that verification: the
-migrated database satisfies the contract exactly (positive control), and a
-single mutated property in any dimension is rejected (negative controls).
-``TestStartupGuards`` proves that the application's production lifespan
-refuses to boot when the live schema is behind the code's migration head,
-and that a failed boot leaves no resources open.
-
-Negative controls that mutate schema objects restore them in ``finally``:
-the integration fixtures truncate rows before every test but do not undo
-DDL, and ``alembic_version`` is not touched by row truncation at all.
-"""
+"""Integration tests for the live schema contract and the startup guards that enforce it."""
 
 import contextlib
 from dataclasses import replace
@@ -27,6 +11,7 @@ from psycopg import sql
 
 from app.main import app, lifespan
 from app.services import db_drift
+from app.services import load_runtime_catalogue_sources as _real_load_runtime_catalogue_sources
 from app.services.database_privileges import validate_runtime_database_role
 from app.services.db_drift import (
     assert_table_column_contract,
@@ -39,13 +24,13 @@ from app.services.db_schema_contract import (
     SESSION_CONSTRAINT_CONTRACT,
     ColumnSpec,
 )
+from app.sources import catalogue_sources
 from config import settings
+from tests.source_fixtures import legacy_source
 
-# ---------------------------------------------------------------------------
 # Prod-lifespan harness (built inline — NOT the e2e_client fixture, which
 # patches Config/command and therefore skips the real alembic-head
 # comparison)
-# ---------------------------------------------------------------------------
 
 
 @contextlib.contextmanager
@@ -59,13 +44,21 @@ def _prod_mode(monkeypatch):
         patch("app.main.validate_security_settings", autospec=True),
         patch("app.main.validate_rate_limit_backend", autospec=True),
         patch("app.main.setup_logging", autospec=True),
-        patch("app.main.seed_admin_user", autospec=True),
         # Role ownership has its own real role-bound integration suite.
         # These tests isolate head/schema checks using the disposable
         # owner connection.
         patch(
             "app.runtime_preflight.validate_runtime_database_role",
             new=create_autospec(validate_runtime_database_role, spec_set=True),
+        ),
+        # Trusted source-file checks have their own startup suite. These tests
+        # retain real production Alembic/schema validation.
+        patch(
+            "app.main.load_runtime_catalogue_sources",
+            new=create_autospec(
+                _real_load_runtime_catalogue_sources,
+                return_value=catalogue_sources((legacy_source().config,)),
+            ),
         ),
     ):
         yield

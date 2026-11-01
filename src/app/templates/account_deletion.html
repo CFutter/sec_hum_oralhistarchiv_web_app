@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% set active_page = 'admin' if admin_action else 'account' %}
+{% block title %}Delete Account — {{ site_name }}{% endblock %}
+
+{% block content %}
+<section class="container auth-page">
+
+  <a href="{{ path_for(request, 'admin_dashboard' if admin_action else 'account_page') }}" class="back-link">
+    Back to {{ 'user management' if admin_action else 'your account' }}
+  </a>
+
+  <h1>{{ 'Delete Account' if admin_action else 'Delete Your Account' }}</h1>
+
+  {% if error %}
+  <div class="auth-error" role="alert">{{ error }}</div>
+  {% endif %}
+
+  <div class="auth-section">
+    <h2>Account to Delete</h2>
+    <dl class="meta-list">
+      <dt>Name</dt>
+      <dd>{{ target.display_name or '—' }}</dd>
+      <dt>Email</dt>
+      <dd>{{ target.email }}</dd>
+      <dt>Authentication Method</dt>
+      <dd>{{ federated_login_label if target.auth_method == 'shibboleth' else 'Local account with TOTP' }}</dd>
+    </dl>
+  </div>
+
+  <div class="auth-error">
+    <strong>Deletion is immediate and permanent.</strong>
+    It removes this account, all its sessions, authenticator and recovery codes,
+    pending account actions, administrator invitations involving this account,
+    and stored outgoing emails. Existing action links will stop working.
+    A security audit record with a hashed email marker is retained. Historical
+    logs and backups follow their retention schedule.
+  </div>
+
+  {% if target.auth_method == 'shibboleth' %}
+  <p>
+    This removes the application account only. The institution's identity is
+    unaffected, and a later institutional login may create a new pending account.
+  </p>
+  {% endif %}
+
+  {% if not admin_action or target.id != user.id %}
+  <form class="auth-form"
+        action="{{ path_for(request, 'admin_account_delete_submit', user_id=target.id) if admin_action else path_for(request, 'account_delete_submit') }}"
+        method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+
+    <div class="form-group">
+      <label for="password">Your Current {{ 'Administrator ' if admin_action else '' }}Password</label>
+      <input type="password" id="password" name="password" required
+             maxlength="{{ local_password_max_chars }}" autocomplete="current-password">
+    </div>
+
+    <div class="form-group">
+      <label for="totp_code">Your Fresh {{ 'Administrator ' if admin_action else '' }}Authentication Code</label>
+      <input type="text" id="totp_code" name="totp_code" required maxlength="{{ totp_code_raw_max_chars }}"
+             pattern="[0-9\s]{6,{{ totp_code_raw_max_chars }}}" inputmode="numeric" autocomplete="one-time-code"
+             placeholder="6-digit code">
+      <span class="form-hint">
+        Use a fresh code from your own authenticator. A code already used during
+        login or another account action cannot be reused.
+      </span>
+    </div>
+
+    <div class="form-group">
+      <label>
+        <input type="checkbox" name="confirm" value="delete" required>
+        {% if admin_action %}
+        I have verified this removal request and understand that this account
+        will be permanently deleted immediately.
+        {% else %}
+        I understand that my account will be permanently deleted immediately.
+        {% endif %}
+      </label>
+    </div>
+
+    <button type="submit" class="btn btn-danger">Permanently Delete {{ 'Account' if admin_action else 'My Account' }}</button>
+  </form>
+  {% endif %}
+
+</section>
+{% endblock %}

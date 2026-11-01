@@ -20,7 +20,7 @@ case "$ci" in
   *) under_ci=1 ;;
 esac
 
-log="$(sed -E $'s/\x1b\\[[0-9;]*m//g' "$input")"
+log="$(sed -E $'s/\x1b\\[[0-9;]*m//g' "$input")" || exit 1
 
 count_line="$(printf '%s\n' "$log" | grep -v '^[[:space:]]*$' | tail -1 | sed -E 's/^=+ ?//; s/ ?=+$//')"
 if ! printf '%s\n' "$count_line" | grep -qE '^[0-9]+ (passed|failed|error|errors|skipped|xfailed|xpassed|deselected)\b.* in [0-9.]+s'; then
@@ -35,7 +35,7 @@ if printf '%s\n' "$log" | grep -qE '^SKIPPED \[[0-9]+\] '; then
 fi
 
 # pytest prints the reason as "Skipped: <reason>"; the list carries the reason alone.
-actual="$(printf '%s\n' "$log" | grep -E '^SKIPPED ' | sed -E 's/^SKIPPED //; s/ - Skipped: / - /' | sort -u)"
+actual="$(printf '%s\n' "$log" | sed -nE '/^SKIPPED /{s/^SKIPPED //; s/ - Skipped: / - /; p;}' | sort -u)" || exit 1
 
 if printf '%s\n' "$count_line" | grep -qE '\b[1-9][0-9]* skipped\b' && [ -z "$actual" ]; then
   echo "The run reports skipped tests but lists none. Run pytest with -rs --no-fold-skipped." >&2
@@ -45,11 +45,17 @@ fi
 if [ "$under_ci" -eq 1 ]; then
   expected=""
 else
-  expected="$(grep -vE '^[[:space:]]*(#|$)' "$expected_list" | sort -u)"
+  expected="$(sed -E '/^[[:space:]]*(#|$)/d' "$expected_list" | sort -u)" || exit 1
 fi
 
-unexpected="$(comm -23 <(printf '%s\n' "$actual" | grep .) <(printf '%s\n' "$expected" | grep .))"
-seen="$(comm -12 <(printf '%s\n' "$actual" | grep .) <(printf '%s\n' "$expected" | grep .))"
+# Materialize the sorted inputs: comparison errors must fail the gate,
+# including on hosts where /dev/fd process substitution is unavailable.
+comparison_dir="$(mktemp -d)" || exit 1
+trap 'rm -rf -- "$comparison_dir"' EXIT
+printf '%s\n' "$actual" | sed '/^$/d' > "$comparison_dir/actual" || exit 1
+printf '%s\n' "$expected" | sed '/^$/d' > "$comparison_dir/expected" || exit 1
+unexpected="$(comm -23 "$comparison_dir/actual" "$comparison_dir/expected")" || exit 1
+seen="$(comm -12 "$comparison_dir/actual" "$comparison_dir/expected")" || exit 1
 
 if [ -n "$seen" ]; then
   echo "Expected skips (listed in ${expected_list}):"

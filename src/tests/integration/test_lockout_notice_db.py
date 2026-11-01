@@ -1,31 +1,12 @@
-"""Integration tests for the durable lockout-notice claim against PostgreSQL.
-
-`queue_lockout_notice_cur` claims the one lockout notice allowed per failure
-streak with a compare-and-set UPDATE that shares its transaction with
-`record_login_failure_cur`. This module proves, against the real database:
-
-- exactly one pending outbox row and a non-NULL marker on the first
-  unlocked-to-locked transition;
-- an expired lock ends the streak, so the next failure releases the marker
-  and the following lockout sends one notice of its own; a successful login
-  releases it the same way;
-- two genuinely concurrent transition attempts (independent connections)
-  produce at most one notice and one marker, and two concurrent failures
-  after an expiry share one fresh budget instead of each restarting it;
-- every recovery writer (password reset, administrator reactivation,
-  federated approval, TOTP-recovery redemption) clears the failure counter,
-  the lock, and the marker together, while a redemption that fails before
-  its commit leaves all three untouched;
-- an outbox failure inside the claim's transaction rolls back the counter,
-  the lock, and the marker together, and the account can still be locked on
-  a later, unbroken attempt.
-"""
+"""Integration tests for the durable lockout-notice claim against PostgreSQL."""
 
 import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import create_autospec, patch
 
+import pyotp
 import pytest
+from psycopg.types.json import Jsonb
 
 from app.routes.auth.login import _record_failure_and_queue_notice
 from app.services import authentication, federated_session_policy, totp_recover, users
@@ -35,6 +16,7 @@ from app.services.password_reset import (
     update_password_with_token,
 )
 from app.services.tokens import hash_token
+from app.services.totp_crypto import encrypt_value
 from app.services.totp_recovery_codes import normalize_recovery_code
 from config import settings
 from tests.integration.conftest import DEFAULT_PASSWORD, do_login
@@ -55,6 +37,7 @@ def _lock_state(sync_conn, user_id):
 
 
 def _notice_outbox_rows(sync_conn, user_id):
+    """Read lockout-notice statuses for the user in insertion order."""
     return sync_conn.execute(
         """SELECT status FROM email_outbox
            WHERE user_id = %s AND message_type = 'account_locked_notice'
@@ -105,6 +88,8 @@ async def _fail_once(db_pool, user):
 
 
 class TestLockoutNoticeSingleClaim:
+    """Check lockout Notice Single Claim."""
+
     def test_first_transition_creates_exactly_one_pending_notice_and_a_marker(
         self, e2e_client, user_factory, sync_conn
     ):
@@ -126,12 +111,7 @@ class TestLockoutNoticeSuppressionAndReset:
     async def test_an_expired_lock_releases_the_marker_and_the_next_lockout_notifies_once(
         self, db_pool, user_factory, sync_conn
     ):
-        """The marker allows one notice per failure streak. When a lock
-        expires the streak is over, so the first failure afterwards has to
-        release the marker — otherwise the account could be locked again
-        without its owner ever being told. The freed marker must then be
-        claimed exactly once, by the failure that crosses the new threshold.
-        """
+        """Verify an expired lock releases the marker and the next lockout notifies once."""
         threshold = settings.login_failure_threshold
         user = user_factory()
 
@@ -166,11 +146,7 @@ class TestLockoutNoticeSuppressionAndReset:
     async def test_concurrent_failures_after_expiry_share_one_fresh_budget(
         self, db_pool, user_factory, sync_conn
     ):
-        """Two failures that arrive together once a lock has expired both see
-        the expired lock before either has written. The row lock has to
-        serialize them so the second continues the new streak instead of
-        resetting it to one again — a budget that can be reset concurrently
-        never reaches the threshold."""
+        """Verify concurrent failures after expiry share one fresh budget."""
         threshold = settings.login_failure_threshold
         user = user_factory(
             failed_login_count=threshold + 2,
@@ -242,10 +218,12 @@ class TestConcurrentLockoutTransitions:
 
 @pytest.fixture
 def _federation_enabled(monkeypatch, db_pool):
+    """Patch trusted federation settings and return the reconciliation callback."""
     monkeypatch.setattr(users.settings, "shibboleth_enabled", True)
     monkeypatch.setattr(users.settings, "shibboleth_trusted_issuers", [_ISSUER])
 
     async def _reconcile():
+        """Reconcile the current test federation policy in PostgreSQL."""
         await federated_session_policy.reconcile_federated_session_policy(db_pool)
 
     return _reconcile
@@ -258,7 +236,10 @@ class TestLockoutStateClearedByRecoveryPaths:
     async def test_password_reset_completion_clears_counter_lock_and_marker_together(
         self, db_pool, user_factory, sync_conn
     ):
+        """Verify password reset completion clears counter lock and marker together."""
+        secret = pyotp.random_base32()
         user = user_factory(
+            totp_secret=encrypt_value(secret),
             failed_login_count=3,
             locked_until=datetime.now(UTC) + timedelta(minutes=15),
             lockout_notice_enqueued_at=datetime.now(UTC),
@@ -269,9 +250,10 @@ class TestLockoutStateClearedByRecoveryPaths:
         await update_password_with_token(
             db_pool,
             user.id,
-            hash_token(token),
+            token,
             "Fresh-Password-Without-Common-Words-824!",
             expected_email=user.email,
+            totp_code=pyotp.TOTP(secret).now(),
         )
 
         assert _lock_state(sync_conn, user.id) == (0, None, None)
@@ -279,6 +261,7 @@ class TestLockoutStateClearedByRecoveryPaths:
     async def test_admin_reactivation_clears_counter_lock_and_marker_together(
         self, db_pool, user_factory, admin_actor, sync_conn
     ):
+        """Verify admin reactivation clears counter lock and marker together."""
         user = user_factory(
             is_active=False,
             failed_login_count=3,
@@ -296,11 +279,16 @@ class TestLockoutStateClearedByRecoveryPaths:
     async def test_federated_approval_clears_counter_lock_and_marker_together(
         self, db_pool, user_factory, admin_actor, sync_conn, _federation_enabled
     ):
+        """Verify federated approval clears counter lock and marker together."""
         await _federation_enabled()
         user = user_factory(
             auth_method="shibboleth",
             is_active=False,
             federated_status="pending",
+            federated_review_revision=1,
+            federated_review=Jsonb(
+                {"issuer": _ISSUER, "affiliation": None, "entitlement": None, "proposal": None}
+            ),
             shibboleth_issuer=_ISSUER,
             shibboleth_subject_id=_SUBJECT,
             access_tier="public",
@@ -314,6 +302,7 @@ class TestLockoutStateClearedByRecoveryPaths:
             user.id,
             expected_issuer=_ISSUER,
             expected_subject_id=_SUBJECT,
+            expected_review_revision=1,
             access_tier="vetted",
             actor_id=admin_actor.id,
             actor_session_id=admin_actor.session_id,
@@ -324,6 +313,7 @@ class TestLockoutStateClearedByRecoveryPaths:
     async def test_totp_recovery_redemption_clears_counter_lock_and_marker_together(
         self, db_pool, user_factory, sync_conn
     ):
+        """Verify TOTP recovery redemption clears counter lock and marker together."""
         user = user_factory(
             failed_login_count=3,
             locked_until=datetime.now(UTC) + timedelta(minutes=15),

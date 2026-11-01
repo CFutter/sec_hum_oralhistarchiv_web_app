@@ -1,18 +1,4 @@
-"""Tier lattice + redaction totality (pure unit tier — no DB, no client).
-
-Pins the access-tier hierarchy in app/services/access_tiers.py
-(can_access / tier_rank / resolve_tier / resolve_required_source_tier /
-SourcePolicy) and the
-redaction machinery in app/services/datasets.py (filter_for_tier,
-_redacted_values, assert_redaction_total, PUBLIC_DISCOVERY_FIELDS,
-PUBLIC_SEARCH_FIELDS).
-
-The tier lattice is the single authorization primitive for metadata
-visibility; filter_for_tier is the single redaction chokepoint every
-dataset read funnels through. A failure here is a silent data leak,
-so each edge of the lattice and both failure modes of the totality
-check are pinned explicitly.
-"""
+"""Tier ordering, source ceilings and total dataset-field redaction."""
 
 import ast
 import dataclasses
@@ -26,7 +12,6 @@ import pytest
 
 from app.services import access_tiers, datasets
 from app.services.access_tiers import (
-    SourcePolicy,
     SourceVisibilityTierError,
     can_access,
     resolve_required_source_tier,
@@ -35,20 +20,20 @@ from app.services.access_tiers import (
 )
 from app.services.datasets import Author, Dataset, filter_for_tier
 from app.services.db_schema_contract import FUNCTION_CONTRACTS
-from app.services.sync import _classify_swissubase_access
+from app.sources import SourcePolicy
+from app.sources.oai_pmh_cmdi import classify_oai_access
+from tests.source_fixtures import legacy_source
+
+_SOURCES = (legacy_source(max_visibility="public"),)
 
 
 def _noop_classifier(_license_val: str | None) -> str:
-    """Placeholder for tests that exercise tier resolution, not classification.
-
-    resolve_tier never calls classify_access; SourcePolicy just requires one.
-    """
+    """Return public as an unused classifier for tier-policy tests."""
     return "public"
 
 
 def make_full_dataset(**overrides) -> Dataset:
-    """A Dataset with EVERY field populated with a distinctive non-default
-    value, so redaction tests can tell 'kept' from 'redacted' for each field."""
+    """Populate every Dataset field with a distinctive value, applying explicit overrides."""
     values = {
         "id": 7,
         "uuid": "uuid-0007",
@@ -77,58 +62,40 @@ def make_full_dataset(**overrides) -> Dataset:
     return Dataset(**cast("Any", values))
 
 
-# ---------------------------------------------------------------------------
-# can_access — the full 3x3 lattice
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     ("user_tier", "required_tier", "expected"),
     [
-        # public user: sees only public
         ("public", "public", True),
         ("public", "registered", False),
         ("public", "vetted", False),
-        # registered user: public + registered
         ("registered", "public", True),
         ("registered", "registered", True),
         ("registered", "vetted", False),
-        # vetted user: sees everything
         ("vetted", "public", True),
         ("vetted", "registered", True),
         ("vetted", "vetted", True),
     ],
 )
 def test_can_access_full_matrix(user_tier, required_tier, expected):
-    """Pins every cell of the 3x3 tier matrix: vetted > registered > public,
-    strict and total. Guards against any reordering/off-by-one in _TIER_RANK
-    (e.g. a swapped comparison letting public viewers see vetted metadata)."""
+    """Check all nine viewer/required-tier combinations."""
     assert can_access(user_tier, required_tier) is expected
 
 
 @pytest.mark.parametrize(
     ("user_tier", "required_tier"),
     [
-        ("garbage", "public"),  # unknown user tier
-        ("vetted", "garbage"),  # unknown required tier
+        ("garbage", "public"),
+        ("vetted", "garbage"),
     ],
 )
 def test_can_access_unknown_tier_raises_value_error(user_tier, required_tier):
-    """Unknown tier strings on EITHER side raise ValueError (fail closed),
-    never a silent True/False. Guards the KeyError -> ValueError translation."""
+    """Raise ValueError for an unknown viewer or required tier."""
     with pytest.raises(ValueError, match="Unknown access tier"):
         can_access(user_tier, required_tier)
 
 
-# ---------------------------------------------------------------------------
-# tier_rank — numeric ranks used in SQL tier gating
-# ---------------------------------------------------------------------------
-
-
 def test_tier_rank_values():
-    """public=0, registered=1, vetted=2. These exact numbers are baked into
-    the SQL CASE expressions in datasets.py (visibility gating); changing
-    them without touching the SQL would desynchronize Python and DB gating."""
+    """Keep public=0, registered=1 and vetted=2 aligned with SQL ranks."""
     assert tier_rank("public") == 0
     assert tier_rank("registered") == 1
     assert tier_rank("vetted") == 2
@@ -140,18 +107,8 @@ def test_tier_rank_unknown_raises_value_error():
         tier_rank("garbage")
 
 
-# ---------------------------------------------------------------------------
-# resolve_tier — record tier vs source ceiling (more restrictive wins)
-# ---------------------------------------------------------------------------
-
-
 def test_resolve_optional_tier_none_returns_ceiling():
-    """An optional-tier source gets its ceiling when the record has no tier.
-
-    Source A uses this model because its public OAI stream does not carry an
-    application visibility classification. Sensitive Source B records use the
-    strict primitive tested below instead.
-    """
+    """An optional-tier source gets its ceiling when the record has no tier."""
     policy = SourcePolicy(
         name="optional-tier-source",
         max_visibility="vetted",
@@ -161,7 +118,7 @@ def test_resolve_optional_tier_none_returns_ceiling():
 
 
 def test_resolve_optional_tier_garbage_returns_ceiling():
-    """The legacy optional-tier resolver does not trust an unknown value."""
+    """Use the source ceiling when an optional record tier is unknown."""
     policy = SourcePolicy(
         name="optional-tier-source",
         max_visibility="registered",
@@ -181,20 +138,12 @@ def test_resolve_optional_tier_clamps_record_more_permissive_than_ceiling():
 
 
 def test_resolve_optional_tier_keeps_record_more_restrictive_than_ceiling():
-    """A record claiming 'vetted' under a 'registered' ceiling KEEPS 'vetted':
-    being more restrictive than the ceiling is always allowed. Also pins the
-    equal case (record at ceiling keeps its own tier)."""
+    """Preserve a record tier equal to or stricter than its source ceiling."""
     policy = SourcePolicy(
         name="open-source", max_visibility="registered", classify_access=_noop_classifier
     )
     assert resolve_tier("vetted", policy) == "vetted"
-    # Record exactly at the ceiling keeps its own tier too (>= comparison).
     assert resolve_tier("registered", policy) == "registered"
-
-
-# ---------------------------------------------------------------------------
-# resolve_required_source_tier — mandatory Source B tier contract
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -221,11 +170,7 @@ def test_resolve_optional_tier_keeps_record_more_restrictive_than_ceiling():
     ],
 )
 def test_required_source_tier_rejects_missing_or_unknown(record_tier):
-    """SB-VIS-001/002: invalid classifications raise before persistence.
-
-    The future Source B adapter must turn this failure into record rejection or
-    quarantine, never a potentially more permissive default.
-    """
+    """Reject missing or unknown mandatory tiers without echoing their values."""
     policy = SourcePolicy(
         name="source-b",
         max_visibility="registered",
@@ -255,7 +200,7 @@ def test_required_source_tier_rejects_missing_or_unknown(record_tier):
     ],
 )
 def test_required_source_tier_full_record_ceiling_matrix(record_tier, ceiling, expected):
-    """SB-VIS-003: policy may only keep or tighten a valid source tier."""
+    """Keep or tighten valid source tiers against their ceiling."""
     policy = SourcePolicy(
         name="source-b",
         max_visibility=ceiling,
@@ -264,15 +209,8 @@ def test_required_source_tier_full_record_ceiling_matrix(record_tier, ceiling, e
     assert resolve_required_source_tier(record_tier, policy) == expected
 
 
-# ---------------------------------------------------------------------------
-# SourcePolicy — frozen dataclass
-# ---------------------------------------------------------------------------
-
-
 def test_source_policy_is_frozen():
-    """SourcePolicy(frozen=True): assigning to a field raises. Guards against
-    the dataclass losing frozen=True, which would let ingest code silently
-    widen a source's visibility ceiling at runtime."""
+    """Reject SourcePolicy mutation with FrozenInstanceError."""
     policy = SourcePolicy(
         name="swissubase", max_visibility="registered", classify_access=_noop_classifier
     )
@@ -281,51 +219,35 @@ def test_source_policy_is_frozen():
 
 
 class TestSwissubaseAccessClassification:
-    """`_classify_swissubase_access` (the SWISSUbase source's
-    `classify_access` implementation) and the SourcePolicy contract that
-    requires every source to supply one explicitly."""
+    """OAI access labels use an explicit local mapping and conservative fallback."""
 
     @pytest.mark.parametrize(
         ("license_val", "expected"),
         [
-            # Case-insensitive prefix match on "restricted access".
-            ("Restricted access — ethics approval", "restricted"),
+            ("Restricted access", "restricted"),
             ("RESTRICTED ACCESS: contact the depositor", "restricted"),
-            # Anything else is public (fail-open by choice for SWISSUbase).
             ("License CC BY", "public"),
-            (None, "public"),
+            (None, "restricted"),
         ],
         ids=[
-            "restricted-access-prefix-mixed-case",
-            "restricted-access-prefix-upper-case",
-            "any-other-license-is-public",
-            "missing-license-is-public",
+            "exact-restricted-access",
+            "unknown-label-is-restricted",
+            "explicit-local-public-label",
+            "missing-license-is-restricted",
         ],
     )
-    def test_classifies_by_restricted_access_prefix(self, license_val, expected):
-        """'restricted access*' (any case) → restricted; everything else
-        (incl. None) → public for source='swissubase'."""
-        assert _classify_swissubase_access(license_val) == expected
+    def test_classifies_by_explicit_mapping(self, license_val, expected):
+        """Only exact public labels map to public; unknown/missing stays restricted."""
+        assert classify_oai_access(license_val) == expected
 
     def test_source_policy_requires_explicit_classifier(self):
-        """A new source cannot inherit SWISSUbase's fail-open classifier
-        by accident — omitting classify_access fails at construction, not per
-        record inside the sync loop."""
+        """Every source must supply its own resource-access classifier."""
         with pytest.raises(TypeError):
             SourcePolicy(name="source-b", max_visibility="vetted")
 
 
-# ---------------------------------------------------------------------------
-# Public discovery policy + filter_for_tier redaction behavior
-# ---------------------------------------------------------------------------
-
-
 def test_public_discovery_fields_are_explicit_and_stable():
-    """SB-DISC-001/002: this exact set is disclosed below tier.
-
-    A source or fork with a different disclosure policy must make a reviewed
-    code-and-test change instead of acquiring a new public field implicitly.
-    """
+    """Keep the exact reviewed set of below-tier discovery fields."""
     assert (
         frozenset(
             {
@@ -343,18 +265,13 @@ def test_public_discovery_fields_are_explicit_and_stable():
 
 
 def test_public_search_fields_are_explicit_and_inside_discovery_envelope():
-    """SB-DISC-006: only title and access level are searchable below tier."""
+    """Limit below-tier search to discovery title and access level."""
     assert frozenset({"title", "access_level"}) == datasets.PUBLIC_SEARCH_FIELDS
     assert datasets.PUBLIC_SEARCH_FIELDS <= datasets.PUBLIC_DISCOVERY_FIELDS
 
 
 def test_schema_contract_public_search_assignment_matches_policy():
-    """SB-DISC-006: runtime-preflight's PostgreSQL function contract builds
-    search_text_public from exactly PUBLIC_SEARCH_FIELDS—no full-only field.
-
-    The live-schema integration suite separately proves that a changed function
-    body is rejected, so this comparison ties that guarded body to field policy.
-    """
+    """Build public search text from exactly PUBLIC_SEARCH_FIELDS."""
     function_source = FUNCTION_CONTRACTS["update_search_text()"].source
     _, separator, after_assignment = function_source.partition("NEW.search_text_public :=")
     assert separator, "schema contract no longer assigns search_text_public"
@@ -366,22 +283,18 @@ def test_schema_contract_public_search_assignment_matches_policy():
 
 
 def test_filter_for_tier_at_or_above_returns_same_object():
-    """A user at or above the dataset's visibility_tier gets the IDENTICAL
-    object back (no copy, no redaction). Pins the identity fast-path with
-    `is`, both for tier == visibility_tier and tier above it."""
+    """Return the original dataset when no field requires redaction."""
     ds_registered = make_full_dataset(visibility_tier="registered")
-    assert filter_for_tier(ds_registered, "registered") is ds_registered  # equal
-    assert filter_for_tier(ds_registered, "vetted") is ds_registered  # above
+    assert (
+        filter_for_tier(ds_registered, "registered", configured_sources=_SOURCES) is ds_registered
+    )
+    assert filter_for_tier(ds_registered, "vetted", configured_sources=_SOURCES) is ds_registered
 
 
 def test_filter_for_tier_below_returns_new_redacted_dataset():
-    """SB-DISC-001/002: a below-tier viewer gets a NEW Dataset keeping
-    exactly PUBLIC_DISCOVERY_FIELDS and every other field reset to its
-    redacted value (None or fresh []). Checked field-by-field over
-    dataclass_fields so a newly added field cannot slip through unclassified.
-    """
+    """Copy below-tier datasets, preserving discovery fields and clearing private fields."""
     ds = make_full_dataset(visibility_tier="vetted")
-    redacted = filter_for_tier(ds, "public")
+    redacted = filter_for_tier(ds, "public", configured_sources=_SOURCES)
 
     assert redacted is not ds
     assert isinstance(redacted, Dataset)
@@ -391,59 +304,44 @@ def test_filter_for_tier_below_returns_new_redacted_dataset():
     expected_redacted = datasets._redacted_values()
     for f in dataclass_fields(Dataset):
         if f.name in expected_visible:
-            # kept verbatim from the original
             assert getattr(redacted, f.name) == getattr(ds, f.name), f.name
         else:
-            # reset to the redacted value, never the original
             assert getattr(redacted, f.name) == expected_redacted[f.name], f.name
 
-    # Spot-check the fields the spec names explicitly.
     assert redacted.authors == []
     assert redacted.keywords == []
     assert redacted.languages == []
     assert redacted.description is None
     assert redacted.doi is None
-    # The original is untouched by redaction.
     assert ds.description == "Long description"
     assert ds.authors == [Author(name="A. Author")]
 
 
 def test_filter_for_tier_redacted_lists_are_not_shared():
-    """MUTATION-ISOLATION pin: redact two datasets, mutate one's .languages
-    in place -> the other's stays []."""
+    """Allocate independent empty lists for each redacted dataset."""
     ds_a = make_full_dataset(id=1, uuid="uuid-a", visibility_tier="vetted")
     ds_b = make_full_dataset(id=2, uuid="uuid-b", visibility_tier="vetted")
 
-    red_a = filter_for_tier(ds_a, "public")
-    red_b = filter_for_tier(ds_b, "public")
+    red_a = filter_for_tier(ds_a, "public", configured_sources=_SOURCES)
+    red_b = filter_for_tier(ds_b, "public", configured_sources=_SOURCES)
 
     red_a.languages.append("Klingon")
 
     assert red_a.languages == ["Klingon"]
-    assert red_b.languages == []  # would be ["Klingon"] if lists were aliased
-    # Same guarantee for the other list-typed redacted fields.
+    assert red_b.languages == []
     red_a.keywords.append("leak")
     red_a.authors.append(Author(name="Mallory"))
     assert red_b.keywords == []
     assert red_b.authors == []
 
 
-# ---------------------------------------------------------------------------
-# assert_redaction_total — startup totality check
-# ---------------------------------------------------------------------------
+def test_assert_field_visibility_total_passes_today():
+    """Classify every Dataset field in exactly one disclosure set."""
+    datasets.assert_field_visibility_total()
 
 
-def test_assert_redaction_total_passes_today():
-    """The current classification is total and disjoint: every Dataset field
-    is in exactly one of PUBLIC_DISCOVERY_FIELDS / _redacted_values(). If this
-    fails, a Dataset field was added without a disclosure decision."""
-    datasets.assert_redaction_total()  # must not raise
-
-
-def test_assert_redaction_total_detects_overlap(monkeypatch):
-    """A field in BOTH sets ('description' added to PUBLIC_DISCOVERY_FIELDS
-    while still in _redacted_values) is an erroneous classification;
-    assert_redaction_total raises AssertionError naming the field."""
+def test_assert_field_visibility_total_detects_overlap(monkeypatch):
+    """Name fields present in both disclosure sets."""
     monkeypatch.setattr(
         datasets,
         "PUBLIC_DISCOVERY_FIELDS",
@@ -453,12 +351,11 @@ def test_assert_redaction_total_detects_overlap(monkeypatch):
         AssertionError,
         match=r"in both sets.*description",
     ):
-        datasets.assert_redaction_total()
+        datasets.assert_field_visibility_total()
 
 
-def test_assert_redaction_total_detects_unapproved_public_search_field(monkeypatch):
-    """SB-DISC-006 fail-fast: an ungated search field outside the public
-    discovery envelope is an authorization oracle and blocks startup."""
+def test_assert_field_visibility_total_detects_unapproved_public_search_field(monkeypatch):
+    """Reject public-search fields outside the discovery set."""
     monkeypatch.setattr(
         datasets,
         "PUBLIC_SEARCH_FIELDS",
@@ -468,17 +365,15 @@ def test_assert_redaction_total_detects_unapproved_public_search_field(monkeypat
         AssertionError,
         match=r"publicly searchable but not public-discovery fields.*description",
     ):
-        datasets.assert_redaction_total()
+        datasets.assert_field_visibility_total()
 
 
-def test_assert_redaction_total_detects_unclassified_field(monkeypatch):
-    """A Dataset field in NEITHER set (drop 'doi' from _redacted_values) is
-    an unclassified field — the exact 'new field silently leaks or vanishes'
-    failure the startup check exists for. AssertionError says 'unclassified'
-    and names the field."""
+def test_assert_field_visibility_total_detects_unclassified_field(monkeypatch):
+    """Name Dataset fields missing from both disclosure sets."""
     original = datasets._redacted_values
 
     def redacted_minus_doi():
+        """Return the redaction map without DOI classification."""
         values = original()
         del values["doi"]
         return values
@@ -490,19 +385,17 @@ def test_assert_redaction_total_detects_unclassified_field(monkeypatch):
         AssertionError,
         match=r"unclassified fields.*doi",
     ):
-        datasets.assert_redaction_total()
+        datasets.assert_field_visibility_total()
 
 
-def test_assert_redaction_total_detects_stale_classified_name(monkeypatch):
-    """A classified name that is NOT a Dataset field (a typo, or a rename applied
-    to the dataclass but not to _redacted_values) would pass the coverage check
-    and then raise TypeError inside filter_for_tier on the first below-tier
-    render. Caught at startup instead."""
+def test_assert_field_visibility_total_detects_stale_classified_name(monkeypatch):
+    """Reject classification names absent from Dataset."""
     original = datasets._redacted_values
 
     def redacted_with_typo():
+        """Return a redaction map with a misspelled license field."""
         values = original()
-        values["licence_val"] = values.pop("license_val")  # British spelling typo
+        values["licence_val"] = values.pop("license_val")
         return values
 
     spy = create_autospec(datasets._redacted_values, spec_set=True)
@@ -512,39 +405,27 @@ def test_assert_redaction_total_detects_stale_classified_name(monkeypatch):
         AssertionError,
         match=r"not Dataset fields.*licence_val",
     ):
-        datasets.assert_redaction_total()
-
-
-# ---------------------------------------------------------------------------
-# assert_tier_rank_complete (the untested twin of
-# assert_redaction_total; both are lifespan fail-fast guards)
-# ---------------------------------------------------------------------------
+        datasets.assert_field_visibility_total()
 
 
 def test_assert_tier_rank_complete_passes_today():
-    """The shipped lattice is complete and total. If this fails, an
-    AccessTier member was added without a rank."""
-    access_tiers.assert_tier_rank_complete()  # must not raise
+    """Assign a rank to every declared access tier."""
+    access_tiers.assert_tier_rank_complete()
 
 
 def test_assert_tier_rank_complete_detects_unranked_tier(monkeypatch):
-    """A tier declared in the AccessTier Literal but absent from _TIER_RANK
-    falls to the fail-closed `ELSE 99` in TIER_CASE_SQL and vanishes from
-    EVERY visibility query — rows become invisible to everyone, including
-    admins. The guard must name it at startup."""
+    """Reject a declared tier missing from the rank map."""
     monkeypatch.setattr(
         access_tiers,
         "_TIER_RANK",
-        {"public": 0, "registered": 1},  # 'vetted' dropped
+        {"public": 0, "registered": 1},
     )
     with pytest.raises(AssertionError, match=r"unranked.*vetted"):
         access_tiers.assert_tier_rank_complete()
 
 
 def test_assert_tier_rank_complete_detects_ranked_but_undeclared(monkeypatch):
-    """The other direction: a rank for a tier the Literal no longer declares
-    (a rename applied to AccessTier but not to _TIER_RANK). Mirrors
-    test_assert_redaction_total_detects_stale_classified_name."""
+    """Reject a ranked tier absent from the declared tier type."""
     monkeypatch.setattr(
         access_tiers,
         "_TIER_RANK",
@@ -554,24 +435,11 @@ def test_assert_tier_rank_complete_detects_ranked_but_undeclared(monkeypatch):
         access_tiers.assert_tier_rank_complete()
 
 
-# ---------------------------------------------------------------------------
-# structural canary — every tier-aware read path must redact
-# ---------------------------------------------------------------------------
-
-
 def test_every_dataset_read_path_funnels_through_filter_for_tier():
-    """The get_recent_datasets hole existed because nobody
-    ENUMERATED it as a redaction channel. This makes the enumeration
-    self-enforcing — a new public async read taking user_tier that never
-    calls filter_for_tier fails HERE, not in production.
-
-    Exemptions are aggregate channels that return scalars/value-lists rather
-    than Dataset rows: they are tier-scoped in SQL, with nothing to redact.
-    Adding to this set must be a reviewed decision with a reason."""
+    """Require every tier-aware dataset read to invoke field redaction."""
     AGGREGATE_CHANNELS = {
-        "get_home_metadata_counts",  # two counts, tier-scoped in one SQL query
+        "count_search_datasets",  # exact scalar count; field gates are applied in SQL
         "get_facets",  # returns value lists; tier-scoped via TIER_CASE_SQL
-        "get_keyword_count",  # returns an int; tier-scoped via TIER_CASE_SQL
     }
 
     tree = ast.parse(inspect.getsource(datasets))

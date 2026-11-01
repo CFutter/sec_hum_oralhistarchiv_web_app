@@ -1,47 +1,52 @@
-"""``validate_rate_limit_configuration`` rejects every unsafe effective
-configuration SlowAPI could otherwise construct — whether the constructor
-was called with unsafe options, an already-built limiter's private state is
-mutated afterwards, or the environment's own settings resolve to something
-unsafe — and admits the exact policy the application actually builds.
-"""
+"""Contract tests for rate limiter configuration validation."""
+
+from collections.abc import Callable
+from typing import Literal
 
 import pytest
 from pydantic import SecretStr
 from slowapi import Limiter
 
 import app.middleware.rate_limiting as rl
-from app.middleware.rate_limiting import redis_storage_options, validate_rate_limit_configuration
+from app.middleware.bounded_rate_limit_storage import bounded_redis_uri
+from app.middleware.rate_limiting import bounded_storage_options, validate_rate_limit_configuration
 from config import settings
 
 
-def _redis_backed_limiter(**overrides) -> Limiter:
-    """A limiter built with exactly `_build_limiter`'s options, against the
-    test environment's own configured Redis URL so its constructed storage
-    URI matches what `validate_rate_limit_configuration` resolves from
-    settings."""
-    kwargs = {
-        "key_func": rl.get_rate_limit_client_id,
-        "default_limits": ["100/minute"],
-        "strategy": "fixed-window",
-        "storage_uri": settings.rate_limit_storage_uri,
-        "storage_options": redis_storage_options(),
-        "enabled": True,
-        "headers_enabled": False,
-        "key_prefix": rl._RATE_LIMIT_KEY_PREFIX,
-        "key_style": "endpoint",
-        "in_memory_fallback_enabled": False,
-        "swallow_errors": False,
-    }
-    kwargs.update(overrides)
-    return Limiter(**kwargs)
+def _redis_backed_limiter(
+    *,
+    in_memory_fallback_enabled: bool = False,
+    swallow_errors: bool = False,
+    headers_enabled: bool = False,
+    strategy: str = "fixed-window",
+    key_style: Literal["endpoint", "url"] = "endpoint",
+    key_prefix: str = rl._RATE_LIMIT_KEY_PREFIX,
+    application_limits: list[str | Callable[..., str]] | None = None,
+) -> Limiter:
+    """Build a Redis limiter from current application settings with explicit constructor overrides."""
+    storage_uri = settings.rate_limit_storage_uri
+    assert storage_uri is not None
+    return Limiter(
+        key_func=rl.get_rate_limit_client_id,
+        default_limits=["100/minute"],
+        application_limits=[] if application_limits is None else application_limits,
+        strategy=strategy,
+        storage_uri=bounded_redis_uri(storage_uri),
+        storage_options=bounded_storage_options(),
+        enabled=True,
+        headers_enabled=headers_enabled,
+        key_prefix=key_prefix,
+        key_style=key_style,
+        in_memory_fallback_enabled=in_memory_fallback_enabled,
+        swallow_errors=swallow_errors,
+    )
 
 
 class TestConstructorOptionsThatMustBeRejected:
-    """Positive control plus one parametrize id per unsafe constructor
-    option; each unsafe limiter must fail validation while the exact
-    application-equivalent construction passes."""
+    """Cover constructor options that must be rejected."""
 
     def test_the_application_equivalent_construction_passes(self):
+        """Check the application equivalent construction passes."""
         validate_rate_limit_configuration(_redis_backed_limiter())
 
     @pytest.mark.parametrize(
@@ -69,12 +74,14 @@ class TestConstructorOptionsThatMustBeRejected:
         ],
     )
     def test_an_unsafe_constructor_option_is_rejected(self, overrides, expected_fragment):
+        """Check an unsafe constructor option is rejected (RuntimeError)."""
         limiter = _redis_backed_limiter(**overrides)
         with pytest.raises(RuntimeError, match=expected_fragment):
             validate_rate_limit_configuration(limiter)
 
 
 def _memory_limiter() -> Limiter:
+    """Build a memory limiter with the production key policy and no error fallback."""
     return Limiter(
         key_func=rl.get_rate_limit_client_id,
         default_limits=["100/minute"],
@@ -91,13 +98,10 @@ def _memory_limiter() -> Limiter:
 
 
 class TestHardenedEnvironmentRequiresADedicatedRedisUrl:
-    """`settings.rate_limit_storage_uri` never actually resolves to `None`
-    today (its final fallback is the literal string `"memory://"`), so this
-    exercises the `resolved_storage_uri is None` branch directly by
-    patching the property — the defensive check `validate_rate_limit_configuration`
-    itself performs, independent of whether anything can reach it today."""
+    """Hardened web startup rejects a missing dedicated rate-limit Redis URL."""
 
     def test_a_hardened_environment_with_no_resolved_url_is_rejected(self, monkeypatch):
+        """Check a hardened environment with no resolved URL is rejected (RuntimeError)."""
         monkeypatch.setattr(type(settings), "rate_limit_storage_uri", property(lambda _self: None))
         monkeypatch.setattr(settings, "env_state", "production")
 
@@ -107,18 +111,14 @@ class TestHardenedEnvironmentRequiresADedicatedRedisUrl:
     def test_a_dev_environment_with_no_resolved_url_is_not_rejected_for_that_reason(
         self, monkeypatch
     ):
-        """Positive control: the same unresolved-URL condition, in a
-        non-hardened (dev) environment, does not trip this check."""
+        """Check a dev environment with no resolved URL is not rejected for that reason."""
         monkeypatch.setattr(type(settings), "rate_limit_storage_uri", property(lambda _self: None))
         monkeypatch.setattr(settings, "env_state", "dev")
 
         validate_rate_limit_configuration(_memory_limiter())
 
     def test_a_hardened_environment_rejects_the_shared_redis_url_substitution(self, monkeypatch):
-        """The specification requires a hardened web process to refuse
-        `rate_limit_storage_uri`'s fallback to the shared `REDIS_URL` cache
-        when no dedicated `RATE_LIMIT_REDIS_URL` is configured — that cache
-        is not provisioned or access-controlled as the rate-limit store."""
+        """Check a hardened environment rejects the shared Redis URL substitution (RuntimeError)."""
         monkeypatch.setattr(settings, "rate_limit_redis_url", SecretStr(""))
         monkeypatch.setattr(settings, "redis_enabled", True)
         monkeypatch.setattr(settings, "redis_url", SecretStr("redis://shared-cache:6379/0"))
@@ -130,13 +130,10 @@ class TestHardenedEnvironmentRequiresADedicatedRedisUrl:
 
 
 class TestMutatingAConstructedLimiterIsAlwaysCaught:
-    """A limiter built exactly like the application's, then mutated on one
-    private attribute after construction, must still be rejected —
-    validation inspects the live object, not a snapshot taken at
-    construction time."""
+    """Cover mutating aconstructed limiter is always caught."""
 
     def test_the_unmutated_limiter_passes(self):
-        """Positive control for every mutation below."""
+        """Check the unmutated limiter passes."""
         validate_rate_limit_configuration(_redis_backed_limiter())
 
     @pytest.mark.parametrize(
@@ -159,6 +156,7 @@ class TestMutatingAConstructedLimiterIsAlwaysCaught:
         ],
     )
     def test_a_mutated_private_attribute_is_rejected(self, attribute, value, expected_fragment):
+        """Check a mutated private attribute is rejected (RuntimeError)."""
         limiter = _redis_backed_limiter()
         setattr(limiter, attribute, value)
         with pytest.raises(RuntimeError, match=expected_fragment):

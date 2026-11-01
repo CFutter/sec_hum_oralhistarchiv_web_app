@@ -3,7 +3,8 @@ Description=Oral History Archive — Background Scheduler
 # The scheduler never receives RATE_LIMIT_REDIS_URL and therefore has no
 # dependency on the security-counter service. General cache/pub-sub Redis is
 # optional best-effort state configured through common.env.
-After=network-online.target postgresql.service oralhistarchiv.service
+After=network-online.target postgresql.service oralhistarchiv.service oralhistarchiv-parser.socket
+Requires=oralhistarchiv-parser.socket
 Wants=network-online.target postgresql.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
@@ -12,15 +13,17 @@ StartLimitBurst=5
 # This UID and group must remain distinct from the web process and proxy group.
 User=oralhistarchiv-scheduler
 Group=oralhistarchiv-scheduler
+SupplementaryGroups=oralhistarchiv-deploy-lock
 UMask=0077
 WorkingDirectory=/opt/oralhistarchiv
 # Deliberately does not load the web-only shibboleth.env impersonation secret.
 EnvironmentFile=/etc/oralhistarchiv/common.env
 EnvironmentFile=/etc/oralhistarchiv/scheduler.env
+Environment=APP_PROCESS_ROLE=scheduler PARSER_EXECUTION_MODE=service
 ExecStartPre=/usr/bin/test ${ENV_STATE} = production
-UnsetEnvironment=PYTHONPATH PYTHONHOME VIRTUAL_ENV RATE_LIMIT_REDIS_URL RATE_LIMIT_MONITOR_REDIS_URL
+UnsetEnvironment=PYTHONPATH PYTHONHOME VIRTUAL_ENV RATE_LIMIT_REDIS_URL RATE_LIMIT_MONITOR_REDIS_URL TOTP_ENCRYPTION_KEYS
 
-ExecStart=/usr/bin/flock --shared --no-fork /run/lock/oralhistarchiv-deploy.lock /opt/oralhistarchiv/.venv/bin/python -I /opt/oralhistarchiv/run_scheduler.py
+ExecStart=/usr/bin/flock --shared --timeout 60 --conflict-exit-code 75 --no-fork /run/lock/oralhistarchiv-deploy.lock /opt/oralhistarchiv/.venv/bin/python -I /opt/oralhistarchiv/run_scheduler.py
 
 StandardOutput=journal
 StandardError=journal
@@ -44,7 +47,10 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-MemoryMax=256M
+# Includes the scheduler and overlapping SMTP child. Separate parser service
+# cgroups have independent limits; include them in whole-host sizing.
+# Qualify the whole-cgroup peak on the target host; see Deployment.md.
+MemoryMax=1G
 
 [Install]
 WantedBy=multi-user.target

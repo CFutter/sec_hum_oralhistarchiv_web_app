@@ -1,0 +1,26 @@
+# Offline configuration for the isolated adapter-extensibility proof.
+[[sources]]
+name = "fixture_demo"
+adapter = "fixture"
+label = "Bundled fixture control"
+sensitivity_badge = "Synthetic examples"
+dataset = "catalogue_v1"
+max_visibility = "public"
+requires_record_tier = true
+incremental_interval_seconds = 1800
+rebuild_interval_seconds = 43200
+write_timeout_seconds = 120
+max_bytes = 65536
+
+[[sources]]
+name = "static_json_demo"
+adapter = "static_json"
+label = "Static JSON extension proof"
+sensitivity_badge = "Synthetic examples"
+dataset = "proof_v1"
+max_visibility = "public"
+requires_record_tier = true
+incremental_interval_seconds = 3600
+rebuild_interval_seconds = 86400
+write_timeout_seconds = 120
+max_bytes = 65536
